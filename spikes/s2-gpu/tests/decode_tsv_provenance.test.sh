@@ -12,7 +12,9 @@ bad() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
 hdr=$(grep -o "echo '--- dmon[^']*'" "$S2/bench_decode.sh" | sed "s/^echo '//; s/'\$//")
 if [ -z "$hdr" ]; then
   bad dmon_header_matches_script "no dmon header in bench_decode.sh"
-elif [ "$(grep -c -- '^--- dmon' "$TSV")" -eq "$(grep -cxF -- "$hdr" "$TSV")" ]; then
+elif [ "$(grep -c -- '^--- dmon' "$TSV")" -eq "$(grep -cxF -- "$hdr" "$TSV")" ] \
+  && [ "$(grep -c -- '^--- dmon' "$TSV")" -gt 0 ] \
+  && [ "$(grep -c -- '^--- dmon' "$TSV")" -eq "$(grep -c -- '^### ' "$TSV")" ]; then
   ok dmon_header_matches_script
 else
   bad dmon_header_matches_script "script prints '$hdr'; decode.tsv has '$(grep -m1 -- '^--- dmon' "$TSV")'"

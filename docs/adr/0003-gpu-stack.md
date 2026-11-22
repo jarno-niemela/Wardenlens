@@ -23,7 +23,7 @@ Method notes. Decode input is synthetic (`testsrc2`, libx264, GOP 2 s, bitrates 
 samples would show the owner's property; synthetic content is simpler than real footage, so absolute numbers are
 indicative. Decode ran with ffmpeg 6.1 `h264_cuvid` at maximum speed (no `-re`), output to the null muxer, so each run
 also includes the device-to-host frame copy. Each stream loops a 20 s clip 11 to 21 times. Inference used random FP32
-input (latency does not depend on content), 20 warm-up runs, 200 timed runs (30 on CPU, 4 intra-op threads on a 4-core host).
+input (latency does not depend on content), 20 warm-up runs, 200 timed runs (30 on CPU, 4 intra-op threads on a 4-core host, `results/gpu.txt`).
 
 ## Measurements
 
@@ -48,7 +48,7 @@ The decoder saturates at roughly 2200-2300 fps of sub-stream pixels, about 320 f
 5 sub streams use about 4 % of the decoder and even decoding all 5 mains would use about 26 %. VRAM grows about 70 MiB per
 extra concurrent sub-stream decoder (40 streams reached 3.3 GB), so session count, not fps, is the VRAM driver.
 Dec util is the mean and maximum of the one-second `nvidia-smi dmon` samples, taken over the first 40 samples only (so the first 40 s of runs longer than that). Each count was measured at the maximum rate; no stall or error occurred in any run. The multi-stream totals are lower
-bounds: each stream is a separate ffmpeg process on a 4-core host, so CPU contention (process start-up, frame copy to host) may
+bounds: each stream is a separate ffmpeg process on a 4-core host (`results/gpu.txt`), so CPU contention (process start-up, frame copy to host) may
 limit them before the decoder does.
 
 ### (b) HEVC on GM204
@@ -78,6 +78,7 @@ Maxwell support was removed from the PyPI wheels after **1.20.2**. Test: load `y
 |---|---|---|
 | 1.32.0 (latest) | 9.28 | CUDA EP does not load: wheel is built for CUDA 13 (`libcublasLt.so.13`), silently falls back to CPU |
 | 1.23.2 | 9.28 | `no kernel image is available` in cuDNN (Conv) |
+| 1.20.2 | 9.28 | CUDA EP loads, but the first Conv fails in cuDNN (`CUDNN_STATUS_EXECUTION_FAILED_CUDART`) |
 | 1.23.2 | 9.1.0.70 / 9.5.1.17 | Conv passes cuDNN, then `cudaErrorNoKernelImageForDevice` in ORT's own `QuickGelu` kernel |
 | 1.22.0, 1.21.1, 1.21.0 | 9.1.0.70 | same `QuickGelu` `no kernel image` failure (ORT kernels lack sm_52) |
 | **1.20.2**, 1.19.2 | **9.1.0.70** | **runs on CUDAExecutionProvider** |

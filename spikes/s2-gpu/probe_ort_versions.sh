@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Probe which onnxruntime-gpu versions load the CUDA EP and run a YOLO model on this GPU (sm_52).
-# Usage: probe_ort_versions.sh <ort>:<cudnn> ...   e.g. 1.23.2:9.5.1.17   Output: results/ort_probe.txt (overwritten)
+# Usage: probe_ort_versions.sh <ort>:<cudnn> ...   e.g. 1.23.2:9.5.1.17   Output: results/ort_probe.txt (overwritten; APPEND=1 adds to it)
 # A failing probe is the measurement, not a script error; its exit code is recorded in the output.
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 res="$S2_DIR/results/ort_probe.txt"
-: > "$res"
+[ "${APPEND:-0}" = 1 ] || : > "$res"
 for spec in "$@"; do
   v=${spec%%:*}
   c=${spec##*:}

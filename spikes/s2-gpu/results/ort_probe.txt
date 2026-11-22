@@ -60,3 +60,10 @@ onnxruntime 1.19.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvide
 session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
 run OK, output shape (1, 84, 2100)
 probe exit code: 0
+=== onnxruntime-gpu 1.20.2 + cudnn 9.28.1.4
+2026-11-22 23:44:03.944017815 [E:onnxruntime:Default, cudnn_fe_call.cc:33 CudaErrString<cudnn_frontend::error_object>] execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()) failed with message: , and code: CUDNN_STATUS_EXECUTION_FAILED_CUDART
+cudnn (pip nvidia-cudnn-cu12): 9.28.1.4
+onnxruntime 1.20.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running Conv node. Name:'node_conv2d' Status Message: CUDNN_FE failure 11: CUDNN_BACKEND_API_FAILED ; GPU=0 ; hostname=9145c90d6232 ; file=/onnxruntime_src/onnxruntime/core/providers/cuda/nn/conv.cc ; line=483 ; expr=s_.cudnn_fe_graph->execute(cudnn_handle, s_.variant_pack, ws.get(
+probe exit code: 1

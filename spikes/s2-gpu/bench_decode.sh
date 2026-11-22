@@ -5,12 +5,19 @@
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-if [ $# -lt 3 ]; then
+usage() {
   echo "usage: bench_decode.sh <label> <decoder> <clip>...   (at least one clip name from fixtures/, without .mp4)" >&2
   exit 2
-fi
+}
+[ $# -ge 3 ] || usage
 label=$1; dec=$2; shift 2
-clips="$*"
+clip_list=()
+for a in "$@"; do
+  a=${a//[[:space:]]/}  # clip names contain no whitespace; drop blank or whitespace-only arguments
+  [ -n "$a" ] && clip_list+=("$a")
+done
+[ ${#clip_list[@]} -gt 0 ] || usage
+clips="${clip_list[*]}"
 run_in_ffmpeg "
 loops=${LOOPS:-5}
 nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits > /tmp/vram_before
@@ -31,6 +38,7 @@ for c in $clips; do
     echo \"\$i \$c \$rc \${frames:-none} \$(echo \"\$e - \$s\" | bc -l) \$(head -c 200 /tmp/err\$i.txt | tr '\\n' ' ')\" > /tmp/out\$i.txt ) &
   pids=\"\$pids \$!\"
 done
+[ -n \"\$pids\" ] || { echo 'no decoders started' >&2; exit 2; }
 wait \$pids
 end=\$(date +%s.%N)
 kill \$dmon \$vr 2>/dev/null
