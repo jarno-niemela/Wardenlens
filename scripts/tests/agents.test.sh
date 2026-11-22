@@ -117,4 +117,26 @@ check "plain list marks UNKNOWN when gh fails" bash -c "\"\$1\" list | grep -qP 
 "$agents" 'done' pr7; "$agents" record reviewer 7 "$A" "$tmp/p1" pr7; "$agents" 'done' pr7
 check "reused id keeps earlier .done" test "$(find "$tmp/state" -name "pr7.prompt.done*" | wc -l)" = 2
 
+# agents check: same validation as record, creates no state
+rm -rf "$tmp/cstate"; printf '[]' >"$tmp/secret.json"
+cs=(env WARDENLENS_AGENT_STATE="$tmp/cstate" "$agents" check)
+printf 'clean prompt\n' >"$tmp/c1"; printf 'host 192.168.1.5\n' >"$tmp/c2"
+check "check accepts clean prompt" "${cs[@]}" "$tmp/c1"
+check "check creates nothing under state dir" test ! -e "$tmp/cstate"
+checkf "check refuses RFC1918 prompt" "${cs[@]}" "$tmp/c2"
+printf '{"password":"s3cretPass!"}' >"$tmp/secret.json"; printf 'pw s3cretPass!\n' >"$tmp/c3"
+checkf "check refuses secret-file value" "${cs[@]}" "$tmp/c3"
+printf '[]' >"$tmp/secret.json"
+checkf "check refuses missing file" "${cs[@]}" "$tmp/none"
+ln -s "$tmp/c1" "$tmp/clink"
+checkf "check refuses symlink" "${cs[@]}" "$tmp/clink"
+checkf "check with 0 args fails" "${cs[@]}"
+checkf "check with 2 args fails" "${cs[@]}" "$tmp/c1" "$tmp/c1"
+head -c 1100000 /dev/zero | tr '\0' a >"$tmp/cbig"
+checkf "check refuses >1 MiB" "${cs[@]}" "$tmp/cbig"
+for t in 'net 10.5/16' 'net 10.5.*' 'net 10.5.X' 'net 192.168/16' 'net 172.16/12' 'rtsp://u:p/w@h/x'; do
+  printf '%s\n' "$t" >"$tmp/c4"; checkf "check refuses: $t" "${cs[@]}" "$tmp/c4"
+done
+printf 'ssh://git@host/x\n' >"$tmp/c4"; check "user-only URL allowed" "${cs[@]}" "$tmp/c4"
+
 exit $fail

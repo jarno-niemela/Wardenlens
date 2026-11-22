@@ -260,7 +260,9 @@ The controller must:
    `scripts/agents record implementer '#29' $SHA "$SCRATCH/29-impl.prompt" a1b2c3d4e5f60718`.
    REF is `#N` (a ticket) for implementers, which are never PR-checked, and the PR number for verifiers.
    `record` refuses prompts containing private (RFC1918, ULA) addresses, `scheme://user:pass@` URLs, or
-   values from the local secret file.
+   values from the local secret file. If `record` refuses after the launch, stop that agent or record it
+   manually (fix the prompt and record again); never continue an untracked agent. Verifier rows must use a
+   numeric PR REF (not `#N`), or stale detection skips them.
 2. **On a rate-limit failure**: `scripts/agents fail AGENT_ID rate_limit HH:MM`, note the reset
    time, and do no other work that needs the model until then.
 3. **After the reset**: resume each failed agent with `SendMessage` "limit reset, continue", or,
