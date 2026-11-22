@@ -150,6 +150,12 @@ No single control is trusted alone. From strongest to weakest:
    blocks force pushes, pushes to main, hook bypass, merges without `--match-head-commit`,
    forged statuses and risky `gh api` calls. It catches mistakes early with a readable message;
    it is not a boundary (see ADR 0001 for what it deliberately does not catch).
+   - **Tamper protection.** The guard also refuses Bash writes (redirects, `tee`, `cp`, `mv`,
+     `install`, `ln`, `rm`, `chmod`, `sed -i`, `truncate`) to `.githooks/`, `.git/hooks`,
+     `.git/config` and `~/.bashrc|.profile|.bash_profile`, and `.claude/settings.json` denies the
+     Edit/Write tools on `.githooks/**`, `.git/**`, `~/.bashrc` and `~/.profile`. **Changing
+     `.githooks/` therefore needs a human, or the controller (with a ticket) temporarily lifting
+     the deny.**
 3. **`scripts/verify`, the merge gate.** Nothing merges without trusted, SHA-bound
    `verify/*` statuses on the current head and green named CI checks.
 4. **`.claude/settings.json` permissions.** The allow/deny lists restrict what agents may run

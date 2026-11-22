@@ -76,8 +76,8 @@ expect refuse "WARDENLENS_ALLOW_REWRITE=1 never allows main" \
   env WARDENLENS_ALLOW_REWRITE=1 git push --force origin HEAD:main
 expect refuse "WARDENLENS_ALLOW_REWRITE=1 does not allow deletion" \
   env WARDENLENS_ALLOW_REWRITE=1 git push origin :feat/y
-# shellcheck disable=SC2016  # the script runs in the inner bash
 skipref=refs/heads/feat/x   # this case pushes a competing commit to feat/x itself
+# shellcheck disable=SC2016  # the script runs in the inner bash
 expect refuse "unknown remote state (remote tip not fetched)" \
   bash -c 'other=$(mktemp -d); git clone -q "$(git remote get-url origin)" "$other/o" && git -C "$other/o" config user.email t@e && git -C "$other/o" config user.name t && git -C "$other/o" checkout -q feat/x && echo z >"$other/o/z" && git -C "$other/o" add z && git -C "$other/o" commit -q -m z && git -C "$other/o" push -q origin feat/x; rm -rf "$other"; git push origin feat/x'
 skipref=none

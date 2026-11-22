@@ -29,6 +29,9 @@
 #    no writes to */statuses/* (forging verification; scripts/verify is the only writer and its internal
 #    calls are not inspected), no write to a percent-encoded endpoint, no contents write to
 #    main/master, and no GraphQL mutation (reading through graphql is fine).
+#  - tamper protection: a redirect, tee, cp, mv, install, ln, rm, unlink, chmod, sed -i, truncate, dd or
+#    touch aimed at .githooks/, .git/hooks, .git/config, ~/.bashrc, ~/.profile or ~/.bash_profile is
+#    refused (also when the working directory is one of those). `git config` keeps its own rules.
 #  - piping into a shell (`| bash`, `| sh -s`, `source /dev/stdin`) hides commands: blocked.
 #
 # The authoritative push control is .githooks/pre-push; this guard is the first, best-effort line.
@@ -242,6 +245,37 @@ is_push_plumbing() {  # is_push_plumbing NAME ARGS...: NAME without the git- pre
       done ;;
   esac
   return 1
+}
+
+# --- tamper protection --------------------------------------------------------------------------
+
+tamper_path() {  # true if the path names the hooks, the repository config or a shell rc file
+  [[ "$1" =~ (^|/)\.githooks(/|$) || "$1" =~ (^|/)\.git/(hooks(/|$)|config$) || "$1" =~ (^|/)\.(bashrc|profile|bash_profile)$ ]]
+}
+
+check_tamper() {  # redirects, tee, cp, mv, install, ln, rm, chmod, sed -i, truncate ... aimed at protected paths
+  local n=${#seg_t[@]} i k t p writer=0 hit=0 want=0
+  local msg="writing to .githooks/, .git/hooks, .git/config or shell rc files is for the user (the hooks are the push control)"
+  for ((i = 0; i < n; i++)); do
+    t=${seg_t[i]}
+    if ((want)); then want=0; tamper_path "$t" && block "$msg"; continue; fi
+    if [[ "$t" =~ ^([0-9]*|\&)\>\>?\|?(.*)$ ]]; then   # > FILE, >> FILE, >FILE, &>FILE
+      p=${BASH_REMATCH[2]}
+      if [[ -z "$p" ]]; then want=1; else tamper_path "$p" && block "$msg"; fi
+      continue
+    fi
+    case "${t##*/}" in
+      tee|cp|mv|install|ln|rm|unlink|chmod|chown|truncate|dd|touch|rsync) writer=1 ;;
+      sed) for ((k = i + 1; k < n; k++)); do
+             case "${seg_t[k]}" in -i*|--in-place*|-[a-zA-Z]*i*) [[ "${seg_t[k]}" == -* ]] && writer=1 ;; esac
+           done ;;
+    esac
+    p=${t#of=}
+    if tamper_path "$p"; then hit=1; fi
+  done
+  if ((writer && hit)); then block "$msg"; fi
+  if ((writer && !cwd_unknown)) && tamper_path "${cwd:-.}"; then block "$msg"; fi
+  return 0
 }
 
 check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flags consume the next token
@@ -627,6 +661,7 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
   if ((piped)); then check_pipe_target; fi
   check_stdin_source
   check_git_env
+  check_tamper
   ((piped)) && sub=1 || true
   for ((i = 0; i < n; i++)); do
     t=${seg_t[i]}

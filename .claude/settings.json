@@ -12,6 +12,8 @@
     ],
     "deny": [
       "Bash(gh repo delete:*)",
+      "Edit(./.githooks/**)", "Write(./.githooks/**)", "Edit(./.git/**)", "Write(./.git/**)",
+      "Edit(~/.bashrc)", "Write(~/.bashrc)", "Edit(~/.profile)", "Write(~/.profile)",
       "Read(./.env)", "Read(./.env.*)",
       "Read(~/.ssh/**)", "Read(~/.config/gh/**)", "Read(~/.cargo/credentials*)"
     ]

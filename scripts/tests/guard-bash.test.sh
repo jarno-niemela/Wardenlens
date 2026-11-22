@@ -226,6 +226,38 @@ allow "git remote add up https://example.com/r.git"
 allow "git fetch-pack /tmp/r.git main"
 allow "git upload-pack /tmp/r.git"
 
+# --- tamper protection
+deny  'echo x > .githooks/pre-push'
+deny  'echo x >> .githooks/pre-push'
+deny  'echo x >.githooks/pre-push'
+deny  'echo x 2> .git/hooks/pre-push'
+deny  'echo "alias git=true" >> ~/.bashrc'
+deny  'echo x >> "$HOME/.profile"'
+deny  'echo x > ~/.bash_profile'
+deny  'printf x | tee .githooks/pre-push'
+deny  'tee -a .git/config <<<x'
+deny  'cp /tmp/x .githooks/pre-push'
+deny  'mv /tmp/x .git/hooks/pre-push'
+deny  'install -m755 /tmp/x .githooks/pre-push'
+deny  'ln -sf /dev/null .githooks/pre-push'
+deny  'rm .githooks/pre-push'
+deny  'rm -rf .git/hooks'
+deny  'chmod -x .githooks/pre-push'
+deny  'sed -i s/exit/true/ .githooks/pre-push'
+deny  'sed -ni p ~/.bashrc'
+deny  'truncate -s 0 .git/config'
+deny  'dd if=/tmp/x of=.githooks/pre-push'
+deny  'bash -c "echo x > .githooks/pre-push"'
+deny_in 'cp /tmp/x pre-push' "$root/.githooks"
+allow 'cat .githooks/pre-push'
+allow 'sed -n 1,5p .githooks/pre-push'
+allow 'git add .githooks/pre-push'
+allow 'git commit -m "update .githooks/pre-push"'
+allow 'grep -n hooksPath .git/config'
+allow 'git config core.hooksPath .githooks'
+allow 'echo x > /tmp/out.txt'
+allow 'bash .githooks/pre-push < /dev/null'
+
 # --- fail closed ---------------------------------------------------------
 # With jq unavailable the guard must block (exit 2), not allow.
 mkdir -p "$tmp/nojq"
