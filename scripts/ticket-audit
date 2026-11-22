@@ -3,6 +3,8 @@
 #
 # Usage: scripts/ticket-audit [--json] [--fail-on error|warn|never]
 #                             [--issues-file F --prs-file F] [--now EPOCH]
+#   --issues-file: array from `gh issue list --state all`
+#   --prs-file:    array from `gh pr list --state all` (all states; rules apply to open PRs)
 # Env:   STALE_DAYS (3)  BACKLOG_DAYS (30)  PR_DAYS (2)
 # Exit:  0 clean (relative to --fail-on), 1 findings at/above threshold, 2 usage error.
 set -euo pipefail
@@ -10,14 +12,17 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 json=0 fail_on=error issues_file="" prs_file="" now=$(date +%s)
 
+usage_err() { echo "ticket-audit: $*" >&2; exit 2; }
+need_val() { [[ $# -ge 2 ]] || usage_err "option $1 needs a value"; }
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) json=1 ;;
-    --fail-on) fail_on=${2:?}; shift ;;
-    --issues-file) issues_file=${2:?}; shift ;;
-    --prs-file) prs_file=${2:?}; shift ;;
-    --now) now=${2:?}; shift ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    --fail-on) need_val "$@"; fail_on=$2; shift ;;
+    --issues-file) need_val "$@"; issues_file=$2; shift ;;
+    --prs-file) need_val "$@"; prs_file=$2; shift ;;
+    --now) need_val "$@"; now=$2; shift ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     *) echo "ticket-audit: unknown argument $1" >&2; exit 2 ;;
   esac
   shift
@@ -32,17 +37,19 @@ if [[ -z "$issues_file" ]]; then
 fi
 if [[ -z "$prs_file" ]]; then
   prs_file=$tmp/prs.json
-  gh pr list --state open --limit 500 \
-    --json number,title,body,createdAt,isDraft,reviewDecision,author >"$prs_file"
+  gh pr list --state all --limit 1000 \
+    --json number,title,body,state,createdAt,isDraft,reviewDecision,author,labels >"$prs_file"
 fi
 
-findings=$(jq -n \
+[[ "$now" =~ ^[0-9]+$ ]] || usage_err "--now must be epoch seconds"
+
+findings=$(jq -n -L "$here/lib" \
   --slurpfile issues "$issues_file" --slurpfile prs "$prs_file" \
   --argjson now "$now" \
   --argjson stale_days "${STALE_DAYS:-3}" \
   --argjson backlog_days "${BACKLOG_DAYS:-30}" \
   --argjson pr_days "${PR_DAYS:-2}" \
-  '$issues[0] as $issues | $prs[0] as $prs | '"$(cat "$here/lib/audit.jq")")
+  'include "common"; $issues[0] as $issues | $prs[0] as $prs | '"$(cat "$here/lib/audit.jq")")
 
 if [[ $json -eq 1 ]]; then
   echo "$findings"

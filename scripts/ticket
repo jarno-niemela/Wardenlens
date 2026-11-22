@@ -20,6 +20,9 @@ for dep in gh jq; do command -v "$dep" >/dev/null || die "missing dependency: $d
 
 valid_state() { [[ " $STATES " == *" $1 "* ]] || die "invalid state '$1' (one of: $STATES)"; }
 valid_num()   { [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: '$1'"; }
+valid_prio()  { [[ "$1" =~ ^p[0-3]$ ]] || die "invalid priority '$1' (p0..p3)"; }
+valid_type()  { [[ "$1" =~ ^(task|bug|chore|spike)$ ]] || die "invalid type '$1' (task|bug|chore|spike)"; }
+valid_area()  { [[ -z "$1" || "$1" =~ ^[a-z0-9-]+$ ]] || die "invalid area '$1' (lowercase letters, digits, dashes)"; }
 
 set_status() {
   local n=$1 s=$2 args=()
@@ -48,6 +51,8 @@ case "$cmd" in
     title=${1:?title required}; shift
     prio=p2 area="" body_file=""
     while getopts "p:a:F:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; F) body_file=$OPTARG;; *) die "bad option";; esac; done
+    shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
+    valid_prio "$prio"; valid_area "$area"
     body=$(if [[ -n "$body_file" ]]; then cat "$body_file"; else cat "$here/templates/epic.md"; fi)
     labels="type:epic,status:backlog,priority:$prio${area:+,area:$area}"
     [[ -n "$area" ]] && gh label create "area:$area" --color 006b75 --force >/dev/null
@@ -58,12 +63,19 @@ case "$cmd" in
     valid_num "$epic"
     prio=p2 area="" blocked="" body_file="" type=task
     while getopts "p:a:b:F:t:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; b) blocked=$OPTARG;; F) body_file=$OPTARG;; t) type=$OPTARG;; *) die "bad option";; esac; done
+    shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
+    valid_prio "$prio"; valid_area "$area"; valid_type "$type"
+    blocked_nums=()
+    if [[ -n "$blocked" ]]; then
+      IFS=', ' read -r -a blocked_nums <<<"${blocked//,/ }"
+      for b in "${blocked_nums[@]}"; do valid_num "$b"; done
+    fi
     [[ "$(gh issue view "$epic" --json labels --jq '[.labels[].name] | index("type:epic") != null')" == true ]] \
       || die "#$epic is not a type:epic issue"
     header="Epic: #$epic"
     state=ready
-    if [[ -n "$blocked" ]]; then
-      header+=$'\n'"Blocked by: $(sed -E 's/([0-9]+)/#\1/g; s/,/, /g' <<<"$blocked")"
+    if [[ ${#blocked_nums[@]} -gt 0 ]]; then
+      header+=$'\n'"Blocked by: $(printf '#%s, ' "${blocked_nums[@]}" | sed 's/, $//')"
       state=blocked
     fi
     body=$(if [[ -n "$body_file" ]]; then cat "$body_file"; else cat "$here/templates/task.md"; fi)
@@ -80,14 +92,22 @@ case "$cmd" in
     gh issue edit "$n" --add-assignee @me --add-label agent:sonnet >/dev/null
     ;;
   next)
-    open_tickets_json | jq -r '
-      (map(.number)) as $open
-      | map(select(([.labels[].name] | index("status:ready")) != null))
-      | map(select(([.labels[].name] | any(. == "type:task" or . == "type:bug" or . == "type:chore" or . == "type:spike"))))
-      | map(. + {blockers: [(.body // "") | split("\n")[] | select(test("^\\s*blocked by:"; "i")) | scan("#([0-9]+)") | .[0] | tonumber]})
-      | map(select(all(.blockers[]; . as $b | $open | index($b) == null)))
-      | map(. + {prio: ([.labels[].name | select(startswith("priority:p")) | .[10:] | tonumber] | first // 9)})
-      | sort_by(.prio, .number) | first | if . == null then empty else .number end'
+    # Eligible: open, exactly one status label (ready), not human/triage-gated, and every
+    # blocker known and closed. Open blockers include open PRs (same rules as the audit).
+    all_issues=$(gh issue list --state all --limit 2000 --json number,title,state,labels,body,assignees,updatedAt)
+    all_prs=$(gh pr list --state all --limit 1000 --json number,state)
+    jq -r -L "$here/lib" --argjson prs "$all_prs" 'include "common";
+      . as $all
+      | ([$all[].number] + [$prs[].number]) as $known
+      | ([$all[] | select(.state == "OPEN") | .number] + [$prs[] | select(.state == "OPEN") | .number]) as $open
+      | [ $all[] | select(.state == "OPEN")
+          | select(labelnames | index("status:ready") != null)
+          | select((prefixed("status:") | length) == 1)
+          | select(labelnames | any(. == "agent:human" or . == "needs:triage") | not)
+          | select(labelnames | any(. == "type:task" or . == "type:bug" or . == "type:chore" or . == "type:spike"))
+          | select(blockers | all(. as $b | ($known | index($b)) != null and ($open | index($b)) == null))
+          | . + {prio: ([prefixed("priority:p")[] | .[10:] | tonumber?] | first // 9)} ]
+      | sort_by(.prio, .number) | first | if . == null then empty else .number end' <<<"$all_issues"
     ;;
   list)
     filter=${1:-}; [[ -n "$filter" ]] && valid_state "$filter"
@@ -97,8 +117,8 @@ case "$cmd" in
     ;;
   epic-progress)
     n=${1:?number}; valid_num "$n"
-    gh issue list --state all --limit 2000 --json number,title,state,body | jq -r --argjson e "$n" '
-      map(select([(.body // "") | capture("^\\s*epic:\\s*#(?<n>[0-9]+)"; "i") | .n | tonumber] | first == $e))
+    gh issue list --state all --limit 2000 --json number,title,state,body | jq -r -L "$here/lib" --argjson e "$n" 'include "common";
+      map(select(epic_ref == $e))
       | "Epic #\($e): \(map(select(.state == "CLOSED")) | length)/\(length) tasks closed",
         (sort_by(.number)[] | "  [\(if .state == "CLOSED" then "x" else " " end)] #\(.number) \(.title)")'
     ;;
@@ -107,6 +127,6 @@ case "$cmd" in
       | while read -r n; do set_status "$n" ready; done
     ;;
   audit) exec "$here/ticket-audit" "$@" ;;
-  ""|-h|--help) sed -n '2,13p' "$0" ;;
+  ""|-h|--help) sed -n '2,12p' "$0" ;;
   *) die "unknown command '$cmd' (see --help)" ;;
 esac

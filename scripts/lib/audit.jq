@@ -2,8 +2,10 @@
 #
 # Inputs (via --slurpfile / --argjson):
 #   $issues        array from `gh issue list --state all --json number,title,state,labels,body,assignees,updatedAt`
-#   $prs           array from `gh pr list --state open --json number,title,body,createdAt,isDraft,reviewDecision,author`
-#                  (bot-authored PRs, e.g. Dependabot, are exempt from the "closes an issue" rule)
+#   $prs           array from `gh pr list --state all --json number,title,body,state,createdAt,isDraft,reviewDecision,author,labels`
+#                  PR rules apply only to state == "OPEN". Bot-authored PRs (e.g. Dependabot) are
+#                  exempt from the "closes an issue" rule. PR numbers count as known blockers.
+# Shared helpers live in common.jq (included by scripts/ticket-audit).
 #   $now           epoch seconds
 #   $stale_days    in-progress without a PR for longer than this is flagged
 #   $backlog_days  backlog untouched for longer than this is flagged
@@ -11,19 +13,17 @@
 #
 # Output: array of {severity, number, title, rule, message}
 
-def labelnames: [.labels[].name];
-def haslabel($l): labelnames | index($l) != null;
-def prefixed($p): labelnames | map(select(startswith($p)));
-def age_days($ts): (($now - ($ts | fromdateiso8601)) / 86400);
-def epic_ref: [(.body // "") | capture("^\\s*epic:\\s*#(?<n>[0-9]+)"; "i") | .n | tonumber] | first;
-def blockers: [(.body // "") | split("\n")[] | select(test("^\\s*blocked by:"; "i")) | scan("#([0-9]+)") | .[0] | tonumber];
-def closing_refs: [((.body // "") + "\n" + (.title // "")) | scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s*:?\\s*#([0-9]+)") | .[0] | tonumber] | unique;
+def age_days($t): (($now - ($t | ts)) / 86400);
 def finding($sev; $rule; $msg): {severity: $sev, number: .number, title: .title, rule: $rule, message: $msg};
 
 ($issues | map({key: (.number | tostring), value: .}) | from_entries) as $by
-| ([$prs[] | closing_refs[]] | unique) as $linked
+| ($prs | map({key: (.number | tostring), value: .}) | from_entries) as $pby
+| [$prs[] | select(.state == "OPEN")] as $open_prs
+| ([$open_prs[] | closing_refs[]] | unique) as $linked
 | def issue($n): $by[$n | tostring];
-  def is_open($n): issue($n) != null and issue($n).state == "OPEN";
+  def pr($n): $pby[$n | tostring];
+  def known($n): issue($n) != null or pr($n) != null;
+  def is_open($n): (issue($n) != null and issue($n).state == "OPEN") or (pr($n) != null and pr($n).state == "OPEN");
 [
   ( $issues[] | select(.state == "OPEN") | . as $i
     | prefixed("type:") as $t
@@ -50,9 +50,11 @@ def finding($sev; $rule; $msg): {severity: $sev, number: .number, title: .title,
       ( if haslabel("status:blocked") then
           blockers as $b
           | if ($b | length) == 0 then finding("error"; "blocked-no-reason"; "blocked but has no 'Blocked by: #N' line")
+            elif any($b[]; known(.) | not) then empty
             elif all($b[]; is_open(.) | not) then finding("warn"; "unblocked"; "all blockers are closed; move to status:ready")
             else empty end
         else empty end ),
+      ( blockers[] as $b | if known($b) | not then finding("error"; "bad-blocker"; "blocked by #\($b), which is neither an issue nor a PR") else empty end ),
       ( if haslabel("status:ready") and ([blockers[] | select(is_open(.))] | length) > 0
         then finding("warn"; "ready-but-blocked"; "status:ready but has open blockers") else empty end ),
       ( if haslabel("status:backlog") and age_days($i.updatedAt) > $backlog_days
@@ -69,10 +71,11 @@ def finding($sev; $rule; $msg): {severity: $sev, number: .number, title: .title,
     | (prefixed("status:") | map(select(. != "status:done"))) as $s
     | if ($s | length) > 0 then finding("info"; "closed-stale-status"; "closed but still labelled \($s | join(","))") else empty end
   ),
-  ( $prs[]
+  ( $open_prs[]
     | ( if (closing_refs | length) == 0 and ((.author.is_bot // false) | not) then finding("error"; "pr-no-issue"; "PR does not close any issue (add 'Closes #N')") else empty end ),
       ( closing_refs[] as $n | if issue($n) == null then finding("error"; "pr-bad-ref"; "closes #\($n), which is not an issue") else empty end ),
       ( if (.isDraft | not) and age_days(.createdAt) > $pr_days and .reviewDecision != "APPROVED"
+           and ((["verify:quality", "verify:security", "verify:adversarial"] - labelnames) | length) > 0
         then finding("warn"; "stale-pr"; "PR open \(age_days(.createdAt) | floor)d without approval") else empty end )
   )
 ]
