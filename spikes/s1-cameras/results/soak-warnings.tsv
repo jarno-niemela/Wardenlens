@@ -1,0 +1,11 @@
+stream	count	warning_type
+reolink-1_main	0	(none)
+reolink-1_sub	0	(none)
+reolink-2_main	0	(none)
+reolink-2_sub	0	(none)
+xr_main	0	(none)
+xr_sub	105	Application provided invalid, non monotonically increasing dts to muxer in stream N: N >= N
+tapo_main	8891	Application provided invalid, non monotonically increasing dts to muxer in stream N: N >= N
+tapo_sub	8889	Application provided invalid, non monotonically increasing dts to muxer in stream N: N >= N
+hdipc_main	0	(none)
+hdipc_sub	0	(none)

@@ -1,3 +1,4 @@
+AGPL-3.0 (neolink); spike-only, never vendored
 diff --git a/crates/core/src/bc_protocol/motion.rs b/crates/core/src/bc_protocol/motion.rs
 index d910ee4..2ca6728 100644
 --- a/crates/core/src/bc_protocol/motion.rs

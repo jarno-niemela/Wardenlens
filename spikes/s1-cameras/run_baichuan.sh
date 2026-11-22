@@ -8,4 +8,4 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/lib.sh"
 cam_creds "$1"
 BC_USER="$CAM_USER" BC_PASS="$CAM_PASS" \
-  "$here/baichuan-probe/target/release/baichuan-probe" "$(cam_host "$1")" "${2:-60}"
+  "$here/baichuan-probe/target/release/baichuan-probe" "$(cam_host "$1")" "${2:-60}" 2>&1 | redact

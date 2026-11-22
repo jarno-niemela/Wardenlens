@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Soak test: open every camera's main and sub RTSP stream in parallel (as an extra client next
-# to AgentDVR) for DURATION seconds, counting frames, drops, warnings and reconnects.
+# to AgentDVR) for DURATION seconds, counting frames, warning lines and restarts.
 # Usage: stream_soak.sh <out-dir> [duration-seconds]   (default 1800)
 # Per-stream log: <out-dir>/<cam>_<kind>.log (credentials redacted); summary: <out-dir>/summary.tsv
 set -euo pipefail
@@ -8,6 +8,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$here/lib.sh"
 out="$1"; duration="${2:-1800}"
+if [[ -e "$out" && -n "$(ls -A "$out")" ]]; then echo "refusing to run: $out is not empty" >&2; exit 1; fi
 mkdir -p "$out"
 deadline=$(( $(date +%s) + duration ))
 

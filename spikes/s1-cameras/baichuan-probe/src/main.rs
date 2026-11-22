@@ -1,5 +1,5 @@
 //! Read-only Reolink Baichuan probe: login, device info, service-port state, event push.
-//! Credentials come from the BC_USER / BC_PASS environment variables (set by run.sh).
+//! Credentials come from the BC_USER / BC_PASS environment variables (set by run_baichuan.sh).
 //! Usage: baichuan-probe <ip> <listen-seconds>
 use neolink_core::bc_protocol::{
     BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods,

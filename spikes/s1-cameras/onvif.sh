@@ -20,6 +20,10 @@ case "$svc" in
   *) echo "bad service" >&2; exit 2 ;;
 esac
 
+# xml_esc <string> -> XML-escaped text (& < > " ').
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
+user_xml="$(xml_esc "$CAM_USER")"
+
 nonce_hex="$(openssl rand -hex 16)"
 created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 nonce_b64="$(printf '%s' "$nonce_hex" | xxd -r -p | base64)"
@@ -31,7 +35,7 @@ envelope=$(cat <<XML
  xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
  xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
 <s:Header><Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-<UsernameToken><Username>${CAM_USER}</Username>
+<UsernameToken><Username>${user_xml}</Username>
 <Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">${digest}</Password>
 <Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">${nonce_b64}</Nonce>
 <Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">${created}</Created>
@@ -41,5 +45,6 @@ XML
 )
 # ONVIF_RAW=1 skips host masking (used by scripts that must parse addresses from responses).
 filter() { if [[ -n "${ONVIF_RAW:-}" ]]; then cat; else redact; fi; }
-curl -sS --max-time "${ONVIF_TIMEOUT:-15}" -H 'Content-Type: application/soap+xml; charset=utf-8' \
-  -w '\nHTTP %{http_code} %{time_total}s\n' --data-binary "$envelope" "$@" "$url" 2>&1 | filter
+# The envelope (which embeds the password digest) goes to curl on stdin, not argv.
+printf '%s' "$envelope" | curl -sS --max-time "${ONVIF_TIMEOUT:-15}" -H 'Content-Type: application/soap+xml; charset=utf-8' \
+  -w '\nHTTP %{http_code} %{time_total}s\n' --data-binary @- "$@" "$url" 2>&1 | filter

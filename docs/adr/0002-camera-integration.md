@@ -18,9 +18,9 @@ event channel should be used per vendor, and what does each vendor's local API r
 
 | id | model | notes |
 |---|---|---|
-| reolink-1, reolink-2 | Reolink RLC-520A (fw v3.0.0.4348) | 2560x1920 H.264; Baichuan on 9000; HTTP disabled |
+| reolink-1, reolink-2 | Reolink RLC-520A (fw v3.0) | 2560x1920 H.264; Baichuan on 9000; HTTP disabled |
 | xr | Dahua OEM IPC-HFW4431R-Z | 2560x1440 H.264; CGI with digest auth; 37777 open |
-| tapo | Tapo C110 (fw 1.5.4) | 1080p H.264; ONVIF on 2020; HTTPS API on 443 |
+| tapo | Tapo C110 (fw 1.5) | 1080p H.264; ONVIF on 2020; HTTPS API on 443 |
 | hdipc | RTT-8700 | 1080p H.264; ONVIF on 1018; ONVIF flaky |
 
 ## Measured results
@@ -31,22 +31,32 @@ Method: `spikes/s1-cameras/stream_soak.sh` opened the main and the sub stream of
 (10 RTSP/TCP sessions) in parallel for 30 minutes with `ffmpeg -c copy -f null`, as a second client next to
 AgentDVR, restarting a stream if ffmpeg exited. Results (`spikes/s1-cameras/results/soak-summary.tsv`):
 
-| stream | frames in 1800 s | avg fps | restarts / reconnects | dropped frames |
-|---|---|---|---|---|
-| reolink-1 main | 32933 | 18.3 | 0 | 0 |
-| reolink-1 sub | 18001 | 10.0 | 0 | 0 |
-| reolink-2 main | 29967 | 16.6 | 0 | 0 |
-| reolink-2 sub | 17998 | 10.0 | 0 | 0 |
-| xr main | 44992 | 25.0 | 0 | 0 |
-| xr sub | 44993 | 25.0 | 0 | 0 |
-| tapo main | 26991 | 15.0 | 0 | 0 |
-| tapo sub | 26996 | 15.0 | 0 | 0 |
-| hdipc main | 15292 | 8.5 | 0 | 0 |
-| hdipc sub | 41491 | 23.0 | 0 | 0 |
+| stream | frames in 1800 s | avg fps | expected at nominal fps | expected at measured fps | restarts | warning lines |
+|---|---|---|---|---|---|---|
+| reolink-1 main | 32933 | 18.3 | 54000 (30, advertised) | 30060 (16.7) | 0 | 0 |
+| reolink-1 sub | 18001 | 10.0 | 18000 (10) | 18000 (10.0) | 0 | 0 |
+| reolink-2 main | 29967 | 16.6 | 54000 (30, advertised) | 30060 (16.7) | 0 | 0 |
+| reolink-2 sub | 17998 | 10.0 | 18000 (10) | 18180 (10.1) | 0 | 0 |
+| xr main | 44992 | 25.0 | 45000 (25) | 45000 (25.0) | 0 | 0 |
+| xr sub | 44993 | 25.0 | 45000 (25) | 45000 (25.0) | 0 | 105 |
+| tapo main | 26991 | 15.0 | 27000 (15) | 27720 (15.4) | 0 | 8891 |
+| tapo sub | 26996 | 15.0 | 27000 (15) | 26460 (14.7) | 0 | 8889 |
+| hdipc main | 15292 | 8.5 | 18000 (10, ONVIF profile) | 15480 (8.6) | 0 | 0 |
+| hdipc sub | 41491 | 23.0 | 45000 (25) | 44280 (24.6) | 0 | 0 |
 
-All ten sessions ran the full 30 minutes with zero reconnects and zero ffmpeg warnings of packet
-loss (RTSP over TCP). The only log noise was ffmpeg's "non monotonically increasing dts" muxer
-warning in stream-copy mode: 0 for most streams, about 8.9k lines each for tapo main/sub and 105 for
+"Measured fps" is the 20 s sample of section 1's second table, so it is a snapshot; the frame counts are
+what ffmpeg wrote in 30 minutes. Every column means what was measured: ffmpeg restarts, and ffmpeg warning
+lines. The test did **not** count dropped frames (stream copy to the null muxer reports `drop_frames=0`
+unconditionally, so that field is not evidence). Reolink main is variable frame rate, so its count follows
+the scene, not either expectation. hdipc sub delivered 7.8 % fewer frames than nominal and 6.3 % fewer than
+its sampled rate: ffmpeg's progress shows the stream clock advanced in real time (`out_time` 30:00, speed 1x),
+with no warnings and no restarts, so the camera sent fewer frames than 25 fps; the cause is **unexplained**
+(open risk 5 below). The warning types per stream are in `results/soak-warnings.tsv` (a histogram with
+numbers normalised; the raw logs were not committed).
+
+All ten sessions ran the full 30 minutes with zero restarts (RTSP over TCP). Over TCP ffmpeg does not log
+packet loss, so absence of warnings is not proof of no loss. The only log noise was ffmpeg's "non monotonically increasing dts" muxer
+warning in stream-copy mode: 0 for most streams, 8891 and 8889 lines for tapo main/sub and 105 for
 xr sub. This points to jittery camera RTP timestamps; Phase 1 must not trust camera timestamps blindly and should
 stamp its own arrival clock. Limit of the test: it proves a second client with AgentDVR's sessions
 present, not the camera's maximum client count.
@@ -81,7 +91,7 @@ transition NOT observed** (see below).
   `neolink_core` (AGPL-3.0, so it is for the spike only and must not be linked into Wardenlens; a
   patch adds one debug print). Run through `run_baichuan.sh`, which feeds credentials via environment.
 - Login on port 9000 succeeds (modern, encrypted BC login) on both cameras with the same account that
-  AgentDVR uses. Device info: RLC-520A, firmware v3.0.0.4348_2411261177, resolution 2560x1920.
+  AgentDVR uses. Device info: RLC-520A, firmware v3.0, resolution 2560x1920.
 - Service ports (read with Baichuan `MSG_ID_GET_SERVICE_PORTS` = 37, read-only):
 
   | service | port | reolink-1 | reolink-2 |
@@ -173,11 +183,17 @@ Across both kinds, successful requests had p50 11 ms and p95 42 ms.
 
 - Failures are TCP connect timeouts, not SOAP faults: the camera simply ignores the connection attempt for a
   while. Success is almost always fast (about 10-60 ms). Failures cluster: after a failure the next
-  attempt (5 s later) fails again 11 of 25 times (auth) and 9 of 20 (unauth); three in a row happened 7 times
-  (auth). So retries must be several, spaced, and with a short connect timeout.
-- Behaviour contract for the adapter: connect timeout 2-3 s, up to 6 attempts with a ~2-5 s backoff,
-  no long-lived reliance on ONVIF. Failures are correlated (runs of three in a row occurred), so even six attempts can fail;
-  never block the video path on ONVIF.
+  attempt (5 s later) fails again 11 of 25 times (auth) and 9 of 21 (unauth). Longest runs of consecutive
+  failures: **auth 8** in a row (rounds 14-21, about 130 s of wall-clock including the 10 s timeouts and
+  5 s pauses), **noauth 4** (rounds 43-46, about 55 s), and 4 in the combined time-ordered series
+  (rounds 25-26, about 45 s). Durations are reconstructed from the per-request seconds plus the 5 s pause.
+  Six attempts in a row can therefore fail, and a single outage can last a couple of minutes.
+- Behaviour contract for the adapter, two levels:
+  1. A single request retries quickly: connect timeout 2-3 s, a few attempts (up to 6) with a ~2-5 s backoff.
+  2. Beyond that, the driver has a total retry budget of **at least 3 minutes** (longer than the worst
+     observed outage). It retries in the background, serves the last good result from cache and marks the camera
+     *degraded* rather than failing; it never blocks the video path on ONVIF, and ONVIF is not relied on for
+     long-lived state.
 - ONVIF details: `GetCapabilities` works with a UsernameToken digest; media, events and PTZ are all served from
   the one `/onvif/device_service` URL; `GetStreamUri` returns `/11` (main, 1080p H.264 10 fps profile, G.711 audio) and `/12` (sub,
   640x360). Events are advertised (`WSSubscriptionPolicySupport`), but no event subscription was attempted because of the flakiness.
@@ -233,17 +249,25 @@ Option 2.
 
 ## Open risks and follow-ups
 
-1. Reolink live motion/person push not observed in 35 min of watching; capture a real event (walk in front of a camera)
+1. (#27) Reolink live motion/person push not observed in 35 min of watching; capture a real event (walk in front of a camera)
    and record the raw `AlarmEvent` XML, including whether vehicle and animal types appear on the RLC-520A firmware.
-2. Tapo live `IsPeople` / `IsMotion` notifications not observed, same follow-up.
+2. (#27) Tapo live `IsPeople` / `IsMotion` notifications not observed, same follow-up.
 3. Dahua `heartbeat` not honoured; dead-connection detection must be built and tested.
 4. The 2-client test did not find the maximum client count; Wardenlens plus AgentDVR plus a probe worked, which is the
    Phase 1 migration scenario, but a third concurrent consumer on Reolink was only briefly exercised.
-5. hdipc connectivity is flaky at the TCP level (about 40 % of connection attempts time out); the cause (connection slots, a
+5. (#28) hdipc connectivity is flaky at the TCP level (about 40 % of connection attempts time out); the cause (connection slots, a
    network issue or the camera firmware) is unknown. Check whether it is the camera, the switch port or AgentDVR holding
-   slots before relying on it.
+   slots before relying on it. The 7.8 % frame shortfall on hdipc sub (section 1) is also unexplained; include it in #28.
 6. Variable frame rate on Reolink main (about 17 fps against 30 advertised) and the DTS jitter on Tapo and Dahua sub
    affect any logic that assumes a constant fps.
 7. Baichuan is proprietary and firmware-dependent; the `enable` flag for the Baichuan service reads 0 while it works.
 8. neolink is AGPL-3.0; code must be written independently from the protocol description.
 9. The HTTP enable write (`SET_SERVICE_PORTS`) was not executed, so its exact behaviour (reboot required or not) is untested.
+10. Phase 1 items (the `EventSource` adapters, own arrival timestamps, per-camera connection budget, the retry
+    contract above) are to be filed by `/plan-epic #16`.
+11. **Accepted spike-only risk: credentials on argv.** `ffmpeg` and `ffprobe` accept RTSP credentials only inside
+    the URL, so the spike scripts pass them on the command line, visible to other local users in
+    `/proc/*/cmdline` while a probe runs. Accepted because the spike runs on a single-user host; everything
+    else (curl config on a pipe, ONVIF envelope on stdin, jq stdin, Baichuan via environment) keeps secrets
+    off argv, and all output goes through `redact`. Phase 1 uses `retina` in-process, so no credentials
+    reach a child process.

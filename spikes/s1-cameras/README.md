@@ -9,9 +9,9 @@ Inputs (outside the repo, never committed):
 
 | script | purpose |
 |---|---|
-| `lib.sh` | shared helpers: inventory and credential lookup, RTSP URL builder, `redact` (masks userinfo and IPv4) |
+| `lib.sh` | shared helpers: inventory and credential lookup, RTSP URL builder, `redact` (masks userinfo, IPv4/IPv6, MAC, serials) |
 | `probe_streams.sh` | one-shot ffprobe of every main/sub stream |
-| `stream_soak.sh <dir> [secs]` | all streams in parallel for 30 min: frames, drops, reconnects |
+| `stream_soak.sh <dir> [secs]` | all streams in parallel for 30 min: frames, warning lines, restarts |
 | `gop_sample.sh [secs]` | fps, bitrate and GOP per stream |
 | `onvif.sh` | minimal ONVIF SOAP client (WS-Security digest) |
 | `onvif_pull.sh` | ONVIF PullPoint event watcher (Tapo) |
@@ -25,3 +25,8 @@ commit `6e05e78`, apply `baichuan-probe/neolink-debug.patch`, link or copy it as
 
 `results/` holds the measured outputs quoted in the ADR (camera ids only).
 Never print `rtsp_url` output; pipe tool output through `redact`.
+
+Known spike-only risk: `ffmpeg`/`ffprobe` can take RTSP credentials only in the URL, so they appear on those
+processes' argv while running (readable by other local users). Accepted for this single-user host; see ADR 0002
+(open risk 11). Phase 1 uses `retina` in-process. `tests/lib.adv.sh` runs the helper and script tests against
+fake config files only.

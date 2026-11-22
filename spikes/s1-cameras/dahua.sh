@@ -9,7 +9,17 @@ source "$here/lib.sh"
 name="$1"; mode="$2"; shift 2
 cam_creds "$name"
 host="$(cam_host "$name")"
-dcurl() { curl -sS --digest -K <(printf 'user = "%s:%s"\n' "$CAM_USER" "$CAM_PASS") "$@" 2>&1 | redact; }
+# cfg_quote <value> -> value escaped for a double-quoted curl config string; refuses CR/LF.
+cfg_quote() {
+  case "$1" in *$'\n'* | *$'\r'*) echo "refusing credential containing a newline" >&2; return 1 ;; esac
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '%s' "$v"
+}
+user_q="$(cfg_quote "$CAM_USER")" || exit 1
+pass_q="$(cfg_quote "$CAM_PASS")" || exit 1
+dcurl() { curl -sS --digest -K <(printf 'user = "%s:%s"\n' "$user_q" "$pass_q") "$@" 2>&1 | redact; }
 case "$mode" in
   get) dcurl --max-time 20 -w '\nHTTP %{http_code} %{time_total}s\n' "http://$host$1" ;;
   attach)
