@@ -244,6 +244,37 @@ daily via `ticket-audit.yml`, which keeps a single "Ticket audit report" issue (
 bot with `agent:human`, `needs:triage`) up to date and closes it when there are no error or warn
 findings. That issue is not a work item.
 
+## Usage-limit recovery
+
+Subagents can die mid-run on the plan's 5-hour usage limit (`failed`, rate_limit / HTTP 429,
+"You've hit your 5-hour limit · resets HH:MM"). No work may be lost or silently dropped. There
+are no external timers or autoresume services (one that started a concurrent session bypassed a
+file lock and was removed); recovery uses Claude Code's own resume (`claude --continue`) plus
+durable state kept by `scripts/agents` in `~/.local/state/wardenlens/agents/` (`inflight.tsv`
+and the saved prompts, mode 0600, never in the repo).
+
+The controller must:
+1. **Record every launch**: save the prompt, run `scripts/agents check PROMPT_FILE`, launch the agent, then
+   `scripts/agents record ROLE REF SHA PROMPT_FILE AGENT_ID`, where AGENT_ID is the id the launch returned
+   (the `SendMessage` target for resume). Example: the launch returns `a1b2c3d4e5f60718`, so run
+   `scripts/agents record implementer '#29' $SHA "$SCRATCH/29-impl.prompt" a1b2c3d4e5f60718`.
+   REF is `#N` (a ticket) for implementers, which are never PR-checked, and the PR number for verifiers.
+   `record` refuses prompts containing private (RFC1918, ULA) addresses, `scheme://user:pass@` URLs, or
+   values from the local secret file. If `record` refuses after the launch, stop that agent or record it
+   manually (fix the prompt and record again); never continue an untracked agent. Verifier rows must use a
+   numeric PR REF (not `#N`), or stale detection skips them.
+2. **On a rate-limit failure**: `scripts/agents fail AGENT_ID rate_limit HH:MM`, note the reset
+   time, and do no other work that needs the model until then.
+3. **After the reset**: resume each failed agent with `SendMessage` "limit reset, continue", or,
+   if it is unreachable (for example in a new session), relaunch it from its saved prompt at the
+   same SHA. If the PR head moved (`scripts/agents list --pr N` flags the row `STALE`; plain `list` checks every verifier PR and shows `UNKNOWN` if gh cannot say), relaunch at
+   the new head. Verdicts bind only to the SHA they were produced on.
+4. **Mark done**: `scripts/agents done AGENT_ID` when the report arrives.
+5. **Session start**: `/work` step 0 runs `scripts/agents list` and resumes or relaunches inflight
+   agents before claiming new work.
+
+`scripts/verify mark` is never run from a partial or interrupted report.
+
 ## Branches, commits, PRs
 
 - Branch: `<type>/<issue>-<slug>`, e.g. `feat/12-config-parser`.
