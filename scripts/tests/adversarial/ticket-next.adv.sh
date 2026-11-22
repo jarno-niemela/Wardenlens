@@ -17,6 +17,7 @@ if [[ "$1 $2" == "pr list" ]]; then
   if [[ -f "${PRFIXTURE:-/nonexistent}" ]]; then cat "$PRFIXTURE"; else echo '[]'; fi
   exit 0
 fi
+if [[ "$1 $2" == "repo view" ]]; then echo "jarno-niemela/Wardenlens"; exit 0; fi
 echo "stub gh: unexpected $*" >&2; exit 1
 STUB
 chmod +x "$tmp/bin/gh"

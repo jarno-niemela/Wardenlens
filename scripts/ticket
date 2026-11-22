@@ -18,7 +18,10 @@ STATES="backlog ready in-progress in-review changes-requested blocked done"
 die() { echo "ticket: $*" >&2; exit 1; }
 for dep in gh jq; do command -v "$dep" >/dev/null || die "missing dependency: $dep"; done
 
-valid_state() { [[ " $STATES " == *" $1 "* ]] || die "invalid state '$1' (one of: $STATES)"; }
+valid_state() {
+  case "$1" in backlog|ready|in-progress|in-review|changes-requested|blocked|done) ;; *) die "invalid state '$1' (one of: $STATES)" ;; esac
+}
+valid_title() { [[ -n "$1" && "$1" != -* ]] || die "invalid title '$1' (empty, or an option where the title belongs)"; }
 valid_num()   { [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: '$1'"; }
 valid_prio()  { [[ "$1" =~ ^p[0-3]$ ]] || die "invalid priority '$1' (p0..p3)"; }
 valid_type()  { [[ "$1" =~ ^(task|bug|chore|spike)$ ]] || die "invalid type '$1' (task|bug|chore|spike)"; }
@@ -49,6 +52,7 @@ cmd=${1:-}; shift || true
 case "$cmd" in
   epic)
     title=${1:?title required}; shift
+    valid_title "$title"
     prio=p2 area="" body_file=""
     while getopts "p:a:F:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; F) body_file=$OPTARG;; *) die "bad option";; esac; done
     shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
@@ -60,15 +64,16 @@ case "$cmd" in
     ;;
   task)
     epic=${1:?epic number required}; title=${2:?title required}; shift 2
-    valid_num "$epic"
+    valid_num "$epic"; valid_title "$title"
     prio=p2 area="" blocked="" body_file="" type=task
     while getopts "p:a:b:F:t:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; b) blocked=$OPTARG;; F) body_file=$OPTARG;; t) type=$OPTARG;; *) die "bad option";; esac; done
     shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
     valid_prio "$prio"; valid_area "$area"; valid_type "$type"
     blocked_nums=()
     if [[ -n "$blocked" ]]; then
+      # comma- or space-separated positive issue numbers; no empty entries, no 0, no newlines
+      [[ "$blocked" =~ ^[1-9][0-9]*([,\ ][1-9][0-9]*)*$ ]] || die "invalid -b '$blocked' (issue numbers like 12,14)"
       IFS=', ' read -r -a blocked_nums <<<"${blocked//,/ }"
-      for b in "${blocked_nums[@]}"; do valid_num "$b"; done
     fi
     [[ "$(gh issue view "$epic" --json labels --jq '[.labels[].name] | index("type:epic") != null')" == true ]] \
       || die "#$epic is not a type:epic issue"
@@ -85,8 +90,11 @@ case "$cmd" in
     echo "$url"
     link_sub_issue "$epic" "${url##*/}"
     ;;
-  status)  set_status "${1:?number}" "${2:?state}" ;;
+  status)
+    [[ $# -le 2 ]] || die "unexpected argument: ${3}"
+    set_status "${1:?number}" "${2:?state}" ;;
   claim)
+    [[ $# -le 1 ]] || die "unexpected argument: ${2}"
     n=${1:?number}; valid_num "$n"
     set_status "$n" in-progress
     gh issue edit "$n" --add-assignee @me --add-label agent:sonnet >/dev/null
@@ -96,7 +104,8 @@ case "$cmd" in
     # blocker known and closed. Open blockers include open PRs (same rules as the audit).
     all_issues=$(gh issue list --state all --limit 2000 --json number,title,state,labels,body,assignees,updatedAt)
     all_prs=$(gh pr list --state all --limit 1000 --json number,state)
-    jq -r -L "$here/lib" --argjson prs "$all_prs" 'include "common";
+    repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) && [[ -n "$repo" ]] || die "cannot resolve the repository"
+    jq -r -L "$here/lib" --argjson prs "$all_prs" --arg repo "$repo" 'include "common";
       . as $all
       | ([$all[].number] + [$prs[].number]) as $known
       | ([$all[] | select(.state == "OPEN") | .number] + [$prs[] | select(.state == "OPEN") | .number]) as $open
@@ -105,8 +114,10 @@ case "$cmd" in
           | select((prefixed("status:") | length) == 1)
           | select(labelnames | any(. == "agent:human" or . == "needs:triage") | not)
           | select(labelnames | any(. == "type:task" or . == "type:bug" or . == "type:chore" or . == "type:spike"))
-          | select(blockers | all(. as $b | ($known | index($b)) != null and ($open | index($b)) == null))
-          | . + {prio: ([prefixed("priority:p")[] | .[10:] | tonumber?] | first // 9)} ]
+          | select(foreign_blockers($repo) | length == 0)
+          | select(. as $t | blockers($repo) | (index($t.number) == null)
+                   and all(. as $b | ($known | index($b)) != null and ($open | index($b)) == null))
+          | . + {prio: ([prefixed("priority:") | .[] | select(test("^priority:p[0-3]$")) | .[10:] | tonumber] | min // 9)} ]
       | sort_by(.prio, .number) | first | if . == null then empty else .number end' <<<"$all_issues"
     ;;
   list)

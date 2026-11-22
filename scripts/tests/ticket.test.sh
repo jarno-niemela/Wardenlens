@@ -30,6 +30,17 @@ rejects "task: bad area"            task 1 "T" -a 'a,b'
 rejects "task: bad blocker"         task 1 "T" -b 'abc'
 rejects "task: bad blocker in list" task 1 "T" -b '2,x3'
 rejects "task: leftover argument"   task 1 "T" extra
+rejects "task: empty -b entry"      task 1 "T" -b '2,,3'
+rejects "task: trailing comma -b"   task 1 "T" -b '2,'
+rejects "task: -b zero"             task 1 "T" -b '0'
+rejects "task: -b leading zero"     task 1 "T" -b '02'
+rejects "task: -b newline"          task 1 "T" -b $'2\n3'
+rejects "task: option without value" task 1 "T" -p
+rejects "task: title is an option"  task 1 -p
+rejects "epic: title is an option"  epic -p
+rejects "status: two states"        status 3 "ready blocked"
+rejects "status: leftover argument" status 3 ready extra
+rejects "claim: leftover argument"  claim 3 extra
 rejects "status: bad state"         status 3 shipped
 rejects "status: bad number"        status x ready
 rejects "unknown command"           frobnicate

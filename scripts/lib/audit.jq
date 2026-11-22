@@ -6,6 +6,7 @@
 #                  PR rules apply only to state == "OPEN". Bot-authored PRs (e.g. Dependabot) are
 #                  exempt from the "closes an issue" rule. PR numbers count as known blockers.
 # Shared helpers live in common.jq (included by scripts/ticket-audit).
+#   $repo          this repository as "owner/name"; only references to it count
 #   $now           epoch seconds
 #   $stale_days    in-progress without a PR for longer than this is flagged
 #   $backlog_days  backlog untouched for longer than this is flagged
@@ -19,7 +20,7 @@ def finding($sev; $rule; $msg): {severity: $sev, number: .number, title: .title,
 ($issues | map({key: (.number | tostring), value: .}) | from_entries) as $by
 | ($prs | map({key: (.number | tostring), value: .}) | from_entries) as $pby
 | [$prs[] | select(.state == "OPEN")] as $open_prs
-| ([$open_prs[] | closing_refs[]] | unique) as $linked
+| ([$open_prs[] | closing_refs($repo)[]] | unique) as $linked
 | def issue($n): $by[$n | tostring];
   def pr($n): $pby[$n | tostring];
   def known($n): issue($n) != null or pr($n) != null;
@@ -48,14 +49,17 @@ def finding($sev; $rule; $msg): {severity: $sev, number: .number, title: .title,
       ( if (haslabel("status:in-review") or haslabel("status:changes-requested")) and ($linked | index($i.number)) == null
         then finding("error"; "review-without-pr"; "\($s | join(",")) but no open PR closes it") else empty end ),
       ( if haslabel("status:blocked") then
-          blockers as $b
-          | if ($b | length) == 0 then finding("error"; "blocked-no-reason"; "blocked but has no 'Blocked by: #N' line")
+          blockers($repo) as $b
+          | if ($b | length) == 0 and (foreign_blockers($repo) | length) > 0 then empty
+            elif ($b | length) == 0 then finding("error"; "blocked-no-reason"; "blocked but has no 'Blocked by: #N' line")
             elif any($b[]; known(.) | not) then empty
+            elif (foreign_blockers($repo) | length) > 0 then empty
             elif all($b[]; is_open(.) | not) then finding("warn"; "unblocked"; "all blockers are closed; move to status:ready")
             else empty end
         else empty end ),
-      ( blockers[] as $b | if known($b) | not then finding("error"; "bad-blocker"; "blocked by #\($b), which is neither an issue nor a PR") else empty end ),
-      ( if haslabel("status:ready") and ([blockers[] | select(is_open(.))] | length) > 0
+      ( if (blockers($repo) | index($i.number)) != null then finding("error"; "self-blocker"; "lists itself as a blocker") else empty end ),
+      ( blockers($repo)[] as $b | if known($b) | not then finding("error"; "bad-blocker"; "blocked by #\($b), which is neither an issue nor a PR") else empty end ),
+      ( if haslabel("status:ready") and ([blockers($repo)[] | select(is_open(.))] | length) > 0
         then finding("warn"; "ready-but-blocked"; "status:ready but has open blockers") else empty end ),
       ( if haslabel("status:backlog") and age_days($i.updatedAt) > $backlog_days
         then finding("info"; "stale-backlog"; "untouched \(age_days($i.updatedAt) | floor)d in backlog") else empty end ),
@@ -72,8 +76,8 @@ def finding($sev; $rule; $msg): {severity: $sev, number: .number, title: .title,
     | if ($s | length) > 0 then finding("info"; "closed-stale-status"; "closed but still labelled \($s | join(","))") else empty end
   ),
   ( $open_prs[]
-    | ( if (closing_refs | length) == 0 and ((.author.is_bot // false) | not) then finding("error"; "pr-no-issue"; "PR does not close any issue (add 'Closes #N')") else empty end ),
-      ( closing_refs[] as $n | if issue($n) == null then finding("error"; "pr-bad-ref"; "closes #\($n), which is not an issue") else empty end ),
+    | ( if (closing_refs($repo) | length) == 0 and ((.author.is_bot // false) | not) then finding("error"; "pr-no-issue"; "PR does not close any issue (add 'Closes #N')") else empty end ),
+      ( closing_refs($repo)[] as $n | if issue($n) == null then finding("error"; "pr-bad-ref"; "closes #\($n), which is not an issue") else empty end ),
       ( if (.isDraft | not) and age_days(.createdAt) > $pr_days and .reviewDecision != "APPROVED"
            and ((["verify:quality", "verify:security", "verify:adversarial"] - labelnames) | length) > 0
         then finding("warn"; "stale-pr"; "PR open \(age_days(.createdAt) | floor)d without approval") else empty end )
