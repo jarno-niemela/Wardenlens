@@ -94,15 +94,19 @@ esac
 STUB
 chmod +x "$stubdir/gh"
 export CALLS=$stubdir/calls
+: >"$CALLS"
 live=$(PATH="$stubdir:$PATH" "$root/scripts/ticket-audit" --json --fail-on never --now "$now")
 if grep -q '^gh repo view' "$CALLS" && jq -e 'any(.[]; .rule == "review-without-pr") | not' <<<"$live" >/dev/null; then
   echo "ok   live path uses gh repo view (fork-owner/Wardenlens)"
 else echo "FAIL live path did not use the repo from gh repo view"; fail=1; fi
+: >"$CALLS"
 live=$(PATH="$stubdir:$PATH" "$root/scripts/ticket-audit" --json --fail-on never --repo jarno-niemela/Wardenlens --now "$now")
 if jq -e 'any(.[]; .rule == "review-without-pr")' <<<"$live" >/dev/null; then echo "ok   --repo overrides gh repo view"
 else echo "FAIL --repo did not override"; fail=1; fi
 rc=0; "$root/scripts/ticket-audit" --issues-file "$fx/issues.json" --prs-file "$fx/prs.json" --now "$now" >/dev/null 2>&1 || rc=$?
 if [[ $rc -eq 2 ]]; then echo "ok   offline without --repo is a usage error"; else echo "FAIL offline without --repo exited $rc"; fail=1; fi
+# one file only is not offline: it must use gh repo view and must not be a usage error
+: >"$CALLS"
 rc=0; PATH="$stubdir:$PATH" "$root/scripts/ticket-audit" --issues-file "$fx/issues.json" --now "$now" >/dev/null 2>&1 || rc=$?
-if grep -q '^gh repo view' "$CALLS"; then echo "ok   one file only is not offline (uses gh repo view)"; else echo "FAIL one file only treated as offline"; fail=1; fi
+if [[ $rc -ne 2 ]] && grep -q '^gh repo view' "$CALLS"; then echo "ok   one file only is not offline (uses gh repo view)"; else echo "FAIL one file only treated as offline"; fail=1; fi
 exit $fail
