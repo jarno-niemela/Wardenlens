@@ -1,0 +1,12 @@
+diff --git a/crates/core/src/bc_protocol/motion.rs b/crates/core/src/bc_protocol/motion.rs
+index d910ee4..2ca6728 100644
+--- a/crates/core/src/bc_protocol/motion.rs
++++ b/crates/core/src/bc_protocol/motion.rs
+@@ -236,6 +236,7 @@ impl BcCamera {
+                                     ..
+                                 }) = motion_msg.body
+                                 {
++                                    println!("BC_MSG33 {:?}", alarm_event_list);
+                                     let mut result = MotionStatus::NoChange(Instant::now());
+                                     for alarm_event in &alarm_event_list.alarm_events {
+                                         if alarm_event.channel_id == channel_id {
