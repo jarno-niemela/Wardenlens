@@ -244,6 +244,30 @@ daily via `ticket-audit.yml`, which keeps a single "Ticket audit report" issue (
 bot with `agent:human`, `needs:triage`) up to date and closes it when there are no error or warn
 findings. That issue is not a work item.
 
+## Usage-limit recovery
+
+Subagents can die mid-run on the plan's 5-hour usage limit (`failed`, rate_limit / HTTP 429,
+"You've hit your 5-hour limit · resets HH:MM"). No work may be lost or silently dropped. There
+are no external timers or autoresume services (one that started a concurrent session bypassed a
+file lock and was removed); recovery uses Claude Code's own resume (`claude --continue`) plus
+durable state kept by `scripts/agents` in `~/.local/state/wardenlens/agents/` (`inflight.tsv`
+and the saved prompts, mode 0600, never in the repo).
+
+The controller must:
+1. **Record every launch**: save the prompt and `scripts/agents record ROLE REF SHA PROMPT_FILE AGENT_ID`.
+   `record` refuses prompts containing `10.99.` addresses or values from the local secret file.
+2. **On a rate-limit failure**: `scripts/agents fail AGENT_ID rate_limit HH:MM`, note the reset
+   time, and do no other work that needs the model until then.
+3. **After the reset**: resume each failed agent with `SendMessage` "limit reset, continue", or,
+   if it is unreachable (for example in a new session), relaunch it from its saved prompt at the
+   same SHA. If the PR head moved (`scripts/agents list --pr N` flags the row `STALE`), relaunch at
+   the new head. Verdicts bind only to the SHA they were produced on.
+4. **Mark done**: `scripts/agents done AGENT_ID` when the report arrives.
+5. **Session start**: `/work` step 0 runs `scripts/agents list` and resumes or relaunches inflight
+   agents before claiming new work.
+
+`scripts/verify mark` is never run from a partial or interrupted report.
+
 ## Branches, commits, PRs
 
 - Branch: `<type>/<issue>-<slug>`, e.g. `feat/12-config-parser`.

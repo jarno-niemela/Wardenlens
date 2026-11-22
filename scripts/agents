@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Durable record of in-flight subagents, so a usage-limit stop loses nothing. Requires: jq (record), gh (list --pr).
+#
+#   agents record ROLE REF SHA PROMPT_FILE AGENT_ID   save the prompt (mode 0600) and append an inflight row.
+#                                                     REF is the ticket (implementer) or PR (verifiers) number.
+#                                                     Refuses a prompt holding a 10.99. address or a value from
+#                                                     the secret file (credential-like keys, length >= 6).
+#   agents done AGENT_ID                              drop the row; keep the prompt as AGENT_ID.prompt.done
+#   agents fail AGENT_ID REASON [RESET]               mark the row `limited` with the reset time (e.g. 14:30)
+#   agents list [--pr N]                              print rows; with --pr, flag STALE a row for PR N whose SHA
+#                                                     is no longer the PR head (relaunch it at the new head)
+#
+# State: ${WARDENLENS_AGENT_STATE:-$HOME/.local/state/wardenlens/agents}/inflight.tsv (never in the repo).
+# Columns: started_utc role ref sha agent_id status reset prompt_file. Status: running | limited.
+# Secret file: ${WARDENLENS_SECRET_FILE:-$HOME/.config/wardenlens/agentdvr-cameras.secret.json}; values are never printed.
+set -euo pipefail
+export LC_ALL=C
+umask 077
+
+state=${WARDENLENS_AGENT_STATE:-$HOME/.local/state/wardenlens/agents}
+secret=${WARDENLENS_SECRET_FILE:-$HOME/.config/wardenlens/agentdvr-cameras.secret.json}
+tsv=$state/inflight.tsv
+
+die() { echo "agents: $*" >&2; exit 1; }
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+valid_id()  { [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] || die "invalid AGENT_ID '${1:-}'"; }
+valid_tok() { [[ "${2:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "invalid $1 '${2:-}'"; }
+valid_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]] || die "SHA must be 40 lowercase hex chars: '${1:-}'"; }
+clean()     { printf '%s' "$1" | tr '\t\r\n' '   ' | cut -c1-200; }
+
+init() {
+  mkdir -p "$state"; chmod 700 "$state"
+  [[ -f "$tsv" ]] || { : >"$tsv"; }
+  chmod 600 "$tsv"
+  if command -v flock >/dev/null; then exec 9>"$state/.lock"; flock 9; fi
+}
+
+scan_prompt() {  # FILE: refuse LAN addresses and secret-file values; never echo a value
+  local f=$1 pats rc=0
+  if grep -q -F '10.99.' -- "$f"; then die "refusing: prompt contains a 10.99. address"; fi
+  [[ -f "$secret" ]] || return 0
+  command -v jq >/dev/null || die "missing dependency: jq"
+  pats=$(mktemp)
+  jq -r '[.. | objects | to_entries[]
+          | select(.key | test("pass|pwd|secret|token|key|auth|cred|user"; "i"))
+          | .value | strings | select(length >= 6 and (contains("\n") | not))] | unique[]' "$secret" >"$pats" \
+    || { rm -f "$pats"; die "cannot read the secret file (failing closed)"; }
+  if [[ -s "$pats" ]] && grep -q -F -f "$pats" -- "$f"; then rc=1; fi
+  rm -f "$pats"
+  [[ $rc -eq 0 ]] || die "refusing: prompt contains a value from the secret file"
+}
+
+cmd_record() {
+  [[ $# -eq 5 ]] || die "usage: record ROLE REF SHA PROMPT_FILE AGENT_ID"
+  local role=$1 ref=$2 sha=$3 pf=$4 id=$5
+  valid_tok ROLE "$role"; valid_tok REF "$ref"; valid_sha "$sha"; valid_id "$id"
+  [[ -f "$pf" && ! -L "$pf" ]] || die "prompt file not found (or a symlink): $pf"
+  scan_prompt "$pf"
+  init
+  if cut -f5 "$tsv" | grep -qxF -- "$id"; then die "AGENT_ID already recorded: $id"; fi
+  cp -- "$pf" "$state/$id.prompt"; chmod 600 "$state/$id.prompt"
+  printf '%s\t%s\t%s\t%s\t%s\trunning\t-\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$role" "$ref" "$sha" "$id" "$state/$id.prompt" >>"$tsv"
+}
+
+cmd_done() {
+  [[ $# -eq 1 ]] || die "usage: done AGENT_ID"
+  valid_id "$1"; init
+  cut -f5 "$tsv" | grep -qxF -- "$1" || die "unknown AGENT_ID: $1"
+  awk -F'\t' -v id="$1" '$5 != id' "$tsv" >"$tsv.new" && mv -- "$tsv.new" "$tsv"
+  chmod 600 "$tsv"
+  if [[ -f "$state/$1.prompt" ]]; then mv -- "$state/$1.prompt" "$state/$1.prompt.done"; fi
+}
+
+cmd_fail() {
+  [[ $# -ge 2 && $# -le 3 ]] || die "usage: fail AGENT_ID REASON [RESET]"
+  valid_id "$1"; init
+  cut -f5 "$tsv" | grep -qxF -- "$1" || die "unknown AGENT_ID: $1"
+  local reason reset
+  reason=$(clean "$2"); reset=$(clean "${3:--}")
+  awk -F'\t' -v OFS='\t' -v id="$1" -v r="$reset" -v why="$reason" \
+    '$5 == id { $6 = "limited"; $7 = r; $9 = why } { print }' "$tsv" >"$tsv.new" && mv -- "$tsv.new" "$tsv"
+  chmod 600 "$tsv"
+}
+
+cmd_list() {
+  local pr=""
+  if [[ "${1:-}" == "--pr" ]]; then
+    [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--pr needs a number"
+    pr=$2
+  elif [[ $# -gt 0 ]]; then die "usage: list [--pr N]"; fi
+  [[ -f "$tsv" ]] || { echo "no inflight agents"; return 0; }
+  local head="" ts role ref sha id st reset extra flag
+  if [[ -n "$pr" ]]; then
+    head=$(gh pr view "$pr" --json headRefOid -q .headRefOid) || die "cannot read PR #$pr"
+    valid_sha "$head"
+  fi
+  [[ -s "$tsv" ]] || { echo "no inflight agents"; return 0; }
+  while IFS=$'\t' read -r ts role ref sha id st reset extra; do
+    flag=""
+    if [[ -n "$pr" && "$ref" == "$pr" && "$sha" != "$head" ]]; then flag="STALE (head is now ${head:0:12})"; fi
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$ts" "$role" "$ref" "${sha:0:12}" "$id" "$st" "$reset" "$extra" "$flag"
+  done <"$tsv"
+}
+
+case "${1:-}" in
+  record) shift; cmd_record "$@" ;;
+  done)   shift; cmd_done "$@" ;;
+  fail)   shift; cmd_fail "$@" ;;
+  list)   shift; cmd_list "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 1 ;;
+esac
