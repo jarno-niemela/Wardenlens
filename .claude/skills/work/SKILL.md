@@ -66,11 +66,11 @@ Collect verdicts:
 - Any BLOCK / BROKEN (blocker or major): step 5.
 - Minor findings: file follow-ups now: `scripts/ticket task <epic> "<title>" -p p3 -F body.md` (bugs: `-t bug`). Link them in a PR comment.
 
-## 5. Fix loop (max 3 rounds)
+## 5. Fix loop (max 5 rounds)
 1. `scripts/ticket status N changes-requested`; post the consolidated findings as a PR comment (`gh pr comment`).
 2. Re-dispatch the `implementer` with the findings verbatim and the adversary's failing tests (tell it to commit those tests: they are now regression tests).
 3. You run the gate, push, set `SHA` to the new head, and go back to step 4 with **all three** verifiers from scratch. `scripts/ticket status N in-review`. Statuses on the old SHA do not count for the new head.
-4. After round 3 still failing: stop. Comment a summary, label issue and PR `agent:human`, leave it `changes-requested`, report to user, continue with the next ticket if `--loop`.
+4. After round 5 still failing: stop. Comment a summary, label issue and PR `agent:human`, leave it `changes-requested`, report to user, continue with the next ticket if `--loop`.
 
 ## 6. Keep adversary tests and merge
 Passing adversary tests listed under WORTH KEEPING: copy them from the adversary worktree into the PR branch, commit them (test-only), run the gate, push, then:

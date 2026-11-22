@@ -118,7 +118,7 @@ allows it, enable rulesets that require the `verify/quality`, `verify/security`,
 
 Fix loop: a blocking finding → `status:changes-requested` → implementer resumes
 with the findings verbatim → controller runs the gate → re-verify (all three, from scratch,
-on the new SHA). After **3 failed rounds** the controller stops, labels the ticket
+on the new SHA). After **5 failed rounds** the controller stops, labels the ticket
 `agent:human`, and comments with a summary.
 
 ## Defence in depth (pushes and merges)
