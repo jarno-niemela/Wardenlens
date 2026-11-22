@@ -25,12 +25,27 @@ We need durable state, independent verification and neglect detection.
   always refers to the final code. `verify:*` labels are display-only and are reset on every push
   by the `verify-labels-reset` workflow. Test-only follow-ups may carry verdicts forward
   (`scripts/verify carry`). CI enforces fmt/clippy/tests/docs/cargo-deny and the tooling tests.
-- **Guard hook**: a fail-closed Bash hook blocks force pushes, pushes to main, hook bypass,
-  `gh pr merge` without `--match-head-commit <sha|$var>`, merge/delete calls and status writes
-  through `gh api`, and piping into a shell. It is a safety net against mistakes, not a security
-  boundary. Accepted limitations: code inside interpreter string literals (`python3 -c`,
-  `perl -e`, `node -e`, awk `system()`), `$'...'` quoting, `$(echo ...)` and variable
-  indirection, and aliases.
+- **Pre-push hook (authoritative)**: `.githooks/pre-push` sees the real ref updates and refuses
+  updates of main/master, deletions, unknown remote state and non-fast-forward updates, whatever
+  the command looked like. Rewriting one's own feature branch needs `WARDENLENS_ALLOW_REWRITE=1`,
+  which the guard denies in agent commands, so only a human can set it. `scripts/gate` checks that
+  `core.hooksPath` is `.githooks`; the hook has real-push tests (`scripts/tests/pre-push.test.sh`).
+- **Guard hook (best effort)**: a fail-closed Bash hook blocks force pushes, pushes to main, hook
+  bypass, `gh pr merge` without `--match-head-commit <sha|$var>`, merge/delete calls, GraphQL
+  mutations and status writes through `gh api`, and piping into a shell. It is a safety net against
+  mistakes, not a security boundary; because git spells a push in too many ways to match as text,
+  the pre-push hook is what actually stops pushes. Accepted limitations (the guard does not catch
+  these; where they push, the pre-push hook still does):
+  - code inside interpreter string literals (`python3 -c`, `perl -e`, `node -e`, awk `system()`),
+    `$'...'` quoting, `$(echo ...)` and variable indirection, aliases and scripts;
+  - pipes into shells through wrappers with arguments (`timeout 10 bash`, `sudo -u x bash`,
+    `nice -n 5 sh`, `busybox sh`, `tee >(bash)`);
+  - `xargs ... git`;
+  - git invoked through other paths (`/usr/lib/git-core/git`, `git-push`);
+  - brace expansion (`git push origin {feat/x,main}`);
+  - heredoc logical-line edge cases (`<<EOF \` continuation, quotes spanning lines) and
+    `${x//<<X/}` being read as a heredoc;
+  - `GIT_CONFIG_*` exported in an earlier command than the git invocation.
 - **Neglect detection**: `scripts/ticket-audit` (pure jq rules with offline tests)
   runs every `/work` iteration and daily in CI.
 - **Tooling in bash + jq** for bootstrap; a Rust port is tracked as a ticket.

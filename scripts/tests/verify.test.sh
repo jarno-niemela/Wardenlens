@@ -220,6 +220,7 @@ t_fail "carry: a gitlink under a test path (160000) is refused" "$verify" carry 
 check  "  posts nothing" bash -c "! grep -q 'statuses/' '$GH_LOG'"
 mkdir -p "$tmp/gitfail"
 real_git=$(command -v git)
+# shellcheck disable=SC2016  # the stub script must contain a literal "$@"
 printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ "$a" == diff-tree ]] && { echo "fatal: simulated" >&2; exit 128; }; done\nexec %s "$@"\n' "$real_git" >"$tmp/gitfail/git"
 chmod +x "$tmp/gitfail/git"
 reset; HEAD=$B; export HEAD

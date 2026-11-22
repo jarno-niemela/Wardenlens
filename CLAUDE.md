@@ -28,4 +28,4 @@ scripts/ticket-audit         # neglected / mislabelled tickets
 
 ## Environment
 Toolchain pinned in `rust-toolchain.toml`. If `cargo` is not on PATH: `source ~/.cargo/env`.
-Git hooks: `git config core.hooksPath .githooks`.
+Git hooks: `git config core.hooksPath .githooks` — required, `scripts/gate` fails otherwise. `.githooks/pre-push` is the authoritative block on pushes to `main`, deletions and force pushes; never bypass it or set `WARDENLENS_ALLOW_REWRITE` (human-only).

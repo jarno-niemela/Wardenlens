@@ -14,21 +14,34 @@
 #    fine), no --mirror/--all/--delete (also abbreviated), no push to main/master (HEAD and @ resolved
 #    through the current branch; heads/main; glob refspecs are refused), a bare push on main is refused,
 #    and a bare push whose directory/branch cannot be resolved is refused (fail closed).
+#    An empty-source refspec (`:dst` deletion, `:` matching push) is refused.
 #  - no hook bypass: --no-verify, commit -n, core.hooksPath (-c, config, anything but .githooks),
-#    GIT_CONFIG_* assignments next to git, -c remote.*.push / alias.* overrides, and unknown git global
-#    options in front of push/commit/merge/rebase.
+#    GIT_CONFIG_* assignments next to git, config keys remote.*.mirror, push.default, remote.*.push,
+#    alias.*, core.hooksPath, include.path, includeIf.* (in -c, git config, --config-env; also
+#    removing/renaming the core section), and unknown git global options in front of
+#    push/commit/merge/rebase.
+#  - any assignment or export of WARDENLENS_ALLOW_REWRITE (the human-only switch of .githooks/pre-push).
+#  - directory tracking fails closed: a cd/pushd/popd in a subshell, pipeline, background job,
+#    backticks or nested shell scan, `env -C`, and GIT_DIR/GIT_WORK_TREE assignments make the working
+#    directory unknown, and a bare push with an unknown directory is refused.
 #  - gh pr merge only with --match-head-commit <40-hex SHA or one $variable>, never --admin; no
 #    repo/issue deletion; gh api: no merges, no DELETE on repos, no branch-protection/ruleset changes,
 #    no writes to */statuses/* (forging verification; scripts/verify is the only writer and its internal
-#    calls are not inspected).
+#    calls are not inspected), no write to a percent-encoded endpoint, no contents write to
+#    main/master, and no GraphQL mutation (reading through graphql is fine).
 #  - piping into a shell (`| bash`, `| sh -s`, `source /dev/stdin`) hides commands: blocked.
 #
+# The authoritative push control is .githooks/pre-push; this guard is the first, best-effort line.
 # Accepted limitations (see docs/adr/0001): code inside interpreter string literals (python3 -c,
 # perl -e, node -e, awk system(), ...), $'...' quoting, $(echo ...) / variable indirection, aliases and
-# scripts. A forbidden command written as plain words inside an unquoted argument, e.g.
+# scripts, pipes into shells through wrappers with arguments (timeout, sudo -u, nice, busybox,
+# tee >(...)), xargs ... git, git under other paths (/usr/lib/git-core/git*), brace expansion, heredoc
+# logical-line edge cases (<<EOF \, quotes spanning lines), ${x//<<X/}, and GIT_CONFIG_* exported in
+# an earlier segment. A forbidden command written as plain words inside an unquoted argument, e.g.
 # `echo git push --force`, can be a false positive. Fails closed: if jq is missing or the input is
 # unreadable, the command is blocked.
 set -Eeuo pipefail
+export LC_ALL=C   # ASCII-only [0-9], [a-z] in every pattern below
 trap 'echo "Blocked by .claude/hooks/guard-bash.sh: internal error (failing closed)" >&2; exit 2' ERR
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -49,7 +62,7 @@ block() { echo "Blocked by .claude/hooks/guard-bash.sh: $1" >&2; exit 2; }
 strip_heredocs() {
   awk '
     BEGIN {
-      interp = "(^|[ \t|;&(`\"/\047])(bash|sh|zsh|dash|ksh|eval|python[0-9.]*|perl|ruby|node|php)([ \t;&|)`\"\047]|$)"
+      interp = "(^|[ \t|;&(`\"/\047])(bash|sh|zsh|dash|ksh|eval|python[0-9.]*|perl|ruby|node|php)([ \t;&|)`<\"\047]|$)"
       q = ""; arith = 0; bad = 0; cs = 0
     }
     in_doc {
@@ -113,7 +126,9 @@ strip_heredocs() {
 }
 
 # Quote-aware tokeniser. Emits one line per token ("t"+text, or "q"+text if any part was quoted) and an
-# "s" line at every simple-command separator (; & || ( ) newline backtick), "p" at a pipe (| or |&).
+# "s" line at every simple-command separator (; && || newline), "s&" for a single & (background), "s`" at
+# a backtick, "o"/"c" at ( and ), "p" at a pipe (| or |&). & glued to > or < (2>&1, >&2) or before > (&>)
+# belongs to a redirection.
 # Unquoted # starts a comment.
 tokenize() {
   CMD=$1 awk '
@@ -139,7 +154,16 @@ tokenize() {
           else { if (substr(s, i + 1, 1) == "&") i++; print "p" }
           continue
         }
-        if (c == ";" || c == "&" || c == "(" || c == ")" || c == "\n" || c == "`") { flush(); print "s"; continue }
+        if (c == "&") {   # part of a redirection (2>&1, >&2, &>file) or a separator
+          pc = (i > 1) ? substr(s, i - 1, 1) : ""
+          if (pc == ">" || pc == "<") { tok = tok c; intok = 1; continue }
+          if (substr(s, i + 1, 1) == ">") { flush(); tok = "&"; intok = 1; continue }
+          flush(); print (pc == "&" || substr(s, i + 1, 1) == "&") ? "s" : "s&"; continue
+        }
+        if (c == "(") { flush(); print "o"; continue }
+        if (c == ")") { flush(); print "c"; continue }
+        if (c == "`") { flush(); print "s`"; continue }
+        if (c == ";" || c == "\n") { flush(); print "s"; continue }
         tok = tok c; intok = 1
       }
       flush()
@@ -189,9 +213,18 @@ is_main_ref() {  # [+]src:dst | name | refs/heads/name | heads/name -> true if t
   [[ "$r" == main || "$r" == master ]]
 }
 
-bad_cfg() {  # true for config overrides that bypass hooks or redirect pushes
+bad_key() {  # true for config keys that bypass hooks, hide commands or change what a push updates
+  case "${1,,}" in
+    remote.*.mirror|push.default|remote.*.push|alias.*|core.hookspath|include.path|includeif.*) return 0 ;;
+  esac
+  return 1
+}
+
+bad_cfg() {  # bad_cfg "key=value" | "-ckey=value" | "--config-env=key=ENV": true if the key is forbidden
   local s=${1,,}
-  [[ "$s" == *core.hookspath* || "$s" == *remote.*.push=* || "$s" == *alias.*=* ]]
+  s=${s#-c}; s=${s#--config-env=}
+  [[ "$s" == *core.hookspath* ]] && return 0
+  bad_key "${s%%=*}"
 }
 
 check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flags consume the next token
@@ -212,20 +245,28 @@ check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flag
 }
 
 check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks; never unset
-  local a key="" val="" have_val=0 np=0 unset_=0 skip=0
+  local a key="" val="" have_val=0 np=0 unset_=0 skip=0 section=0 sec
   local -a pos=()
   for a in "$@"; do
     if ((skip)); then skip=0; continue; fi
     case "$a" in
       --unset|--unset-all) unset_=1 ;;
-      -f|--file|--blob|--default|--type) skip=1 ;;
+      --remove-section|--rename-section) section=1 ;;
+      -f|--file|--blob|--default|--type|--comment) skip=1 ;;
       -*) ;;
       *) pos+=("$a") ;;
     esac
   done
-  if [[ "${pos[0]:-}" == set || "${pos[0]:-}" == unset ]]; then
+  if [[ "${pos[0]:-}" == set || "${pos[0]:-}" == unset || "${pos[0]:-}" == remove-section || "${pos[0]:-}" == rename-section ]]; then
     [[ "${pos[0]}" == unset ]] && unset_=1 || true
+    [[ "${pos[0]}" == remove-section || "${pos[0]}" == rename-section ]] && section=1 || true
     pos=("${pos[@]:1}")
+  fi
+  if ((section)); then  # removing/renaming a whole section drops core.hooksPath, aliases, push settings
+    sec=${pos[0]:-}; case "${sec,,}" in
+      core|alias|include|includeif.*|push|remote|remote.*) block "removing or renaming the '${pos[0]}' config section bypasses the git hooks" ;;
+    esac
+    return 0
   fi
   np=${#pos[@]}
   ((np > 0)) && key=${pos[0],,} || true
@@ -237,7 +278,7 @@ check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks
     fi
   fi
   if ((have_val || unset_)); then
-    [[ "$key" == remote.*.push || "$key" == alias.* ]] && block "changing $key can redirect pushes or hide commands" || true
+    [[ "$key" != core.hookspath ]] && bad_key "$key" && block "changing $key can redirect pushes, hide commands or bypass hooks" || true
   fi
   return 0
 }
@@ -276,6 +317,7 @@ check_push() {  # check_push DIR GITDIR UNKNOWN args...
   done
   for ((i = 1; i < ${#pos[@]}; i++)); do
     r=${pos[i]#+}; dst=${r##*:}
+    [[ "$r" == :* ]] && block "an empty-source refspec ('$r') deletes a remote ref or pushes all matching branches; requires the user" || true
     [[ "$dst" == *'*'* ]] && block "glob refspecs can push main; name the branch explicitly" || true
     if [[ "$r" == HEAD || "$r" == @ ]]; then
       cur=$(branch_of "$d" "$gd" "$unk") || exit 2
@@ -298,7 +340,7 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
   done
   while ((j < n)); do
     opt=${seg_t[j]}
-    if bad_cfg "$opt"; then block "overriding core.hooksPath / remote push / aliases through git options is not allowed"; fi
+    if bad_cfg "$opt"; then block "overriding hooks, push or alias settings through git options is not allowed"; fi
     case "$opt" in
       -C)
         val=${seg_t[j + 1]:-}
@@ -308,12 +350,15 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
         j=$((j + 2)) ;;
       -c|--config-env)
         val=${seg_t[j + 1]:-}
-        if bad_cfg "$val"; then block "overriding core.hooksPath / remote push / aliases through git -c is not allowed"; fi
+        if bad_cfg "$val"; then block "overriding hooks, push or alias settings through git -c is not allowed"; fi
         j=$((j + 2)) ;;
       --git-dir) gd=${seg_t[j + 1]:-}; j=$((j + 2)) ;;
       --git-dir=*) gd=${opt#--git-dir=}; j=$((j + 1)) ;;
       --work-tree|--namespace|--super-prefix|--attr-source) j=$((j + 2)) ;;
-      --work-tree=*|--namespace=*|--super-prefix=*|--attr-source=*|--config-env=*|--exec-path=*) j=$((j + 1)) ;;
+      --config-env=*)
+        if bad_cfg "$opt"; then block "overriding core.hooksPath / remote push / aliases through --config-env is not allowed"; fi
+        j=$((j + 1)) ;;
+      --work-tree=*|--namespace=*|--super-prefix=*|--attr-source=*|--exec-path=*) j=$((j + 1)) ;;
       --exec-path|--no-pager|--paginate|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|--no-lazy-fetch|-p|-P|-c?*) j=$((j + 1)) ;;
       --*)
         for ((k = j + 1; k < n; k++)); do
@@ -334,7 +379,7 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
     tok=${seg_t[k]}
     if ((skipnext)); then skipnext=0; continue; fi
     if [[ "${seg_q[k]}" == t ]]; then
-      if [[ "$tok" =~ ^([0-9]*|\&)(\>\>?|\<)$ ]]; then skipnext=1; continue; fi
+      if [[ "$tok" =~ ^([0-9]*|\&)(\>\>?|\<)\&?$ ]]; then skipnext=1; continue; fi
       if [[ "$tok" =~ ^([0-9]*|\&)(\>|\<) ]]; then continue; fi
       if [[ "$tok" == *[\<\>]* ]]; then tok=${tok%%[<>]*}; [[ -n "$tok" ]] || continue; fi
     fi
@@ -369,6 +414,10 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       -R|--repo) skip=1; continue ;;
       -*) continue ;;
     esac
+    if [[ "${seg_q[k]}" == t && "$a" =~ ^([0-9]*|\&)(\>\>?|\<)\&?[^[:space:]]*$ ]]; then  # redirection, not an argument
+      [[ "$a" =~ ^([0-9]*|\&)(\>\>?|\<)\&?$ ]] && skip=1 || true
+      continue
+    fi
     if [[ -z "$a1" ]]; then a1=$a; idx1=$k; elif [[ -z "$a2" ]]; then a2=$a; fi
   done
   case "$a1 $a2" in
@@ -392,14 +441,19 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       ((have)) || block "gh pr merge needs --match-head-commit \"\$sha\" with sha=\$(scripts/verify check PR) so only the verified SHA merges" ;;
     "repo delete"|"issue delete") block "deleting repos/issues requires the user" ;;
     "api "*)
-      local method="" ep="" prev="" haswrite=0
+      local method="" ep="" prev="" haswrite=0 all="" fld c rest ci
+      local -a fields=()
       for ((k = idx1 + 1; k < n; k++)); do
         a=${seg_t[k]}
+        all+=" ${a,,}"
         case "$a" in
           *mergePullRequest*|*enablePullRequestAutoMerge*) block "merging through the API bypasses the verification gate" ;;
         esac
         if [[ -n "$prev" ]]; then
-          case "$prev" in -X|--method) method=$a ;; esac
+          case "$prev" in
+            -X|--method) method=$a ;;
+            -f|-F|--field|--raw-field) fields+=("$a") ;;
+          esac
           prev=""; continue
         fi
         case "$a" in
@@ -408,8 +462,21 @@ check_gh() {  # check_gh INDEX ; reads seg_t
           -X?*) method=${a#-X} ;;
           --method=*) method=${a#--method=} ;;
           -f|-F|--field|--raw-field|--input) haswrite=1; prev=$a ;;
-          -f?*|-F?*|--field=*|--raw-field=*|--input=*) haswrite=1 ;;
+          -f?*) haswrite=1; fields+=("${a#-f}") ;;
+          -F?*) haswrite=1; fields+=("${a#-F}") ;;
+          --field=*|--raw-field=*) haswrite=1; fields+=("${a#*=}") ;;
+          --input=*) haswrite=1 ;;
           -H|--header|-q|--jq|-t|--template|--hostname|--cache|--preview|-p) prev=$a ;;
+          -[A-Za-z][A-Za-z]*)
+            # a cluster of short flags (-iX DELETE, -iXPOST): the first flag that takes a value ends it
+            for ((ci = 1; ci < ${#a}; ci++)); do
+              c=${a:ci:1}; rest=${a:ci+1}
+              case "$c" in
+                X) if [[ -n "$rest" ]]; then method=${rest#=}; else prev=-X; fi; break ;;
+                f|F) haswrite=1; if [[ -n "$rest" ]]; then fields+=("$rest"); else prev=-f; fi; break ;;
+                H|q|t|p) [[ -n "$rest" ]] || prev=-H; break ;;
+              esac
+            done ;;
           -*) ;;
           *) [[ -z "$ep" ]] && ep=$a || true ;;
         esac
@@ -420,7 +487,14 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       case "$ep" in
         */merge|*/merge/*|*/merges) block "merging through the API bypasses the verification gate" ;;
       esac
+      [[ "$ep" == graphql && "$all" == *mutation* ]] && block "GraphQL mutations can merge, push or change refs; use scripts/verify and plain gh commands" || true
       if [[ "$method" != GET && "$method" != HEAD ]]; then
+        [[ "$ep" == *%* ]] && block "percent-encoded endpoint on a write request cannot be checked" || true
+        if [[ "$ep" == repos/*/contents/* ]]; then
+          for fld in "${fields[@]}"; do
+            case "${fld,,}" in branch=main|branch=master|branch=refs/heads/main|branch=refs/heads/master) block "writing files to main/master through the API requires the user" ;; esac
+          done
+        fi
         [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
         case "$ep" in
           */branches/*/protection*) block "changing branch protection requires the user" ;;
@@ -486,34 +560,57 @@ check_git_env() {  # GIT_CONFIG_* assignments in a segment that runs git inject 
 }
 
 scan() {  # scan TEXT DEPTH
-  local text=$1 depth=$2 line kind code had pending=0
+  local text=$1 depth=$2 line kind code had pending=0 subdepth=0 bt=0 insub
   local -a seg_t=() seg_q=()
   if ! code=$(strip_heredocs "$text"); then
     block "ambiguous heredoc delimiter (mixed quoted and unquoted parts); use a plain <<'EOF'"
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     kind=${line:0:1}
-    if [[ "$kind" == s || "$kind" == p ]]; then
+    if [[ "$kind" == [spoc] ]]; then
       had=${#seg_t[@]}
-      check_segment "$depth" "$pending"
+      insub=$((subdepth > 0 || bt))
+      # a command followed by | or a single & runs in a subshell
+      if [[ "$kind" == p || "$line" == 's&' ]]; then insub=1; fi
+      check_segment "$depth" "$pending" "$insub"
       seg_t=(); seg_q=()
       if [[ "$kind" == p ]]; then pending=1; elif ((had > 0)); then pending=0; fi
+      case "$kind" in
+        o) subdepth=$((subdepth + 1)) ;;
+        c) ((subdepth > 0)) && subdepth=$((subdepth - 1)) || true ;;
+        s) [[ "$line" == 's`' ]] && bt=$((1 - bt)) || true ;;
+      esac
     else
       seg_t+=("${line:1}"); seg_q+=("$kind")
     fi
   done < <(tokenize "$code")
-  check_segment "$depth" "$pending"
+  check_segment "$depth" "$pending" $((subdepth > 0 || bt))
 }
 
-check_segment() {  # check_segment DEPTH PIPED ; reads seg_t, seg_q
-  local depth=$1 piped=$2 n=${#seg_t[@]} i t wrapped=0
+check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: runs in a subshell)
+  local depth=$1 piped=$2 sub=$3 n=${#seg_t[@]} i k t wrapped=0
   ((n > 0)) || return 0
-  case "${seg_t[0]}" in cd|pushd) track_cd ;; esac
+  # cwd tracking: a cd in a subshell, pipeline, background job or nested scan does not carry over reliably
+  case "${seg_t[0]}" in
+    cd|pushd) if ((depth > 0 || sub)); then cwd_unknown=1; else track_cd; fi ;;
+    popd) cwd_unknown=1 ;;
+  esac
   if ((piped)); then check_pipe_target; fi
   check_stdin_source
   check_git_env
+  ((piped)) && sub=1 || true
   for ((i = 0; i < n; i++)); do
     t=${seg_t[i]}
+    if [[ "$t" == WARDENLENS_ALLOW_REWRITE=* ]]; then block "WARDENLENS_ALLOW_REWRITE is the human-only switch that permits history rewrites; agents never set it"; fi
+    if [[ "$t" == WARDENLENS_ALLOW_REWRITE && i -gt 0 ]]; then
+      case "${seg_t[0]}" in export|declare|typeset|readonly|local|env) block "WARDENLENS_ALLOW_REWRITE is the human-only switch that permits history rewrites; agents never set it" ;; esac
+    fi
+    if [[ "$t" =~ ^(GIT_DIR|GIT_WORK_TREE)= ]]; then cwd_unknown=1; fi
+    case "${t##*/}" in
+      env) for ((k = i + 1; k < n; k++)); do   # env -C DIR / --chdir changes the directory of what follows
+             case "${seg_t[k]}" in -C|-C?*|--chdir|--chdir=*) cwd_unknown=1 ;; -*|*=*) ;; *) break ;; esac
+           done ;;
+    esac
     if [[ "${seg_q[i]}" == q && "$depth" -lt 4 ]]; then
       # shellcheck disable=SC2016  # matching the literal text $(
       if ((wrapped)) || [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "${t#<<<}" $((depth + 1)); fi

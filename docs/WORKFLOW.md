@@ -81,7 +81,8 @@ A PR may be merged only when **all** hold:
      Anything else (a workflow token, a collaborator, a hand-written status) is ignored: it
      neither passes nor overrides. The latest status per context is the one with the highest id.
    - **Named CI checks.** Every name in `REQUIRED_CHECKS` at the top of `scripts/verify` must be
-     present with bucket `pass`: `fmt · clippy · test · doc`, `cargo-deny`,
+     present with bucket `pass` and reported by the workflow named `CI` (a same-named check from
+     another workflow does not count): `fmt · clippy · test · doc`, `cargo-deny`,
      `scripts (shellcheck + tooling tests + audit)`. A test asserts the list equals the job
      names in `ci.yml`, so renaming a job cannot silently stop gating. Missing, pending and
      failing all count as failing; `verify/*` contexts are not part of the CI evaluation.
@@ -95,7 +96,8 @@ A PR may be merged only when **all** hold:
 Test-only follow-up commits (adversary tests worth keeping) do not need re-verification:
 `scripts/verify carry PR FROM_SHA` copies the success statuses to the new head, but only if
 the diff since `FROM_SHA` only **adds or modifies** files under `crates/*/tests/**` and
-`scripts/tests/**` (deletions, type changes, renames, submodule bumps and everything else are
+`scripts/tests/**`, and every changed entry is a regular file (mode `100644` or `100755`:
+symlinks and submodule gitlinks, deletions, type changes, renames and everything else are
 refused; a git failure refuses too), and the head has no trusted non-success `verify/*` status.
 Only trusted successes are carried. Carried test scripts run unreviewed on the operator's
 machine (`scripts/gate` executes every `scripts/tests/**/*.sh`), so the controller must read
@@ -118,6 +120,30 @@ Fix loop: a blocking finding → `status:changes-requested` → implementer resu
 with the findings verbatim → controller runs the gate → re-verify (all three, from scratch,
 on the new SHA). After **3 failed rounds** the controller stops, labels the ticket
 `agent:human`, and comments with a summary.
+
+## Defence in depth (pushes and merges)
+
+No single control is trusted alone. From strongest to weakest:
+
+1. **`.githooks/pre-push`, authoritative for git pushes.** Git hands it the real ref updates, so
+   it does not matter how the command was spelled (refspecs, `-c` config, aliases, wrappers,
+   `git` under another path). It refuses any update of `refs/heads/main|master`, any deletion,
+   a remote tip that is not present locally (fetch first) and any non-fast-forward update.
+   Enable it with `git config core.hooksPath .githooks`; `scripts/gate` fails locally when
+   `core.hooksPath` is not `.githooks`, and CI runs `scripts/tests/pre-push.test.sh`.
+   - **Rewriting your own feature branch** (`--force-with-lease` after a rebase) is a legitimate
+     human workflow, but a pre-push hook cannot tell a lease from a plain force. A non-fast-forward
+     update of a `refs/heads/*` branch other than main/master is therefore allowed only when
+     `WARDENLENS_ALLOW_REWRITE=1` is set. **Agents never rewrite pushed history**; the Bash guard
+     denies any assignment or export of that variable, so only a human can set it.
+2. **`.claude/hooks/guard-bash.sh`, best effort, for commands.** Parses each Bash command and
+   blocks force pushes, pushes to main, hook bypass, merges without `--match-head-commit`,
+   forged statuses and risky `gh api` calls. It catches mistakes early with a readable message;
+   it is not a boundary (see ADR 0001 for what it deliberately does not catch).
+3. **`scripts/verify`, the merge gate.** Nothing merges without trusted, SHA-bound
+   `verify/*` statuses on the current head and green named CI checks.
+4. **`.claude/settings.json` permissions.** The allow/deny lists restrict what agents may run
+   at all, independently of the guard.
 
 ## No neglected tickets
 

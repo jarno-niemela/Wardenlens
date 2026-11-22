@@ -129,6 +129,53 @@ deny  $'cat <<<"x"\ngit push --force origin x'
 deny  $'cat <<<EOF\ngit push --force origin x'
 deny  $'echo $((1<<EOF))\ngit push -f'
 
+# --- round 4: human-only rewrite switch, config keys, refspecs, gh api forms ---------------------------
+runc() { jq -n --arg c "$1" --arg d "$2" '{tool_input: {command: $c}, cwd: $d}' | "$guard" >/dev/null 2>&1; }
+allow_in() { if runc "$1" "$2"; then echo "ok   allow: $1"; else echo "FAIL should allow: $1"; fail=1; fi; }
+deny_in()  { if runc "$1" "$2"; then echo "FAIL should deny: $1"; fail=1; else echo "ok   deny:  $1"; fi; }
+deny  "WARDENLENS_ALLOW_REWRITE=1 git push --force-with-lease origin feat/x"
+deny  "export WARDENLENS_ALLOW_REWRITE=1"
+deny  "env WARDENLENS_ALLOW_REWRITE=1 git push origin feat/x"
+deny  "bash -c 'WARDENLENS_ALLOW_REWRITE=1 git push origin feat/x'"
+deny  "declare -x WARDENLENS_ALLOW_REWRITE"
+allow "git commit -m 'document WARDENLENS_ALLOW_REWRITE for humans'"
+deny  "git -c Push.Default=Matching push origin feat/x"
+deny  "git -c remote.origin.mirror=true status"
+deny  "git -cremote.origin.mirror=true status"
+deny  "git --config-env=push.default=X push origin feat/x"
+deny  "git config alias.p push"
+deny  "git config --unset alias.p"
+deny  "git config includeIf.gitdir:/x.path /tmp/evil"
+deny  "git config remove-section core"
+deny  "git config rename-section core old"
+deny  "git push origin :"
+deny  "git push origin :feat/y"
+allow "git config --get push.default"
+allow "git push origin feat/x:refs/heads/feat/y"
+deny  "gh api -X PUT repos/o/r/contents/a%2Fb -f message=m -f content=eA=="
+deny  "gh api --method POST repos/o/r/git/refs%2Fheads -f ref=x"
+deny  "gh api -X PUT repos/o/r/contents/x -F branch=master -f content=eA=="
+deny  "gh api -X PUT repos/o/r/contents/x --field branch=main"
+allow "gh api -X PUT repos/o/r/contents/x -f branch=feat/x -f content=eA=="
+deny  "gh api -iX DELETE repos/o/r"
+deny  "gh api graphql -f query='MUTATION { x }'"
+deny  "gh api graphql --raw-field 'query=mutation{x}'"
+allow "gh api graphql -f query='query { viewer { login } }'"
+allow "gh api repos/o/r/issues/7/comments 2>&1"
+deny  "gh pr merge 7 --squash 2>&1"
+deny_in "popd; git push" "$tmp/onfeat"
+deny_in "(cd /tmp); git push" "$tmp/onfeat"
+deny_in "cd /tmp | cat; git push" "$tmp/onfeat"
+deny_in "cd /tmp & git push" "$tmp/onfeat"
+deny_in "echo \`cd /tmp\`; git push" "$tmp/onfeat"
+deny_in "GIT_WORK_TREE=/tmp; git push" "$tmp/onfeat"
+deny_in "git push 2>&1" "$tmp/onmain"
+allow_in "git push" "$tmp/onfeat"
+allow_in "git push 2>&1" "$tmp/onfeat"
+allow_in "cd $tmp/onfeat && git push" "$tmp/onmain"
+allow_in "(cd /tmp); git push origin feat/x" "$tmp/onmain"
+deny  $'bash<<EOF\ngit push -f\nEOF'
+
 # --- fail closed ---------------------------------------------------------
 # With jq unavailable the guard must block (exit 2), not allow.
 mkdir -p "$tmp/nojq"
