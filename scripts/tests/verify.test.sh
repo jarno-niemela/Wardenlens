@@ -14,6 +14,7 @@ case "$1 $2" in
   "pr checks") cat "$CHECKS" ;;
   "pr edit") ;;
   "api -X") ;;   # POST status
+  "api user") echo jarno-niemela ;;
   "api --paginate")
     for a in "$@"; do
       if [[ "$a" =~ commits/([0-9a-f]{40})/statuses ]]; then
@@ -45,11 +46,13 @@ cd "$repo"
 status_file() {  # status_file SHA context:state...
   local sha=$1; shift; local items="" i=0
   for cs in "$@"; do
-    i=$((i + 1)); items+="${items:+,}{\"context\":\"${cs%%:*}\",\"state\":\"${cs##*:}\",\"description\":\"d\",\"created_at\":\"2026-11-2${i}T00:00:00Z\"}"
+    i=$((i + 1)); items+="${items:+,}{\"context\":\"${cs%%:*}\",\"state\":\"${cs##*:}\",\"description\":\"Opus $(d=${cs%%:*}; echo "${d#verify/}") verification\",\"id\":$i,\"created_at\":\"2026-11-2${i}T00:00:00Z\",\"creator\":{\"login\":\"jarno-niemela\",\"type\":\"User\"}}"
   done
   printf '[%s]\n' "$items" >"$STATUS_DIR/$sha.json"
 }
-ALL_OK='[{"name":"CI","bucket":"pass"},{"name":"lint","bucket":"skipping"}]'
+# The job names must match REQUIRED_CHECKS (and ci.yml; asserted below).
+REQ1='fmt · clippy · test · doc'; REQ2='cargo-deny'; REQ3='scripts (shellcheck + tooling tests + audit)'
+ALL_OK=$(jq -nc --arg a "$REQ1" --arg b "$REQ2" --arg c "$REQ3" '[{name:$a,bucket:"pass"},{name:$b,bucket:"pass"},{name:$c,bucket:"pass"},{name:"lint",bucket:"skipping"},{name:"verify/quality",bucket:"fail"}]')
 reset() { : >"$GH_LOG"; rm -f "$STATUS_DIR"/*.json; printf '%s' "$ALL_OK" >"$CHECKS"; HEAD=$C; export HEAD; }
 t_ok()   { local n=$1; shift; if "$@" >"$tmp/out" 2>"$tmp/err"; then echo "ok   $n"; else echo "FAIL $n: exit $?: $(head -c 300 "$tmp/err")"; fail=1; fi; }
 t_fail() { local n=$1; shift; if "$@" >"$tmp/out" 2>"$tmp/err"; then echo "FAIL $n: expected failure"; fail=1; else echo "ok   $n"; fi; }
@@ -107,12 +110,24 @@ status_file "$C" verify/quality:success verify/security:success verify/adversari
 t_ok   "check: latest status per context wins (failure then success)" "$verify" check 7
 reset
 status_file "$C" verify/quality:success verify/security:success verify/adversarial:success
-printf '%s' '[{"name":"CI","bucket":"pending"}]' >"$CHECKS"
-t_fail "check: pending CI counts as failure" "$verify" check 7
-printf '%s' '[{"name":"CI","bucket":"fail"}]' >"$CHECKS"
-t_fail "check: failing CI" "$verify" check 7
+jq -c --arg n "$REQ3" 'map(if .name == $n then .bucket = "pending" else . end)' <<<"$ALL_OK" >"$CHECKS"
+t_fail "check: pending required check counts as failure" "$verify" check 7
+jq -c --arg n "$REQ2" 'map(if .name == $n then .bucket = "fail" else . end)' <<<"$ALL_OK" >"$CHECKS"
+t_fail "check: failing required check" "$verify" check 7
+jq -c --arg n "$REQ1" 'map(select(.name != $n))' <<<"$ALL_OK" >"$CHECKS"
+t_fail "check: required check missing" "$verify" check 7
+check  "  names the missing check" grep -q "required check 'fmt" "$tmp/err"
+printf '%s' '[{"name":"CI","bucket":"pass"}]' >"$CHECKS"
+t_fail "check: an arbitrary passing check is not enough" "$verify" check 7
 printf '%s' '[]' >"$CHECKS"
 t_fail "check: no CI reported" "$verify" check 7
+printf '%s' "$ALL_OK" >"$CHECKS"
+t_ok   "check: verify/* contexts are ignored in CI evaluation" "$verify" check 7
+
+# REQUIRED_CHECKS must equal the job names in ci.yml, so a renamed job cannot silently stop gating.
+want=$(grep -E '^    name: ' "$root/.github/workflows/ci.yml" | sed 's/^    name: //' | sort)
+got=$(bash -c "$(sed -n '/^REQUIRED_CHECKS=(/,/^)/p' "$verify"); printf '%s\\n' \"\${REQUIRED_CHECKS[@]}\"" | sort)
+check  "REQUIRED_CHECKS matches ci.yml job names" test "$want" = "$got"
 
 # --- carry ------------------------------------------------------------------
 reset; HEAD=$B; export HEAD
@@ -125,5 +140,52 @@ status_file "$A" verify/quality:success verify/security:success verify/adversari
 t_fail "carry: source change is refused" "$verify" carry 7 "$A"
 check  "  lists the offending file" grep -q 'crates/x/src/lib.rs' "$tmp/err"
 check  "  posts nothing" bash -c "! grep -q 'statuses' '$GH_LOG'"
+
+# --- trust: creator, type and description; latest by id ------------------------------------
+raw() {  # raw DIM STATE ID [LOGIN] [TYPE] [DESC] -> one status object
+  jq -nc --arg d "$1" --arg s "$2" --argjson id "$3" --arg l "${4:-jarno-niemela}" --arg t "${5:-User}" --arg ds "${6:-Opus $1 verification}" \
+    '{context:"verify/\($d)",state:$s,description:$ds,id:$id,created_at:"2026-11-22T00:00:00Z",creator:{login:$l,type:$t}}'
+}
+put() { local sha=$1; shift; printf '[%s]\n' "$(IFS=,; echo "$*")" >"$STATUS_DIR/$sha.json"; }
+reset
+put "$C" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3 mallory)"
+t_fail "check: status by another user is ignored" "$verify" check 7
+put "$C" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3 jarno-niemela Bot)"
+t_fail "check: status by a Bot is ignored" "$verify" check 7
+put "$C" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3 jarno-niemela User 'looks good')"
+t_fail "check: status with a foreign description is ignored" "$verify" check 7
+put "$C" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3)" "$(raw adversarial failure 4 mallory)"
+t_ok   "check: untrusted failure neither overrides nor blocks" "$verify" check 7
+put "$C" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial failure 9)" "$(raw adversarial success 3)"
+t_fail "check: highest id wins regardless of listing order" "$verify" check 7
+put "$C" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 9)" "$(raw adversarial failure 3)"
+t_ok   "check: highest id wins (success newest)" "$verify" check 7
+
+# --- DIM must be exact ---------------------------------------------------------------------
+reset
+t_fail "mark: DIM 'quality security'" "$verify" mark 7 "quality security" pass "$C"
+t_fail "mark: DIM 'qual' (substring)" "$verify" mark 7 qual pass "$C"
+check  "  nothing written" test ! -s "$GH_LOG"
+
+# --- carry hardening -------------------------------------------------------------------------
+reset; HEAD=$B; export HEAD
+put "$A" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3 mallory)"
+t_ok   "carry: only trusted successes are carried" "$verify" carry 7 "$A"
+check  "  carried quality" log_has "statuses/$B.*context=verify/quality"
+check  "  did not carry the forged one" bash -c "! grep -q 'statuses/$B.*context=verify/adversarial' '$GH_LOG'"
+reset; HEAD=$B; export HEAD
+put "$A" "$(raw quality success 1)"
+put "$B" "$(raw security failure 5)"
+t_fail "carry: head with a trusted non-success status is refused" "$verify" carry 7 "$A"
+check  "  posts nothing" bash -c "! grep -q 'statuses/' '$GH_LOG'"
+reset; HEAD=$B; export HEAD
+put "$A" "$(raw quality success 1)"
+put "$B" "$(raw security failure 5 mallory)"
+t_ok   "carry: an untrusted failure on the head does not block" "$verify" carry 7 "$A"
+# a deleted test file is refused (D), even under a test path
+git -C "$repo" checkout -q "$B"; git -C "$repo" rm -q crates/x/tests/t.rs; git -C "$repo" commit -q -m d; Dl=$(git -C "$repo" rev-parse HEAD)
+reset; HEAD=$Dl; export HEAD
+put "$B" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3)"
+t_fail "carry: deleting a test file is refused" "$verify" carry 7 "$B"
 
 exit $fail

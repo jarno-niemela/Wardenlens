@@ -5,7 +5,7 @@
       "Bash(cargo fmt:*)", "Bash(cargo clippy:*)", "Bash(cargo test:*)", "Bash(cargo build:*)",
       "Bash(cargo check:*)", "Bash(cargo doc:*)", "Bash(cargo deny:*)", "Bash(cargo tree:*)",
       "Bash(cargo metadata:*)", "Bash(scripts/gate:*)", "Bash(scripts/ticket:*)",
-      "Bash(scripts/ticket-audit:*)", "Bash(scripts/verify:*)", "Bash(scripts/tests/ticket-audit.test.sh)",
+      "Bash(scripts/ticket-audit:*)", "Bash(scripts/verify check:*)", "Bash(scripts/tests/ticket-audit.test.sh)",
       "Bash(git status:*)", "Bash(gh issue view:*)", "Bash(gh issue list:*)",
       "Bash(gh pr view:*)", "Bash(gh pr list:*)", "Bash(gh pr diff:*)", "Bash(gh pr checks:*)",
       "Bash(gh run list:*)", "Bash(gh run view:*)"
