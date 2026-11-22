@@ -29,7 +29,14 @@ We need durable state, independent verification and neglect detection.
   updates of main/master, deletions, unknown remote state and non-fast-forward updates, whatever
   the command looked like. Rewriting one's own feature branch needs `WARDENLENS_ALLOW_REWRITE=1`,
   which the guard denies in agent commands, so only a human can set it. `scripts/gate` checks that
-  `core.hooksPath` is `.githooks`; the hook has real-push tests (`scripts/tests/pre-push.test.sh`).
+  `core.hooksPath` is `.githooks`; the hook has real-push tests (`scripts/tests/pre-push.test.sh`). It also refuses any update or
+  deletion of an existing remote tag. **Scope: the hook covers `git push` only.** It does not run
+  under `--no-verify`, a `core.hooksPath` override, git plumbing (`send-pack`, `http-push`, remote
+  helpers) or a branch whose committed hook was modified; the guard denies those on a best-effort
+  basis. GitHub branch protection is unavailable on this plan; the owner accepted tooling-only
+  enforcement (#11). PRs touching `.github/workflows/`, `.githooks/`, `.claude/hooks/` or
+  `.claude/settings.json` need explicit security-auditor attention (a PR could redefine the
+  workflow named "CI").
 - **Guard hook (best effort)**: a fail-closed Bash hook blocks force pushes, pushes to main, hook
   bypass, `gh pr merge` without `--match-head-commit <sha|$var>`, merge/delete calls, GraphQL
   mutations and status writes through `gh api`, and piping into a shell. It is a safety net against

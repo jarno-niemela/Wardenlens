@@ -130,7 +130,17 @@ No single control is trusted alone. From strongest to weakest:
    `git` under another path). It refuses any update of `refs/heads/main|master`, any deletion,
    a remote tip that is not present locally (fetch first) and any non-fast-forward update.
    Enable it with `git config core.hooksPath .githooks`; `scripts/gate` fails locally when
-   `core.hooksPath` is not `.githooks`, and CI runs `scripts/tests/pre-push.test.sh`.
+   `core.hooksPath` is not `.githooks` (only GitHub Actions, `GITHUB_ACTIONS=true`, skips that
+   check), and CI runs `scripts/tests/pre-push.test.sh`. It also refuses any update or deletion
+   of an existing remote tag; creating a new tag is allowed.
+   - **Scope, stated precisely: the hook covers `git push` only.** It does NOT run under
+     `--no-verify`, a `core.hooksPath` override, git plumbing (`send-pack`, `http-push`, remote
+     helpers such as `git-remote-https`) or a branch whose committed hook was modified. The guard
+     (item 2) denies those spellings on a best-effort basis. GitHub branch protection is
+     unavailable on this plan and the owner accepted tooling-only enforcement (#11).
+   - **PRs touching `.github/workflows/`, `.githooks/`, `.claude/hooks/` or `.claude/settings.json`
+     need explicit security-auditor attention**: a PR could redefine the workflow named "CI" or
+     weaken a hook, and the checks that would catch it are the ones being changed.
    - **Rewriting your own feature branch** (`--force-with-lease` after a rebase) is a legitimate
      human workflow, but a pre-push hook cannot tell a lease from a plain force. A non-fast-forward
      update of a `refs/heads/*` branch other than main/master is therefore allowed only when
