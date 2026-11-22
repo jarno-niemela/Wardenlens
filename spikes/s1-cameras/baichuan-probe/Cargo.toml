@@ -1,0 +1,13 @@
+# Spike-only probe. NOT a workspace member (own [workspace] table keeps it out of scripts/gate).
+# Depends on neolink_core (AGPL-3.0): never ship or link this into Wardenlens.
+[package]
+name = "baichuan-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+neolink_core = { path = "neolink/crates/core" }
+tokio = { version = "1", features = ["full"] }
