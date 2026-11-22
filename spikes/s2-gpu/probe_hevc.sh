@@ -3,6 +3,7 @@
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+build_ffmpeg_image
 {
   echo "# HEVC NVDEC on GM204"
   # shellcheck disable=SC2016 # expanded inside the container

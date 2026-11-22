@@ -19,9 +19,11 @@ i=0; pids=''
 for c in $clips; do
   i=\$((i+1))
   ( s=\$(date +%s.%N)
-    ffmpeg -v error -nostats -progress pipe:1 -c:v $dec -stream_loop \$loops -i /fx/\$c.mp4 -f null - 2>/tmp/err\$i.txt | grep '^frame=' | tail -1 > /tmp/fr\$i.txt
+    rc=0
+    ffmpeg -v error -nostats -progress /tmp/prog\$i.txt -c:v $dec -stream_loop \$loops -i /fx/\$c.mp4 -f null - 2>/tmp/err\$i.txt || rc=\$?
     e=\$(date +%s.%N)
-    echo \"\$i \$c \$(cut -d= -f2 /tmp/fr\$i.txt) \$(echo \"\$e - \$s\" | bc -l) \$(head -c 200 /tmp/err\$i.txt | tr '\n' ' ')\" > /tmp/out\$i.txt ) &
+    frames=\$(grep '^frame=' /tmp/prog\$i.txt 2>/dev/null | tail -1 | cut -d= -f2 || true)
+    echo \"\$i \$c \$rc \${frames:-none} \$(echo \"\$e - \$s\" | bc -l) \$(head -c 200 /tmp/err\$i.txt | tr '\\n' ' ')\" > /tmp/out\$i.txt ) &
   pids=\"\$pids \$!\"
 done
 wait \$pids
@@ -29,15 +31,22 @@ end=\$(date +%s.%N)
 kill \$dmon \$vr 2>/dev/null
 before=\$(cat /tmp/vram_before)
 peak=\$(sort -n /tmp/vram.txt | tail -1)
-tot=0
+tot=0; failed=0
 for f in /tmp/out*.txt; do
-  read id c frames secs err < \$f
-  fps=\$(echo \"scale=1; \${frames:-0} / \$secs\" | bc -l)
-  printf '$label\tstream\t%s\t%s frames\t%.1fs\t%s fps\t%s\n' \"\$c\" \"\${frames:-0}\" \"\$secs\" \"\$fps\" \"\$err\"
-  tot=\$(echo \"\$tot + \${frames:-0}\" | bc -l)
+  read -r id c rc frames secs err < \$f
+  case \"\$frames\" in ''|*[!0-9]*) frames=none;; esac
+  if [ \"\$rc\" != 0 ] || [ \"\$frames\" = none ] || [ \"\$frames\" = 0 ]; then
+    echo \"FAILED decode of \$c: ffmpeg rc=\$rc frames=\$frames \$err\" >&2
+    failed=\$((failed+1))
+    continue
+  fi
+  fps=\$(echo \"scale=1; \$frames / \$secs\" | bc -l)
+  printf '$label\tstream\t%s\t%s frames\t%.1fs\t%s fps\t%s\n' \"\$c\" \"\$frames\" \"\$secs\" \"\$fps\" \"\$err\"
+  tot=\$(echo \"\$tot + \$frames\" | bc -l)
 done
+if [ \"\$failed\" -ne 0 ]; then echo \"\$failed stream(s) failed; no TOTAL row\" >&2; exit 1; fi
 wall=\$(echo \"\$end - \$start\" | bc -l)
 printf '$label\tTOTAL\twall=%.1fs\ttotal_fps=%.1f\tvram_before=%sMiB\tvram_peak=%sMiB\n' \$wall \$(echo \"\$tot / \$wall\" | bc -l) \$before \$peak
-echo '--- dmon (sm mem enc dec jpg ofa), steady-state rows'
-awk 'NR>2 && \$1==0 {print}' /tmp/dmon.txt | head -40 | awk '{s+=\$5; n++; if(\$5>m)m=\$5} END{printf \"dec util avg=%.0f%% max=%d%% (n=%d samples)\n\", s/n, m, n}'
-" 
+echo '--- dmon (sm mem enc dec jpg ofa), steady-state rows (all samples)'
+awk 'NR>2 && \$1==0 {print}' /tmp/dmon.txt | awk '{s+=\$5; n++; if(\$5>m)m=\$5} END{printf \"dec util avg=%.0f%% max=%d%% (n=%d samples)\n\", s/n, m, n}'
+"

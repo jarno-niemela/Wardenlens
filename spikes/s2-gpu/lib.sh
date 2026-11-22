@@ -9,5 +9,6 @@ build_ffmpeg_image() { docker build -q -f "$S2_DIR/Dockerfile.ffmpeg" -t "$FFMPE
 
 # run_ffmpeg_container <args...>: run a shell snippet in the ffmpeg image with fixtures mounted at /fx.
 run_in_ffmpeg() {
-  docker run --rm "${GPU_ARGS[@]}" -v "$S2_DIR/fixtures:/fx" -v "$S2_DIR/results:/res" "$FFMPEG_IMAGE" bash -c "$1"
+  mkdir -p "$S2_DIR/fixtures" "$S2_DIR/results" # create as the invoking user, otherwise Docker creates them root-owned
+  docker run --rm --user "$(id -u):$(id -g)" "${GPU_ARGS[@]}" -v "$S2_DIR/fixtures:/fx" -v "$S2_DIR/results:/res" "$FFMPEG_IMAGE" bash -c "$1"
 }

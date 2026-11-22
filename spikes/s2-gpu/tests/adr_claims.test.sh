@@ -26,7 +26,7 @@ clip_fps() { case $1 in sub_640x480) echo 10;; sub_704x576|sub_640x360_25|main_2
 plays() { awk -F'\t' '$2=="stream"{split($4,a," "); print $3, a[1], $7}' "$R/decode.tsv" | while read -r c fr err; do
   f=$(clip_fps "$c"); [ -n "${err:-}" ] && { echo "ERR $c $err"; continue; }; echo $((fr / (f * 20))) $((fr % (f * 20))); done; }
 decode_rows_complete_and_error_free() { ! plays | grep -qvE '^[0-9]+ 0$'; }
-# ADR: "Each stream loops a 20 s clip 6 to 21 times".
+# ADR: "Each stream loops a 20 s clip 11 to 21 times".
 adr_loop_range_matches_raw() {
   local lo hi; lo=$(plays | cut -d' ' -f1 | sort -n | head -1); hi=$(plays | cut -d' ' -f1 | sort -n | tail -1)
   grep -q "loops a 20 s clip $lo to $hi times" "$ADR" || { echo "  raw: $lo to $hi plays" >&2; return 1; }

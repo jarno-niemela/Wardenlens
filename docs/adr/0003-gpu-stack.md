@@ -41,13 +41,13 @@ input (latency does not depend on content), 20 warm-up runs, 200 timed runs (30 
 | 5 sub + 5 main together | sub 68-83, main 56-76 | 532 | 1454 MiB (+913) | 88 / 100 % |
 | 10x 2560x1440 | 32 each | 319 | 1703 MiB | 92 / 100 % |
 | 20x 640x480 | 116-140 each | 2321 | 1910 MiB | 91 / 100 % |
-| 40x 640x480 | about 58 each | 2335 | 3280 MiB | 92 / 100 % |
+| 40x 640x480 | 58-84 each | 2335 | 3280 MiB | 92 / 100 % |
 
 The decoder saturates at roughly 2200-2300 fps of sub-stream pixels, about 320 fps at 1440p and about 220 fps at 2560x1920
 (throughput scales roughly with pixel rate: about 0.7 Gpixel/s for 640x480 frames, 0.8 at 1080p and 1.0 to 1.2 at 1440p and above, because per-frame overhead dominates small frames). Real-time demand is 85 fps (subs) and 83 fps (mains), so the
 5 sub streams use about 4 % of the decoder and even decoding all 5 mains would use about 26 %. VRAM grows about 70 MiB per
 extra concurrent sub-stream decoder (40 streams reached 3.3 GB), so session count, not fps, is the VRAM driver.
-Each count was measured at the maximum rate; no stall or error occurred in any run. The multi-stream totals are lower
+Dec util is the mean and maximum of the one-second `nvidia-smi dmon` samples, taken over the first 40 samples only (so the first 40 s of runs longer than that). Each count was measured at the maximum rate; no stall or error occurred in any run. The multi-stream totals are lower
 bounds: each stream is a separate ffmpeg process on a 4-core host, so CPU contention (process start-up, frame copy to host) may
 limit them before the decoder does.
 
@@ -85,11 +85,11 @@ Maxwell support was removed from the PyPI wheels after **1.20.2**. Test: load `y
 Conclusion: the newest usable wheel is `onnxruntime-gpu==1.20.2` (CUDA 12.x build) with cuDNN 9.1.0.70 and the CUDA 12.9
 runtime libraries. 1.20.0/1.20.1 were not tested separately. Newer cuDNN (9.28) is not usable with it on this GPU. The ORT
 session must be created with the CUDA EP only and asserted (`get_providers()[0] == CUDAExecutionProvider`), because ORT silently
-falls back to the CPU EP when its CUDA libraries do not load (we hit this with 1.32.0, which needs CUDA 13, and in an earlier draft of the probe with missing libraries).
+falls back to the CPU EP when its CUDA libraries do not load (seen with 1.32.0, which needs CUDA 13: `session providers: ['CPUExecutionProvider']` and exit code 0 in `ort_probe.txt`).
 
 ### (e) YOLO FP32, ORT 1.20.2 CUDA EP vs CPU (4 threads), batch 1
 Models: Ultralytics YOLOv8n/s and YOLO11n/s exported to ONNX (opset 19, fixed shape, FP32, from release v8.3.0 weights); SHA-256 in
-`spikes/s2-gpu/results/models.sha256`. VRAM = process total on the GPU after warm-up, including the 541 MiB host baseline.
+`spikes/s2-gpu/results/models.sha256`. VRAM = `nvidia-smi` `memory.used` of the whole GPU after warm-up, so it includes the 541 MiB host baseline (and any other GPU user).
 
 | model | input | GPU mean / p95 ms | GPU fps | GPU VRAM total (delta) | CPU mean ms | CPU fps |
 |---|---|---|---|---|---|---|

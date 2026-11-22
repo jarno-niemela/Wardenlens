@@ -19,3 +19,5 @@ for m in yolov8n yolov8s yolo11n yolo11s; do
 done
 sha256sum *.pt *.onnx | tee SHA256SUMS
 '
+# record exactly what was installed in the export image
+docker run --rm --entrypoint '' wl-s2-export pip freeze > "$S2_DIR/results/pip-freeze-export.txt"
