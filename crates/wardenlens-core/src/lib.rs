@@ -15,4 +15,13 @@ mod tests {
     fn version_is_semver_like() {
         assert_eq!(VERSION.split('.').count(), 3);
     }
+
+    // Adversarial: every component must be a number (the existing test accepts "a.b.c"),
+    // and unwrap/indexing in tests must be accepted by the lint config (clippy.toml claims so).
+    #[test]
+    fn version_components_are_numeric() {
+        let parts: Vec<u64> = VERSION.split('.').map(|p| p.parse().unwrap()).collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0] < 1000);
+    }
 }

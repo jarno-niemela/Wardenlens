@@ -25,6 +25,6 @@ The binding source is `docs/CODING_GUIDELINES.md` — read the relevant section 
 - Failing test first; one behaviour per test, named for it; cover empty/max/unicode/invalid; proptest for invariants; deterministic.
 
 **Workflow**
-- `scripts/gate` before every push. Conventional commits with `Refs #N`. `#[expect(lint, reason = "...")]` instead of bare `#[allow]`.
+- `scripts/gate` before every push. Conventional commits with `Refs #N`. Suppress lints only with `#[expect(lint, reason = "...")]`; bare `#[allow]` is forbidden (ERR-1, DOC-6).
 
 **New crate checklist**: add under `crates/`, `[lints] workspace = true`, inherit `workspace.package` fields, crate-level `//!` doc stating its responsibility and what it must not do, an ADR if it introduces a new boundary.

@@ -35,6 +35,9 @@ as_conversions = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 mem_forget = "deny"
+# Lint suppressions must be #[expect(lint, reason = "...")]: justified, and flagged when stale.
+allow_attributes_without_reason = "deny"
+allow_attributes = "warn"
 undocumented_unsafe_blocks = "deny"
 # Noisy pedantic lints we deliberately accept.
 module_name_repetitions = "allow"

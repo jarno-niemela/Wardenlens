@@ -54,7 +54,8 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
 - **ERR-1 No panics in non-test code.** `unwrap`, `expect`, `panic!`, `todo!`,
   `unimplemented!`, unchecked indexing are denied by lint. The only allowed
   exception is a provably-unreachable invariant, documented with
-  `#[allow(clippy::expect_used, reason = "...")]` stating the invariant.
+  `#[expect(clippy::expect_used, reason = "...")]` stating the invariant (a bare
+  `#[allow]` is forbidden, see DOC-6).
 - **ERR-2 Libraries return typed errors.** Each library crate defines its own
   error enum (with `thiserror` once added as a dependency). Variants describe
   *what failed*, carry context, and wrap sources with `#[source]`.
@@ -121,8 +122,9 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   `SCREAMING_SNAKE` consts; no abbreviations except universally known ones
   (`id`, `url`, `io`).
 - **DOC-5 Significant decisions get an ADR** in `docs/adr/` (template there).
-- **DOC-6 `#[allow(...)]` always carries `reason = "..."`.** Prefer `#[expect]`
-  so the suppression is removed when no longer needed.
+- **DOC-6 Suppress lints only with `#[expect(lint, reason = "...")]`.** A bare
+  `#[allow]` is forbidden (`allow_attributes` warns, `allow_attributes_without_reason`
+  denies); `#[expect]` flags itself once the suppression is no longer needed.
 
 ## 7. Performance (`PERF`)
 
