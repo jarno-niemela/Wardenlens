@@ -44,13 +44,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
       - run: shellcheck scripts/ticket scripts/ticket-audit scripts/verify scripts/gate scripts/labels.sh scripts/tests/*.sh scripts/tests/adversarial/*.sh .claude/hooks/*.sh .githooks/*
-      - run: scripts/tests/ticket-audit.test.sh
-      - run: scripts/tests/ticket.test.sh
-      - run: scripts/tests/verify.test.sh
-      - run: scripts/tests/guard-bash.test.sh
-      - run: scripts/tests/adversarial/guard-bash.adv.sh
-      - run: scripts/tests/adversarial/ticket-audit.adv.sh
-      - run: scripts/tests/adversarial/ticket-next.adv.sh
+      - name: Tooling tests (same loop as scripts/gate)
+        run: |
+          for t in scripts/tests/*.test.sh scripts/tests/adversarial/*.sh; do
+            echo "== $t"
+            "$t" >/dev/null || { "$t" | grep -v '^ok'; exit 1; }
+          done
       - name: Ticket audit (report only)
         run: scripts/ticket-audit --fail-on never
         env:

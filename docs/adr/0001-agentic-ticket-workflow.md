@@ -26,7 +26,11 @@ We need durable state, independent verification and neglect detection.
   by the `verify-labels-reset` workflow. Test-only follow-ups may carry verdicts forward
   (`scripts/verify carry`). CI enforces fmt/clippy/tests/docs/cargo-deny and the tooling tests.
 - **Guard hook**: a fail-closed Bash hook blocks force pushes, pushes to main, hook bypass,
-  `gh pr merge` without `--match-head-commit`, and merge/delete calls through `gh api`.
+  `gh pr merge` without `--match-head-commit <sha|$var>`, merge/delete calls and status writes
+  through `gh api`, and piping into a shell. It is a safety net against mistakes, not a security
+  boundary. Accepted limitations: code inside interpreter string literals (`python3 -c`,
+  `perl -e`, `node -e`, awk `system()`), `$'...'` quoting, `$(echo ...)` and variable
+  indirection, and aliases.
 - **Neglect detection**: `scripts/ticket-audit` (pure jq rules with offline tests)
   runs every `/work` iteration and daily in CI.
 - **Tooling in bash + jq** for bootstrap; a Rust port is tracked as a ticket.

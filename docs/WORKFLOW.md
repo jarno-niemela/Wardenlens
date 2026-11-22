@@ -75,8 +75,16 @@ commit never counts for a new head, so any push invalidates earlier approval by 
 A PR may be merged only when **all** hold:
 
 1. `scripts/verify check PR` succeeds: all three `verify/*` statuses are `success` on the
-   PR's current head SHA, and every other check (CI: fmt, clippy `-D warnings`, tests, docs,
-   cargo-deny, tooling tests, audit) is passing. Pending counts as failing. It prints the head SHA.
+   PR's current head SHA, and CI is green. It prints the head SHA.
+   - **Trusted statuses only.** A `verify/*` status counts only if its creator is the operator
+     (`gh api user`), is not a Bot, and its description starts with `Opus <dim> verification`.
+     Anything else (a workflow token, a collaborator, a hand-written status) is ignored: it
+     neither passes nor overrides. The latest status per context is the one with the highest id.
+   - **Named CI checks.** Every name in `REQUIRED_CHECKS` at the top of `scripts/verify` must be
+     present with bucket `pass`: `fmt · clippy · test · doc`, `cargo-deny`,
+     `scripts (shellcheck + tooling tests + audit)`. A test asserts the list equals the job
+     names in `ci.yml`, so renaming a job cannot silently stop gating. Missing, pending and
+     failing all count as failing; `verify/*` contexts are not part of the CI evaluation.
 2. The merge pins that SHA, so a push after verification cannot slip in:
    `sha=$(scripts/verify check PR) && gh pr merge PR --squash --delete-branch --match-head-commit "$sha"`.
    The Bash guard hook blocks `gh pr merge` without `--match-head-commit`, and always blocks `--admin`.
@@ -86,7 +94,16 @@ A PR may be merged only when **all** hold:
 
 Test-only follow-up commits (adversary tests worth keeping) do not need re-verification:
 `scripts/verify carry PR FROM_SHA` copies the success statuses to the new head, but only if
-the diff since `FROM_SHA` touches nothing outside `crates/*/tests/**` and `scripts/tests/**`.
+the diff since `FROM_SHA` only **adds or modifies** files under `crates/*/tests/**` and
+`scripts/tests/**` (deletions, type changes, renames, submodule bumps and everything else are
+refused; a git failure refuses too), and the head has no trusted non-success `verify/*` status.
+Only trusted successes are carried. Carried test scripts run unreviewed on the operator's
+machine (`scripts/gate` executes every `scripts/tests/**/*.sh`), so the controller must read
+the carried files before running the gate.
+
+A verified head is **not** re-verified after `main` moves: the merge pins the head SHA, not
+the base. Accepted for now; updating the branch changes the head and therefore requires
+re-verification.
 
 The `verify-labels-reset` workflow (`pull_request_target`, no checkout) removes the display
 labels on every push; it tolerates only HTTP 404 (label already absent).
@@ -115,6 +132,7 @@ on the new SHA). After **3 failed rounds** the controller stops, labels the tick
 | `review-without-pr`: `in-review`/`changes-requested` without an open PR that closes it | error |
 | `blocked-no-reason`: `blocked` without a `Blocked by: #N` line | error |
 | `bad-blocker`: a blocker number that is neither an issue nor a PR (never reported as unblocked) | error |
+| `self-blocker`: a ticket lists itself as a blocker | error |
 | `pr-no-issue`: open PR that closes no issue (bots such as Dependabot are exempt) | error |
 | `pr-bad-ref`: open PR closes a number that is not an issue | error |
 | `stale-in-progress`: `in-progress` > `STALE_DAYS` (3) without an open PR | warn |
@@ -131,6 +149,9 @@ on the new SHA). After **3 failed rounds** the controller stops, labels the tick
 
 Closing references are read from the PR **body** only (GitHub does not link titles): the
 keywords close/fix/resolve in any tense, followed by `#N`, `owner/repo#N` or an issue URL.
+References (closing and `Blocked by`, including task-list lines such as `- [ ] Blocked by #2`)
+count only when they point at **this** repository (exact owner/name, case-insensitive); other
+repositories are ignored, and `ticket next` skips a ticket that is blocked by a foreign repo.
 PR rules apply to open PRs only; merged and closed PRs are ignored. A blocker counts as open
 if it is an open issue **or** an open PR.
 

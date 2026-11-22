@@ -76,8 +76,9 @@ Then merge only on the exact verified head:
 ```bash
 gh pr checks <pr> --watch --fail-fast
 sha=$(scripts/verify check <pr>) && gh pr merge <pr> --squash --delete-branch --match-head-commit "$sha"
-git worktree remove .claude/worktrees/N && git worktree remove .claude/worktrees/N-adv && git fetch -q origin
+git worktree remove .claude/worktrees/N && git fetch -q origin
 ```
+Remove the adversary worktree as its own step, only after its tests have been copied out: `git worktree remove --force .claude/worktrees/N-adv` (it holds untracked files, so `--force` is needed).
 `scripts/verify check` succeeds only when all three `verify/*` statuses are `success` on the current head and every other check is green; the guard hook blocks `gh pr merge` without `--match-head-commit`. Never merge with a red or pending check, an unticked acceptance criterion or a head that changed after verification. Never use `--admin`.
 
 ## 7. Close out
