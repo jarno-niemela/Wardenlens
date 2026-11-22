@@ -69,6 +69,17 @@ We need durable state, independent verification and neglect detection.
     `environments*`, and the pre-push hook refuses pushes whose commits change them unless a human
     sets `WARDENLENS_ALLOW_WORKFLOWS=1`. A new remote branch is judged against the commits not on any
     remote-tracking ref, so a push by URL with no remote configured examines the whole history.
+- **Owner decision (2026-11-22, hobby project): the guard and pre-push hook are best effort.**
+  They exist to catch agent mistakes, not a deliberate adversary. The real gate is the SHA-bound
+  Opus verification plus CI before merge. Server-side options were considered and declined for
+  now: a fine-grained token without the Workflows and Administration permissions, and GitHub Pro
+  branch protection; they are what to do if stronger guarantees are ever needed. Accepted
+  round-7 gaps (tracked as p3 tickets):
+  - fake remote-tracking refs hiding new-branch commits from the workflow check;
+  - a fresh clone or old worktree without the current hook;
+  - branch rename / default-branch changes through `gh api`;
+  - `cp -t` / `-rt` into an ancestor and pathless `find -delete` / `-exec rm`;
+  - exported editor variables, `shred`, `--git-dir` / `--work-tree` with the missing-hook check.
 - **Neglect detection**: `scripts/ticket-audit` (pure jq rules with offline tests)
   runs every `/work` iteration and daily in CI.
 - **Tooling in bash + jq** for bootstrap; a Rust port is tracked as a ticket.

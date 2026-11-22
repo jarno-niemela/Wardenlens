@@ -100,7 +100,13 @@ skipref=none
 expect refuse "workflow added then reverted in the range"   bash -c "$wf_add && git revert --no-edit HEAD >/dev/null && git push origin feat/x"
 expect refuse "workflow change hidden in a merged side branch" \
   bash -c "git checkout -q -b side && $wf_add && git checkout -q feat/x && git merge -q -s ours --no-ff side -m m && git push origin feat/x"
-expect refuse "new branch whose history adds a workflow"    bash -c "git checkout -q -b feat/new && $wf_add && git push origin feat/new"
+expect allow  "merge origin/main that already carries a human workflow change" \
+  bash -c "git checkout -q main && mkdir -p .github/workflows && echo a >.github/workflows/ci.yml && git add -A && git commit -q -m wf && git -c core.hooksPath=/dev/null push -q origin main && git checkout -q feat/x && git merge -q --no-edit origin/main && git push origin feat/x"
+expect allow  "git pull --no-rebase origin main (workflow change already on main)" \
+  bash -c "git checkout -q main && mkdir -p .github/workflows && echo a >.github/workflows/ci.yml && git add -A && git commit -q -m wf && git -c core.hooksPath=/dev/null push -q origin main && git checkout -q feat/x && git pull -q --no-rebase --no-edit origin main && git push origin feat/x"
+expect refuse "merge commit that itself edits a workflow" \
+  bash -c "git merge -q --no-ff --no-commit main && mkdir -p .github/workflows && echo a >.github/workflows/ci.yml && git add -A && git commit -q -m m && git push origin feat/x"
+expect refuse "new branch whose history adds a workflow"   bash -c "git checkout -q -b feat/new && $wf_add && git push origin feat/new"
 expect refuse "new branch, workflow in an older local commit" bash -c "git checkout -q -b feat/new && $wf_add && echo n >n && git add n && git commit -q -m n && git push origin feat/new"
 expect refuse "WARDENLENS_ALLOW_WORKFLOWS=0 is not the switch" env WARDENLENS_ALLOW_WORKFLOWS=0 bash -c "$wf_add && git push origin feat/x"
 expect refuse "WARDENLENS_ALLOW_REWRITE=1 does not allow workflows" env WARDENLENS_ALLOW_REWRITE=1 bash -c "$wf_add && git push origin feat/x"

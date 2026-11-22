@@ -125,6 +125,15 @@ on the new SHA). After **3 failed rounds** the controller stops, labels the tick
 
 No single control is trusted alone. From strongest to weakest:
 
+**Owner decision (2026-11-22, hobby project):** the guard and the pre-push hook catch agent
+mistakes on a best-effort basis; they are not meant to stop a deliberate adversary. The real
+gate is the SHA-bound Opus verification plus CI before merge. Server-side options were
+considered and declined for now: a fine-grained token without the Workflows and Administration
+permissions, and GitHub Pro branch protection; use them if stronger guarantees are ever needed.
+Accepted gaps (see ADR 0001): fake remote-tracking refs; a fresh clone or old worktree without
+the current hook; branch rename / default-branch changes through `gh api`; `cp -t` / pathless
+`find`; exported editor variables, `shred`, `--git-dir`.
+
 1. **`.githooks/pre-push`, authoritative for git pushes.** Git hands it the real ref updates, so
    it does not matter how the command was spelled (refspecs, `-c` config, aliases, wrappers,
    `git` under another path). It refuses any update of `refs/heads/main|master`, any deletion,
