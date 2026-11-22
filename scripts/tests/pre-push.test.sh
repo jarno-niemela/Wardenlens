@@ -6,6 +6,9 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 hooks=${HOOKS:-$root/.githooks}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# Only pre-push is under test: a hooks dir holding just it keeps the repo's pre-commit (cargo fmt) out
+# of commits made inside the throwaway clones.
+hooks_src=$hooks; hooks=$tmp/hooks; mkdir -p "$hooks"; ln -s "$hooks_src/pre-push" "$hooks/pre-push"
 fail=0
 unset GIT_DIR GIT_WORK_TREE WARDENLENS_ALLOW_REWRITE WARDENLENS_ALLOW_WORKFLOWS GIT_CONFIG_PARAMETERS
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
@@ -108,5 +111,5 @@ expect allow  "new branch, workflow already on the remote" \
 expect allow  "push touching only other .github files"      bash -c "mkdir -p .github && echo a >.github/CODEOWNERS && git add -A && git commit -q -m co && git push origin feat/x"
 
 # the hook script itself must be executable and the repo must point hooksPath at it
-if [[ -x $hooks/pre-push ]]; then echo "ok   pre-push is executable"; else echo "FAIL pre-push not executable"; fail=1; fi
+if [[ -x $hooks_src/pre-push ]]; then echo "ok   pre-push is executable"; else echo "FAIL pre-push not executable"; fail=1; fi
 exit $fail
