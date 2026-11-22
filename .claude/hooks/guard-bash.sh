@@ -150,7 +150,7 @@ tokenize() {
         if (c == " " || c == "\t") { flush(); continue }
         if (c == "|") {
           flush()
-          if (substr(s, i + 1, 1) == "|") { i++; print "s" }
+          if (substr(s, i + 1, 1) == "|") { i++; print "s|" }
           else { if (substr(s, i + 1, 1) == "&") i++; print "p" }
           continue
         }
@@ -503,6 +503,9 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       method=${method#=}; method=${method^^}
       if [[ -z "$method" ]]; then if ((haswrite)); then method=POST; else method=GET; fi; fi
       ep=${ep#https://api.github.com/}; ep=${ep#http://api.github.com/}; ep=${ep#/}; ep=${ep%%\?*}; ep=${ep%%#*}; ep=${ep,,}
+      while [[ "$ep" == *//* ]]; do ep=${ep//\/\//\/}; done   # collapse //, /./ and a trailing /
+      while [[ "$ep" == */./* ]]; do ep=${ep//\/.\//\/}; done
+      ep=${ep%/}
       case "$ep" in
         */merge|*/merge/*|*/merges) block "merging through the API bypasses the verification gate" ;;
       esac
@@ -519,7 +522,8 @@ check_gh() {  # check_gh INDEX ; reads seg_t
           */branches/*/protection*) block "changing branch protection requires the user" ;;
           */rulesets*) block "changing rulesets requires the user" ;;
           */statuses|*/statuses/*) block "writing commit statuses forges verification; scripts/verify is the only writer" ;;
-          */git/refs/heads/main*|*/git/refs/heads/master*) block "writing main/master refs through the API requires the user" ;;
+          */git/refs|*/git/refs/*|*/git/refs\?*) block "writing git refs through the API requires the user" ;;
+          */../*|*/..) block "path traversal in a write endpoint cannot be checked" ;;
         esac
       fi ;;
   esac
@@ -579,7 +583,7 @@ check_git_env() {  # GIT_CONFIG_* assignments in a segment that runs git inject 
 }
 
 scan() {  # scan TEXT DEPTH
-  local text=$1 depth=$2 line kind code had pending=0 subdepth=0 bt=0 insub
+  local text=$1 depth=$2 line kind code had pending=0 subdepth=0 bt=0 insub cond=0
   local -a seg_t=() seg_q=()
   if ! code=$(strip_heredocs "$text"); then
     block "ambiguous heredoc delimiter (mixed quoted and unquoted parts); use a plain <<'EOF'"
@@ -593,6 +597,7 @@ scan() {  # scan TEXT DEPTH
       if [[ "$kind" == p || "$line" == 's&' ]]; then insub=1; fi
       check_segment "$depth" "$pending" "$insub"
       seg_t=(); seg_q=()
+      cond=0; [[ "$line" == 's|' ]] && cond=1 || true   # the next command runs only if this one failed
       if [[ "$kind" == p ]]; then pending=1; elif ((had > 0)); then pending=0; fi
       case "$kind" in
         o) subdepth=$((subdepth + 1)) ;;
@@ -610,8 +615,13 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
   local depth=$1 piped=$2 sub=$3 n=${#seg_t[@]} i k t pn wrapped=0
   ((n > 0)) || return 0
   # cwd tracking: a cd in a subshell, pipeline, background job or nested scan does not carry over reliably
+  # a cd/pushd/popd anywhere but as the first word (after {, if, then, do, command, builtin, time, !, ...)
+  # is not followed; neither is one that only runs after a ||
+  for ((i = 1; i < n; i++)); do
+    case "${seg_t[i]}" in cd|pushd|popd) cwd_unknown=1 ;; esac
+  done
   case "${seg_t[0]}" in
-    cd|pushd) if ((depth > 0 || sub)); then cwd_unknown=1; else track_cd; fi ;;
+    cd|pushd) if ((depth > 0 || sub || cond)); then cwd_unknown=1; else track_cd; fi ;;
     popd) cwd_unknown=1 ;;
   esac
   if ((piped)); then check_pipe_target; fi
@@ -620,9 +630,12 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
   ((piped)) && sub=1 || true
   for ((i = 0; i < n; i++)); do
     t=${seg_t[i]}
-    if [[ "$t" == WARDENLENS_ALLOW_REWRITE=* ]]; then block "WARDENLENS_ALLOW_REWRITE is the human-only switch that permits history rewrites; agents never set it"; fi
-    if [[ "$t" == WARDENLENS_ALLOW_REWRITE && i -gt 0 ]]; then
-      case "${seg_t[0]}" in export|declare|typeset|readonly|local|env) block "WARDENLENS_ALLOW_REWRITE is the human-only switch that permits history rewrites; agents never set it" ;; esac
+    # the name as a word in any segment (=, +=, read, export, declare, ...). A quoted mention in the text
+    # of a git/gh command (commit message, PR body) is data and stays allowed.
+    if [[ "$t" =~ (^|[^A-Za-z0-9_])WARDENLENS_ALLOW_REWRITE($|[^A-Za-z0-9_]) ]]; then
+      if [[ "${seg_q[i]}" != q || ( "${seg_t[0]}" != git && "${seg_t[0]}" != gh ) ]]; then
+        block "WARDENLENS_ALLOW_REWRITE is the human-only switch that permits history rewrites; agents never set it"
+      fi
     fi
     if [[ "$t" =~ ^(GIT_DIR|GIT_WORK_TREE)= ]]; then cwd_unknown=1; fi
     case "${t##*/}" in

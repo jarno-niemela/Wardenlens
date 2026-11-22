@@ -176,6 +176,35 @@ allow_in "cd $tmp/onfeat && git push" "$tmp/onmain"
 allow_in "(cd /tmp); git push origin feat/x" "$tmp/onmain"
 deny  $'bash<<EOF\ngit push -f\nEOF'
 
+# --- WARDENLENS_ALLOW_REWRITE as a word anywhere
+deny  'WARDENLENS_ALLOW_REWRITE+=1 git push origin feat/x'
+deny  'read WARDENLENS_ALLOW_REWRITE <<<1; git push origin feat/x'
+deny  'export "WARDENLENS_ALLOW_REWRITE=1"'
+deny  'printf -v WARDENLENS_ALLOW_REWRITE 1'
+deny  'typeset -x WARDENLENS_ALLOW_REWRITE=1'
+allow 'gh pr create --title t --body "mentions WARDENLENS_ALLOW_REWRITE for humans"'
+
+# --- gh api paths and refs
+deny  'gh api -X PATCH repos/o/r/git/refs/heads/feat/x -f sha=abc'
+deny  'gh api -X POST repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc'
+deny  'gh api -X PATCH repos/o//r/git/refs/heads//main -f sha=abc'
+deny  'gh api -X PATCH repos/o/r/./git/refs/heads/main -f sha=abc'
+deny  'gh api -X PATCH repos/o/r/git/refs/ -f sha=abc'
+deny  'gh api -X DELETE repos/o/r//statuses/abc'
+deny  'gh api -X POST repos/o/r/./statuses/abc -f state=success'
+allow 'gh api repos/o/r/git/refs/heads/main'
+
+# --- cd tracking: any cd that is not the first word makes the directory unknown
+deny_in '{ cd /tmp; }; git push' "$tmp/onfeat"
+deny_in 'if cd /tmp; then git push; fi' "$tmp/onfeat"
+deny_in 'true; command cd /tmp; git push' "$tmp/onfeat"
+deny_in 'builtin cd /tmp; git push' "$tmp/onfeat"
+deny_in 'time cd /tmp; git push' "$tmp/onfeat"
+deny_in '! cd /tmp; git push' "$tmp/onfeat"
+deny_in 'while cd /tmp; do git push; break; done' "$tmp/onfeat"
+deny_in 'false || cd /tmp; git push' "$tmp/onfeat"
+allow_in 'cd /tmp || true; git push origin feat/x' "$tmp/onfeat"
+
 # --- push plumbing (skips pre-push) -----------------------------------------
 deny  "git send-pack origin refs/heads/main:refs/heads/main"
 deny  "git -C x send-pack origin main"
