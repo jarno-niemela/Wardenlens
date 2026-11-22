@@ -5,6 +5,8 @@
 #
 # Refused:
 #   - any update of refs/heads/main or refs/heads/master (open a PR instead)
+#   - any update or deletion of an EXISTING remote tag (refs/tags/*), even with WARDENLENS_ALLOW_REWRITE=1;
+#     creating a new tag is allowed
 #   - any deletion (deleting remote branches requires the user)
 #   - a remote sha not present locally (unknown remote state; fetch first)
 #   - a non-fast-forward update (force push)
@@ -20,6 +22,9 @@ refuse() { echo "pre-push: refused: $1 ($2)" >&2; exit 1; }
 while read -r lref lsha rref rsha; do
   case "$rref" in
     refs/heads/main|refs/heads/master) refuse "never push to main; open a PR" "$lref -> $rref" ;;
+  esac
+  case "$rref" in
+    refs/tags/*) if ! is_zero "$rsha"; then refuse "existing tags are immutable (no update or deletion, forward or rewrite)" "$rref"; fi ;;
   esac
   if is_zero "$lsha"; then refuse "deleting remote branches requires the user" "$rref"; fi
   if ! is_zero "$rsha"; then

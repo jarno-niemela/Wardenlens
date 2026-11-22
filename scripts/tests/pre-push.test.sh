@@ -19,7 +19,8 @@ setup() {  # setup -> sets $w (clone dir); remote has main, feat/x, feat/y; loca
   git -C "$w" config user.email t@example.com; git -C "$w" config user.name t
   git -C "$w" checkout -q -b main 2>/dev/null || true
   echo 1 >"$w/f"; git -C "$w" add f; git -C "$w" commit -q -m base
-  git -C "$w" push -q origin main      # hooksPath not set yet
+  git -C "$w" tag -a -m v1 v1
+  git -C "$w" push -q origin main v1   # hooksPath not set yet
   git -C "$w" checkout -q -b feat/x; echo x >"$w/x"; git -C "$w" add x; git -C "$w" commit -q -m x
   git -C "$w" push -q origin feat/x
   git -C "$w" branch feat/y; git -C "$w" push -q origin feat/y
@@ -28,17 +29,29 @@ setup() {  # setup -> sets $w (clone dir); remote has main, feat/x, feat/y; loca
   git -C "$w" config core.hooksPath "$hooks"
 }
 
+skipref=none  # a ref the case itself moves on the remote (excluded from the state comparison)
+refs() { git -C "$w/../remote.git" for-each-ref --format='%(refname) %(objectname)' | grep -v "^$skipref " | sort; }
+
 # expect allow|refuse NAME GIT_ARGS... (run in the fresh clone; "refuse" must come from the hook)
 expect() {
   local want=$1 name=$2; shift 2
   setup
-  local rc=0 out
+  local rc=0 out before after
+  before=$(refs)
   out=$(cd "$w" && "$@" 2>&1) || rc=$?
+  after=$(refs)
   if [[ $want == allow ]]; then
     if ((rc == 0)); then echo "ok   allow:  $name"; else echo "FAIL allow: $name: $out"; fail=1; fi
-  elif ((rc != 0)) && grep -q 'pre-push: refused' <<<"$out"; then echo "ok   refuse: $name"
+  elif ((rc != 0)) && grep -q 'pre-push: refused' <<<"$out" && [[ "$before" == "$after" ]]; then echo "ok   refuse: $name"
   else echo "FAIL refuse: $name (rc=$rc): $out"; fail=1; fi
 }
+expect allow  "create a new tag"                 bash -c 'git tag -a -m n v2 && git push origin v2'
+expect refuse "move existing tag forward"        bash -c 'git tag -f -a -m m v1 feat/x >/dev/null && git push --force origin v1'
+expect refuse "re-push existing tag, same commit" bash -c 'git tag -f -a -m again v1 v1^{commit} >/dev/null && git push --force origin v1'
+expect refuse "delete existing tag"              git push origin :refs/tags/v1
+expect refuse "delete existing tag (--delete)"   git push --delete origin v1
+expect refuse "tag move with WARDENLENS_ALLOW_REWRITE=1" \
+  env WARDENLENS_ALLOW_REWRITE=1 bash -c 'git tag -f v1 feat/x >/dev/null && git push --force origin v1'
 # shellcheck disable=SC2329  # passed to bash -c through declare -f
 rewrite() { git reset -q --hard HEAD~2 && echo r >r && git add r && git -c core.hooksPath=/dev/null commit -q -m r; }  # drops the remote tip
 
@@ -64,8 +77,10 @@ expect refuse "WARDENLENS_ALLOW_REWRITE=1 never allows main" \
 expect refuse "WARDENLENS_ALLOW_REWRITE=1 does not allow deletion" \
   env WARDENLENS_ALLOW_REWRITE=1 git push origin :feat/y
 # shellcheck disable=SC2016  # the script runs in the inner bash
+skipref=refs/heads/feat/x   # this case pushes a competing commit to feat/x itself
 expect refuse "unknown remote state (remote tip not fetched)" \
   bash -c 'other=$(mktemp -d); git clone -q "$(git remote get-url origin)" "$other/o" && git -C "$other/o" config user.email t@e && git -C "$other/o" config user.name t && git -C "$other/o" checkout -q feat/x && echo z >"$other/o/z" && git -C "$other/o" add z && git -C "$other/o" commit -q -m z && git -C "$other/o" push -q origin feat/x; rm -rf "$other"; git push origin feat/x'
+skipref=none
 if [[ -x /usr/lib/git-core/git ]]; then
   expect refuse "/usr/lib/git-core/git push --force" \
     bash -c "$(declare -f rewrite); rewrite; /usr/lib/git-core/git push --force origin feat/x"
