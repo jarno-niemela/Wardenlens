@@ -1,0 +1,11 @@
+[package]
+name = "cuda-bgsub"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12090"] }
+
+# Spike only: not a member of the Wardenlens workspace.
+[workspace]

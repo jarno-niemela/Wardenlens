@@ -1,0 +1,11 @@
+# onnxruntime-gpu probe/bench image. Build: docker build --build-arg ORT_VERSION=1.xx.y --build-arg CUDNN_VERSION=9.x -t wl-s2-ort-<ver> -f Dockerfile.ort .
+FROM nvidia/cuda:12.9.1-base-ubuntu24.04
+ARG ORT_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+    && rm -rf /var/lib/apt/lists/* && python3 -m venv /opt/v
+ARG CUDNN_VERSION=9.1.0.70
+RUN /opt/v/bin/pip install --no-cache-dir "onnxruntime-gpu==${ORT_VERSION}" numpy \
+    && /opt/v/bin/pip install --no-cache-dir "nvidia-cudnn-cu12==${CUDNN_VERSION}" nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 \
+       nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12
+ENV LD_LIBRARY_PATH=/opt/v/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/v/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/v/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/v/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/v/lib/python3.12/site-packages/nvidia/curand/lib:/opt/v/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib
+ENTRYPOINT []

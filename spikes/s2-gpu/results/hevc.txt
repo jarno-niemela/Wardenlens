@@ -1,0 +1,8 @@
+# HEVC NVDEC on GM204
+[hevc_cuvid] Codec hevc_cuvid is not supported.
+[vist#0:0/hevc] Error while opening decoder: Invalid argument
+[vost#0:0/wrapped_avframe] Error initializing a simple filtergraph
+Error opening output file -.
+Error opening output files: Invalid argument
+hevc exit=234
+h264 control exit=0

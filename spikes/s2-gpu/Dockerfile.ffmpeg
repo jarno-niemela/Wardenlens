@@ -1,0 +1,5 @@
+# ffmpeg with NVDEC (cuvid) decoders + nvidia-smi helpers, runtime part only.
+FROM nvidia/cuda:12.9.1-base-ubuntu24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates bc \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT []

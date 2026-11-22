@@ -1,0 +1,4 @@
+fixtures/
+results/raw/
+models/
+cuda-bgsub/target/
