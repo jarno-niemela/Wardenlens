@@ -1,0 +1,16 @@
+cuda	yolov8n_320.onnx	mean=5.5ms	p50=5.4ms	p95=6.0ms	fps=182.4	vram_delta=243MiB	vram_total=784MiB
+cpu	yolov8n_320.onnx	mean=15.3ms	p50=14.9ms	p95=18.8ms	fps=65.4	vram_delta=0MiB	vram_total=541MiB
+cuda	yolov8n_640.onnx	mean=10.4ms	p50=10.3ms	p95=11.3ms	fps=95.8	vram_delta=147MiB	vram_total=688MiB
+cpu	yolov8n_640.onnx	mean=67.6ms	p50=66.9ms	p95=76.2ms	fps=14.8	vram_delta=0MiB	vram_total=541MiB
+cuda	yolov8s_320.onnx	mean=8.4ms	p50=8.3ms	p95=9.1ms	fps=119.3	vram_delta=405MiB	vram_total=946MiB
+cpu	yolov8s_320.onnx	mean=38.8ms	p50=35.7ms	p95=61.9ms	fps=25.8	vram_delta=0MiB	vram_total=541MiB
+cuda	yolov8s_640.onnx	mean=20.9ms	p50=20.7ms	p95=22.3ms	fps=47.8	vram_delta=339MiB	vram_total=880MiB
+cpu	yolov8s_640.onnx	mean=182.8ms	p50=170.3ms	p95=241.5ms	fps=5.5	vram_delta=0MiB	vram_total=541MiB
+cuda	yolo11n_320.onnx	mean=6.3ms	p50=6.3ms	p95=6.7ms	fps=158.4	vram_delta=243MiB	vram_total=784MiB
+cpu	yolo11n_320.onnx	mean=18.6ms	p50=14.8ms	p95=33.9ms	fps=53.8	vram_delta=0MiB	vram_total=541MiB
+cuda	yolo11n_640.onnx	mean=11.4ms	p50=11.2ms	p95=12.2ms	fps=88.1	vram_delta=147MiB	vram_total=688MiB
+cpu	yolo11n_640.onnx	mean=69.6ms	p50=64.8ms	p95=95.5ms	fps=14.4	vram_delta=0MiB	vram_total=541MiB
+cuda	yolo11s_320.onnx	mean=8.9ms	p50=8.8ms	p95=9.4ms	fps=112.5	vram_delta=403MiB	vram_total=944MiB
+cpu	yolo11s_320.onnx	mean=36.2ms	p50=35.3ms	p95=46.5ms	fps=27.6	vram_delta=0MiB	vram_total=541MiB
+cuda	yolo11s_640.onnx	mean=21.5ms	p50=21.3ms	p95=22.6ms	fps=46.6	vram_delta=211MiB	vram_total=752MiB
+cpu	yolo11s_640.onnx	mean=178.4ms	p50=172.3ms	p95=224.5ms	fps=5.6	vram_delta=0MiB	vram_total=541MiB

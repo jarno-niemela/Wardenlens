@@ -1,0 +1,59 @@
+NOTE: the first four sections below ran with the first Dockerfile.ort draft (pip extras, newest cuDNN 9.28). 1.20.2 and
+1.19.2 there fell back to CPU only because the CUDA libraries were not installed ("session providers: CPUExecutionProvider"),
+so they are NOT evidence of GPU support. The sections with "+ cudnn 9.1.0.70" use the final Dockerfile and are authoritative.
+=== onnxruntime-gpu 1.23.2
+2026-11-22 22:15:00.362826298 [E:onnxruntime:Default, cudnn_fe_call.cc:33 CudaErrString<cudnn_frontend::error_object>] execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()) failed with message: err 209 no kernel image is available for execution on the device != cudaSuccess :: cudaGetLastError()
+onnxruntime 1.23.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running Conv node. Name:'node_conv2d' Status Message: CUDNN_FE failure 11: CUDNN_BACKEND_API_FAILED ; GPU=0 ; hostname=a120b454a111 ; file=/onnxruntime_src/onnxruntime/core/providers/cuda/nn/conv.cc ; line=483 ; expr=s_.cudnn_fe_graph->execute(cudnn_handle, s_.variant_pack, ws.get(
+=== onnxruntime-gpu 1.22.0
+2026-11-22 22:19:04.082535545 [E:onnxruntime:Default, cudnn_fe_call.cc:33 CudaErrString<cudnn_frontend::error_object>] execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()) failed with message: , and code: CUDNN_STATUS_EXECUTION_FAILED_CUDART
+onnxruntime 1.22.0 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running Conv node. Name:'node_conv2d' Status Message: CUDNN_FE failure 11: CUDNN_BACKEND_API_FAILED ; GPU=0 ; hostname=a2788eff62d5 ; file=/onnxruntime_src/onnxruntime/core/providers/cuda/nn/conv.cc ; line=483 ; expr=s_.cudnn_fe_graph->execute(cudnn_handle, s_.variant_pack, ws.get(
+=== onnxruntime-gpu 1.20.2
+2026-11-22 22:20:36.887302175 [E:onnxruntime:Default, provider_bridge_ort.cc:1862 TryGetProviderInfo_CUDA] /onnxruntime_src/onnxruntime/core/session/provider_bridge_ort.cc:1539 onnxruntime::Provider& onnxruntime::ProviderLibrary::Get() [ONNXRuntimeError] : 1 : FAIL : Failed to load library libonnxruntime_providers_cuda.so with error: libcublasLt.so.12: cannot open shared object file: No such file 
+2026-11-22 22:20:36.887318470 [W:onnxruntime:Default, onnxruntime_pybind_state.cc:993 CreateExecutionProviderInstance] Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 12.*. Please install all dependencies as mentioned in the GPU requirements page (https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements), make sure they're in the PATH, and that yo
+onnxruntime 1.20.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CPUExecutionProvider']
+run OK, output shape (1, 84, 2100)
+=== onnxruntime-gpu 1.19.2
+2026-11-22 22:22:16.336507747 [E:onnxruntime:Default, provider_bridge_ort.cc:1992 TryGetProviderInfo_CUDA] /onnxruntime_src/onnxruntime/core/session/provider_bridge_ort.cc:1637 onnxruntime::Provider& onnxruntime::ProviderLibrary::Get() [ONNXRuntimeError] : 1 : FAIL : Failed to load library libonnxruntime_providers_cuda.so with error: libcublasLt.so.12: cannot open shared object file: No such file 
+2026-11-22 22:22:16.336523035 [W:onnxruntime:Default, onnxruntime_pybind_state.cc:965 CreateExecutionProviderInstance] Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 12.*. Please install all dependencies as mentioned in the GPU requirements page (https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements), make sure they're in the PATH, and that yo
+onnxruntime 1.19.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CPUExecutionProvider']
+run OK, output shape (1, 84, 2100)
+=== onnxruntime-gpu 1.23.2 + cudnn 9.1.0.70
+2026-11-22 22:26:22.088889382 [E:onnxruntime:, sequential_executor.cc:572 ExecuteKernel] Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+onnxruntime 1.23.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+=== onnxruntime-gpu 1.23.2 + cudnn 9.5.1.17
+2026-11-22 22:30:33.294003926 [E:onnxruntime:, sequential_executor.cc:572 ExecuteKernel] Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+onnxruntime 1.23.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+=== onnxruntime-gpu 1.22.0 + cudnn 9.1.0.70
+2026-11-22 22:34:55.457410492 [E:onnxruntime:, sequential_executor.cc:572 ExecuteKernel] Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+onnxruntime 1.22.0 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+=== onnxruntime-gpu 1.20.2 + cudnn 9.1.0.70
+onnxruntime 1.20.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+run OK, output shape (1, 84, 2100)
+=== onnxruntime-gpu 1.19.2 + cudnn 9.1.0.70
+onnxruntime 1.19.2 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+run OK, output shape (1, 84, 2100)
+=== onnxruntime-gpu 1.21.1 + cudnn 9.1.0.70
+2026-11-22 22:49:19.857200397 [E:onnxruntime:, sequential_executor.cc:572 ExecuteKernel] Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+onnxruntime 1.21.1 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+=== onnxruntime-gpu 1.21.0 + cudnn 9.1.0.70
+2026-11-22 22:53:21.423544953 [E:onnxruntime:, sequential_executor.cc:572 ExecuteKernel] Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+onnxruntime 1.21.0 providers ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+session providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running QuickGelu node. Name:'node_silu/QuickGeluFusion/' Status Message: CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available for execution on the device
+=== onnxruntime-gpu 1.20.2 + cudnn 9.1.0.70 (and 1.19.2): run OK on CUDAExecutionProvider (see yolo.tsv for 1.20.2)
