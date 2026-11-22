@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Authoritative push control. Git runs this before every push with the remote name and URL as $1 and
+# $2 (unused) and one line per ref update on stdin: <local ref> <local sha> <remote ref> <remote sha>.
+# It sees the real updates, whatever the command line looked like (refspecs, config, aliases, wrappers).
+#
+# Refused:
+#   - any update of refs/heads/main or refs/heads/master (open a PR instead)
+#   - any deletion (deleting remote branches requires the user)
+#   - a remote sha not present locally (unknown remote state; fetch first)
+#   - a non-fast-forward update (force push)
+# Exception: a non-fast-forward update of a refs/heads/* branch other than main/master is allowed when
+# WARDENLENS_ALLOW_REWRITE=1, because `--force-with-lease` on your own feature branch is legitimate and
+# a pre-push hook cannot tell it from `--force`. Agents never set it (the Bash guard denies it).
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+is_zero() { [[ "$1" =~ ^0+$ ]]; }
+refuse() { echo "pre-push: refused: $1 ($2)" >&2; exit 1; }
+
+while read -r lref lsha rref rsha; do
+  case "$rref" in
+    refs/heads/main|refs/heads/master) refuse "never push to main; open a PR" "$lref -> $rref" ;;
+  esac
+  if is_zero "$lsha"; then refuse "deleting remote branches requires the user" "$rref"; fi
+  if ! is_zero "$rsha"; then
+    git cat-file -e "$rsha^{commit}" 2>/dev/null || refuse "unknown remote state; fetch first" "$rref at $rsha"
+    if ! git merge-base --is-ancestor "$rsha" "$lsha" 2>/dev/null; then
+      if [[ "${WARDENLENS_ALLOW_REWRITE:-}" == 1 && "$rref" == refs/heads/* ]]; then
+        echo "pre-push: WARNING: rewriting $rref (WARDENLENS_ALLOW_REWRITE=1)" >&2
+      else
+        refuse "non-fast-forward / force push" "$rref"
+      fi
+    fi
+  fi
+done
+exit 0
