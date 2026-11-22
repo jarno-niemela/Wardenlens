@@ -1,0 +1,44 @@
+# Keeps issue status:* labels in step with issue and PR events.
+name: ticket-sync
+on:
+  issues:
+    types: [closed, reopened]
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed]
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVENT: ${{ github.event_name }}
+      ACTION: ${{ github.event.action }}
+      ISSUE: ${{ github.event.issue.number }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_DRAFT: ${{ github.event.pull_request.draft }}
+      PR_MERGED: ${{ github.event.pull_request.merged }}
+    steps:
+      # Always run the trusted scripts from the default branch, never from the PR head.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Sync labels
+        run: |
+          refs() { printf '%s\n%s\n' "$PR_BODY" "$PR_TITLE" \
+            | grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?):? *#[0-9]+' | grep -oE '[0-9]+' | sort -u; }
+          is_open() { [[ "$(gh issue view "$1" --json state --jq .state 2>/dev/null)" == OPEN ]]; }
+          case "$EVENT:$ACTION" in
+            issues:closed)   scripts/ticket status "$ISSUE" done ;;
+            issues:reopened) scripts/ticket status "$ISSUE" ready ;;
+            pull_request:opened|pull_request:reopened|pull_request:ready_for_review)
+              [[ "$PR_DRAFT" == true ]] && exit 0
+              for n in $(refs); do is_open "$n" && scripts/ticket status "$n" in-review; done ;;
+            pull_request:closed)
+              [[ "$PR_MERGED" == true ]] && exit 0   # issue close event marks it done
+              for n in $(refs); do is_open "$n" && scripts/ticket status "$n" ready; done ;;
+          esac

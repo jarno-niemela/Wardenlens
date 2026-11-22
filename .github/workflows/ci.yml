@@ -1,0 +1,44 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  rust:
+    name: fmt · clippy · test · doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo doc --workspace --no-deps --all-features --locked
+        env: { RUSTDOCFLAGS: -D warnings }
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with: { command: check }
+  tooling:
+    name: scripts (shellcheck + audit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - run: shellcheck scripts/ticket scripts/ticket-audit scripts/gate scripts/labels.sh scripts/tests/*.sh .claude/hooks/*.sh .githooks/*
+      - run: scripts/tests/ticket-audit.test.sh
+      - run: scripts/tests/guard-bash.test.sh

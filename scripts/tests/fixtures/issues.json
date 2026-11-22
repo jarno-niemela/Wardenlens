@@ -1,0 +1,14 @@
+[
+  {"number":1,"title":"Epic A","state":"OPEN","labels":[{"name":"type:epic"},{"name":"status:backlog"},{"name":"priority:p1"}],"body":"goal","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":2,"title":"Good task","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:ready"},{"name":"priority:p2"}],"body":"Epic: #1\n\nctx","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":3,"title":"Orphan no labels","state":"OPEN","labels":[],"body":"","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":4,"title":"Stale WIP","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:in-progress"},{"name":"priority:p2"}],"body":"Epic: #1","assignees":[],"updatedAt":"2026-11-01T00:00:00Z"},
+  {"number":5,"title":"Review no PR","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:in-review"},{"name":"priority:p2"}],"body":"Epic: #1","assignees":[{"login":"x"}],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":6,"title":"Blocked by closed","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:blocked"},{"name":"priority:p2"}],"body":"Epic: #1\nBlocked by: #7, #99","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":7,"title":"Closed done-ish","state":"CLOSED","labels":[{"name":"type:task"},{"name":"status:in-review"},{"name":"priority:p2"}],"body":"Epic: #1","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":8,"title":"Ready but blocked","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:ready"},{"name":"priority:p1"}],"body":"Epic: #1\nBlocked by: #2","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":9,"title":"Empty epic","state":"OPEN","labels":[{"name":"type:epic"},{"name":"status:backlog"}],"body":"","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":10,"title":"Task of non-epic","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:ready"},{"name":"status:blocked"}],"body":"epic: #2","assignees":[],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":11,"title":"In review with PR","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:in-review"},{"name":"priority:p2"}],"body":"Epic: #1","assignees":[{"login":"x"}],"updatedAt":"2026-11-20T00:00:00Z"},
+  {"number":12,"title":"Old backlog","state":"OPEN","labels":[{"name":"type:chore"},{"name":"status:backlog"}],"body":"","assignees":[],"updatedAt":"2026-09-01T00:00:00Z"}
+]

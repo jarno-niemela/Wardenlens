@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Ticket helper over GitHub issues. Requires: gh, jq.
+#
+#   ticket epic  "Title" [-p p0..p3] [-a area] [-F body.md]
+#   ticket task  EPIC "Title" [-p p2] [-a area] [-b 12,14] [-F body.md] [-t task|bug|chore|spike]
+#   ticket status N STATE          backlog|ready|in-progress|in-review|changes-requested|blocked|done
+#   ticket claim N                 status:in-progress + assign @me + agent:sonnet
+#   ticket next                    print the highest-priority unblocked ready ticket number
+#   ticket list [STATE]            open tickets, optionally filtered by status
+#   ticket epic-progress N         task completion for an epic
+#   ticket unblock                 move blocked tickets whose blockers are all closed to ready
+#   ticket audit [args]            run scripts/ticket-audit
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+STATES="backlog ready in-progress in-review changes-requested blocked done"
+
+die() { echo "ticket: $*" >&2; exit 1; }
+for dep in gh jq; do command -v "$dep" >/dev/null || die "missing dependency: $dep"; done
+
+valid_state() { [[ " $STATES " == *" $1 "* ]] || die "invalid state '$1' (one of: $STATES)"; }
+valid_num()   { [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: '$1'"; }
+
+set_status() {
+  local n=$1 s=$2 args=()
+  valid_num "$n"; valid_state "$s"
+  while read -r l; do
+    [[ -n "$l" && "$l" != "status:$s" ]] && args+=(--remove-label "$l")
+  done < <(gh issue view "$n" --json labels --jq '.labels[].name | select(startswith("status:"))')
+  gh issue edit "$n" --add-label "status:$s" "${args[@]}" >/dev/null
+  echo "#$n -> status:$s"
+}
+
+link_sub_issue() {  # best effort: native GitHub sub-issue for the UI; the 'Epic:' line stays authoritative
+  local epic=$1 child=$2 id
+  id=$(gh api "repos/{owner}/{repo}/issues/$child" --jq .id) || return 0
+  gh api -X POST "repos/{owner}/{repo}/issues/$epic/sub_issues" -F "sub_issue_id=$id" >/dev/null 2>&1 \
+    || echo "ticket: note: could not add #$child as sub-issue of #$epic (non-fatal)" >&2
+}
+
+open_tickets_json() {
+  gh issue list --state open --limit 2000 --json number,title,labels,body,assignees,updatedAt
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  epic)
+    title=${1:?title required}; shift
+    prio=p2 area="" body_file=""
+    while getopts "p:a:F:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; F) body_file=$OPTARG;; *) die "bad option";; esac; done
+    body=$(if [[ -n "$body_file" ]]; then cat "$body_file"; else cat "$here/templates/epic.md"; fi)
+    labels="type:epic,status:backlog,priority:$prio${area:+,area:$area}"
+    [[ -n "$area" ]] && gh label create "area:$area" --color 006b75 --force >/dev/null
+    gh issue create --title "$title" --label "$labels" --body "$body"
+    ;;
+  task)
+    epic=${1:?epic number required}; title=${2:?title required}; shift 2
+    valid_num "$epic"
+    prio=p2 area="" blocked="" body_file="" type=task
+    while getopts "p:a:b:F:t:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; b) blocked=$OPTARG;; F) body_file=$OPTARG;; t) type=$OPTARG;; *) die "bad option";; esac; done
+    [[ "$(gh issue view "$epic" --json labels --jq '[.labels[].name] | index("type:epic") != null')" == true ]] \
+      || die "#$epic is not a type:epic issue"
+    header="Epic: #$epic"
+    state=ready
+    if [[ -n "$blocked" ]]; then
+      header+=$'\n'"Blocked by: $(sed -E 's/([0-9]+)/#\1/g; s/,/, /g' <<<"$blocked")"
+      state=blocked
+    fi
+    body=$(if [[ -n "$body_file" ]]; then cat "$body_file"; else cat "$here/templates/task.md"; fi)
+    labels="type:$type,status:$state,priority:$prio${area:+,area:$area}"
+    [[ -n "$area" ]] && gh label create "area:$area" --color 006b75 --force >/dev/null
+    url=$(gh issue create --title "$title" --label "$labels" --body "$header"$'\n\n'"$body")
+    echo "$url"
+    link_sub_issue "$epic" "${url##*/}"
+    ;;
+  status)  set_status "${1:?number}" "${2:?state}" ;;
+  claim)
+    n=${1:?number}; valid_num "$n"
+    set_status "$n" in-progress
+    gh issue edit "$n" --add-assignee @me --add-label agent:sonnet >/dev/null
+    ;;
+  next)
+    open_tickets_json | jq -r '
+      (map(.number)) as $open
+      | map(select(([.labels[].name] | index("status:ready")) != null))
+      | map(select(([.labels[].name] | any(. == "type:task" or . == "type:bug" or . == "type:chore" or . == "type:spike"))))
+      | map(. + {blockers: [(.body // "") | split("\n")[] | select(test("^\\s*blocked by:"; "i")) | scan("#([0-9]+)") | .[0] | tonumber]})
+      | map(select(all(.blockers[]; . as $b | $open | index($b) == null)))
+      | map(. + {prio: ([.labels[].name | select(startswith("priority:p")) | .[10:] | tonumber] | first // 9)})
+      | sort_by(.prio, .number) | first | if . == null then empty else .number end'
+    ;;
+  list)
+    filter=${1:-}; [[ -n "$filter" ]] && valid_state "$filter"
+    open_tickets_json | jq -r --arg f "${filter:+status:$filter}" '
+      map(select($f == "" or ([.labels[].name] | index($f)) != null)) | sort_by(.number)[]
+      | "#\(.number)\t\([.labels[].name | select(startswith("status:") or startswith("type:") or startswith("priority:"))] | join(","))\t\(.title)"'
+    ;;
+  epic-progress)
+    n=${1:?number}; valid_num "$n"
+    gh issue list --state all --limit 2000 --json number,title,state,body | jq -r --argjson e "$n" '
+      map(select([(.body // "") | capture("^\\s*epic:\\s*#(?<n>[0-9]+)"; "i") | .n | tonumber] | first == $e))
+      | "Epic #\($e): \(map(select(.state == "CLOSED")) | length)/\(length) tasks closed",
+        (sort_by(.number)[] | "  [\(if .state == "CLOSED" then "x" else " " end)] #\(.number) \(.title)")'
+    ;;
+  unblock)
+    "$here/ticket-audit" --json --fail-on never | jq -r '.[] | select(.rule == "unblocked") | .number' \
+      | while read -r n; do set_status "$n" ready; done
+    ;;
+  audit) exec "$here/ticket-audit" "$@" ;;
+  ""|-h|--help) sed -n '2,13p' "$0" ;;
+  *) die "unknown command '$cmd' (see --help)" ;;
+esac

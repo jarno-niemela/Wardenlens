@@ -1,0 +1,39 @@
+# Merge gate for Opus verification. New commits invalidate earlier verification.
+name: verify-gate
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+concurrency:
+  group: verify-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+jobs:
+  verify-gate:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+      ACTION: ${{ github.event.action }}
+    steps:
+      - name: Reset verification labels on new commits
+        if: github.event.action == 'synchronize'
+        run: |
+          for l in verify:quality verify:security verify:adversarial; do
+            gh pr edit "$PR" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true
+          done
+          echo "New commits pushed: verification labels cleared; re-run /verify."
+      - name: Require quality, security and adversarial verification
+        run: |
+          have=$(gh pr view "$PR" -R "$REPO" --json labels --jq '[.labels[].name] | join(" ")')
+          missing=()
+          for l in verify:quality verify:security verify:adversarial; do
+            [[ " $have " == *" $l "* ]] || missing+=("$l")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing verification: ${missing[*]}"; exit 1
+          fi
+          echo "All verification labels present."

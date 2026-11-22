@@ -1,0 +1,5 @@
+[
+  {"number":20,"title":"Fix thing","body":"Closes #11","createdAt":"2026-11-21T12:00:00Z","isDraft":false,"reviewDecision":""},
+  {"number":21,"title":"Unlinked","body":"no refs","createdAt":"2026-11-10T00:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED"},
+  {"number":22,"title":"Bump serde","body":"deps","createdAt":"2026-11-21T20:00:00Z","isDraft":false,"reviewDecision":"","author":{"login":"app/dependabot","is_bot":true}}
+]

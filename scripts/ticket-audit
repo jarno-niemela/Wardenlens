@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Detect neglected or mis-labelled tickets and PRs. Requires: gh, jq.
+#
+# Usage: scripts/ticket-audit [--json] [--fail-on error|warn|never]
+#                             [--issues-file F --prs-file F] [--now EPOCH]
+# Env:   STALE_DAYS (3)  BACKLOG_DAYS (30)  PR_DAYS (2)
+# Exit:  0 clean (relative to --fail-on), 1 findings at/above threshold, 2 usage error.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+json=0 fail_on=error issues_file="" prs_file="" now=$(date +%s)
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) json=1 ;;
+    --fail-on) fail_on=${2:?}; shift ;;
+    --issues-file) issues_file=${2:?}; shift ;;
+    --prs-file) prs_file=${2:?}; shift ;;
+    --now) now=${2:?}; shift ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    *) echo "ticket-audit: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$fail_on" in error|warn|never) ;; *) echo "ticket-audit: bad --fail-on" >&2; exit 2 ;; esac
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+if [[ -z "$issues_file" ]]; then
+  issues_file=$tmp/issues.json
+  gh issue list --state all --limit 2000 \
+    --json number,title,state,labels,body,assignees,updatedAt >"$issues_file"
+fi
+if [[ -z "$prs_file" ]]; then
+  prs_file=$tmp/prs.json
+  gh pr list --state open --limit 500 \
+    --json number,title,body,createdAt,isDraft,reviewDecision,author >"$prs_file"
+fi
+
+findings=$(jq -n \
+  --slurpfile issues "$issues_file" --slurpfile prs "$prs_file" \
+  --argjson now "$now" \
+  --argjson stale_days "${STALE_DAYS:-3}" \
+  --argjson backlog_days "${BACKLOG_DAYS:-30}" \
+  --argjson pr_days "${PR_DAYS:-2}" \
+  '$issues[0] as $issues | $prs[0] as $prs | '"$(cat "$here/lib/audit.jq")")
+
+if [[ $json -eq 1 ]]; then
+  echo "$findings"
+else
+  count=$(jq length <<<"$findings")
+  if [[ $count -eq 0 ]]; then
+    echo "ticket-audit: clean"
+  else
+    jq -r '.[] | "\(.severity | ascii_upcase | .[0:5] | . + "     " | .[0:5]) #\(.number) [\(.rule)] \(.message) — \(.title)"' <<<"$findings"
+    echo "ticket-audit: $count finding(s)"
+  fi
+fi
+
+case "$fail_on" in
+  never) exit 0 ;;
+  warn)  jq -e 'any(.[]; .severity == "error" or .severity == "warn") | not' <<<"$findings" >/dev/null || exit 1 ;;
+  error) jq -e 'any(.[]; .severity == "error") | not' <<<"$findings" >/dev/null || exit 1 ;;
+esac

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Local quality gate — the same checks CI runs. Must pass before a PR is opened.
+# Usage: scripts/gate [--quick]   (--quick skips doc + deny)
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+quick=0; [[ "${1:-}" == "--quick" ]] && quick=1
+step() { printf '\n== %s\n' "$*"; }
+
+step "fmt";    cargo fmt --all -- --check
+step "clippy"; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+step "test";   cargo test --workspace --all-features --locked
+step "tooling tests"
+scripts/tests/ticket-audit.test.sh >/dev/null
+scripts/tests/guard-bash.test.sh >/dev/null
+if command -v shellcheck >/dev/null; then
+  step "shellcheck"; shellcheck scripts/ticket scripts/ticket-audit scripts/gate scripts/labels.sh scripts/tests/*.sh .claude/hooks/*.sh .githooks/*
+fi
+if [[ $quick -eq 0 ]]; then
+  step "doc";  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+  if command -v cargo-deny >/dev/null; then step "deny"; cargo deny check
+  else echo "(cargo-deny not installed; skipped locally — CI enforces it. Install: cargo install --locked cargo-deny)"; fi
+fi
+printf '\ngate: PASS\n'
