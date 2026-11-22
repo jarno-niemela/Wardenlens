@@ -2,6 +2,8 @@
 # NVDEC decode benchmark. Usage: bench_decode.sh <label> <codec_decoder> <clip>...   (clips run concurrently, max speed)
 # Env: LOOPS (default 5) extra loops of each 20 s clip. Prints one TSV row per stream plus a summary row,
 # and records nvidia-smi dmon (dec utilisation) and peak VRAM during the run.
+set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 label=$1; dec=$2; shift 2
 clips="$*"

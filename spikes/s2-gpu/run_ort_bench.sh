@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # YOLO FP32 benchmark: CUDA EP (ORT 1.20.2 + cuDNN 9.1.0.70) vs CPU EP. Output: results/yolo.tsv
+set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 img=wl-s2-ort-1.20.2-cudnn9.1.0.70
 out="$S2_DIR/results/yolo.tsv"; : > "$out"

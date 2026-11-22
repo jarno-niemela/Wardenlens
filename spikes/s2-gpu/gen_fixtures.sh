@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Generate synthetic H.264 fixtures (testsrc2) matching the S1 camera stream parameters, plus one HEVC clip.
 # Output: spikes/s2-gpu/fixtures/*.mp4 (gitignored; regenerate any time).
+# shellcheck disable=SC2016 # the container script is single-quoted on purpose: $-expansions happen inside the container
+set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 build_ffmpeg_image
 run_in_ffmpeg '

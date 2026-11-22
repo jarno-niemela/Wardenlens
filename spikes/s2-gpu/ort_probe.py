@@ -1,5 +1,6 @@
 """Check whether the ORT CUDA EP loads and runs on this GPU (sm_52). Usage: ort_probe.py <model.onnx>"""
-import sys, numpy as np, onnxruntime as ort
+import sys, importlib.metadata as md, numpy as np, onnxruntime as ort
+print("cudnn (pip nvidia-cudnn-cu12):", md.version("nvidia-cudnn-cu12"))
 print("onnxruntime", ort.__version__, "providers", ort.get_available_providers())
 so = ort.SessionOptions(); so.log_severity_level = 2
 s = ort.InferenceSession(sys.argv[1], so, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])

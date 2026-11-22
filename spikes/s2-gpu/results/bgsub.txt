@@ -15,5 +15,5 @@ A copy of this license is made available in this container at /NGC-DL-CONTAINER-
 
 device: NVIDIA GeForce GTX 970 sm_52
 correctness: GPU == CPU reference over 30 frames (counts and masks identical)
-kernel only (device resident): 104629 frames/s, 9.6 us/frame
-end to end (H2D + kernel + D2H count): 5153 frames/s, 194.0 us/frame (checksum 38954)
+kernel only (device resident): 95806 frames/s, 10.4 us/frame
+end to end (H2D copy into preallocated buffer + kernel + D2H count): 14367 frames/s, 69.6 us/frame (checksum 38954)

@@ -5,7 +5,7 @@
 - Ticket: #21 (epic #15)
 
 ## Context
-The NVR box has one GeForce GTX 970 (GM204, sm_52, 4 GB, driver 580.178.04, 163 W, 1455 MHz max SM clock). Spike S1
+The NVR box has one GeForce GTX 970 (GM204, sm_52, 4 GB, driver 580.178.04, 163 W power limit, 1455 MHz max SM clock; `spikes/s2-gpu/results/gpu.txt`). Spike S1
 (ADR 0002) fixed the stream parameters: 5 cameras, each with a main and a sub stream, all H.264.
 
 | stream set | resolution @ fps (S1) | real-time demand |
@@ -22,7 +22,7 @@ output are in `spikes/s2-gpu/`. The host had 541 MiB VRAM already in use (deskto
 Method notes. Decode input is synthetic (`testsrc2`, libx264, GOP 2 s, bitrates comparable to S1) because recorded camera
 samples would show the owner's property; synthetic content is simpler than real footage, so absolute numbers are
 indicative. Decode ran with ffmpeg 6.1 `h264_cuvid` at maximum speed (no `-re`), output to the null muxer, so each run
-also includes the device-to-host frame copy. Each stream loops a 20 s clip 6 to 21 times. Inference used random FP32
+also includes the device-to-host frame copy. Each stream loops a 20 s clip 11 to 21 times. Inference used random FP32
 input (latency does not depend on content), 20 warm-up runs, 200 timed runs (30 on CPU, 4 intra-op threads on a 4-core host).
 
 ## Measurements
@@ -44,15 +44,17 @@ input (latency does not depend on content), 20 warm-up runs, 200 timed runs (30 
 | 40x 640x480 | about 58 each | 2335 | 3280 MiB | 92 / 100 % |
 
 The decoder saturates at roughly 2200-2300 fps of sub-stream pixels, about 320 fps at 1440p and about 220 fps at 2560x1920
-(throughput scales with pixel rate, about 1.1 Gpixel/s). Real-time demand is 85 fps (subs) and 83 fps (mains), so the
+(throughput scales roughly with pixel rate: about 0.7 Gpixel/s for 640x480 frames, 0.8 at 1080p and 1.0 to 1.2 at 1440p and above, because per-frame overhead dominates small frames). Real-time demand is 85 fps (subs) and 83 fps (mains), so the
 5 sub streams use about 4 % of the decoder and even decoding all 5 mains would use about 26 %. VRAM grows about 70 MiB per
 extra concurrent sub-stream decoder (40 streams reached 3.3 GB), so session count, not fps, is the VRAM driver.
-Each count was measured at the maximum rate; no stall or error occurred in any run.
+Each count was measured at the maximum rate; no stall or error occurred in any run. The multi-stream totals are lower
+bounds: each stream is a separate ffmpeg process on a 4-core host, so CPU contention (process start-up, frame copy to host) may
+limit them before the decoder does.
 
 ### (b) HEVC on GM204
 Refuted. `hevc_cuvid -i hevc_1920x1080.mp4` fails immediately with `Codec hevc_cuvid is not supported` while the
-`h264_cuvid` control on the same host/container succeeds (`spikes/s2-gpu/results/hevc.txt`). GM204 (2nd-gen Maxwell) NVDEC is
-H.264 (plus MPEG-2, VC-1, VP8 per ffmpeg's decoder list); HEVC arrived with GM206/GP10x. Consequence: any camera
+`h264_cuvid` control on the same host/container succeeds (`spikes/s2-gpu/results/hevc.txt`, produced by `probe_hevc.sh`). Only
+H.264 was verified on this GPU (other codecs were not tested); HEVC NVDEC arrived with GM206/GP10x, not GM204. Consequence: any camera
 switched to H.265 must be decoded on the CPU (or the stream left on H.264). All five cameras currently deliver H.264.
 
 ### (c) CUDA kernel for sm_52 via cudarc
@@ -63,10 +65,10 @@ toolkit needed, libraries are `dlopen`ed) and runs in the `nvidia/cuda:12.9.1-de
 
 | measurement | result |
 |---|---|
-| kernel only, device-resident frame | 104,629 frames/s (9.6 us/frame) |
-| end to end: pageable H2D upload + kernel + D2H of count | 5,153 frames/s (194 us/frame) |
+| kernel only, device-resident frame | 95,806 frames/s (10.4 us/frame) |
+| end to end: pageable H2D copy into a preallocated buffer + kernel + D2H of count | 14,367 frames/s (69.6 us/frame) |
 
-One camera sub stream at 25 fps needs 25 of these; the upload copy, not the kernel, dominates.
+One camera sub stream at 25 fps needs 25 of these; the synchronous copies and launch round-trip, not the kernel, dominate (70 us versus 10 us).
 
 ### (d) ONNX Runtime CUDA execution provider on sm_52
 Maxwell support was removed from the PyPI wheels after **1.20.2**. Test: load `yolov8n_320.onnx` with the CUDA EP and run once
@@ -83,7 +85,7 @@ Maxwell support was removed from the PyPI wheels after **1.20.2**. Test: load `y
 Conclusion: the newest usable wheel is `onnxruntime-gpu==1.20.2` (CUDA 12.x build) with cuDNN 9.1.0.70 and the CUDA 12.9
 runtime libraries. 1.20.0/1.20.1 were not tested separately. Newer cuDNN (9.28) is not usable with it on this GPU. The ORT
 session must be created with the CUDA EP only and asserted (`get_providers()[0] == CUDAExecutionProvider`), because ORT silently
-falls back to the CPU EP; the first run of every probe above showed this fallback.
+falls back to the CPU EP when its CUDA libraries do not load (we hit this with 1.32.0, which needs CUDA 13, and in an earlier draft of the probe with missing libraries).
 
 ### (e) YOLO FP32, ORT 1.20.2 CUDA EP vs CPU (4 threads), batch 1
 Models: Ultralytics YOLOv8n/s and YOLO11n/s exported to ONNX (opset 19, fixed shape, FP32, from release v8.3.0 weights); SHA-256 in
@@ -124,7 +126,7 @@ depend on the chosen convolution algorithms); budget about 0.4 GB per model sess
   pinned to an ONNX Runtime 1.20.x build (the version mapping and dynamic loading are for the integration ticket to verify).
   Fail hard if the CUDA EP is not the first provider.
 - **Container**: `nvidia/cuda:12.9.1-{base|runtime|devel}-ubuntu24.04`, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`.
-  `spikes/s2-gpu/Dockerfile.*` are the pinned recipes.
+  `spikes/s2-gpu/Dockerfile.*` are the recipes (the base image tag and the ORT/cuDNN versions are pinned; apt packages and the other pip packages are not, so `results/pip-freeze-ort-*.txt` records what was actually installed).
 - **Models**: not in the repo; `export_models.sh` regenerates them and `results/models.sha256` records checksums.
 
 ## Capacity plan (5 cameras)
@@ -134,7 +136,7 @@ depend on the chosen convolution algorithms); budget about 0.4 GB per model sess
 | NVDEC if all 5 mains were decoded (83 fps) | about 26 % | 317 fps | 3.8x (use for occasional snapshots or re-detect) |
 | Detection, YOLOv8n 640 at 5 fps per camera | 25 inf/s, about 26 % of GPU time | 96 inf/s | 3.8x |
 | Detection, YOLOv8s 640 at 5 fps per camera | 25 inf/s, about 52 % of GPU time | 48 inf/s | 1.9x |
-| Motion kernel on 5 subs (125 fps total) | trivial | 5,153 fps end to end | 40x |
+| Motion kernel on 5 subs (125 fps total) | trivial | 14,367 fps end to end | 115x |
 | VRAM (above the 541 MiB host baseline) | 5 sub decoders about 350 MiB + one 640 model about 150-400 MiB + CUDA context | 4096 MiB | about 3 GB spare, 3.5 GB if the desktop moves off the GPU |
 
 Recommended operating point: all 5 subs decoded on NVDEC, motion kernel gates detection, YOLO at 640 with at most 5 fps per

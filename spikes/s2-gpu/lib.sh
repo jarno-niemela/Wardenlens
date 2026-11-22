@@ -3,7 +3,7 @@
 set -euo pipefail
 S2_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FFMPEG_IMAGE=wl-s2-ffmpeg
-GPU_ARGS=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility)
+GPU_ARGS=(--gpus all -e "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility")
 
 build_ffmpeg_image() { docker build -q -f "$S2_DIR/Dockerfile.ffmpeg" -t "$FFMPEG_IMAGE" "$S2_DIR" >/dev/null; }
 

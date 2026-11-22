@@ -130,14 +130,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Throughput 2: end to end per frame: H2D upload (pageable) + kernel + D2H of the 4-byte count.
     let host = frame(9);
+    let mut up_d = stream.alloc_zeros::<u8>(W * H)?; // allocated once; each iteration only copies into it
     let iters = 5_000;
     let t0 = Instant::now();
     let mut total = 0u64;
     for _ in 0..iters {
-        let up = stream.clone_htod(&host)?;
+        stream.memcpy_htod(&host, &mut up_d)?;
         stream.memset_zeros(&mut cnt_d)?;
         let mut b = stream.launch_builder(&f);
-        b.arg(&up)
+        b.arg(&up_d)
             .arg(&mut bg_d)
             .arg(&mut mask_d)
             .arg(&mut cnt_d)
@@ -148,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let s = t0.elapsed().as_secs_f64();
     println!(
-        "end to end (H2D + kernel + D2H count): {:.0} frames/s, {:.1} us/frame (checksum {total})",
+        "end to end (H2D copy into preallocated buffer + kernel + D2H count): {:.0} frames/s, {:.1} us/frame (checksum {total})",
         f64::from(iters) / s,
         s / f64::from(iters) * 1e6
     );

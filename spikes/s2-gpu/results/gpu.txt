@@ -1,0 +1,2 @@
+name, driver_version, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], compute_cap
+NVIDIA GeForce GTX 970, 580.178.04, 4096 MiB, 163.46 W, 1455 MHz, 5.2
