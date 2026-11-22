@@ -9,8 +9,8 @@ Closes #
 
 ## Verification
 - [ ] `scripts/gate` passes locally (fmt, clippy, test, doc, deny)
-- [ ] Opus code-quality review → `verify:quality`
-- [ ] Opus security audit → `verify:security`
-- [ ] Opus adversarial pass → `verify:adversarial`
+- [ ] Opus code-quality review → `verify/quality` status
+- [ ] Opus security audit → `verify/security` status
+- [ ] Opus adversarial pass → `verify/adversarial` status
 
 ## Risk / rollback

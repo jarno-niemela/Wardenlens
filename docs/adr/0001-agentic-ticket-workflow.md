@@ -19,14 +19,21 @@ We need durable state, independent verification and neglect detection.
   well-specified tasks); three Opus verifiers run in fresh contexts — `reviewer`
   (quality), `security-auditor`, and `adversary` (tries to break the change with
   failing tests). Separating writer and judge counters self-approval bias.
-- **Gate enforced mechanically**: `verify:*` labels are required by the
-  `verify-gate` check and cleared on every new push, so approval always refers
-  to the final code. CI enforces fmt/clippy/tests/docs/cargo-deny.
+- **Gate bound to a commit**: each verdict is a commit status `verify/quality|security|adversarial`
+  on the exact SHA verified (`scripts/verify mark`). `scripts/verify check` requires all three on the
+  current head plus green CI, and the merge uses `--match-head-commit` with that SHA, so approval
+  always refers to the final code. `verify:*` labels are display-only and are reset on every push
+  by the `verify-labels-reset` workflow. Test-only follow-ups may carry verdicts forward
+  (`scripts/verify carry`). CI enforces fmt/clippy/tests/docs/cargo-deny and the tooling tests.
+- **Guard hook**: a fail-closed Bash hook blocks force pushes, pushes to main, hook bypass,
+  `gh pr merge` without `--match-head-commit`, and merge/delete calls through `gh api`.
 - **Neglect detection**: `scripts/ticket-audit` (pure jq rules with offline tests)
   runs every `/work` iteration and daily in CI.
 - **Tooling in bash + jq** for bootstrap; a Rust port is tracked as a ticket.
 
 ## Consequences
 - Every change costs at least four agent runs; accepted for reliability.
-- Branch protection is needed to make the gate binding for humans too.
+- The repository is private on a plan without branch protection, so the gate is enforced by
+  tooling (`scripts/verify check`, the guard hook), not by GitHub. Enable rulesets requiring the
+  `verify/*` status contexts if the plan allows it; until then the gate binds the agents only.
 - Label hygiene becomes critical; it is automated (`ticket-sync.yml`) and audited.

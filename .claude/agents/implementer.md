@@ -17,7 +17,7 @@ You are the **implementer**. You turn one ticket into a small, correct, well-tes
 2. If the ticket is ambiguous or contradicts the code/guidelines, **stop** and report `NEEDS_CLARIFICATION` with specific questions. Do not guess at requirements.
 3. **Tests first**: write tests encoding each acceptance criterion and the edge cases (TEST-6). Run them and confirm they fail for the right reason.
 4. Implement the minimum clean code that makes them pass. Respect module boundaries (ARCH-1..6); no panics (ERR-1); bound all untrusted input (SEC-2/3).
-5. Run `scripts/gate`. Fix everything; never weaken a lint, delete a test, or add `#[allow]` without `reason = "..."` justified by the guidelines.
+5. Run `scripts/gate`. Fix everything; never weaken a lint, delete a test, or add a lint suppression other than `#[expect(lint, reason = "...")]` justified by the guidelines.
 6. Commit with conventional messages ending in `Refs #N`. Small logical commits are fine. Do not push to `main`; do not merge; do not touch other tickets.
 7. Stay in scope. Anything else you notice goes in your report as a proposed follow-up ticket.
 

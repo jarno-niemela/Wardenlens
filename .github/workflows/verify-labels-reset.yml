@@ -1,39 +1,41 @@
-# Merge gate for Opus verification. New commits invalidate earlier verification.
-name: verify-gate
+# Display-only housekeeping: clears the verify:* labels when new commits are pushed to a PR.
+#
+# The merge gate is NOT this workflow. The gate is the SHA-bound commit statuses verify/quality,
+# verify/security and verify/adversarial, checked by `scripts/verify check` before
+# `gh pr merge --match-head-commit`. A status on an old SHA never counts for a new head, so stale
+# approval cannot merge. The labels only mirror the state for humans, hence this reset.
+#
+# pull_request_target runs in the base-repo context with a token that may write labels even for
+# PRs from forks. That is safe here because the job never checks out or runs code from the PR.
+name: verify-labels-reset
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  pull_request_target:
+    types: [synchronize]
 permissions:
   contents: read
   pull-requests: write
   issues: write
 concurrency:
-  group: verify-gate-${{ github.event.pull_request.number }}
+  group: verify-labels-reset-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 jobs:
-  verify-gate:
+  reset:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
       REPO: ${{ github.repository }}
-      ACTION: ${{ github.event.action }}
     steps:
-      - name: Reset verification labels on new commits
-        if: github.event.action == 'synchronize'
+      - name: Remove verify:* labels (404 = already absent; any other error fails)
         run: |
           for l in verify:quality verify:security verify:adversarial; do
-            gh pr edit "$PR" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true
+            enc=${l//:/%3A}
+            if ! out=$(gh api -X DELETE "repos/$REPO/issues/$PR/labels/$enc" 2>&1); then
+              if [[ "$out" == *"HTTP 404"* ]]; then
+                echo "$l was not set"
+              else
+                echo "::error::could not remove $l: $out"; exit 1
+              fi
+            fi
           done
-          echo "New commits pushed: verification labels cleared; re-run /verify."
-      - name: Require quality, security and adversarial verification
-        run: |
-          have=$(gh pr view "$PR" -R "$REPO" --json labels --jq '[.labels[].name] | join(" ")')
-          missing=()
-          for l in verify:quality verify:security verify:adversarial; do
-            [[ " $have " == *" $l "* ]] || missing+=("$l")
-          done
-          if (( ${#missing[@]} )); then
-            echo "::error::Missing verification: ${missing[*]}"; exit 1
-          fi
-          echo "All verification labels present."
+          echo "New commits pushed: verify:* labels cleared; earlier verify/* statuses no longer match the head SHA."

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# SHA-bound Opus verification gate. Requires: gh, jq, git.
+#
+#   verify mark PR DIM pass|fail SHA   record a verdict as commit status verify/DIM on SHA;
+#                                      the verify:DIM label is updated only if SHA is the PR head
+#   verify check PR                    succeed (print head SHA) only if verify/quality, verify/security
+#                                      and verify/adversarial are all success on the PR head SHA and
+#                                      every other check passes; otherwise list gaps on stderr, exit 1
+#   verify carry PR FROM_SHA           copy success verify/* statuses from FROM_SHA to the PR head,
+#                                      allowed only if the diff touches nothing but test paths
+#
+# DIM is one of: quality security adversarial. Labels are display-only; statuses are the gate.
+# Merge with: sha=$(scripts/verify check PR) && gh pr merge PR --squash --delete-branch --match-head-commit "$sha"
+set -euo pipefail
+
+DIMS="quality security adversarial"
+
+die() { echo "verify: $*" >&2; exit 1; }
+for dep in gh jq git; do command -v "$dep" >/dev/null || die "missing dependency: $dep"; done
+
+valid_pr()  { [[ "${1:-}" =~ ^[0-9]+$ ]] || die "PR must be a number: '${1:-}'"; }
+valid_dim() { [[ " $DIMS " == *" ${1:-} "* ]] || die "DIM must be one of: $DIMS (got '${1:-}')"; }
+valid_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]] || die "SHA must be 40 lowercase hex chars: '${1:-}'"; }
+
+head_sha() {
+  local sha
+  sha=$(gh pr view "$1" --json headRefOid -q .headRefOid) || die "cannot read PR #$1"
+  valid_sha "$sha"
+  printf '%s' "$sha"
+}
+
+# Latest status per context for a commit, as a JSON object {context: {state, description}}.
+latest_statuses() {
+  gh api --paginate "repos/{owner}/{repo}/commits/$1/statuses?per_page=100" \
+    | jq -s 'add // [] | sort_by(.created_at) | map({key: .context, value: {state, description}}) | from_entries'
+}
+
+post_status() {  # SHA DIM STATE DESCRIPTION
+  gh api -X POST "repos/{owner}/{repo}/statuses/$1" \
+    -f "state=$3" -f "context=verify/$2" -f "description=$4" >/dev/null
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  mark)
+    [[ $# -eq 4 ]] || die "usage: verify mark PR DIM pass|fail SHA"
+    pr=$1 dim=$2 verdict=$3 sha=$4
+    valid_pr "$pr"; valid_dim "$dim"; valid_sha "$sha"
+    case "$verdict" in pass) state=success ;; fail) state=failure ;; *) die "verdict must be pass or fail" ;; esac
+    post_status "$sha" "$dim" "$state" "Opus $dim verification"
+    if [[ "$(head_sha "$pr")" == "$sha" ]]; then
+      if [[ "$verdict" == pass ]]; then
+        gh pr edit "$pr" --add-label "verify:$dim" >/dev/null
+      else
+        gh pr edit "$pr" --remove-label "verify:$dim" >/dev/null || true
+      fi
+    else
+      echo "verify: $sha is not the head of PR #$pr; status recorded, label untouched" >&2
+    fi
+    echo "verify/$dim=$state on ${sha:0:12}"
+    ;;
+  check)
+    [[ $# -eq 1 ]] || die "usage: verify check PR"
+    valid_pr "$1"
+    sha=$(head_sha "$1")
+    statuses=$(latest_statuses "$sha")
+    missing=()
+    for dim in $DIMS; do
+      state=$(jq -r --arg c "verify/$dim" '.[$c].state // "missing"' <<<"$statuses")
+      [[ "$state" == success ]] || missing+=("verify/$dim is $state on ${sha:0:12}")
+    done
+    checks=$(gh pr checks "$1" --json name,bucket 2>/dev/null || true)
+    if jq -e 'type == "array" and length > 0' <<<"$checks" >/dev/null 2>&1; then
+      while IFS= read -r line; do missing+=("check $line"); done < <(
+        jq -r '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) is \(.bucket)"' <<<"$checks")
+    else
+      missing+=("no CI checks reported for PR #$1")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+      printf 'verify: not mergeable:\n' >&2
+      printf '  - %s\n' "${missing[@]}" >&2
+      exit 1
+    fi
+    echo "$sha"
+    ;;
+  carry)
+    [[ $# -eq 2 ]] || die "usage: verify carry PR FROM_SHA"
+    pr=$1 from=$2
+    valid_pr "$pr"; valid_sha "$from"
+    head=$(head_sha "$pr")
+    git cat-file -e "$from^{commit}" 2>/dev/null || git fetch -q origin "$from" 2>/dev/null || die "cannot find commit $from locally"
+    git cat-file -e "$head^{commit}" 2>/dev/null || git fetch -q origin "$head" 2>/dev/null || die "cannot find commit $head locally"
+    bad=()
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      [[ "$f" =~ ^crates/[^/]+/tests/ || "$f" =~ ^scripts/tests/ ]] || bad+=("$f")
+    done < <(git diff --no-renames --name-only "$from" "$head")
+    if [[ ${#bad[@]} -gt 0 ]]; then
+      echo "verify: cannot carry verification; non-test files changed since ${from:0:12}:" >&2
+      printf '  %s\n' "${bad[@]}" >&2
+      exit 1
+    fi
+    statuses=$(latest_statuses "$from")
+    carried=0
+    for dim in $DIMS; do
+      if [[ "$(jq -r --arg c "verify/$dim" '.[$c].state // ""' <<<"$statuses")" == success ]]; then
+        post_status "$head" "$dim" success "Opus $dim verification (carried from ${from:0:12}, test-only changes)"
+        gh pr edit "$pr" --add-label "verify:$dim" >/dev/null
+        carried=$((carried + 1))
+      fi
+    done
+    echo "carried $carried verification(s) from ${from:0:12} to ${head:0:12}"
+    ;;
+  ""|-h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0" ;;
+  *) die "unknown command '$cmd' (see --help)" ;;
+esac

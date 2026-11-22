@@ -7,7 +7,7 @@ Keep this file short; details live in the linked docs.
 - **No work without a ticket.** Every change maps to an issue (`type:task|bug|chore|spike`); tasks have `Epic: #N`.
 - **Never push to `main`.** Branch `<type>/<issue>-<slug>`, PR with `Closes #N`, squash merge.
 - **Labels must be truthful**: exactly one `status:*` per open issue. Use `scripts/ticket`, not hand-edits.
-- **Sonnet implements, Opus verifies.** Production code is written by the `implementer` subagent; a PR merges only with `verify:quality`, `verify:security`, `verify:adversarial` + green CI.
+- **Sonnet implements, Opus verifies.** Production code is written by the `implementer` subagent; a PR merges only with SHA-bound `verify/quality`, `verify/security`, `verify/adversarial` statuses + green CI (`scripts/verify check`, then `gh pr merge --match-head-commit`).
 - **`scripts/gate` passes before every push.** Never weaken lints, skip hooks (`--no-verify`) or delete tests to get green.
 - Follow `docs/CODING_GUIDELINES.md` (cite rule IDs in reviews). No `unsafe`, no panics in non-test code.
 
@@ -16,8 +16,8 @@ Keep this file short; details live in the linked docs.
 - `docs/WORKFLOW.md` — ticket lifecycle, labels, roles, merge gate · `docs/CODING_GUIDELINES.md` · `docs/adr/`
 - `.claude/agents/` — implementer (sonnet), reviewer / security-auditor / adversary / planner (opus)
 - `.claude/skills/` — `/work`, `/plan-epic`, `/new-ticket`, `/verify`, `/ticket-audit`, `rust-guidelines`
-- `.claude/hooks/` — Bash guard (no force-push / push to main / `--no-verify` / `--admin`), rustfmt on edit
-- `scripts/ticket` (create/claim/status/next/list/epic-progress/unblock), `scripts/ticket-audit`, `scripts/gate`, `scripts/labels.sh`
+- `.claude/hooks/` — Bash guard (no force-push / push to main / `--no-verify` / `--admin` / merge without `--match-head-commit`), rustfmt on edit
+- `scripts/ticket` (create/claim/status/next/list/epic-progress/unblock), `scripts/ticket-audit`, `scripts/verify` (mark/check/carry the SHA-bound verification gate), `scripts/gate`, `scripts/labels.sh`
 
 ## Commands
 ```bash

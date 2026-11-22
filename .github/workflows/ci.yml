@@ -15,11 +15,11 @@ jobs:
     name: fmt · clippy · test · doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
@@ -29,16 +29,29 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with: { command: check }
   tooling:
-    name: scripts (shellcheck + audit tests)
+    name: scripts (shellcheck + tooling tests + audit)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
-      - run: shellcheck scripts/ticket scripts/ticket-audit scripts/gate scripts/labels.sh scripts/tests/*.sh .claude/hooks/*.sh .githooks/*
+      - run: shellcheck scripts/ticket scripts/ticket-audit scripts/verify scripts/gate scripts/labels.sh scripts/tests/*.sh scripts/tests/adversarial/*.sh .claude/hooks/*.sh .githooks/*
       - run: scripts/tests/ticket-audit.test.sh
+      - run: scripts/tests/ticket.test.sh
+      - run: scripts/tests/verify.test.sh
       - run: scripts/tests/guard-bash.test.sh
+      - run: scripts/tests/adversarial/guard-bash.adv.sh
+      - run: scripts/tests/adversarial/ticket-audit.adv.sh
+      - run: scripts/tests/adversarial/ticket-next.adv.sh
+      - name: Ticket audit (report only)
+        run: scripts/ticket-audit --fail-on never
+        env:
+          GH_TOKEN: ${{ github.token }}
