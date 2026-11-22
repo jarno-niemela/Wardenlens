@@ -5,6 +5,10 @@
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+if [ $# -lt 3 ]; then
+  echo "usage: bench_decode.sh <label> <decoder> <clip>...   (at least one clip name from fixtures/, without .mp4)" >&2
+  exit 2
+fi
 label=$1; dec=$2; shift 2
 clips="$*"
 run_in_ffmpeg "
@@ -14,6 +18,7 @@ nvidia-smi dmon -s u -d 1 > /tmp/dmon.txt &
 dmon=\$!
 ( while true; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> /tmp/vram.txt; sleep 0.5; done ) &
 vr=\$!
+trap 'kill \$dmon \$vr 2>/dev/null' EXIT
 start=\$(date +%s.%N)
 i=0; pids=''
 for c in $clips; do
@@ -47,6 +52,6 @@ done
 if [ \"\$failed\" -ne 0 ]; then echo \"\$failed stream(s) failed; no TOTAL row\" >&2; exit 1; fi
 wall=\$(echo \"\$end - \$start\" | bc -l)
 printf '$label\tTOTAL\twall=%.1fs\ttotal_fps=%.1f\tvram_before=%sMiB\tvram_peak=%sMiB\n' \$wall \$(echo \"\$tot / \$wall\" | bc -l) \$before \$peak
-echo '--- dmon (sm mem enc dec jpg ofa), steady-state rows (all samples)'
-awk 'NR>2 && \$1==0 {print}' /tmp/dmon.txt | awk '{s+=\$5; n++; if(\$5>m)m=\$5} END{printf \"dec util avg=%.0f%% max=%d%% (n=%d samples)\n\", s/n, m, n}'
+echo '--- dmon (sm mem enc dec jpg ofa), steady-state rows'
+awk 'NR>2 && \$1==0 {print}' /tmp/dmon.txt | head -40 | awk '{s+=\$5; n++; if(\$5>m)m=\$5} END{if(n==0) print \"dec util: no samples\"; else printf \"dec util avg=%.0f%% max=%d%% (n=%d samples)\\n\", s/n, m, n}'
 "

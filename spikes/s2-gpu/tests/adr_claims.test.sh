@@ -9,7 +9,7 @@ R="$S2/results"
 fails=0
 check() { local name=$1; shift; if "$@"; then echo "ok   $name"; else echo "FAIL $name"; fails=$((fails + 1)); fi; }
 
-shellcheck_clean() { (cd "$S2" && shellcheck -x ./*.sh tests/*.sh >/dev/null); }
+shellcheck_clean() { (cd "$S2" && shellcheck -x -P SCRIPTDIR ./*.sh tests/*.sh >/dev/null); }
 
 # Every onnxruntime-gpu version named in the ADR ORT table has a probe section in ort_probe.txt.
 ort_versions_have_raw_evidence() {

@@ -15,6 +15,7 @@ for m in yolov8n yolov8s yolo11n yolo11s; do
   for sz in 320 640; do
     [ -f ${m}_$sz.onnx ] && continue
     python -c "from ultralytics import YOLO; p=YOLO(\"$m.pt\").export(format=\"onnx\", imgsz=$sz, opset=19, simplify=True, dynamic=False, half=False); import os; os.replace(p, \"${m}_$sz.onnx\")"
+    rm -f $m.onnx.data
   done
 done
 sha256sum *.pt *.onnx | tee SHA256SUMS
