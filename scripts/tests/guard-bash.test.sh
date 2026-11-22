@@ -24,11 +24,14 @@ allow "git -C $tmp/onfeat push origin feat/x"
 allow "git -C $tmp/onfeat push"
 allow "git commit -m 'feat: add parser'"
 allow "git -C x commit -am wip"
-allow "gh pr merge 7 --squash --match-head-commit abc"
+allow "gh pr merge 7 --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+allow 'gh pr merge 7 --squash --match-head-commit="$sha"'
+allow 'gh pr merge 7 --squash --match-head-commit ${sha}'
+allow 'gh -R o/r pr merge 7 --squash --match-head-commit "$sha"'
 allow 'gh pr merge 7 --squash --delete-branch --match-head-commit "$sha"'
 allow 'sha=$(scripts/verify check 7) && gh pr merge 7 --squash --match-head-commit "$sha"'
 allow "gh api repos/o/r/issues/7/labels"
-allow "gh api -X POST repos/o/r/statuses/abc -f state=success"
+allow "gh api repos/o/r/commits/abc/statuses"
 allow "cargo test --workspace"
 allow "grep -rn -- '--no-verify' docs"
 allow "git log --grep 'gh pr merge --admin'"
@@ -99,6 +102,10 @@ deny  "git --config-env=core.hooksPath=X commit -m x"
 
 # --- gh ------------------------------------------------------------------
 deny  "gh pr merge 7 --squash"
+deny  "gh pr merge 7 --squash --match-head-commit abc"
+deny  'gh pr merge 7 --squash --match-head-commit $(git rev-parse HEAD)'
+deny  'gh pr merge 7 --squash --match-head-commit "$sha$x"'
+deny  "gh api -X POST repos/o/r/statuses/abc -f state=success"
 deny  "gh pr merge 3 --squash --delete-branch"
 deny  "gh pr merge 3 --auto --squash"
 deny  "gh pr merge 3 --admin --squash --match-head-commit abc"

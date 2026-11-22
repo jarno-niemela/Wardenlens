@@ -4,18 +4,30 @@
 #
 # How it works: heredoc bodies that feed a non-interpreter (file contents, PR bodies) are dropped, then
 # the command is tokenised quote-aware, split into simple commands at ; & | ( ) newline, and each `git`
-# / `gh` invocation is checked (git global options such as -C and -c are skipped). Quoted arguments of
-# shells and wrappers (bash -c '...', eval, xargs, sudo ...) and $(...) substitutions are scanned too.
+# / `gh` invocation is checked (git global options such as -C, -c and --git-dir are parsed; redirections
+# glued to a token are stripped). Quoted arguments of shells and wrappers (bash -c '...', eval, xargs,
+# sudo ...), $(...) substitutions and here-strings fed to a shell are scanned too. Heredoc detection
+# ignores << inside quotes, comments and arithmetic ((...)).
 #
-# Enforced: no force push (--force, -f, +refspec; --force-with-lease is fine), no --mirror/--all/--delete,
-# no push to main/master (also when on main with a bare `git push`), no hook bypass (--no-verify, commit -n,
-# core.hooksPath override), gh pr merge only with --match-head-commit and never --admin, no repo/issue
-# deletion, no gh api merge/DELETE-repos/branch-protection calls.
+# Enforced:
+#  - git push: no force (--force, -f, +refspec, also unambiguous abbreviations; --force-with-lease is
+#    fine), no --mirror/--all/--delete (also abbreviated), no push to main/master (HEAD and @ resolved
+#    through the current branch; heads/main; glob refspecs are refused), a bare push on main is refused,
+#    and a bare push whose directory/branch cannot be resolved is refused (fail closed).
+#  - no hook bypass: --no-verify, commit -n, core.hooksPath (-c, config, anything but .githooks),
+#    GIT_CONFIG_* assignments next to git, -c remote.*.push / alias.* overrides, and unknown git global
+#    options in front of push/commit/merge/rebase.
+#  - gh pr merge only with --match-head-commit <40-hex SHA or one $variable>, never --admin; no
+#    repo/issue deletion; gh api: no merges, no DELETE on repos, no branch-protection/ruleset changes,
+#    no writes to */statuses/* (forging verification; scripts/verify is the only writer and its internal
+#    calls are not inspected).
+#  - piping into a shell (`| bash`, `| sh -s`, `source /dev/stdin`) hides commands: blocked.
 #
-# Known limits (accepted): a forbidden command written as plain words inside an unquoted argument, e.g.
-# `echo git push --force`, or a forbidden string inside a separator-containing commit message, can be a
-# false positive. Indirection (variables, aliases, scripts) is not followed. Fails closed: if jq is
-# missing or the input is unreadable, the command is blocked.
+# Accepted limitations (see docs/adr/0001): code inside interpreter string literals (python3 -c,
+# perl -e, node -e, awk system(), ...), $'...' quoting, $(echo ...) / variable indirection, aliases and
+# scripts. A forbidden command written as plain words inside an unquoted argument, e.g.
+# `echo git push --force`, can be a false positive. Fails closed: if jq is missing or the input is
+# unreadable, the command is blocked.
 set -Eeuo pipefail
 trap 'echo "Blocked by .claude/hooks/guard-bash.sh: internal error (failing closed)" >&2; exit 2' ERR
 
@@ -23,15 +35,23 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "Blocked by .claude/hooks/guard-bash.sh: jq is required to inspect commands (failing closed)" >&2
   exit 2
 fi
-cmd=$(jq -r '.tool_input.command // ""') || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook input" >&2; exit 2; }
+input=$(cat) || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook input" >&2; exit 2; }
+cmd=$(jq -r '.tool_input.command // ""' <<<"$input") || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook input" >&2; exit 2; }
+cwd=$(jq -r '.cwd // ""' <<<"$input") || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook input" >&2; exit 2; }
+cwd_unknown=0
 
 block() { echo "Blocked by .claude/hooks/guard-bash.sh: $1" >&2; exit 2; }
 
 # Drop heredoc bodies unless the line opening them starts a shell/interpreter (then the body is code).
-# A here-string (<<<) and arithmetic shifts ($((1<<X))) are not heredocs.
+# Scans each line with quote, comment and arithmetic awareness so that << inside "...", '...', after an
+# unquoted #, or in $((...)) / ((...)) is not a heredoc, and <<< is a here-string. A delimiter that mixes
+# quoted and unquoted parts (<<EOF"X") is ambiguous: exit status 3.
 strip_heredocs() {
   awk '
-    BEGIN { interp = "(^|[ \t|;&(`\"/\047])(bash|sh|zsh|dash|ksh|eval|python[0-9.]*|perl|ruby|node|php)([ \t;&|)`\"\047]|$)" }
+    BEGIN {
+      interp = "(^|[ \t|;&(`\"/\047])(bash|sh|zsh|dash|ksh|eval|python[0-9.]*|perl|ruby|node|php)([ \t;&|)`\"\047]|$)"
+      q = ""; arith = 0; bad = 0; cs = 0
+    }
     in_doc {
       line = $0
       if (dash[cur]) sub(/^\t+/, "", line)
@@ -41,23 +61,60 @@ strip_heredocs() {
     }
     {
       print
-      t = $0
-      gsub(/\$\(\([^)]*\)\)/, "", t)
-      gsub(/<<</, "", t)
-      n = 0
-      while (match(t, /<<-?[ \t]*[\\"\047]?[A-Za-z_][A-Za-z0-9_]*["\047]?/)) {
-        op = substr(t, RSTART, RLENGTH)
-        t = substr(t, RSTART + RLENGTH)
-        d = (op ~ /^<<-/)
-        gsub(/^<<-?[ \t]*/, "", op); gsub(/[\\"\047]/, "", op)
-        n++; term[n] = op; dash[n] = d
+      line = $0; len = length(line); n = 0; prev = " "
+      for (i = 1; i <= len; i++) {
+        c = substr(line, i, 1)
+        if (q == "\047") { if (c == "\047") q = ""; prev = c; continue }
+        if (q == "\"") {
+          if (c == "\\") i++
+          else if (c == "\"") q = ""
+          else if (c == "$" && substr(line, i + 1, 1) == "(" && substr(line, i + 2, 1) != "(") {
+            cs++; save[cs] = "\""; pd[cs] = 1; q = ""; i++; prev = "("; continue   # $( inside "...": code again
+          }
+          prev = c; continue
+        }
+        if (arith > 0) {
+          if (c == "(") arith++
+          else if (c == ")") arith--
+          prev = c; continue
+        }
+        if (c == "\\") { i++; prev = "x"; continue }
+        if (cs > 0 && c == "(" && substr(line, i + 1, 1) != "(") pd[cs]++
+        else if (cs > 0 && c == ")") { pd[cs]--; if (pd[cs] == 0) { q = save[cs]; cs--; prev = ")"; continue } }
+        if (c == "\047" || c == "\"") { q = c; prev = c; continue }
+        if (c == "#" && (prev == " " || prev == "\t" || prev == ";" || prev == "&" || prev == "|" || prev == "(")) break
+        if (c == "(" && substr(line, i + 1, 1) == "(") { arith = 2; i++; prev = c; continue }
+        if (c == "<" && substr(line, i + 1, 1) == "<") {
+          if (substr(line, i + 2, 1) == "<") { i += 2; prev = "<"; continue }
+          j = i + 2; dashf = 0
+          if (substr(line, j, 1) == "-") { dashf = 1; j++ }
+          while (j <= len && (substr(line, j, 1) == " " || substr(line, j, 1) == "\t")) j++
+          tt = ""; quoted = 0; plain = 0
+          while (j <= len) {
+            d = substr(line, j, 1)
+            if (d == " " || d == "\t" || d == ";" || d == "&" || d == "|" || d == "(" || d == ")" || d == "<" || d == ">") break
+            if (d == "\047" || d == "\"") {
+              k = index(substr(line, j + 1), d)
+              if (k == 0) { tt = tt substr(line, j + 1); j = len + 1; quoted = 1; break }
+              tt = tt substr(line, j + 1, k - 1); j = j + k + 1; quoted = 1; continue
+            }
+            if (d == "\\") { tt = tt substr(line, j + 1, 1); j += 2; continue }
+            tt = tt d; plain = 1; j++
+          }
+          if (quoted && plain) bad = 1
+          if (tt != "") { n++; term[n] = tt; dash[n] = dashf }
+          i = j - 1; prev = "x"; continue
+        }
+        prev = c
       }
       if (n > 0) { in_doc = 1; cur = 1; keep_body = ($0 ~ interp) }
-    }' <<<"$1"
+    }
+    END { if (bad) exit 3 }' <<<"$1"
 }
 
 # Quote-aware tokeniser. Emits one line per token ("t"+text, or "q"+text if any part was quoted) and an
-# "s" line at every simple-command separator (; & | ( ) newline backtick). Unquoted # starts a comment.
+# "s" line at every simple-command separator (; & || ( ) newline backtick), "p" at a pipe (| or |&).
+# Unquoted # starts a comment.
 tokenize() {
   CMD=$1 awk '
     function flush() { if (intok) { print (quoted ? "q" : "t") tok }; tok = ""; intok = 0; quoted = 0 }
@@ -76,22 +133,65 @@ tokenize() {
         if (c == "\\") { if (i < len) { i++; if (substr(s, i, 1) != "\n") { tok = tok substr(s, i, 1); intok = 1 } } continue }
         if (c == "#" && !intok) { while (i < len && substr(s, i + 1, 1) != "\n") i++; continue }
         if (c == " " || c == "\t") { flush(); continue }
-        if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")" || c == "\n" || c == "`") { flush(); print "s"; continue }
+        if (c == "|") {
+          flush()
+          if (substr(s, i + 1, 1) == "|") { i++; print "s" }
+          else { if (substr(s, i + 1, 1) == "&") i++; print "p" }
+          continue
+        }
+        if (c == ";" || c == "&" || c == "(" || c == ")" || c == "\n" || c == "`") { flush(); print "s"; continue }
         tok = tok c; intok = 1
       }
       flush()
     }'
 }
 
-is_main_ref() {  # [+]src:dst | name | refs/heads/name -> true if the destination is main/master
+# --- path helpers -------------------------------------------------------------------------------
+
+expand_home() {  # print P with a leading ~, $HOME or ${HOME} expanded; fail if anything else is dynamic
+  local p=$1
+  # shellcheck disable=SC2016,SC2088  # matching the literal text ~ and $HOME, not expanding them
+  case "$p" in
+    "~"|"~/"*) p="${HOME:-}${p#"~"}" ;;
+    '$HOME'|'$HOME/'*) p="${HOME:-}${p#'$HOME'}" ;;
+    '${HOME}'|'${HOME}/'*) p="${HOME:-}${p#'${HOME}'}" ;;
+  esac
+  [[ -n "$p" && "$p" != *'$'* && "$p" != *'`'* && "$p" != "~"* ]] || return 1
+  printf '%s' "$p"
+}
+
+track_cd() {  # cd/pushd in the current segment: follow it so a later bare push is checked in the right place
+  local k=1 tgt new
+  while [[ "${seg_t[k]:-}" == -[PLe@] || "${seg_t[k]:-}" == -- ]]; do k=$((k + 1)); done
+  tgt=${seg_t[k]:-'~'}
+  if [[ "$tgt" == - ]]; then cwd_unknown=1; return 0; fi
+  if ! new=$(expand_home "$tgt"); then cwd_unknown=1; return 0; fi
+  if [[ "$new" == /* ]]; then cwd=$new; cwd_unknown=0; else cwd=${cwd:-.}/$new; fi
+}
+
+branch_of() {  # branch_of DIR GITDIR UNKNOWN: print the current branch, or block if it cannot be determined
+  local d=$1 gd=$2 unk=$3 out gdx
+  if ((unk)); then block "cannot resolve the repository directory of this git command (use a plain path in cd / -C)"; fi
+  if [[ -n "$gd" ]]; then
+    gdx=$(expand_home "$gd") || block "cannot resolve --git-dir '$gd'"
+    out=$(git -C "$d" --git-dir="$gdx" branch --show-current 2>/dev/null) || block "cannot determine the current branch (git failed in '$d')"
+  else
+    out=$(git -C "$d" branch --show-current 2>/dev/null) || block "cannot determine the current branch (git failed in '$d')"
+  fi
+  printf '%s' "$out"
+}
+
+# --- git ----------------------------------------------------------------------------------------
+
+is_main_ref() {  # [+]src:dst | name | refs/heads/name | heads/name -> true if the destination is main/master
   local r=${1#+}
-  r=${r##*:}; r=${r#refs/heads/}
+  r=${r##*:}; r=${r#refs/}; r=${r#heads/}
   [[ "$r" == main || "$r" == master ]]
 }
 
-current_branch() {  # current_branch DIR
-  local d=${1:-.}
-  git -C "$d" branch --show-current 2>/dev/null || true
+bad_cfg() {  # true for config overrides that bypass hooks or redirect pushes
+  local s=${1,,}
+  [[ "$s" == *core.hookspath* || "$s" == *remote.*.push=* || "$s" == *alias.*=* ]]
 }
 
 check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flags consume the next token
@@ -111,66 +211,135 @@ check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flag
   return 0
 }
 
-check_push() {  # check_push DIR args...
-  local dir=$1; shift
+check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks; never unset
+  local a key="" val="" have_val=0 np=0 unset_=0 skip=0
   local -a pos=()
-  local skip=0 a
   for a in "$@"; do
     if ((skip)); then skip=0; continue; fi
     case "$a" in
-      --force|--for|--forc) block "force push is not allowed (use --force-with-lease on your own feature branch)" ;;
-      --force-with-lease*|--force-if-includes) ;;
-      --mirror) block "git push --mirror is not allowed" ;;
-      --all) block "git push --all would include main; push the branch explicitly" ;;
-      --delete) block "deleting remote branches requires the user" ;;
-      --repo|--receive-pack|--exec|--push-option) skip=1 ;;
-      --*) ;;
+      --unset|--unset-all) unset_=1 ;;
+      -f|--file|--blob|--default|--type) skip=1 ;;
+      -*) ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+  if [[ "${pos[0]:-}" == set || "${pos[0]:-}" == unset ]]; then
+    [[ "${pos[0]}" == unset ]] && unset_=1 || true
+    pos=("${pos[@]:1}")
+  fi
+  np=${#pos[@]}
+  ((np > 0)) && key=${pos[0],,} || true
+  ((np > 1)) && { val=${pos[1]}; have_val=1; } || true
+  if [[ "$key" == core.hookspath ]]; then
+    ((unset_)) && block "unsetting core.hooksPath bypasses the git hooks" || true
+    if ((have_val)); then
+      [[ "$val" == .githooks ]] || block "core.hooksPath may only be set to .githooks"
+    fi
+  fi
+  if ((have_val || unset_)); then
+    [[ "$key" == remote.*.push || "$key" == alias.* ]] && block "changing $key can redirect pushes or hide commands" || true
+  fi
+  return 0
+}
+
+check_push() {  # check_push DIR GITDIR UNKNOWN args...
+  local d=$1 gd=$2 unk=$3; shift 3
+  local -a pos=()
+  local skip=0 end=0 a name r dst cur i
+  for a in "$@"; do
+    if ((skip)); then skip=0; continue; fi
+    [[ "$a" == +* ]] && block "force push (+refspec) is not allowed" || true
+    if ((end)); then pos+=("$a"); continue; fi
+    case "$a" in
+      --) end=1 ;;
+      --*)
+        name=${a%%=*}
+        case "$name" in
+          --force-with-lease|--force-if-includes) continue ;;
+          --repo|--receive-pack|--exec|--push-option) [[ "$a" == *=* ]] || skip=1; continue ;;
+        esac
+        # git accepts any unambiguous prefix of a long option; refuse every prefix of the dangerous ones
+        if ((${#name} >= 3)); then
+          [[ "--force" == "$name"* ]] && block "force push is not allowed (use --force-with-lease on your own feature branch)" || true
+          [[ "--mirror" == "$name"* ]] && block "git push --mirror is not allowed" || true
+          [[ "--all" == "$name"* ]] && block "git push --all would include main; push the branch explicitly" || true
+          [[ "--delete" == "$name"* ]] && block "deleting remote branches requires the user" || true
+        fi ;;
       -o) skip=1 ;;
       -[a-zA-Z]*)
         if [[ "$a" =~ ^-[a-zA-Z]+$ ]]; then
           [[ "$a" == *f* ]] && block "force push is not allowed (use --force-with-lease on your own feature branch)" || true
           [[ "$a" == *d* ]] && block "deleting remote branches requires the user" || true
         fi ;;
-      +*) block "force push (+refspec) is not allowed" ;;
       *) pos+=("$a") ;;
     esac
   done
-  local i cur=""
   for ((i = 1; i < ${#pos[@]}; i++)); do
-    if [[ "${pos[i]}" == HEAD || "${pos[i]#+}" == HEAD ]]; then
-      cur=$(current_branch "$dir")
-      [[ "$cur" == main || "$cur" == master ]] && block "HEAD is main; create a feature branch first" || true
+    r=${pos[i]#+}; dst=${r##*:}
+    [[ "$dst" == *'*'* ]] && block "glob refspecs can push main; name the branch explicitly" || true
+    if [[ "$r" == HEAD || "$r" == @ ]]; then
+      cur=$(branch_of "$d" "$gd" "$unk") || exit 2
+      [[ "$cur" == main || "$cur" == master ]] && block "HEAD is $cur; create a feature branch first" || true
     fi
     is_main_ref "${pos[i]}" && block "never push to main; open a PR"
   done
   if ((${#pos[@]} < 2)); then  # bare push: pushes the current branch
-    cur=$(current_branch "$dir")
+    cur=$(branch_of "$d" "$gd" "$unk") || exit 2
     [[ "$cur" == main || "$cur" == master ]] && block "current branch is $cur; create a feature branch first" || true
   fi
   return 0
 }
 
-check_git() {  # check_git INDEX ; reads seg_t, cwd
-  local j=$(($1 + 1)) n=${#seg_t[@]} dir="" opt val
+check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
+  local idx=$1 j=$(($1 + 1)) n=${#seg_t[@]} opt val k tok
+  local d=${cwd:-.} unk=$cwd_unknown gd=""
+  for ((k = 0; k < idx; k++)); do
+    if [[ "${seg_t[k]}" == GIT_DIR=* ]]; then gd=${seg_t[k]#GIT_DIR=}; fi
+  done
   while ((j < n)); do
     opt=${seg_t[j]}
-    [[ "${opt,,}" == *core.hookspath* ]] && block "overriding core.hooksPath bypasses the git hooks" || true
+    if bad_cfg "$opt"; then block "overriding core.hooksPath / remote push / aliases through git options is not allowed"; fi
     case "$opt" in
-      -C) dir=${seg_t[j + 1]:-}; j=$((j + 2)) ;;
+      -C)
+        val=${seg_t[j + 1]:-}
+        if tok=$(expand_home "$val"); then
+          if [[ "$tok" == /* ]]; then d=$tok; else d=$d/$tok; fi
+        else unk=1; fi
+        j=$((j + 2)) ;;
       -c|--config-env)
         val=${seg_t[j + 1]:-}
-        [[ "${val,,}" == *core.hookspath* ]] && block "overriding core.hooksPath bypasses the git hooks" || true
+        if bad_cfg "$val"; then block "overriding core.hooksPath / remote push / aliases through git -c is not allowed"; fi
         j=$((j + 2)) ;;
-      --git-dir|--work-tree|--namespace|--exec-path|--super-prefix) j=$((j + 2)) ;;
-      --*=*|--no-pager|--paginate|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|-p|-P|-c?*) j=$((j + 1)) ;;
+      --git-dir) gd=${seg_t[j + 1]:-}; j=$((j + 2)) ;;
+      --git-dir=*) gd=${opt#--git-dir=}; j=$((j + 1)) ;;
+      --work-tree|--namespace|--super-prefix|--attr-source) j=$((j + 2)) ;;
+      --work-tree=*|--namespace=*|--super-prefix=*|--attr-source=*|--config-env=*|--exec-path=*) j=$((j + 1)) ;;
+      --exec-path|--no-pager|--paginate|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|--no-lazy-fetch|-p|-P|-c?*) j=$((j + 1)) ;;
+      --*)
+        for ((k = j + 1; k < n; k++)); do
+          case "${seg_t[k]}" in
+            push|commit|merge|rebase) block "unknown git global option '$opt' before ${seg_t[k]}; remove it so the command can be checked" ;;
+          esac
+        done
+        return 0 ;;
       *) break ;;
     esac
   done
   ((j < n)) || return 0
   local sub=${seg_t[j]}
-  local -a args=("${seg_t[@]:j+1}")
-  local d=${dir:-${cwd:-.}}
-  [[ -n "$dir" && "$dir" != /* && -n "${cwd:-}" ]] && d=$cwd/$dir || true
+  # arguments with unquoted redirections removed (a glued `main>/dev/null` is just `main`)
+  local -a args=()
+  local skipnext=0
+  for ((k = j + 1; k < n; k++)); do
+    tok=${seg_t[k]}
+    if ((skipnext)); then skipnext=0; continue; fi
+    if [[ "${seg_q[k]}" == t ]]; then
+      if [[ "$tok" =~ ^([0-9]*|\&)(\>\>?|\<)$ ]]; then skipnext=1; continue; fi
+      if [[ "$tok" =~ ^([0-9]*|\&)(\>|\<) ]]; then continue; fi
+      if [[ "$tok" == *[\<\>]* ]]; then tok=${tok%%[<>]*}; [[ -n "$tok" ]] || continue; fi
+    fi
+    args+=("$tok")
+  done
   case "$sub" in
     commit|push|merge|rebase|pull|am|cherry-pick|revert)
       if [[ "$sub" != commit ]]; then
@@ -180,77 +349,174 @@ check_git() {  # check_git INDEX ; reads seg_t, cwd
         done
       fi ;;&
     commit) check_commit_flags "${args[@]}" ;;
-    push) check_push "$d" "${args[@]}" ;;
+    push) check_push "$d" "$gd" "$unk" "${args[@]}" ;;
+    config) check_config "${args[@]}" ;;
   esac
 }
 
+# --- gh -----------------------------------------------------------------------------------------
+
+valid_head_val() {  # a 40-hex SHA or a single shell variable reference
+  [[ "$1" =~ ^[0-9a-f]{40}$ || "$1" =~ ^\$[A-Za-z_][A-Za-z0-9_]*$ || "$1" =~ ^\$\{[A-Za-z_][A-Za-z0-9_]*\}$ ]]
+}
+
 check_gh() {  # check_gh INDEX ; reads seg_t
-  local n=${#seg_t[@]} i a1="" a2="" a3="" a
-  local -a args=("${seg_t[@]:$1+1}")
-  for a in "${args[@]}"; do
-    [[ "$a" == -* ]] && continue || true
-    if [[ -z "$a1" ]]; then a1=$a; elif [[ -z "$a2" ]]; then a2=$a; elif [[ -z "$a3" ]]; then a3=$a; fi
+  local n=${#seg_t[@]} k a a1="" a2="" skip=0 idx1=-1
+  for ((k = $1 + 1; k < n; k++)); do
+    a=${seg_t[k]}
+    if ((skip)); then skip=0; continue; fi
+    case "$a" in
+      -R|--repo) skip=1; continue ;;
+      -*) continue ;;
+    esac
+    if [[ -z "$a1" ]]; then a1=$a; idx1=$k; elif [[ -z "$a2" ]]; then a2=$a; fi
   done
   case "$a1 $a2" in
     "pr merge")
-      local have=0
-      for a in "${args[@]}"; do
+      local have=0 want=0
+      for ((k = idx1 + 1; k < n; k++)); do
+        a=${seg_t[k]}
         [[ "$a" == --admin ]] && block "--admin bypasses required checks" || true
-        [[ "$a" == --match-head-commit || "$a" == --match-head-commit=* || "$a" == --disable-auto ]] && have=1 || true
+        if ((want)); then
+          want=0
+          if valid_head_val "$a"; then have=1; else block "--match-head-commit needs a 40-hex SHA or one \$variable (sha=\$(scripts/verify check PR))"; fi
+          continue
+        fi
+        case "$a" in
+          --match-head-commit) want=1 ;;
+          --match-head-commit=*)
+            if valid_head_val "${a#--match-head-commit=}"; then have=1; else block "--match-head-commit needs a 40-hex SHA or one \$variable (sha=\$(scripts/verify check PR))"; fi ;;
+          --disable-auto) have=1 ;;
+        esac
       done
-      ((have)) || block "gh pr merge needs --match-head-commit \$(scripts/verify check PR) so only the verified SHA merges" ;;
+      ((have)) || block "gh pr merge needs --match-head-commit \"\$sha\" with sha=\$(scripts/verify check PR) so only the verified SHA merges" ;;
     "repo delete"|"issue delete") block "deleting repos/issues requires the user" ;;
     "api "*)
-      local method="" ep="" prev=""
-      for a in "${args[@]:1}"; do
+      local method="" ep="" prev="" haswrite=0
+      for ((k = idx1 + 1; k < n; k++)); do
+        a=${seg_t[k]}
         case "$a" in
           *mergePullRequest*|*enablePullRequestAutoMerge*) block "merging through the API bypasses the verification gate" ;;
         esac
-        case "$prev" in
-          -X|--method) method=$a; prev=""; continue ;;
-          -f|-F|-H|-q|-t|--field|--raw-field|--header|--jq|--template|--input|--hostname|--cache|--preview|-p) prev=""; continue ;;
-        esac
+        if [[ -n "$prev" ]]; then
+          case "$prev" in -X|--method) method=$a ;; esac
+          prev=""; continue
+        fi
         case "$a" in
-          -X?*) method=${a#-X}; continue ;;
-          --method=*) method=${a#--method=}; continue ;;
-          -*) prev=$a; continue ;;
+          -X|--method) prev=$a ;;
+          -X=*) method=${a#-X=} ;;
+          -X?*) method=${a#-X} ;;
+          --method=*) method=${a#--method=} ;;
+          -f|-F|--field|--raw-field|--input) haswrite=1; prev=$a ;;
+          -f?*|-F?*|--field=*|--raw-field=*|--input=*) haswrite=1 ;;
+          -H|--header|-q|--jq|-t|--template|--hostname|--cache|--preview|-p) prev=$a ;;
+          -*) ;;
+          *) [[ -z "$ep" ]] && ep=$a || true ;;
         esac
-        if [[ -z "$ep" ]]; then ep=$a; fi
       done
-      method=${method^^}; ep=${ep#/}
+      method=${method#=}; method=${method^^}
+      if [[ -z "$method" ]]; then if ((haswrite)); then method=POST; else method=GET; fi; fi
+      ep=${ep#https://api.github.com/}; ep=${ep#http://api.github.com/}; ep=${ep#/}; ep=${ep%%\?*}; ep=${ep%%#*}; ep=${ep,,}
       case "$ep" in
         */merge|*/merge/*|*/merges) block "merging through the API bypasses the verification gate" ;;
       esac
-      [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
-      [[ "$ep" == */branches/*/protection* && "$method" != GET && -n "$method" ]] && block "changing branch protection requires the user" || true
-      [[ "$ep" == */rulesets* && "$method" != GET && -n "$method" ]] && block "changing rulesets requires the user" || true ;;
+      if [[ "$method" != GET && "$method" != HEAD ]]; then
+        [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
+        case "$ep" in
+          */branches/*/protection*) block "changing branch protection requires the user" ;;
+          */rulesets*) block "changing rulesets requires the user" ;;
+          */statuses|*/statuses/*) block "writing commit statuses forges verification; scripts/verify is the only writer" ;;
+          */git/refs/heads/main*|*/git/refs/heads/master*) block "writing main/master refs through the API requires the user" ;;
+        esac
+      fi ;;
   esac
   return 0
 }
 
-WRAPPERS=" bash sh zsh dash ksh eval xargs sudo env timeout nohup time exec watch ssh command builtin setsid nice python python3 perl ruby node "
+# --- scanning -----------------------------------------------------------------------------------
 
-scan() {  # scan TEXT DEPTH
-  local text=$1 depth=$2 line kind
-  local -a seg_t=() seg_q=()
-  local code
-  code=$(strip_heredocs "$text")
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    kind=${line:0:1}
-    if [[ "$kind" == s ]]; then check_segment "$depth"; seg_t=(); seg_q=(); else seg_t+=("${line:1}"); seg_q+=("$kind"); fi
-  done < <(tokenize "$code")
-  check_segment "$depth"
+WRAPPERS=" bash sh zsh dash ksh eval xargs sudo env timeout nohup time exec watch ssh command builtin setsid nice python python3 perl ruby node "
+SHELLS=" bash sh zsh dash ksh ash csh tcsh fish "
+PIPE_MSG="piping into a shell hides commands; write a script file and run that"
+
+check_pipe_target() {  # the segment after a | must not start a shell
+  local k t base n=${#seg_t[@]}
+  for ((k = 0; k < n; k++)); do
+    t=${seg_t[k]}
+    if [[ "$t" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then continue; fi
+    base=${t##*/}
+    case "$base" in env|sudo|exec|command|nohup|time|nice|setsid|builtin|stdbuf|timeout|'{'|'!'|-*) continue ;; esac
+    if [[ "$SHELLS" == *" $base "* ]]; then
+      # a script file or -c string argument means stdin is not the program (-s says it is)
+      local m has_script=0 has_s=0
+      for ((m = k + 1; m < n; m++)); do
+        case "${seg_t[m]}" in
+          -s) has_s=1 ;;
+          -*) ;;
+          /dev/stdin|/dev/fd/0|/proc/self/fd/0) ;;
+          *) has_script=1; break ;;
+        esac
+      done
+      if ((has_s || !has_script)); then block "$PIPE_MSG"; fi
+    fi
+    break
+  done
 }
 
-check_segment() {
-  local depth=$1 n=${#seg_t[@]} i t wrapped=0
+check_stdin_source() {  # source /dev/stdin, bash /dev/stdin ...
+  local k t n=${#seg_t[@]} seen=0
+  for ((k = 0; k < n; k++)); do
+    t=${seg_t[k]}
+    case "$t" in
+      /dev/stdin|/dev/fd/0|/proc/self/fd/0) if ((seen)); then block "$PIPE_MSG"; fi ;;
+      source|.) seen=1 ;;
+      *) if [[ "$SHELLS" == *" ${t##*/} "* ]]; then seen=1; fi ;;
+    esac
+  done
+}
+
+check_git_env() {  # GIT_CONFIG_* assignments in a segment that runs git inject config (hooks, pushes)
+  local t has_git=0 bad=0
+  for t in "${seg_t[@]}"; do
+    case "$t" in git|*/bin/git) has_git=1 ;; esac
+    if [[ "$t" =~ ^GIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+|PARAMETERS)= ]]; then bad=1; fi
+  done
+  if ((has_git && bad)); then block "GIT_CONFIG_* environment overrides git config (hooks, pushes) and is not allowed"; fi
+  return 0
+}
+
+scan() {  # scan TEXT DEPTH
+  local text=$1 depth=$2 line kind code had pending=0
+  local -a seg_t=() seg_q=()
+  if ! code=$(strip_heredocs "$text"); then
+    block "ambiguous heredoc delimiter (mixed quoted and unquoted parts); use a plain <<'EOF'"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    kind=${line:0:1}
+    if [[ "$kind" == s || "$kind" == p ]]; then
+      had=${#seg_t[@]}
+      check_segment "$depth" "$pending"
+      seg_t=(); seg_q=()
+      if [[ "$kind" == p ]]; then pending=1; elif ((had > 0)); then pending=0; fi
+    else
+      seg_t+=("${line:1}"); seg_q+=("$kind")
+    fi
+  done < <(tokenize "$code")
+  check_segment "$depth" "$pending"
+}
+
+check_segment() {  # check_segment DEPTH PIPED ; reads seg_t, seg_q
+  local depth=$1 piped=$2 n=${#seg_t[@]} i t wrapped=0
   ((n > 0)) || return 0
-  if [[ "${seg_t[0]}" == cd && n -ge 2 ]]; then cwd=${seg_t[1]}; fi
+  case "${seg_t[0]}" in cd|pushd) track_cd ;; esac
+  if ((piped)); then check_pipe_target; fi
+  check_stdin_source
+  check_git_env
   for ((i = 0; i < n; i++)); do
     t=${seg_t[i]}
     if [[ "${seg_q[i]}" == q && "$depth" -lt 4 ]]; then
       # shellcheck disable=SC2016  # matching the literal text $(
-      if ((wrapped)) || [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "$t" $((depth + 1)); fi
+      if ((wrapped)) || [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "${t#<<<}" $((depth + 1)); fi
     fi
     case "$t" in
       git|*/bin/git) check_git "$i" ;;
@@ -261,7 +527,5 @@ check_segment() {
   return 0
 }
 
-cwd=""
 scan "$cmd" 0
 exit 0
-
