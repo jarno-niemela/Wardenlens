@@ -5,7 +5,7 @@
 # shellcheck disable=SC2016  # inner bash -c scripts expand in the clone, not here
 set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-hooks=$root/.githooks
+hooks=${HOOKS:-$root/.githooks}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 fail=0; n=0
 unset GIT_DIR GIT_WORK_TREE WARDENLENS_ALLOW_REWRITE GIT_CONFIG_PARAMETERS

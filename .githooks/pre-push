@@ -10,14 +10,29 @@
 #   - any deletion (deleting remote branches requires the user)
 #   - a remote sha not present locally (unknown remote state; fetch first)
 #   - a non-fast-forward update (force push)
-# Exception: a non-fast-forward update of a refs/heads/* branch other than main/master is allowed when
-# WARDENLENS_ALLOW_REWRITE=1, because `--force-with-lease` on your own feature branch is legitimate and
-# a pre-push hook cannot tell it from `--force`. Agents never set it (the Bash guard denies it).
+#   - commits that change any file under .github/workflows/ (workflows are privileged: a PR could
+#     redefine the CI check). The commits examined are remote_sha..local_sha, or for a new remote ref
+#     the commits not already on any remote-tracking ref (git rev-list local_sha --not --remotes).
+# Exceptions (human-only; the Bash guard denies agents setting either name):
+#   - a non-fast-forward update of a refs/heads/* branch other than main/master is allowed when
+#     WARDENLENS_ALLOW_REWRITE=1, because `--force-with-lease` on your own feature branch is legitimate
+#     and a pre-push hook cannot tell it from `--force`.
+#   - a push that changes .github/workflows/ is allowed when WARDENLENS_ALLOW_WORKFLOWS=1.
 # Enable with: git config core.hooksPath .githooks
 set -euo pipefail
 
 is_zero() { [[ "$1" =~ ^0+$ ]]; }
 refuse() { echo "pre-push: refused: $1 ($2)" >&2; exit 1; }
+
+# workflow_files LSHA RSHA: print the paths under .github/workflows/ touched by the pushed commits
+workflow_files() {
+  local lsha=$1 rsha=$2
+  if is_zero "$rsha"; then
+    git log --full-history -m --no-renames --format= --name-only "$lsha" --not --remotes -- ':(top).github/workflows'
+  else
+    git log --full-history -m --no-renames --format= --name-only "$rsha..$lsha" -- ':(top).github/workflows'
+  fi
+}
 
 while read -r lref lsha rref rsha; do
   case "$rref" in
@@ -35,6 +50,14 @@ while read -r lref lsha rref rsha; do
       else
         refuse "non-fast-forward / force push" "$rref"
       fi
+    fi
+  fi
+  wf=$(workflow_files "$lsha" "$rsha" 2>/dev/null) || refuse "cannot inspect the pushed commits for workflow changes" "$rref"
+  if [[ -n "$wf" ]]; then
+    if [[ "${WARDENLENS_ALLOW_WORKFLOWS:-}" == 1 ]]; then
+      echo "pre-push: WARNING: pushing changes to .github/workflows/ (WARDENLENS_ALLOW_WORKFLOWS=1)" >&2
+    else
+      refuse "changes to .github/workflows/ need the user (WARDENLENS_ALLOW_WORKFLOWS=1, human only)" "$rref: $(head -n1 <<<"$wf")"
     fi
   fi
 done

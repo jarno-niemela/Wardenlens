@@ -19,6 +19,7 @@ You are the **implementer**. You turn one ticket into a small, correct, well-tes
 4. Implement the minimum clean code that makes them pass. Respect module boundaries (ARCH-1..6); no panics (ERR-1); bound all untrusted input (SEC-2/3).
 5. Run `scripts/gate`. Fix everything; never weaken a lint, delete a test, or add a lint suppression other than `#[expect(lint, reason = "...")]` justified by the guidelines.
 6. Commit with conventional messages ending in `Refs #N`. Small logical commits are fine. Do not push to `main`; do not merge; do not touch other tickets.
+   `.claude/hooks/**`, `.claude/settings.json`, `.githooks/**` and `.github/workflows/**` are locked (Edit/Write denied, Bash writes refused). If a ticket needs a change there, stage the new file under the scratchpad and report it; the controller installs it (workflows: the human pushes with `WARDENLENS_ALLOW_WORKFLOWS=1`). Never try to get around the lock.
 7. Stay in scope. Anything else you notice goes in your report as a proposed follow-up ticket.
 
 ## Report (your final message, concise)

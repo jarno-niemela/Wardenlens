@@ -58,7 +58,17 @@ We need durable state, independent verification and neglect detection.
     `.claude/settings*.json`, shell rc files); `git apply` and `patch` are denied outright because
     their patches cannot be inspected, and a read such as `cp .githooks/x /tmp/y` is a known false
     positive. The enforcement files are additionally protected by `permissions.deny` on the Edit
-    and Write tools; the guard is best effort throughout.
+    and Write tools; the guard is best effort throughout;
+  - `git checkout <rev> -- .` and `git reset --hard <old>` can restore an older committed hook;
+    accepted because any older committed hook still refuses main and verification is SHA-bound;
+  - variable indirection in git options (`git ${x}>...`), and `find -path <protected> ... -delete`
+    style writes whose target is only reachable through patterns; a read-only `find -exec` of a
+    command outside the guard's short read-only list (grep, cat, ls, ...) is a false positive;
+  - workflows (`.github/workflows/`) are privileged files: the guard and `permissions.deny` block
+    writes, `gh workflow run --ref <non-main>` and `gh api` writes to `actions/*` and
+    `environments*`, and the pre-push hook refuses pushes whose commits change them unless a human
+    sets `WARDENLENS_ALLOW_WORKFLOWS=1`. A new remote branch is judged against the commits not on any
+    remote-tracking ref, so a push by URL with no remote configured examines the whole history.
 - **Neglect detection**: `scripts/ticket-audit` (pure jq rules with offline tests)
   runs every `/work` iteration and daily in CI.
 - **Tooling in bash + jq** for bootstrap; a Rust port is tracked as a ticket.

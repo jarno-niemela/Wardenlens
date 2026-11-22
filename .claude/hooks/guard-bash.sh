@@ -5,41 +5,51 @@
 # How it works: heredoc bodies that feed a non-interpreter (file contents, PR bodies) are dropped, then
 # the command is tokenised quote-aware, split into simple commands at ; & | ( ) newline, and each `git`
 # / `gh` invocation is checked (git global options such as -C, -c and --git-dir are parsed).
-# Redirections (N>, >>, >|, &>, <>, >&, <<<; glued or not) are split off and removed from the segment before
-# analysis; their targets are kept for the tamper check. Quoted arguments of shells and wrappers (bash -c '...', eval, xargs,
-# sudo ...), $(...) substitutions and here-strings fed to a shell are scanned too. Heredoc detection
-# ignores << inside quotes, comments and arithmetic ((...)).
+# Redirections (N>, {name}>, >>, >|, &>, <>, >&, <<<; glued or not) are split off and removed from the
+# segment before analysis; their targets are kept for the tamper check. Quoted arguments of shells and
+# wrappers (bash -c '...', eval, xargs, sudo ...), $(...) substitutions and here-strings fed to a shell
+# are scanned too. Heredoc detection ignores << inside quotes, comments and arithmetic ((...)).
 #
 # Enforced:
 #  - git push: no force (--force, -f, +refspec, also unambiguous abbreviations; --force-with-lease is
-#    fine), no --mirror/--all/--delete (also abbreviated), no push to main/master (HEAD and @ resolved
-#    through the current branch; heads/main; glob refspecs are refused), a bare push on main is refused,
-#    and a bare push whose directory/branch cannot be resolved is refused (fail closed).
-#    An empty-source refspec (`:dst` deletion, `:` matching push) is refused.
+#    fine except aimed at a tag), no --mirror/--all/--delete (also abbreviated), no push to main/master
+#    (HEAD and @ resolved through the current branch; heads/main; glob refspecs are refused), a bare push
+#    on main is refused, and a bare push whose directory/branch cannot be resolved is refused (fail
+#    closed). An empty-source refspec (`:dst` deletion, `:` matching push) is refused. A push is refused
+#    when <toplevel>/.githooks/pre-push is missing or not executable (known directory only).
 #  - no hook bypass: --no-verify, commit -n, core.hooksPath (-c, config, anything but .githooks),
 #    GIT_CONFIG_* assignments next to git, config keys remote.*.mirror, push.default, remote.*.push,
-#    alias.*, core.hooksPath, include.path, includeIf.* (in -c, git config, --config-env; also
-#    removing/renaming the core section), and unknown git global options in front of
+#    alias.*, core.hooksPath, core.editor, sequence.editor, include.path, includeIf.* (in -c, git config,
+#    --config-env; also removing/renaming the core section), `git config -e/--edit`, GIT_EDITOR / EDITOR /
+#    VISUAL / GIT_SEQUENCE_EDITOR assignments in front of git, and unknown git global options in front of
 #    push/commit/merge/rebase.
-#  - any assignment or export of WARDENLENS_ALLOW_REWRITE (the human-only switch of .githooks/pre-push).
+#  - any assignment or export of WARDENLENS_ALLOW_REWRITE or WARDENLENS_ALLOW_WORKFLOWS (the human-only
+#    switches of .githooks/pre-push).
 #  - directory tracking fails closed: only a cd/pushd that is the very first command of the whole input
 #    is followed. Any other cd/pushd/popd (later, in a subshell, pipeline, background job, backticks,
 #    nested shell scan, if/{/case body), `env -C`, and GIT_DIR/GIT_WORK_TREE assignments make the
 #    working directory unknown, and a bare push with an unknown directory is refused.
 #  - gh pr merge only with --match-head-commit <40-hex SHA or one $variable>, never --admin; no
-#    repo/issue deletion; gh api: no merges, no DELETE on repos, no branch-protection/ruleset changes,
-#    no writes to */statuses/* (forging verification; scripts/verify is the only writer and its internal
-#    calls are not inspected), no write to a percent-encoded endpoint, a contents write
-#    needs an explicit branch= field that is not main/master (and never --input), and no GraphQL
-#    mutation (reading through graphql is fine).
+#    repo/issue deletion; gh workflow run only on main; gh api: no merges, no DELETE on repos, no
+#    branch-protection/ruleset changes, no writes to */statuses/* (forging verification; scripts/verify
+#    is the only writer and its internal calls are not inspected), no writes to */actions/* (workflow
+#    dispatches, runs) or */environments*, no write to a percent-encoded endpoint, a contents write needs
+#    an explicit `branch` field (exact spelling) that is not main/master/@file (and never --input), and
+#    no GraphQL mutation (reading through graphql is fine).
 #  - tamper protection: a redirect (any form), tee, cp, mv, install, ln, rm, unlink, chmod, chown, truncate,
 #    dd, touch, rsync, sed -i, perl -i, find -delete/-exec, or git checkout/restore aimed at anything
-#    under .git/, .githooks/, .claude/hooks/, .claude/settings(.local).json, ~/.bashrc, ~/.profile,
-#    ~/.bash_profile, ~/.bash_login or ~/.config/systemd/user/ is refused. Paths are resolved against
-#    the tracked directory (// and /./ and .. normalised); when the directory is unknown, a relative
-#    target named config, pre-push, settings.json, .bashrc ... is refused. git apply and patch are
-#    refused (the patch cannot be inspected), as are extensions.worktreeConfig and git config
-#    --worktree writes. Reading with a writer word (cp .githooks/x /tmp/y) is a known false positive.
+#    under .git/, .githooks/, .github/workflows/, .claude/hooks/, .claude/settings(.local).json, ~/.bashrc,
+#    ~/.profile, ~/.bash_profile, ~/.bash_login or ~/.config/systemd/user/ is refused. rm, mv, chmod,
+#    chown and find -delete/-exec are also refused when a target is an ANCESTOR of such a path (.claude,
+#    .github, the repository root and its parents, ~/.config, ~/.config/systemd, ~, /); cp, install, ln
+#    and rsync when the DESTINATION is such a directory. find -exec of a read-only command (grep, cat,
+#    ...) is not a writer; `find . -name PATTERN -delete` is allowed at the repository root when the
+#    pattern matches no protected name. Paths are resolved against the tracked directory (// and /./ and
+#    .. normalised); when the directory is unknown, a relative target named config, pre-push,
+#    settings.json, rustfmt.sh, .claude, .github ... is refused. git apply and patch are refused (the
+#    patch cannot be inspected), as are extensions.worktreeConfig and git config --worktree writes.
+#    Reading with a writer word (cp .githooks/x /tmp/y) is a known false positive, as is
+#    `find -path .git ...` with a writer. rsync --exclude values are patterns and ignored.
 #  - piping into a shell (`| bash`, `| sh -s`, `source /dev/stdin`) hides commands: blocked.
 #
 # The authoritative push control is .githooks/pre-push; this guard is the first, best-effort line.
@@ -48,9 +58,9 @@
 # scripts, pipes into shells through wrappers with arguments (timeout, sudo -u, nice, busybox,
 # tee >(...)), xargs ... git, git under other paths (/usr/lib/git-core/git*), brace expansion, heredoc
 # logical-line edge cases (<<EOF \, quotes spanning lines), ${x//<<X/}, and GIT_CONFIG_* exported in
-# an earlier segment. A forbidden command written as plain words inside an unquoted argument, e.g.
-# `echo git push --force`, can be a false positive. Fails closed: if jq is missing or the input is
-# unreadable, the command is blocked.
+# an earlier segment, `git checkout <rev> -- .` and `git reset --hard <old>`. A forbidden command
+# written as plain words inside an unquoted argument, e.g. `echo git push --force`, can be a false
+# positive. Fails closed: if jq is missing or the input is unreadable, the command is blocked.
 set -Eeuo pipefail
 export LC_ALL=C   # ASCII-only [0-9], [a-z] in every pattern below
 trap 'echo "Blocked by .claude/hooks/guard-bash.sh: internal error (failing closed)" >&2; exit 2' ERR
@@ -139,8 +149,8 @@ strip_heredocs() {
 
 # Quote-aware tokeniser. Emits one line per token ("t"+text, or "q"+text if any part was quoted) and an
 # "s" line at every simple-command separator (; && || newline), "s&" for a single & (background), "s`" at
-# a backtick, "o"/"c" at ( and ), "p" at a pipe (| or |&). A redirection operator (2>, >>, >|, &>, <>, >&,
-# <<<, ...) is emitted as "r"+operator and split from its neighbours; the next token is its target.
+# a backtick, "o"/"c" at ( and ), "p" at a pipe (| or |&). A redirection operator (2>, {fd}>, >>, >|, &>,
+# <>, >&, <<<, ...) is emitted as "r"+operator and split from its neighbours; the next token is its target.
 # Unquoted # starts a comment.
 tokenize() {
   CMD=$1 awk '
@@ -169,7 +179,7 @@ tokenize() {
         if (c == ">" || c == "<") {   # redirection operator: split off its word, emit "r"+[fd]operator
           if (substr(s, i + 1, 1) == "(") { tok = tok c; intok = 1; continue }   # <(...) / >(...)
           pre = ""
-          if (intok && !quoted && (tok ~ /^[0-9]+$/ || tok == "&")) { pre = tok; tok = ""; intok = 0 } else flush()
+          if (intok && !quoted && (tok ~ /^[0-9]+$/ || tok == "&" || tok ~ /^\{[A-Za-z_][A-Za-z0-9_]*\}$/)) { pre = tok; tok = ""; intok = 0 } else flush()
           op = c; n2 = substr(s, i + 1, 1)
           if (c == ">") {
             if (n2 == ">") { op = ">>"; i++ }
@@ -244,7 +254,7 @@ is_main_ref() {  # [+]src:dst | name | refs/heads/name | heads/name -> true if t
 
 bad_key() {  # true for config keys that bypass hooks, hide commands or change what a push updates
   case "${1,,}" in
-    remote.*.mirror|push.default|remote.*.push|alias.*|core.hookspath|include.path|includeif.*|extensions.worktreeconfig) return 0 ;;
+    remote.*.mirror|push.default|remote.*.push|alias.*|core.hookspath|core.editor|sequence.editor|include.path|includeif.*|extensions.worktreeconfig) return 0 ;;
   esac
   return 1
 }
@@ -275,9 +285,10 @@ is_push_plumbing() {  # is_push_plumbing NAME ARGS...: NAME without the git- pre
 
 # --- tamper protection --------------------------------------------------------------------------
 
-TAMPER_RE='(^|/)(\.git|\.githooks)(/|$)|(^|/)\.claude/(hooks(/|$)|settings(\.local)?\.json$)|(^|/)\.(bashrc|profile|bash_profile|bash_login)$|(^|/)\.config/systemd/user(/|$)'
-TAMPER_MSG="writing to .git/, .githooks/, .claude/hooks, .claude/settings*.json or shell rc files is for the user (they are the push and tool controls); use the Edit/Write tools for repository files"
+TAMPER_RE='(^|/)(\.git|\.githooks)(/|$)|(^|/)\.github/workflows(/|$)|(^|/)\.claude/(hooks(/|$)|settings(\.local)?\.json$)|(^|/)\.(bashrc|profile|bash_profile|bash_login)$|(^|/)\.config/systemd/user(/|$)'
+TAMPER_MSG="writing to .git/, .githooks/, .github/workflows/, .claude/hooks, .claude/settings*.json or shell rc files is for the user (they are the push and tool controls); use the Edit/Write tools for other repository files"
 NP=""
+ANC=""
 
 norm_path() {  # NP = P with //, /./, a trailing / and .. resolved lexically
   local p=$1 lead="" part
@@ -303,7 +314,7 @@ tamper_hit() {  # tamper_hit PATH [BASE UNKNOWN]: true if PATH (resolved against
   if [[ "$p" != /* ]]; then
     if ((unk)); then
       case "${p##*/}" in
-        config|config.worktree|pre-push|pre-commit|guard-bash.sh|settings.json|settings.local.json|.bashrc|.profile|.bash_profile|.bash_login) return 0 ;;
+        config|config.worktree|pre-push|pre-commit|guard-bash.sh|rustfmt.sh|settings.json|settings.local.json|.bashrc|.profile|.bash_profile|.bash_login) return 0 ;;
       esac
     else
       norm_path "$base/$p"; p=$NP
@@ -312,31 +323,117 @@ tamper_hit() {  # tamper_hit PATH [BASE UNKNOWN]: true if PATH (resolved against
   [[ "$p" =~ $TAMPER_RE ]]
 }
 
+tamper_anc() {  # tamper_anc PATH [BASE UNKNOWN]: true if PATH is a directory that is, or contains, a protected path
+  # Sets ANC=root (the repository root, its parents or any directory holding .git/.githooks/.claude) or
+  # ANC=dir (.claude, .github, ~/.config, ~/.config/systemd, ~ and its parents, /).
+  local p=$1 base=${2-${cwd:-.}} unk=${3-$cwd_unknown} e h top
+  ANC=""
+  [[ -n "$p" ]] || return 1
+  if e=$(expand_home "$p"); then p=$e; fi
+  norm_path "$p"; p=$NP
+  if [[ "$p" != /* ]]; then
+    if ((unk)); then
+      case "${p##*/}" in .claude|.github|.config) ANC=dir; return 0 ;; esac
+      return 1
+    fi
+    norm_path "$base/$p"; p=$NP
+  fi
+  [[ "$p" == /* ]] || return 1
+  if [[ "$p" == / ]]; then ANC=dir; return 0; fi
+  case "${p##*/}" in .claude|.github) ANC=dir; return 0 ;; esac
+  h=${HOME:-}
+  if [[ -n "$h" ]]; then
+    norm_path "$h"; h=$NP
+    if [[ "$h" == "$p" || "$h" == "$p"/* || "$p" == "$h/.config" || "$p" == "$h/.config/systemd" ]]; then ANC=dir; return 0; fi
+  fi
+  if ((!unk)); then
+    top=$(git -C "$base" rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [[ -n "$top" ]]; then
+      norm_path "$top"; top=$NP
+      if [[ "$top" == "$p" || "$top" == "$p"/* ]]; then ANC=root; return 0; fi
+    fi
+  fi
+  if [[ -d "$p" ]] && [[ -e "$p/.git" || -e "$p/.githooks" || -e "$p/.claude" ]]; then ANC=root; return 0; fi
+  return 1
+}
+
+# names a `find -name PATTERN -delete` must not be able to match (it would reach a protected path)
+FIND_NAMES=(.git .githooks .github .claude hooks workflows pre-push pre-commit settings.json settings.local.json guard-bash.sh rustfmt.sh config .bashrc .profile .bash_profile .bash_login systemd user)
+
 check_tamper() {  # redirects (rd_op/rd_tgt) and writer commands aimed at protected paths; reads seg_t
-  local n=${#seg_t[@]} i k t p writer=0 hit=0 cmdword=""
+  local n=${#seg_t[@]} i k t p b nx writer=0 hit=0 cmdword="" wa=-1 isrsync=0 skipn=0 isfind=0 findw=0 hasor=0 safe=0 anc=0 last="" nm pat
+  local -a pats=()
   for ((i = 0; i < ${#rd_op[@]}; i++)); do
     if [[ "${rd_op[i]}" == *'>'* ]] && tamper_hit "${rd_tgt[i]}"; then block "$TAMPER_MSG"; fi
   done
   for ((i = 0; i < n; i++)); do
-    t=${seg_t[i]}
+    t=${seg_t[i]}; b=${t##*/}
+    if ((skipn)); then skipn=0; continue; fi   # the value of an rsync --exclude: a pattern, not a target
     if [[ -z "$cmdword" && ! "$t" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      case "${t##*/}" in sudo|env|command|exec|nohup|time|nice|setsid|builtin|xargs|timeout|'{'|'!') ;; *) cmdword=${t##*/} ;; esac
+      case "$b" in sudo|env|command|exec|nohup|time|nice|setsid|builtin|xargs|timeout|'{'|'!') ;; *) cmdword=$b ;; esac
     fi
-    case "${t##*/}" in
-      tee|cp|mv|install|ln|rm|unlink|chmod|chown|truncate|dd|touch|rsync) writer=1 ;;
+    case "$b" in
+      tee|unlink|truncate|dd|touch) writer=1 ;;
+      rm|mv|chmod|chown) writer=1; ((wa >= 0)) || wa=$i ;;
+      cp|install|ln) writer=1 ;;
+      rsync) writer=1; isrsync=1 ;;
       sed|perl) for ((k = i + 1; k < n; k++)); do
                   if [[ "${seg_t[k]}" =~ ^-[a-zA-Z]*i || "${seg_t[k]}" == --in-place* ]]; then writer=1; fi
                 done ;;
-      find) for ((k = i + 1; k < n; k++)); do
-              case "${seg_t[k]}" in -delete|-exec|-execdir|-ok|-okdir|-fprint|-fprint0|-fprintf|-fls) writer=1 ;; esac
-            done ;;
+      find) isfind=1
+            for ((k = i + 1; k < n; k++)); do
+              case "${seg_t[k]}" in
+                -delete|-fprint|-fprint0|-fprintf|-fls) findw=1 ;;
+                -exec|-execdir|-ok|-okdir)
+                  nx=${seg_t[k + 1]:-}; nx=${nx##*/}
+                  case "$nx" in   # read-only commands run by find are not writers
+                    grep|egrep|fgrep|rg|cat|ls|head|tail|wc|file|stat|sha256sum|sha1sum|md5sum|du|diff|cmp|echo|printf|test|basename|dirname|readlink|realpath) ;;
+                    *) findw=1 ;;
+                  esac ;;
+                -o|-or) hasor=1 ;;
+                -name|-iname) pats+=("${seg_t[k + 1]:-}") ;;
+              esac
+            done
+            if ((findw)); then writer=1; ((wa >= 0)) || wa=$i; fi ;;
     esac
+    if ((isrsync)) && [[ "$t" == --exclude* || "$t" == --include* || "$t" == --filter* ]]; then
+      [[ "$t" == *=* ]] || skipn=1
+      continue
+    fi
     p=${t#of=}
     [[ "$p" == --*=* ]] && p=${p#*=}
     if [[ "$p" != -* ]] && tamper_hit "$p"; then hit=1; fi
   done
   if [[ "$cmdword" == patch ]]; then block "patch cannot be inspected and can rewrite protected files; use the Edit/Write tools"; fi
   if ((writer && hit)); then block "$TAMPER_MSG"; fi
+  # ancestors: a write whose target is a directory containing a protected path
+  if ((isfind && ${#pats[@]} > 0 && !hasor)); then
+    safe=1
+    for pat in "${pats[@]}"; do
+      for nm in "${FIND_NAMES[@]}"; do
+        # shellcheck disable=SC2053  # PATTERN is a glob on purpose
+        if [[ "$nm" == $pat ]]; then safe=0; fi
+      done
+    done
+  fi
+  if ((wa >= 0)); then
+    for ((k = wa + 1; k < n; k++)); do
+      t=${seg_t[k]}
+      case "$t" in -*|'{}'|'+'|';'|'!') continue ;; esac
+      if tamper_anc "$t"; then
+        if ((safe)) && [[ "$ANC" == root ]]; then continue; fi
+        anc=1
+      fi
+    done
+  fi
+  case "$cmdword" in
+    cp|install|ln|rsync)   # the destination is the last non-option argument
+      for ((k = n - 1; k > 0; k--)); do
+        if [[ "${seg_t[k]}" != -* ]]; then last=${seg_t[k]}; break; fi
+      done
+      if [[ -n "$last" ]] && tamper_anc "$last"; then anc=1; fi ;;
+  esac
+  if ((anc)); then block "$TAMPER_MSG (the target is, or contains, a protected path)"; fi
   if ((writer && !cwd_unknown)) && tamper_hit .; then block "$TAMPER_MSG"; fi
   return 0
 }
@@ -375,6 +472,8 @@ check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks
       -f|--file) skip=1; fl=1 ;;
       --file=*) if tamper_hit "${a#--file=}"; then block "$TAMPER_MSG"; fi ;;
       --blob|--default|--type|--comment) skip=1 ;;
+      --e|--ed|--edi|--edit) block "git config --edit runs an editor (core.editor) and can change any config key" ;;
+      -[a-zA-Z]*) if [[ "$a" == *e* ]]; then block "git config -e runs an editor (core.editor) and can change any config key"; fi ;;
       -*) ;;
       *) pos+=("$a") ;;
     esac
@@ -385,9 +484,10 @@ check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks
     [[ "${pos[0]}" == remove-section || "${pos[0]}" == rename-section ]] && section=1 || true
     pos=("${pos[@]:1}")
   fi
+  if [[ "${pos[0]:-}" == edit ]]; then block "git config edit runs an editor (core.editor) and can change any config key"; fi
   if ((section)); then  # removing/renaming a whole section drops core.hooksPath, aliases, push settings
     sec=${pos[0]:-}; case "${sec,,}" in
-      core|alias|include|includeif.*|push|remote|remote.*|extensions) block "removing or renaming the '${pos[0]}' config section bypasses the git hooks" ;;
+      core|alias|include|includeif.*|push|remote|remote.*|extensions|sequence) block "removing or renaming the '${pos[0]}' config section bypasses the git hooks" ;;
     esac
     return 0
   fi
@@ -409,7 +509,7 @@ check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks
 check_push() {  # check_push DIR GITDIR UNKNOWN args...
   local d=$1 gd=$2 unk=$3; shift 3
   local -a pos=()
-  local skip=0 end=0 a name r dst cur i
+  local skip=0 end=0 a name r dst cur i lease=0 tags=0 top
   for a in "$@"; do
     if ((skip)); then skip=0; continue; fi
     [[ "$a" == +* ]] && block "force push (+refspec) is not allowed" || true
@@ -419,15 +519,21 @@ check_push() {  # check_push DIR GITDIR UNKNOWN args...
       --*)
         name=${a%%=*}
         case "$name" in
-          --force-with-lease|--force-if-includes) continue ;;
+          --force-with-lease|--force-if-includes)
+            lease=1
+            [[ "$a" == *refs/tags/* ]] && block "force-with-lease aimed at a tag is not allowed (tags are immutable)" || true
+            continue ;;
           --repo|--receive-pack|--exec|--push-option) [[ "$a" == *=* ]] || skip=1; continue ;;
+          --tags) tags=1; continue ;;
         esac
         # git accepts any unambiguous prefix of a long option; refuse every prefix of the dangerous ones
+        if ((${#name} >= 9)) && [[ "--force-with-lease" == "$name"* || "--force-if-includes" == "$name"* ]]; then lease=1; continue; fi
         if ((${#name} >= 3)); then
           [[ "--force" == "$name"* ]] && block "force push is not allowed (use --force-with-lease on your own feature branch)" || true
           [[ "--mirror" == "$name"* ]] && block "git push --mirror is not allowed" || true
           [[ "--all" == "$name"* ]] && block "git push --all would include main; push the branch explicitly" || true
           [[ "--delete" == "$name"* ]] && block "deleting remote branches requires the user" || true
+          [[ "--tags" == "$name"* ]] && tags=1 || true
         fi ;;
       -o) skip=1 ;;
       -[a-zA-Z]*)
@@ -442,15 +548,25 @@ check_push() {  # check_push DIR GITDIR UNKNOWN args...
     r=${pos[i]#+}; dst=${r##*:}
     [[ "$r" == :* ]] && block "an empty-source refspec ('$r') deletes a remote ref or pushes all matching branches; requires the user" || true
     [[ "$dst" == *'*'* ]] && block "glob refspecs can push main; name the branch explicitly" || true
+    if ((lease)) && [[ "$dst" == refs/tags/* || "$dst" == tags/* || "$r" == tag ]]; then block "force-with-lease aimed at a tag is not allowed (tags are immutable)"; fi
     if [[ "$r" == HEAD || "$r" == @ ]]; then
       cur=$(branch_of "$d" "$gd" "$unk") || exit 2
       [[ "$cur" == main || "$cur" == master ]] && block "HEAD is $cur; create a feature branch first" || true
     fi
     is_main_ref "${pos[i]}" && block "never push to main; open a PR"
   done
+  if ((lease && tags)); then block "force-with-lease together with --tags can move tags; tags are immutable"; fi
   if ((${#pos[@]} < 2)); then  # bare push: pushes the current branch
     cur=$(branch_of "$d" "$gd" "$unk") || exit 2
     [[ "$cur" == main || "$cur" == master ]] && block "current branch is $cur; create a feature branch first" || true
+  fi
+  # the authoritative control is .githooks/pre-push: a push from a checkout without it is refused
+  # (only when the directory is known; a missing cwd is "." and not checked)
+  if ((!unk)) && [[ "$d" != . && -z "$gd" ]]; then
+    top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [[ -n "$top" && ! -x "$top/.githooks/pre-push" ]]; then
+      block "$top/.githooks/pre-push is missing or not executable; the push would not be checked"
+    fi
   fi
   return 0
 }
@@ -556,8 +672,25 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       done
       ((have)) || block "gh pr merge needs --match-head-commit \"\$sha\" with sha=\$(scripts/verify check PR) so only the verified SHA merges" ;;
     "repo delete"|"issue delete") block "deleting repos/issues requires the user" ;;
+    "workflow run")
+      local wk=0 wv wmsg="gh workflow run may only run on main (--ref main or no --ref): a branch can carry an edited workflow"
+      for ((k = idx1 + 1; k < n; k++)); do
+        a=${seg_t[k]}; wv=""
+        if ((wk)); then wk=0; wv=$a
+        else
+          case "$a" in
+            --ref|-r) wk=1; continue ;;
+            --ref=*) wv=${a#--ref=} ;;
+            -r?*) wv=${a#-r} ;;
+            *) continue ;;
+          esac
+        fi
+        wv=${wv#refs/}; wv=${wv#heads/}
+        [[ "$wv" == main ]] || block "$wmsg"
+      done
+      ((!wk)) || block "$wmsg" ;;
     "api "*)
-      local method="" ep="" prev="" haswrite=0 hasinput=0 all="" fld c rest ci br okbranch=0
+      local method="" ep="" prev="" haswrite=0 hasinput=0 all="" fld c rest ci br okbranch=0 key
       local -a fields=()
       for ((k = idx1 + 1; k < n; k++)); do
         a=${seg_t[k]}
@@ -613,21 +746,27 @@ check_gh() {  # check_gh INDEX ; reads seg_t
         if [[ "$ep" == repos/*/contents/* ]]; then
           ((hasinput)) && block "contents writes with --input cannot be checked; the branch is hidden in the body"
           for fld in "${fields[@]}"; do
-            case "${fld,,}" in
-              branch=*) br=${fld#*=}; br=${br,,}; br=${br#refs/}; br=${br#heads/}
-                        if [[ "$br" == main || "$br" == master ]]; then block "writing files to main/master through the API requires the user"; fi
-                        okbranch=1 ;;
-            esac
+            key=${fld%%=*}
+            [[ "$fld" == *=* && "$key" == branch ]] || continue   # exactly `branch`, case-sensitive
+            br=${fld#*=}
+            [[ "$br" == @* ]] && block "a branch value read from a file/stdin (@...) cannot be checked"
+            br=${br,,}; br=${br#refs/}; br=${br#heads/}
+            [[ -n "$br" ]] || block "an empty branch value means the default branch (main); name a feature branch"
+            if [[ "$br" == main || "$br" == master ]]; then block "writing files to main/master through the API requires the user"; fi
+            okbranch=1
           done
           ((okbranch)) || block "a contents write through the API needs an explicit branch=<feature branch> field (the default branch is main)"
         fi
-                [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
+        [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
         case "$ep" in
+          */../*|*/..) block "path traversal in a write endpoint cannot be checked" ;;
+          repos/*/contents/*) ;;   # a file path, not an API route (checked above)
           */branches/*/protection*) block "changing branch protection requires the user" ;;
           */rulesets*) block "changing rulesets requires the user" ;;
           */statuses|*/statuses/*) block "writing commit statuses forges verification; scripts/verify is the only writer" ;;
           */git/refs|*/git/refs/*|*/git/refs\?*) block "writing git refs through the API requires the user" ;;
-          */../*|*/..) block "path traversal in a write endpoint cannot be checked" ;;
+          */actions|*/actions/*) block "writes to actions (workflow dispatches, runs, secrets, variables) require the user" ;;
+          */environments*) block "changing deployment environments requires the user" ;;
         esac
       fi ;;
   esac
@@ -676,13 +815,17 @@ check_stdin_source() {  # source /dev/stdin, bash /dev/stdin ...
   done
 }
 
-check_git_env() {  # GIT_CONFIG_* assignments in a segment that runs git inject config (hooks, pushes)
-  local t has_git=0 bad=0
-  for t in "${seg_t[@]}"; do
+check_git_env() {  # GIT_CONFIG_* and editor assignments in a segment that runs git inject config or commands
+  local t i has_git=0 bad=0 ed=0
+  for ((i = 0; i < ${#seg_t[@]}; i++)); do
+    t=${seg_t[i]}
     case "$t" in git|*/bin/git) has_git=1 ;; esac
     if [[ "$t" =~ ^GIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+|PARAMETERS)= ]]; then bad=1; fi
+    # an editor assignment in front of git (GIT_EDITOR=x git rebase -i, env EDITOR=x git ...) runs that program
+    if ((!has_git)) && [[ "$t" =~ ^(GIT_EDITOR|EDITOR|VISUAL|GIT_SEQUENCE_EDITOR)= ]]; then ed=1; fi
   done
   if ((has_git && bad)); then block "GIT_CONFIG_* environment overrides git config (hooks, pushes) and is not allowed"; fi
+  if ((has_git && ed)); then block "GIT_EDITOR / EDITOR / VISUAL / GIT_SEQUENCE_EDITOR in front of git runs an arbitrary program; not allowed"; fi
   return 0
 }
 
@@ -761,11 +904,11 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
   ((piped)) && sub=1 || true
   for ((i = 0; i < n; i++)); do
     t=${seg_t[i]}
-    # the name as a word in any segment (=, +=, read, export, declare, ...). A quoted mention in the text
+    # the names as a word in any segment (=, +=, read, export, declare, ...). A quoted mention in the text
     # of a git/gh command (commit message, PR body) is data and stays allowed.
-    if [[ "$t" =~ (^|[^A-Za-z0-9_])WARDENLENS_ALLOW_REWRITE($|[^A-Za-z0-9_]) ]]; then
+    if [[ "$t" =~ (^|[^A-Za-z0-9_])WARDENLENS_ALLOW_(REWRITE|WORKFLOWS)($|[^A-Za-z0-9_]) ]]; then
       if [[ "${seg_q[i]}" != q || ( "${seg_t[0]}" != git && "${seg_t[0]}" != gh ) ]]; then
-        block "WARDENLENS_ALLOW_REWRITE is the human-only switch that permits history rewrites; agents never set it"
+        block "WARDENLENS_ALLOW_REWRITE / WARDENLENS_ALLOW_WORKFLOWS are human-only switches (history rewrites, workflow changes); agents never set them"
       fi
     fi
     if [[ "$t" =~ ^(GIT_DIR|GIT_WORK_TREE)= ]]; then cwd_unknown=1; fi

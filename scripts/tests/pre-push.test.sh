@@ -4,10 +4,10 @@
 # remote's main so that matching/mirror pushes would really update it.
 set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-hooks=$root/.githooks
+hooks=${HOOKS:-$root/.githooks}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 fail=0
-unset GIT_DIR GIT_WORK_TREE WARDENLENS_ALLOW_REWRITE GIT_CONFIG_PARAMETERS
+unset GIT_DIR GIT_WORK_TREE WARDENLENS_ALLOW_REWRITE WARDENLENS_ALLOW_WORKFLOWS GIT_CONFIG_PARAMETERS
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
 n=0
 
@@ -85,6 +85,27 @@ if [[ -x /usr/lib/git-core/git ]]; then
   expect refuse "/usr/lib/git-core/git push --force" \
     bash -c "$(declare -f rewrite); rewrite; /usr/lib/git-core/git push --force origin feat/x"
 else echo "skip /usr/lib/git-core/git case (not installed)"; fi
+
+# --- workflows are privileged: commits touching .github/workflows/ are refused ------------------------
+wf_add='mkdir -p .github/workflows && echo a >.github/workflows/ci.yml && git add -A && git commit -q -m wf'
+nohook='git -c core.hooksPath=/dev/null push -q origin feat/x'   # puts a state on the remote without the hook
+expect refuse "push a commit that adds a workflow"          bash -c "$wf_add && git push origin feat/x"
+skipref=refs/heads/feat/x   # these two put a state on feat/x first
+expect refuse "push a commit that edits a workflow"         bash -c "$wf_add && $nohook && echo b >>.github/workflows/ci.yml && git commit -q -am e && git push origin feat/x"
+expect refuse "push a commit that deletes a workflow"       bash -c "$wf_add && $nohook && git rm -q .github/workflows/ci.yml && git commit -q -m d && git push origin feat/x"
+skipref=none
+expect refuse "workflow added then reverted in the range"   bash -c "$wf_add && git revert --no-edit HEAD >/dev/null && git push origin feat/x"
+expect refuse "workflow change hidden in a merged side branch" \
+  bash -c "git checkout -q -b side && $wf_add && git checkout -q feat/x && git merge -q -s ours --no-ff side -m m && git push origin feat/x"
+expect refuse "new branch whose history adds a workflow"    bash -c "git checkout -q -b feat/new && $wf_add && git push origin feat/new"
+expect refuse "new branch, workflow in an older local commit" bash -c "git checkout -q -b feat/new && $wf_add && echo n >n && git add n && git commit -q -m n && git push origin feat/new"
+expect refuse "WARDENLENS_ALLOW_WORKFLOWS=0 is not the switch" env WARDENLENS_ALLOW_WORKFLOWS=0 bash -c "$wf_add && git push origin feat/x"
+expect refuse "WARDENLENS_ALLOW_REWRITE=1 does not allow workflows" env WARDENLENS_ALLOW_REWRITE=1 bash -c "$wf_add && git push origin feat/x"
+expect refuse "WARDENLENS_ALLOW_WORKFLOWS=1 never allows main" env WARDENLENS_ALLOW_WORKFLOWS=1 bash -c "$wf_add && git push origin HEAD:main"
+expect allow  "workflow change with WARDENLENS_ALLOW_WORKFLOWS=1" env WARDENLENS_ALLOW_WORKFLOWS=1 bash -c "$wf_add && git push origin feat/x"
+expect allow  "new branch, workflow already on the remote" \
+  bash -c "$wf_add && $nohook && git checkout -q -b feat/new && echo n >n && git add n && git commit -q -m n && git push origin feat/new"
+expect allow  "push touching only other .github files"      bash -c "mkdir -p .github && echo a >.github/CODEOWNERS && git add -A && git commit -q -m co && git push origin feat/x"
 
 # the hook script itself must be executable and the repo must point hooksPath at it
 if [[ -x $hooks/pre-push ]]; then echo "ok   pre-push is executable"; else echo "FAIL pre-push not executable"; fail=1; fi

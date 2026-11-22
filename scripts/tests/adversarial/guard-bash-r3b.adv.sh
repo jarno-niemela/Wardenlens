@@ -4,10 +4,11 @@
 # shellcheck disable=SC2016  # single quotes are intentional: cases are literal command text
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-guard=$root/.claude/hooks/guard-bash.sh
+guard=${GUARD:-$root/.claude/hooks/guard-bash.sh}
 fail=0
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 git init -q -b main "$tmp/onmain"; git init -q -b feat/x "$tmp/onfeat"
+for r in onmain onfeat; do mkdir -p "$tmp/$r/.githooks"; : >"$tmp/$r/.githooks/pre-push"; chmod +x "$tmp/$r/.githooks/pre-push"; done  # the guard refuses pushes from a checkout without the hook
 mkdir -p "$tmp/home"
 
 run() { jq -n --arg c "$1" --arg d "${2:-}" '{tool_input: {command: $c}} + (if $d == "" then {} else {cwd: $d} end)' | HOME=$tmp/home "$guard" >/dev/null 2>&1; }

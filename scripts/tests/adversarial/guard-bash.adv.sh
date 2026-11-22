@@ -4,7 +4,7 @@
 # Run from a feature branch (the bare-push-on-main rule depends on the current branch).
 set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-guard=$root/.claude/hooks/guard-bash.sh
+guard=${GUARD:-$root/.claude/hooks/guard-bash.sh}
 fail=0
 
 run() { jq -n --arg c "$1" '{tool_input: {command: $c}}' | "$guard" >/dev/null 2>&1; }

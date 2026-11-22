@@ -5,7 +5,7 @@
 # shellcheck disable=SC2016  # single quotes are intentional: cases are literal command text
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-guard=$root/.claude/hooks/guard-bash.sh
+guard=${GUARD:-$root/.claude/hooks/guard-bash.sh}
 fail=0
 
 # HOME points at a dir holding a repo on main, so `cd ~/repo` really is on main for a shell.
@@ -16,6 +16,7 @@ deny()  { if run "$1"; then echo "FAIL should deny: $(printf '%q' "$1")"; fail=1
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 git init -q -b main "$tmp/onmain"
 git init -q -b feat/x "$tmp/onfeat"
+for r in onmain onfeat; do mkdir -p "$tmp/$r/.githooks"; : >"$tmp/$r/.githooks/pre-push"; chmod +x "$tmp/$r/.githooks/pre-push"; done  # the guard refuses pushes from a checkout without the hook
 mkdir -p "$tmp/home"; git init -q -b main "$tmp/home/repo"
 
 # --- push: unambiguous long-option abbreviations (git's parse-options accepts them) ----------

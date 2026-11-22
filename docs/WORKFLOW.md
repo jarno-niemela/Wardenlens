@@ -160,7 +160,30 @@ No single control is trusted alone. From strongest to weakest:
      controller (with a ticket) temporarily lifting the deny.** A cd is tracked only as the first
      command of an input; after any other cd the directory is unknown and relative targets named
      `config`, `pre-push`, `settings.json`, ... are refused.
-   - **The guard is best effort.** Accepted gaps: code inside interpreter strings (`python3 -c`,
+   - **Parent directories count.** `rm`, `mv`, `chmod`, `chown`, `find -delete/-exec` are refused
+     when a target is a directory that contains a protected path (`.claude`, `.github`, the
+     repository root and its parents, `~/.config`, `~/.config/systemd`, `~`, `/`), and `cp`,
+     `install`, `ln`, `rsync` when the destination is one. `find . -name '*.orig' -delete` stays
+     allowed when the pattern matches no protected name, and `find -exec` of a read-only command
+     (`grep`, `cat`, ...) is not a write. `rsync --exclude` values are patterns and ignored; a
+     `find -path .git ... -delete` is a known false positive.
+   - **Git editors.** `git config -e/--edit`, `core.editor`, `sequence.editor` (in `-c` and
+     `git config`) and `GIT_EDITOR=`, `EDITOR=`, `VISUAL=`, `GIT_SEQUENCE_EDITOR=` in front of git
+     are refused (they run an arbitrary program in a git command).
+   - **Workflows are privileged.** `.github/workflows/**` is denied to the Edit/Write tools, the
+     guard refuses Bash writes to it, `gh workflow run --ref` anything but main and `gh api`
+     writes to `actions/*` and `environments*`. `.githooks/pre-push` refuses a push whose commits
+     (`remote_sha..local_sha`, or for a new branch the commits not on any remote-tracking ref)
+     change a file under `.github/workflows/`. **A workflow change needs the human, or the
+     controller with a ticket, and is applied by the human pushing with
+     `WARDENLENS_ALLOW_WORKFLOWS=1`** (agents never set it; the guard denies the name exactly as it
+     denies `WARDENLENS_ALLOW_REWRITE`). Open the PR as usual; the human pushes the branch.
+   - **A push needs the hook.** The guard refuses `git push` when `<toplevel>/.githooks/pre-push`
+     is missing or not executable (when the directory is known), and `--force-with-lease` /
+     `--force-if-includes` aimed at a tag.
+   - **The guard is best effort.** Accepted gaps: `git checkout <rev> -- .` and
+     `git reset --hard <old>` (an older committed hook still refuses main; verification is
+     SHA-bound), code inside interpreter strings (`python3 -c`,
      `perl -e`), brace expansion, git under other paths (`/usr/lib/git-core/git`), variable
      indirection. A read with a writer word (`cp .githooks/x /tmp/y`) is a known false positive.
      `git apply` and `patch` are refused outright because the patch cannot be inspected; use
