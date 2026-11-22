@@ -254,13 +254,18 @@ durable state kept by `scripts/agents` in `~/.local/state/wardenlens/agents/` (`
 and the saved prompts, mode 0600, never in the repo).
 
 The controller must:
-1. **Record every launch**: save the prompt and `scripts/agents record ROLE REF SHA PROMPT_FILE AGENT_ID`.
-   `record` refuses prompts containing private (RFC1918) addresses or values from the local secret file.
+1. **Record every launch**: save the prompt, run `scripts/agents check PROMPT_FILE`, launch the agent, then
+   `scripts/agents record ROLE REF SHA PROMPT_FILE AGENT_ID`, where AGENT_ID is the id the launch returned
+   (the `SendMessage` target for resume). Example: the launch returns `a1b2c3d4e5f60718`, so run
+   `scripts/agents record implementer '#29' $SHA "$SCRATCH/29-impl.prompt" a1b2c3d4e5f60718`.
+   REF is `#N` (a ticket) for implementers, which are never PR-checked, and the PR number for verifiers.
+   `record` refuses prompts containing private (RFC1918, ULA) addresses, `scheme://user:pass@` URLs, or
+   values from the local secret file.
 2. **On a rate-limit failure**: `scripts/agents fail AGENT_ID rate_limit HH:MM`, note the reset
    time, and do no other work that needs the model until then.
 3. **After the reset**: resume each failed agent with `SendMessage` "limit reset, continue", or,
    if it is unreachable (for example in a new session), relaunch it from its saved prompt at the
-   same SHA. If the PR head moved (`scripts/agents list --pr N` flags the row `STALE`), relaunch at
+   same SHA. If the PR head moved (`scripts/agents list --pr N` flags the row `STALE`; plain `list` checks every verifier PR and shows `UNKNOWN` if gh cannot say), relaunch at
    the new head. Verdicts bind only to the SHA they were produced on.
 4. **Mark done**: `scripts/agents done AGENT_ID` when the report arrives.
 5. **Session start**: `/work` step 0 runs `scripts/agents list` and resumes or relaunches inflight

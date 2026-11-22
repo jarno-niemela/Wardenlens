@@ -81,4 +81,40 @@ check "short/non-credential values allowed" "$agents" record reviewer 5 "$A" "$t
 printf 'not json' >"$tmp/secret.json"
 checkf "unreadable secret file fails closed" "$agents" record reviewer 5 "$A" "$tmp/p1" ag8
 
+# more address / credential forms (non-owner private values)
+printf '[]' >"$tmp/secret.json"
+for t in 'host 192.168.7.' 'net 172.18.x' 'foo.10.20.1.2' 'v6 fd12:3456::1' 'url https://bob:pw1@example.org/x'; do
+  n=$((n + 1)); printf '%s\n' "$t" >"$tmp/p2"
+  checkf "refused: $t" "$agents" record reviewer 5 "$A" "$tmp/p2" "more$n"
+done
+printf 'v 1.10.20.1.2.3\n' >"$tmp/p2"
+check "version string allowed" "$agents" record reviewer 5 "$A" "$tmp/p2" ver1
+
+# secret scan: login, numeric password, array, allowlisted camera name
+printf '[{"name":"Frontdoor","login":"camoperator","password":87654321,"keys":["arr-secret-1"]}]' >"$tmp/secret.json"
+for v in camoperator 87654321 arr-secret-1; do
+  printf 'x %s y\n' "$v" >"$tmp/p2"
+  checkf "secret scalar $v refused" "$agents" record reviewer 5 "$A" "$tmp/p2" "sec$v"
+done
+printf 'camera Frontdoor\n' >"$tmp/p2"
+check "allowlisted camera name accepted" "$agents" record reviewer 5 "$A" "$tmp/p2" camname
+
+# fail edge cases, list without state, gh failure, implementer rows
+checkf "fail unknown id refused" "$agents" fail nosuch rate_limit
+"$agents" record implementer '#29' "$A" "$tmp/p1" impl1
+check "implementer row has 9 columns" test "$(awk -F'\t' '$5=="impl1"{print NF}' "$tmp/state/inflight.tsv")" = 9
+check "implementer row never STALE" bash -c "! \"\$1\" list | grep -P 'impl1.*(STALE|UNKNOWN)'" _ "$agents"
+"$agents" fail impl1 "x\ny" 'bogus'
+check "fail keeps 9 columns" test "$(awk -F'\t' '$5=="impl1"{print NF}' "$tmp/state/inflight.tsv")" = 9
+check "list without state dir" bash -c "[[ \$(WARDENLENS_AGENT_STATE=\$1/none \"\$2\" list) == 'no inflight agents' ]]" _ "$tmp" "$agents"
+"$agents" record reviewer 7 "$A" "$tmp/p1" pr7
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+checkf "list --pr dies when gh fails" "$agents" list --pr 7
+check "plain list marks UNKNOWN when gh fails" bash -c "\"\$1\" list | grep -qP 'pr7.*UNKNOWN'" _ "$agents"
+"$agents" 'done' pr7; "$agents" record reviewer 7 "$A" "$tmp/p1" pr7; "$agents" 'done' pr7
+check "reused id keeps earlier .done" test "$(find "$tmp/state" -name "pr7.prompt.done*" | wc -l)" = 2
+
 exit $fail
