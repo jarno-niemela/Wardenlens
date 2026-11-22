@@ -190,6 +190,7 @@ Across both kinds, successful requests had p50 11 ms and p95 42 ms.
   Six attempts in a row can therefore fail, and a single outage can last a couple of minutes.
 - Behaviour contract for the adapter, two levels:
   1. A single request retries quickly: connect timeout 2-3 s, a few attempts (up to 6) with a ~2-5 s backoff.
+     Note: the 2-3 s connect timeout is untested (the spike used 10 s); it is tracked in #28.
   2. Beyond that, the driver has a total retry budget of **at least 3 minutes** (longer than the worst
      observed outage). It retries in the background, serves the last good result from cache and marks the camera
      *degraded* rather than failing; it never blocks the video path on ONVIF, and ONVIF is not relied on for

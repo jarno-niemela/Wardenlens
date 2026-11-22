@@ -8,14 +8,18 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$here/lib.sh"
 out="$1"; duration="${2:-1800}"
-if [[ -e "$out" && -n "$(ls -A "$out")" ]]; then echo "refusing to run: $out is not empty" >&2; exit 1; fi
+if [[ -e "$out" ]]; then
+  [[ -d "$out" ]] || { echo "refusing to run: $out is not a directory" >&2; exit 1; }
+  listing="$(ls -A "$out")" || { echo "refusing to run: cannot list $out" >&2; exit 1; }
+  [[ -z "$listing" ]] || { echo "refusing to run: $out is not empty" >&2; exit 1; }
+fi
 mkdir -p "$out"
 deadline=$(( $(date +%s) + duration ))
 
 run_stream() { # <cam> <kind>
   local cam="$1" kind="$2" tag restarts=0 url left rc
   tag="$(printf '%s_%s' "${cam// /_}" "$kind" | tr -d '()')"
-  url="$(rtsp_url "$cam" "$(rtsp_path "$cam" "$kind")")"
+  url="$(rtsp_url "$cam" "$(rtsp_path "$cam" "$kind")")" || return 1
   : >"$out/$tag.log"; : >"$out/$tag.progress"
   while :; do
     left=$(( deadline - $(date +%s) ))
@@ -38,13 +42,17 @@ run_stream() { # <cam> <kind>
 
 streams=("IPC-BO:main" "IPC-BO:sub" "IPC-BO (2):main" "IPC-BO (2):sub" "XR:main" "XR:sub"
   "C110:main" "C110:sub" "HDIPC:main" "HDIPC:sub")
+# Fail before starting anything if a URL cannot be built (unknown camera, missing host).
+for s in "${streams[@]}"; do rtsp_url "${s%%:*}" "$(rtsp_path "${s%%:*}" "${s##*:}")" >/dev/null || exit 1; done
 for s in "${streams[@]}"; do run_stream "${s%%:*}" "${s##*:}" & done
 wait
 
 printf 'stream\trestarts\tlast_frame_count_per_run\twarnings\n' >"$out/summary.tsv"
-for f in "$out"/*.restarts; do
-  tag="$(basename "$f" .restarts)"
-  frames="$(grep -E '^frame=' "$out/$tag.progress" | tail -1 | cut -d= -f2)"
-  warns="$(grep -cviE 'RESTART|^$' "$out/$tag.log" || true)"
-  printf '%s\t%s\t%s\t%s\n' "$tag" "$(cat "$f")" "${frames:-0}" "$warns" >>"$out/summary.tsv"
+for s in "${streams[@]}"; do
+  cam="${s%%:*}"; kind="${s##*:}"
+  tag="$(printf '%s_%s' "${cam// /_}" "$kind" | tr -d '()')"
+  restarts="$(cat "$out/$tag.restarts" 2>/dev/null || echo -)"
+  frames="$(grep -E '^frame=' "$out/$tag.progress" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+  warns="$(grep -cviE 'RESTART|^$' "$out/$tag.log" 2>/dev/null || true)"
+  printf '%s\t%s\t%s\t%s\n' "$tag" "$restarts" "${frames:-0}" "${warns:-0}" >>"$out/summary.tsv"
 done
