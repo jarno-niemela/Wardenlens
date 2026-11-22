@@ -6,11 +6,12 @@
 #                             [--repo owner/name]
 #   --issues-file: array from `gh issue list --state all`
 #   --prs-file:    array from `gh pr list --state all` (all states; rules apply to open PRs)
-#   --repo:        repository the references must point at (default: `gh repo view`; offline tests
-#                  with both files given default to jarno-niemela/Wardenlens)
+#   --repo:        repository the references must point at (default: `gh repo view`; there is no
+#                  built-in default, so offline runs with both files must pass --repo)
 # Env:   STALE_DAYS (3)  BACKLOG_DAYS (30)  PR_DAYS (2)
 # Exit:  0 clean (relative to --fail-on), 1 findings at/above threshold, 2 usage error.
 set -euo pipefail
+export LC_ALL=C
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 json=0 fail_on=error issues_file="" prs_file="" repo="" now=$(date +%s)
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
 done
 case "$fail_on" in error|warn|never) ;; *) echo "ticket-audit: bad --fail-on" >&2; exit 2 ;; esac
 
+# Offline only when BOTH inputs were given on the command line; decided before anything is fetched.
+offline=0
+[[ -n "$issues_file" && -n "$prs_file" ]] && offline=1
+
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 if [[ -z "$issues_file" ]]; then
   issues_file=$tmp/issues.json
@@ -46,8 +51,8 @@ if [[ -z "$prs_file" ]]; then
 fi
 
 if [[ -z "$repo" ]]; then
-  if [[ -n "$issues_file" && -n "$prs_file" ]]; then repo=jarno-niemela/Wardenlens
-  else repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || usage_err "cannot resolve the repository (use --repo)"; fi
+  ((offline == 0)) || usage_err "offline mode (--issues-file and --prs-file) needs --repo owner/name"
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || usage_err "cannot resolve the repository (use --repo)"
 fi
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || usage_err "--repo must be owner/name"
 [[ "$now" =~ ^[0-9]+$ ]] || usage_err "--now must be epoch seconds"

@@ -52,7 +52,7 @@ status_file() {  # status_file SHA context:state...
 }
 # The job names must match REQUIRED_CHECKS (and ci.yml; asserted below).
 REQ1='fmt · clippy · test · doc'; REQ2='cargo-deny'; REQ3='scripts (shellcheck + tooling tests + audit)'
-ALL_OK=$(jq -nc --arg a "$REQ1" --arg b "$REQ2" --arg c "$REQ3" '[{name:$a,bucket:"pass"},{name:$b,bucket:"pass"},{name:$c,bucket:"pass"},{name:"lint",bucket:"skipping"},{name:"verify/quality",bucket:"fail"}]')
+ALL_OK=$(jq -nc --arg a "$REQ1" --arg b "$REQ2" --arg c "$REQ3" '[{name:$a,bucket:"pass",workflow:"CI"},{name:$b,bucket:"pass",workflow:"CI"},{name:$c,bucket:"pass",workflow:"CI"},{name:"lint",bucket:"skipping",workflow:"CI"},{name:"verify/quality",bucket:"fail",workflow:"CI"}]')
 reset() { : >"$GH_LOG"; rm -f "$STATUS_DIR"/*.json; printf '%s' "$ALL_OK" >"$CHECKS"; HEAD=$C; export HEAD; }
 t_ok()   { local n=$1; shift; if "$@" >"$tmp/out" 2>"$tmp/err"; then echo "ok   $n"; else echo "FAIL $n: exit $?: $(head -c 300 "$tmp/err")"; fail=1; fi; }
 t_fail() { local n=$1; shift; if "$@" >"$tmp/out" 2>"$tmp/err"; then echo "FAIL $n: expected failure"; fail=1; else echo "ok   $n"; fi; }
@@ -117,8 +117,13 @@ t_fail "check: failing required check" "$verify" check 7
 jq -c --arg n "$REQ1" 'map(select(.name != $n))' <<<"$ALL_OK" >"$CHECKS"
 t_fail "check: required check missing" "$verify" check 7
 check  "  names the missing check" grep -q "required check 'fmt" "$tmp/err"
-printf '%s' '[{"name":"CI","bucket":"pass"}]' >"$CHECKS"
+printf '%s' '[{"name":"CI","bucket":"pass","workflow":"CI"}]' >"$CHECKS"
 t_fail "check: an arbitrary passing check is not enough" "$verify" check 7
+jq -c 'map(.workflow = "Other")' <<<"$ALL_OK" >"$CHECKS"
+t_fail "check: required names from another workflow do not count" "$verify" check 7
+check  "  names the missing check" grep -q "required check 'cargo-deny' is missing" "$tmp/err"
+jq -c 'map(del(.workflow))' <<<"$ALL_OK" >"$CHECKS"
+t_fail "check: checks without a workflow do not count" "$verify" check 7
 printf '%s' '[]' >"$CHECKS"
 t_fail "check: no CI reported" "$verify" check 7
 printf '%s' "$ALL_OK" >"$CHECKS"
@@ -128,6 +133,10 @@ t_ok   "check: verify/* contexts are ignored in CI evaluation" "$verify" check 7
 want=$(grep -E '^    name: ' "$root/.github/workflows/ci.yml" | sed 's/^    name: //' | sort)
 got=$(bash -c "$(sed -n '/^REQUIRED_CHECKS=(/,/^)/p' "$verify"); printf '%s\\n' \"\${REQUIRED_CHECKS[@]}\"" | sort)
 check  "REQUIRED_CHECKS matches ci.yml job names" test "$want" = "$got"
+# ...and every job must have a name: line, so an unnamed job cannot hide from the list
+jobs=$(awk '/^jobs:/{j=1;next} j && /^  [A-Za-z0-9_-]+:[ ]*$/{n++} END{print n+0}' "$root/.github/workflows/ci.yml")
+names=$(grep -cE '^    name: ' "$root/.github/workflows/ci.yml")
+check  "ci.yml: every job has a name ($jobs jobs, $names names)" test "$jobs" -gt 0 -a "$jobs" = "$names"
 
 # --- carry ------------------------------------------------------------------
 reset; HEAD=$B; export HEAD
@@ -187,5 +196,35 @@ git -C "$repo" checkout -q "$B"; git -C "$repo" rm -q crates/x/tests/t.rs; git -
 reset; HEAD=$Dl; export HEAD
 put "$B" "$(raw quality success 1)" "$(raw security success 2)" "$(raw adversarial success 3)"
 t_fail "carry: deleting a test file is refused" "$verify" carry 7 "$B"
+
+# --- carry: only regular files; fail closed when git cannot diff ----------------------------------
+git -C "$repo" checkout -q "$B"
+echo 1 >"$repo/scripts/tests/run.sh"; chmod +x "$repo/scripts/tests/run.sh"
+git -C "$repo" add -A; git -C "$repo" commit -q -m exec; Ex=$(git -C "$repo" rev-parse HEAD)
+reset; HEAD=$Ex; export HEAD
+put "$B" "$(raw quality success 1)"
+t_ok   "carry: an added executable test file (100755) is allowed" "$verify" carry 7 "$B"
+git -C "$repo" checkout -q "$B"
+ln -s /etc/passwd "$repo/scripts/tests/link"
+git -C "$repo" add -A; git -C "$repo" commit -q -m symlink; Sl=$(git -C "$repo" rev-parse HEAD)
+reset; HEAD=$Sl; export HEAD
+put "$B" "$(raw quality success 1)"
+t_fail "carry: a symlink under a test path (120000) is refused" "$verify" carry 7 "$B"
+check  "  posts nothing" bash -c "! grep -q 'statuses/' '$GH_LOG'"
+git -C "$repo" checkout -q "$B"
+git -C "$repo" update-index --add --cacheinfo "160000,$A,scripts/tests/sub"
+git -C "$repo" commit -q -m gitlink; Gl=$(git -C "$repo" rev-parse HEAD)
+reset; HEAD=$Gl; export HEAD
+put "$B" "$(raw quality success 1)"
+t_fail "carry: a gitlink under a test path (160000) is refused" "$verify" carry 7 "$B"
+check  "  posts nothing" bash -c "! grep -q 'statuses/' '$GH_LOG'"
+mkdir -p "$tmp/gitfail"
+real_git=$(command -v git)
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ "$a" == diff-tree ]] && { echo "fatal: simulated" >&2; exit 128; }; done\nexec %s "$@"\n' "$real_git" >"$tmp/gitfail/git"
+chmod +x "$tmp/gitfail/git"
+reset; HEAD=$B; export HEAD
+put "$A" "$(raw quality success 1)"
+t_fail "carry: fails closed when git diff-tree exits non-zero" env PATH="$tmp/gitfail:$PATH" "$verify" carry 7 "$A"
+check  "  posts nothing" bash -c "! grep -q 'statuses/' '$GH_LOG'"
 
 exit $fail

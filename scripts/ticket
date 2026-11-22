@@ -11,6 +11,7 @@
 #   ticket unblock                 move blocked tickets whose blockers are all closed to ready
 #   ticket audit [args]            run scripts/ticket-audit
 set -euo pipefail
+export LC_ALL=C
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STATES="backlog ready in-progress in-review changes-requested blocked done"
@@ -66,7 +67,7 @@ case "$cmd" in
     epic=${1:?epic number required}; title=${2:?title required}; shift 2
     valid_num "$epic"; valid_title "$title"
     prio=p2 area="" blocked="" body_file="" type=task
-    while getopts "p:a:b:F:t:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; b) blocked=$OPTARG;; F) body_file=$OPTARG;; t) type=$OPTARG;; *) die "bad option";; esac; done
+    while getopts "p:a:b:F:t:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; b) blocked+="${blocked:+,}$OPTARG";; F) body_file=$OPTARG;; t) type=$OPTARG;; *) die "bad option";; esac; done
     shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
     valid_prio "$prio"; valid_area "$area"; valid_type "$type"
     blocked_nums=()

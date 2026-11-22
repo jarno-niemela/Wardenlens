@@ -71,7 +71,7 @@ apr() { jq -nc --argjson n "$1" --arg b "$2" \
   '{number:$n,title:"pr",body:$b,state:"OPEN",createdAt:"2026-11-21T12:00:00Z",isDraft:false,reviewDecision:"",author:{login:"x",is_bot:false},labels:[]}'; }
 has() { # name expect(1|0) issues prs number rule
   printf '%s' "$3" >"$tmp/i.json"; printf '%s' "$4" >"$tmp/p.json"
-  local out; out=$("$audit" --json --fail-on never --issues-file "$tmp/i.json" --prs-file "$tmp/p.json" --now "$now" 2>&1) \
+  local out; out=$("$audit" --json --fail-on never --repo jarno-niemela/Wardenlens --issues-file "$tmp/i.json" --prs-file "$tmp/p.json" --now "$now" 2>&1) \
     || { echo "FAIL [$1] crashed: $out"; fail=1; return; }
   local got=0; jq -e --argjson n "$5" --arg r "$6" 'any(.[]; .number == $n and .rule == $r)' <<<"$out" >/dev/null && got=1
   if [[ $got == "$2" ]]; then echo "ok   [$1]"; else echo "FAIL [$1] expected=$2 for #$5 $6; got $(jq -c 'map([.number,.rule])' <<<"$out")"; fail=1; fi

@@ -35,7 +35,7 @@ STUB
 chmod +x "$tmp/bin/gh" "$tmp/gitbin/git"
 export PATH="$tmp/bin:$PATH" GH_LOG="$tmp/gh.log" STATUS_DIR="$tmp/statuses" CHECKS="$tmp/checks.json"
 fail=0
-ALL_OK=$(jq -nc '[{name:"fmt · clippy · test · doc",bucket:"pass"},{name:"cargo-deny",bucket:"pass"},{name:"scripts (shellcheck + tooling tests + audit)",bucket:"pass"}]')
+ALL_OK=$(jq -nc '[{name:"fmt · clippy · test · doc",bucket:"pass",workflow:"CI"},{name:"cargo-deny",bucket:"pass",workflow:"CI"},{name:"scripts (shellcheck + tooling tests + audit)",bucket:"pass",workflow:"CI"}]')
 reset() { : >"$GH_LOG"; rm -f "$STATUS_DIR"/*.json; printf '%s' "$ALL_OK" >"$CHECKS"; unset PR_VIEW_FAIL; }
 t_ok()   { local n=$1; shift; if "$@" >"$tmp/out" 2>"$tmp/err"; then echo "ok   $n"; else echo "FAIL $n: exit $?: $(head -c 300 "$tmp/err")"; fail=1; fi; }
 t_fail() { local n=$1; shift; if "$@" >"$tmp/out" 2>"$tmp/err"; then echo "FAIL $n: expected failure (out: $(head -c 200 "$tmp/out"))"; fail=1; else echo "ok   $n"; fi; }

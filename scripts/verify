@@ -12,12 +12,15 @@
 # DIM is exactly one of: quality security adversarial. Labels are display-only; statuses are the gate.
 # Trust: a verify/* status counts only if its creator is the operator (`gh api user`), is not a Bot, and
 # its description starts with "Opus <dim> verification". Everything else is ignored. The latest status
-# per context is the one with the highest id. CI must be real: every REQUIRED_CHECKS name must pass.
+# per context is the one with the highest id. CI must be real: every REQUIRED_CHECKS name must pass,
+# reported by the workflow named "CI" (same-named checks from other workflows do not count).
 # Merge with: sha=$(scripts/verify check PR) && gh pr merge PR --squash --delete-branch --match-head-commit "$sha"
 set -euo pipefail
+export LC_ALL=C
 
 DIMS="quality security adversarial"
 # Must equal the job names in .github/workflows/ci.yml (a test asserts this).
+CI_WORKFLOW="CI"
 REQUIRED_CHECKS=(
   "fmt · clippy · test · doc"
   "cargo-deny"
@@ -98,11 +101,11 @@ case "$cmd" in
       state=$(jq -r --arg c "verify/$dim" '.[$c].state // "missing"' <<<"$statuses")
       [[ "$state" == success ]] || missing+=("verify/$dim is $state on ${sha:0:12}")
     done
-    checks=$(gh pr checks "$1" --json name,bucket 2>/dev/null || true)
+    checks=$(gh pr checks "$1" --json name,bucket,workflow 2>/dev/null || true)
     jq -e 'type == "array"' <<<"$checks" >/dev/null 2>&1 || checks='[]'
     checks=$(jq -c 'map(select((.name | startswith("verify/")) | not))' <<<"$checks")
     for req in "${REQUIRED_CHECKS[@]}"; do
-      state=$(jq -r --arg n "$req" '[.[] | select(.name == $n) | .bucket] | if length == 0 then "missing" elif all(. == "pass") then "pass" else (map(select(. != "pass")) | first) end' <<<"$checks")
+      state=$(jq -r --arg n "$req" --arg w "$CI_WORKFLOW" '[.[] | select(.name == $n and .workflow == $w) | .bucket] | if length == 0 then "missing" elif all(. == "pass") then "pass" else (map(select(. != "pass")) | first) end' <<<"$checks")
       [[ "$state" == pass ]] || missing+=("required check '$req' is $state")
     done
     while IFS= read -r line; do missing+=("check $line"); done < <(
@@ -121,13 +124,16 @@ case "$cmd" in
     head=$(head_sha "$pr")
     git cat-file -e "$from^{commit}" 2>/dev/null || git fetch -q origin "$from" 2>/dev/null || die "cannot find commit $from locally"
     git cat-file -e "$head^{commit}" 2>/dev/null || git fetch -q origin "$head" 2>/dev/null || die "cannot find commit $head locally"
-    # Only added or modified files under test paths may differ. Fail closed if git cannot compute the diff.
-    diff=$(git diff-tree -r --no-renames --no-relative --ignore-submodules=none --name-status "$from" "$head") || die "git diff-tree failed; cannot verify the diff"
+    # Only added or modified regular files (modes 100644/100755: no symlinks, no gitlinks) under test
+    # paths may differ. Fail closed if git cannot compute the diff.
+    diff=$(git diff-tree -r --raw --no-renames --no-relative --ignore-submodules=none "$from" "$head") || die "git diff-tree failed; cannot verify the diff"
     bad=()
-    while IFS=$'\t' read -r st f extra; do
-      [[ -z "$st" ]] && continue
-      if [[ ! "$st" =~ ^[AM]$ || -n "${extra:-}" || ! ( "$f" =~ ^crates/[^/]+/tests/ || "$f" =~ ^scripts/tests/ ) ]]; then
-        bad+=("$st $f")
+    while IFS=$'\t' read -r meta f extra; do
+      [[ -z "$meta" ]] && continue
+      read -r _ dmode _ _ st <<<"${meta#:}"
+      if [[ ! "$st" =~ ^[AM]$ || ! "$dmode" =~ ^100(644|755)$ || -n "${extra:-}" \
+            || ! ( "$f" =~ ^crates/[^/]+/tests/ || "$f" =~ ^scripts/tests/ ) ]]; then
+        bad+=("${st:-?} $f (mode ${dmode:-?})")
       fi
     done <<<"$diff"
     if [[ ${#bad[@]} -gt 0 ]]; then

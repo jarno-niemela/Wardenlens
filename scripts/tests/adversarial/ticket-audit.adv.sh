@@ -21,7 +21,7 @@ pr() { # number body [title]
 }
 case_run() { # name issues-json prs-json -> sets $out (or empty + CRASH)
   printf '%s' "$2" >"$tmp/i.json"; printf '%s' "$3" >"$tmp/p.json"
-  if ! out=$("$audit" --json --fail-on never --issues-file "$tmp/i.json" --prs-file "$tmp/p.json" --now "$now" 2>"$tmp/err"); then
+  if ! out=$("$audit" --json --fail-on never --repo jarno-niemela/Wardenlens --issues-file "$tmp/i.json" --prs-file "$tmp/p.json" --now "$now" 2>"$tmp/err"); then
     echo "FAIL [$1] audit crashed: $(head -c 200 "$tmp/err")"; fail=1; out=""; return 1
   fi
 }

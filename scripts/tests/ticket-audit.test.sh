@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 fx=$root/scripts/tests/fixtures
 now=$(date -d 2026-11-22T00:00:00Z +%s 2>/dev/null || date -j -f %Y-%m-%dT%H:%M:%SZ 2026-11-22T00:00:00Z +%s)
-out=$("$root/scripts/ticket-audit" --json --fail-on never --issues-file "$fx/issues.json" --prs-file "$fx/prs.json" --now "$now")
+out=$("$root/scripts/ticket-audit" --json --fail-on never --repo jarno-niemela/Wardenlens --issues-file "$fx/issues.json" --prs-file "$fx/prs.json" --now "$now")
 
 fail=0
 expect() {  # expect NUMBER RULE
@@ -70,12 +70,39 @@ reject_rule 28 review-without-pr; reject_rule 29 review-without-pr
 reject_rule 1 epic-complete
 
 # exit-code contract
-if "$root/scripts/ticket-audit" --fail-on error --issues-file "$fx/issues.json" --prs-file "$fx/prs.json" --now "$now" >/dev/null; then
+if "$root/scripts/ticket-audit" --fail-on error --repo jarno-niemela/Wardenlens --issues-file "$fx/issues.json" --prs-file "$fx/prs.json" --now "$now" >/dev/null; then
   echo "FAIL expected non-zero exit with errors present"; fail=1
 else echo "ok   exit code on errors"; fi
 echo '[]' >"${TMPDIR:-/tmp}/empty.$$.json"
-if "$root/scripts/ticket-audit" --issues-file "${TMPDIR:-/tmp}/empty.$$.json" --prs-file "${TMPDIR:-/tmp}/empty.$$.json" >/dev/null; then
+if "$root/scripts/ticket-audit" --repo jarno-niemela/Wardenlens --issues-file "${TMPDIR:-/tmp}/empty.$$.json" --prs-file "${TMPDIR:-/tmp}/empty.$$.json" >/dev/null; then
   echo "ok   clean exit"
 else echo "FAIL clean input should exit 0"; fail=1; fi
 rm -f "${TMPDIR:-/tmp}/empty.$$.json"
+
+# repo detection: the live path asks `gh repo view` and uses its answer (no hard-coded default);
+# offline mode without --repo is a usage error.
+stubdir=$(mktemp -d); trap 'rm -rf "$stubdir"' EXIT
+cat >"$stubdir/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh $*" >>"$CALLS"
+case "$1 $2" in
+  "repo view") echo fork-owner/Wardenlens ;;
+  "issue list") echo '[{"number":3,"title":"t","state":"OPEN","labels":[{"name":"type:task"},{"name":"status:in-review"},{"name":"priority:p2"}],"body":"Epic: #1","assignees":[],"updatedAt":"2026-11-21T00:00:00Z"},{"number":1,"title":"e","state":"OPEN","labels":[{"name":"type:epic"},{"name":"status:backlog"}],"body":"","assignees":[],"updatedAt":"2026-11-21T00:00:00Z"}]' ;;
+  "pr list") echo '[{"number":9,"title":"p","body":"Closes fork-owner/Wardenlens#3","state":"OPEN","createdAt":"2026-11-21T00:00:00Z","isDraft":false,"reviewDecision":"","author":{"login":"x","is_bot":false},"labels":[]}]' ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$stubdir/gh"
+export CALLS=$stubdir/calls
+live=$(PATH="$stubdir:$PATH" "$root/scripts/ticket-audit" --json --fail-on never --now "$now")
+if grep -q '^gh repo view' "$CALLS" && jq -e 'any(.[]; .rule == "review-without-pr") | not' <<<"$live" >/dev/null; then
+  echo "ok   live path uses gh repo view (fork-owner/Wardenlens)"
+else echo "FAIL live path did not use the repo from gh repo view"; fail=1; fi
+live=$(PATH="$stubdir:$PATH" "$root/scripts/ticket-audit" --json --fail-on never --repo jarno-niemela/Wardenlens --now "$now")
+if jq -e 'any(.[]; .rule == "review-without-pr")' <<<"$live" >/dev/null; then echo "ok   --repo overrides gh repo view"
+else echo "FAIL --repo did not override"; fail=1; fi
+rc=0; "$root/scripts/ticket-audit" --issues-file "$fx/issues.json" --prs-file "$fx/prs.json" --now "$now" >/dev/null 2>&1 || rc=$?
+if [[ $rc -eq 2 ]]; then echo "ok   offline without --repo is a usage error"; else echo "FAIL offline without --repo exited $rc"; fail=1; fi
+rc=0; PATH="$stubdir:$PATH" "$root/scripts/ticket-audit" --issues-file "$fx/issues.json" --now "$now" >/dev/null 2>&1 || rc=$?
+if grep -q '^gh repo view' "$CALLS"; then echo "ok   one file only is not offline (uses gh repo view)"; else echo "FAIL one file only treated as offline"; fail=1; fi
 exit $fail

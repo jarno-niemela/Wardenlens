@@ -45,6 +45,24 @@ rejects "status: bad state"         status 3 shipped
 rejects "status: bad number"        status x ready
 rejects "unknown command"           frobnicate
 
+# repeated -b accumulates every list; unicode digits are not digits
+ok_dir=$(mktemp -d); trap 'rm -rf "$tmp" "$ok_dir"' EXIT
+cat >"$ok_dir/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh $*" >>"$CALLS"
+case "$1 $2" in
+  "issue view") echo true ;;
+  "issue create") echo https://github.com/o/r/issues/50 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$ok_dir/gh"
+CALLS=$ok_dir/calls PATH="$ok_dir:$PATH" "$ticket" task 1 "T" -b 2 -b 3,4 >/dev/null 2>&1
+if grep -q 'Blocked by: #2, #3, #4' "$ok_dir/calls"; then echo "ok   task: repeated -b accumulates"; else echo "FAIL task: repeated -b lost values: $(cat "$ok_dir/calls")"; fail=1; fi
+rejects "task: -b unicode digit"    task 1 "T" -b '٣'
+rejects "task: epic unicode digit"  task '٣' "T"
+rejects "epic: priority unicode digit" epic "T" -p 'p٣'
+
 # --help must not print the `set -euo` line
 if "$ticket" --help | grep -q 'set -euo'; then echo "FAIL ticket --help leaks code"; fail=1; else echo "ok   ticket --help is clean"; fi
 audit=$root/scripts/ticket-audit

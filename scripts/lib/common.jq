@@ -18,11 +18,12 @@ def epic_ref:
 def local_repo($repo): . == null or (ascii_downcase == ($repo | ascii_downcase));
 
 # [owner/name or null, N] for every reference on "Blocked by" lines (optionally task-list items such
-# as "- [ ] Blocked by #2"): #N, owner/name#N or a github.com issue URL.
+# as "- [ ] Blocked by #2"): #N, owner/name#N or a github.com issue or pull request URL (the host is
+# matched case-insensitively; a PR number is a known blocker, see audit.jq).
 def blocker_refs:
   [ body_lines
     | select(test("^\\s*(?:[-*]\\s*(?:\\[[ xX]\\]\\s*)?)?blocked[ -]by\\b:?\\s*"; "i"))
-    | scan("(?:https://github\\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/|(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#|(?<![A-Za-z0-9_])#)([0-9]+)")
+    | scan("(?:https://github\\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/|(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#|(?<![A-Za-z0-9_])#)([0-9]+)"; "i")
     | [(.[0] // .[1]), (.[2] | tonumber)] ];
 
 # Issue numbers this repository's ticket is blocked by. References to other repositories are ignored here.
