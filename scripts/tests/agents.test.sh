@@ -106,6 +106,10 @@ check "implementer row has 9 columns" test "$(awk -F'\t' '$5=="impl1"{print NF}'
 check "implementer row never STALE" bash -c "! \"\$1\" list | grep -P 'impl1.*(STALE|UNKNOWN)'" _ "$agents"
 "$agents" fail impl1 "x\ny" 'bogus'
 check "fail keeps 9 columns" test "$(awk -F'\t' '$5=="impl1"{print NF}' "$tmp/state/inflight.tsv")" = 9
+"$agents" fail impl1 rate_limit 14:30
+check "fail stores reason exactly" test "$(awk -F"\t" '$5=="impl1"{print $9}' "$tmp/state/inflight.tsv")" = rate_limit
+"$agents" fail impl1 "a b/c"
+check "fail sanitises to a_b_c" test "$(awk -F"\t" '$5=="impl1"{print $9}' "$tmp/state/inflight.tsv")" = a_b_c
 check "list without state dir" bash -c "[[ \$(WARDENLENS_AGENT_STATE=\$1/none \"\$2\" list) == 'no inflight agents' ]]" _ "$tmp" "$agents"
 "$agents" record reviewer 7 "$A" "$tmp/p1" pr7
 cat >"$tmp/bin/gh" <<'STUB'
