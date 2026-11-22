@@ -60,8 +60,15 @@ checkf "path-traversal id refused" "$agents" record reviewer 5 "$A" "$tmp/p1" ..
 checkf "missing prompt refused" "$agents" record reviewer 5 "$A" "$tmp/none" ag3
 
 # secret scan
-printf 'camera at 10.99.1.2\n' >"$tmp/p2"
-checkf "LAN address refused" "$agents" record reviewer 5 "$A" "$tmp/p2" ag4
+n=0
+for ip in 10.1.2.3 172.20.0.5 192.168.50.7; do
+  n=$((n + 1)); printf 'camera at %s:80\n' "$ip" >"$tmp/p2"
+  checkf "private address $ip refused" "$agents" record reviewer 5 "$A" "$tmp/p2" "lan$n"
+done
+for ip in 3.0.0.4 203.0.113.9 172.32.0.1 1.10.1.2.3; do
+  n=$((n + 1)); printf 'ver %s ok\n' "$ip" >"$tmp/p2"
+  check "non-private $ip allowed" "$agents" record reviewer 5 "$A" "$tmp/p2" "pub$n"
+done
 printf 'login with s3cretPass! please\n' >"$tmp/p3"
 checkf "secret value refused" "$agents" record reviewer 5 "$A" "$tmp/p3" ag5
 printf 'key tok-123456789\n' >"$tmp/p4"

@@ -3,7 +3,7 @@
 #
 #   agents record ROLE REF SHA PROMPT_FILE AGENT_ID   save the prompt (mode 0600) and append an inflight row.
 #                                                     REF is the ticket (implementer) or PR (verifiers) number.
-#                                                     Refuses a prompt holding a 10.99. address or a value from
+#                                                     Refuses a prompt holding a private (RFC1918) address or a value from
 #                                                     the secret file (credential-like keys, length >= 6).
 #   agents done AGENT_ID                              drop the row; keep the prompt as AGENT_ID.prompt.done
 #   agents fail AGENT_ID REASON [RESET]               mark the row `limited` with the reset time (e.g. 14:30)
@@ -38,7 +38,11 @@ init() {
 
 scan_prompt() {  # FILE: refuse LAN addresses and secret-file values; never echo a value
   local f=$1 pats rc=0
-  if grep -q -F '10.99.' -- "$f"; then die "refusing: prompt contains a 10.99. address"; fi
+  local o='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+  local rfc1918="(10(\\.$o){3}|172\\.(1[6-9]|2[0-9]|3[01])(\\.$o){2}|192\\.168(\\.$o){2})"
+  if grep -q -P -- "(?<![0-9.])$rfc1918(?![0-9]|\\.[0-9])" "$f"; then
+    die "refusing: prompt contains a private (RFC1918) address"
+  fi
   [[ -f "$secret" ]] || return 0
   command -v jq >/dev/null || die "missing dependency: jq"
   pats=$(mktemp)

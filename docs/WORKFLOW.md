@@ -255,7 +255,7 @@ and the saved prompts, mode 0600, never in the repo).
 
 The controller must:
 1. **Record every launch**: save the prompt and `scripts/agents record ROLE REF SHA PROMPT_FILE AGENT_ID`.
-   `record` refuses prompts containing `10.99.` addresses or values from the local secret file.
+   `record` refuses prompts containing private (RFC1918) addresses or values from the local secret file.
 2. **On a rate-limit failure**: `scripts/agents fail AGENT_ID rate_limit HH:MM`, note the reset
    time, and do no other work that needs the model until then.
 3. **After the reset**: resume each failed agent with `SendMessage` "limit reset, continue", or,
