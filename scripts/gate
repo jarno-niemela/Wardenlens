@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Local quality gate — the same checks CI runs. Must pass before a PR is opened.
+# Usage: scripts/gate [--quick]   (--quick skips doc + deny)
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+quick=0; [[ "${1:-}" == "--quick" ]] && quick=1
+if [[ "${GITHUB_ACTIONS:-}" != true && "$(git config core.hooksPath || true)" != .githooks ]]; then
+  echo "gate: core.hooksPath must be .githooks (run: git config core.hooksPath .githooks); the pre-push hook is the authoritative push control" >&2
+  exit 1
+fi
+step() { printf '\n== %s\n' "$*"; }
+
+step "fmt";    cargo fmt --all -- --check
+step "clippy"; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+step "test";   cargo test --workspace --all-features --locked
+step "tooling tests"
+for t in scripts/tests/*.test.sh scripts/tests/adversarial/*.sh; do "$t" >/dev/null || { echo "FAILED: $t" >&2; "$t" | grep -v '^ok' >&2 || true; exit 1; }; done
+if command -v shellcheck >/dev/null; then
+  step "shellcheck"
+  shellcheck scripts/ticket scripts/ticket-audit scripts/verify scripts/gate scripts/labels.sh \
+    scripts/tests/*.sh scripts/tests/adversarial/*.sh .claude/hooks/*.sh .githooks/*
+fi
+if [[ $quick -eq 0 ]]; then
+  step "doc";  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+  if command -v cargo-deny >/dev/null; then step "deny"; cargo deny check
+  else echo "(cargo-deny not installed; skipped locally — CI enforces it. Install: cargo install --locked cargo-deny)"; fi
+fi
+printf '\ngate: PASS\n'

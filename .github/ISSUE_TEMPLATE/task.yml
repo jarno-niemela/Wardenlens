@@ -1,0 +1,22 @@
+name: Task
+description: One mergeable unit of work belonging to an epic
+labels: ["type:task", "status:backlog", "needs:triage"]
+body:
+  - type: input
+    id: epic
+    attributes: { label: Epic, description: "Parent epic. Keep the exact form 'Epic: #N' in the body after triage.", placeholder: "Epic: #1" }
+    validations: { required: true }
+  - type: textarea
+    id: context
+    attributes: { label: Context }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance criteria, value: "- [ ] " }
+    validations: { required: true }
+  - type: textarea
+    id: tests
+    attributes: { label: Test plan }
+  - type: textarea
+    id: security
+    attributes: { label: Security notes, description: "Untrusted inputs, trust boundaries, secrets, new deps" }

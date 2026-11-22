@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Ticket helper over GitHub issues. Requires: gh, jq.
+#
+#   ticket epic  "Title" [-p p0..p3] [-a area] [-F body.md]
+#   ticket task  EPIC "Title" [-p p2] [-a area] [-b 12,14] [-F body.md] [-t task|bug|chore|spike]
+#   ticket status N STATE          backlog|ready|in-progress|in-review|changes-requested|blocked|done
+#   ticket claim N                 status:in-progress + assign @me + agent:sonnet
+#   ticket next                    print the highest-priority unblocked ready ticket number
+#   ticket list [STATE]            open tickets, optionally filtered by status
+#   ticket epic-progress N         task completion for an epic
+#   ticket unblock                 move blocked tickets whose blockers are all closed to ready
+#   ticket audit [args]            run scripts/ticket-audit
+set -euo pipefail
+export LC_ALL=C
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+STATES="backlog ready in-progress in-review changes-requested blocked done"
+
+die() { echo "ticket: $*" >&2; exit 1; }
+for dep in gh jq; do command -v "$dep" >/dev/null || die "missing dependency: $dep"; done
+
+valid_state() {
+  case "$1" in backlog|ready|in-progress|in-review|changes-requested|blocked|done) ;; *) die "invalid state '$1' (one of: $STATES)" ;; esac
+}
+valid_title() { [[ -n "$1" && "$1" != -* ]] || die "invalid title '$1' (empty, or an option where the title belongs)"; }
+valid_num()   { [[ "$1" =~ ^[0-9]+$ ]] || die "not an issue number: '$1'"; }
+valid_prio()  { [[ "$1" =~ ^p[0-3]$ ]] || die "invalid priority '$1' (p0..p3)"; }
+valid_type()  { [[ "$1" =~ ^(task|bug|chore|spike)$ ]] || die "invalid type '$1' (task|bug|chore|spike)"; }
+valid_area()  { [[ -z "$1" || "$1" =~ ^[a-z0-9-]+$ ]] || die "invalid area '$1' (lowercase letters, digits, dashes)"; }
+
+set_status() {
+  local n=$1 s=$2 args=()
+  valid_num "$n"; valid_state "$s"
+  while read -r l; do
+    [[ -n "$l" && "$l" != "status:$s" ]] && args+=(--remove-label "$l")
+  done < <(gh issue view "$n" --json labels --jq '.labels[].name | select(startswith("status:"))')
+  gh issue edit "$n" --add-label "status:$s" "${args[@]}" >/dev/null
+  echo "#$n -> status:$s"
+}
+
+link_sub_issue() {  # best effort: native GitHub sub-issue for the UI; the 'Epic:' line stays authoritative
+  local epic=$1 child=$2 id
+  id=$(gh api "repos/{owner}/{repo}/issues/$child" --jq .id) || return 0
+  gh api -X POST "repos/{owner}/{repo}/issues/$epic/sub_issues" -F "sub_issue_id=$id" >/dev/null 2>&1 \
+    || echo "ticket: note: could not add #$child as sub-issue of #$epic (non-fatal)" >&2
+}
+
+open_tickets_json() {
+  gh issue list --state open --limit 2000 --json number,title,labels,body,assignees,updatedAt
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  epic)
+    title=${1:?title required}; shift
+    valid_title "$title"
+    prio=p2 area="" body_file=""
+    while getopts "p:a:F:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; F) body_file=$OPTARG;; *) die "bad option";; esac; done
+    shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
+    valid_prio "$prio"; valid_area "$area"
+    body=$(if [[ -n "$body_file" ]]; then cat "$body_file"; else cat "$here/templates/epic.md"; fi)
+    labels="type:epic,status:backlog,priority:$prio${area:+,area:$area}"
+    [[ -n "$area" ]] && gh label create "area:$area" --color 006b75 --force >/dev/null
+    gh issue create --title "$title" --label "$labels" --body "$body"
+    ;;
+  task)
+    epic=${1:?epic number required}; title=${2:?title required}; shift 2
+    valid_num "$epic"; valid_title "$title"
+    prio=p2 area="" blocked="" body_file="" type=task
+    while getopts "p:a:b:F:t:" o; do case $o in p) prio=$OPTARG;; a) area=$OPTARG;; b) blocked+="${blocked:+,}$OPTARG";; F) body_file=$OPTARG;; t) type=$OPTARG;; *) die "bad option";; esac; done
+    shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "unexpected argument: $1"
+    valid_prio "$prio"; valid_area "$area"; valid_type "$type"
+    blocked_nums=()
+    if [[ -n "$blocked" ]]; then
+      # comma- or space-separated positive issue numbers; no empty entries, no 0, no newlines
+      [[ "$blocked" =~ ^[1-9][0-9]*([,\ ][1-9][0-9]*)*$ ]] || die "invalid -b '$blocked' (issue numbers like 12,14)"
+      IFS=', ' read -r -a blocked_nums <<<"${blocked//,/ }"
+    fi
+    [[ "$(gh issue view "$epic" --json labels --jq '[.labels[].name] | index("type:epic") != null')" == true ]] \
+      || die "#$epic is not a type:epic issue"
+    header="Epic: #$epic"
+    state=ready
+    if [[ ${#blocked_nums[@]} -gt 0 ]]; then
+      header+=$'\n'"Blocked by: $(printf '#%s, ' "${blocked_nums[@]}" | sed 's/, $//')"
+      state=blocked
+    fi
+    body=$(if [[ -n "$body_file" ]]; then cat "$body_file"; else cat "$here/templates/task.md"; fi)
+    labels="type:$type,status:$state,priority:$prio${area:+,area:$area}"
+    [[ -n "$area" ]] && gh label create "area:$area" --color 006b75 --force >/dev/null
+    url=$(gh issue create --title "$title" --label "$labels" --body "$header"$'\n\n'"$body")
+    echo "$url"
+    link_sub_issue "$epic" "${url##*/}"
+    ;;
+  status)
+    [[ $# -le 2 ]] || die "unexpected argument: ${3}"
+    set_status "${1:?number}" "${2:?state}" ;;
+  claim)
+    [[ $# -le 1 ]] || die "unexpected argument: ${2}"
+    n=${1:?number}; valid_num "$n"
+    set_status "$n" in-progress
+    gh issue edit "$n" --add-assignee @me --add-label agent:sonnet >/dev/null
+    ;;
+  next)
+    # Eligible: open, exactly one status label (ready), not human/triage-gated, and every
+    # blocker known and closed. Open blockers include open PRs (same rules as the audit).
+    all_issues=$(gh issue list --state all --limit 2000 --json number,title,state,labels,body,assignees,updatedAt)
+    all_prs=$(gh pr list --state all --limit 1000 --json number,state)
+    repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) && [[ -n "$repo" ]] || die "cannot resolve the repository"
+    jq -r -L "$here/lib" --argjson prs "$all_prs" --arg repo "$repo" 'include "common";
+      . as $all
+      | ([$all[].number] + [$prs[].number]) as $known
+      | ([$all[] | select(.state == "OPEN") | .number] + [$prs[] | select(.state == "OPEN") | .number]) as $open
+      | [ $all[] | select(.state == "OPEN")
+          | select(labelnames | index("status:ready") != null)
+          | select((prefixed("status:") | length) == 1)
+          | select(labelnames | any(. == "agent:human" or . == "needs:triage") | not)
+          | select(labelnames | any(. == "type:task" or . == "type:bug" or . == "type:chore" or . == "type:spike"))
+          | select(foreign_blockers($repo) | length == 0)
+          | select(. as $t | blockers($repo) | (index($t.number) == null)
+                   and all(. as $b | ($known | index($b)) != null and ($open | index($b)) == null))
+          | . + {prio: ([prefixed("priority:") | .[] | select(test("^priority:p[0-3]$")) | .[10:] | tonumber] | min // 9)} ]
+      | sort_by(.prio, .number) | first | if . == null then empty else .number end' <<<"$all_issues"
+    ;;
+  list)
+    filter=${1:-}; [[ -n "$filter" ]] && valid_state "$filter"
+    open_tickets_json | jq -r --arg f "${filter:+status:$filter}" '
+      map(select($f == "" or ([.labels[].name] | index($f)) != null)) | sort_by(.number)[]
+      | "#\(.number)\t\([.labels[].name | select(startswith("status:") or startswith("type:") or startswith("priority:"))] | join(","))\t\(.title)"'
+    ;;
+  epic-progress)
+    n=${1:?number}; valid_num "$n"
+    gh issue list --state all --limit 2000 --json number,title,state,body | jq -r -L "$here/lib" --argjson e "$n" 'include "common";
+      map(select(epic_ref == $e))
+      | "Epic #\($e): \(map(select(.state == "CLOSED")) | length)/\(length) tasks closed",
+        (sort_by(.number)[] | "  [\(if .state == "CLOSED" then "x" else " " end)] #\(.number) \(.title)")'
+    ;;
+  unblock)
+    "$here/ticket-audit" --json --fail-on never | jq -r '.[] | select(.rule == "unblocked") | .number' \
+      | while read -r n; do set_status "$n" ready; done
+    ;;
+  audit) exec "$here/ticket-audit" "$@" ;;
+  ""|-h|--help) sed -n '2,12p' "$0" ;;
+  *) die "unknown command '$cmd' (see --help)" ;;
+esac

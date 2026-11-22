@@ -1,0 +1,18 @@
+[package]
+name = "wardenlens-cli"
+description = "Command-line entry point for Wardenlens."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wardenlens"
+path = "src/main.rs"
+
+[dependencies]
+wardenlens-core.workspace = true
+
+[lints]
+workspace = true

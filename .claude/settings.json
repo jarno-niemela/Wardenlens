@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt:*)", "Bash(cargo clippy:*)", "Bash(cargo test:*)", "Bash(cargo build:*)",
+      "Bash(cargo check:*)", "Bash(cargo doc:*)", "Bash(cargo deny:*)", "Bash(cargo tree:*)",
+      "Bash(cargo metadata:*)", "Bash(scripts/gate:*)", "Bash(scripts/ticket:*)",
+      "Bash(scripts/ticket-audit:*)", "Bash(scripts/verify check:*)", "Bash(scripts/tests/ticket-audit.test.sh)",
+      "Bash(git status:*)", "Bash(gh issue view:*)", "Bash(gh issue list:*)",
+      "Bash(gh pr view:*)", "Bash(gh pr list:*)", "Bash(gh pr diff:*)", "Bash(gh pr checks:*)",
+      "Bash(gh run list:*)", "Bash(gh run view:*)"
+    ],
+    "deny": [
+      "Bash(gh repo delete:*)",
+      "Edit(./.githooks/**)", "Write(./.githooks/**)", "Edit(./.git/**)", "Write(./.git/**)",
+      "Edit(~/.bashrc)", "Write(~/.bashrc)", "Edit(~/.profile)", "Write(~/.profile)",
+      "Edit(~/.bash_profile)", "Write(~/.bash_profile)", "Edit(~/.bash_login)", "Write(~/.bash_login)",
+      "Edit(./.claude/hooks/**)", "Write(./.claude/hooks/**)",
+      "Edit(./.claude/settings.json)", "Write(./.claude/settings.json)",
+      "Edit(./.claude/settings.local.json)", "Write(./.claude/settings.local.json)",
+      "Edit(./.github/workflows/**)", "Write(./.github/workflows/**)",
+      "Read(./.env)", "Read(./.env.*)",
+      "Read(~/.ssh/**)", "Read(~/.config/gh/**)", "Read(~/.cargo/credentials*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-bash.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write|MultiEdit", "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/rustfmt.sh" }] }
+    ]
+  }
+}

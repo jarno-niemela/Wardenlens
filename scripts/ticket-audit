@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Detect neglected or mis-labelled tickets and PRs. Requires: gh, jq.
+#
+# Usage: scripts/ticket-audit [--json] [--fail-on error|warn|never]
+#                             [--issues-file F --prs-file F] [--now EPOCH]
+#                             [--repo owner/name]
+#   --issues-file: array from `gh issue list --state all`
+#   --prs-file:    array from `gh pr list --state all` (all states; rules apply to open PRs)
+#   --repo:        repository the references must point at (default: `gh repo view`; there is no
+#                  built-in default, so offline runs with both files must pass --repo)
+# Env:   STALE_DAYS (3)  BACKLOG_DAYS (30)  PR_DAYS (2)
+# Exit:  0 clean (relative to --fail-on), 1 findings at/above threshold, 2 usage error.
+set -euo pipefail
+export LC_ALL=C
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+json=0 fail_on=error issues_file="" prs_file="" repo="" now=$(date +%s)
+
+usage_err() { echo "ticket-audit: $*" >&2; exit 2; }
+need_val() { [[ $# -ge 2 ]] || usage_err "option $1 needs a value"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) json=1 ;;
+    --fail-on) need_val "$@"; fail_on=$2; shift ;;
+    --issues-file) need_val "$@"; issues_file=$2; shift ;;
+    --prs-file) need_val "$@"; prs_file=$2; shift ;;
+    --repo) need_val "$@"; repo=$2; shift ;;
+    --now) need_val "$@"; now=$2; shift ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "ticket-audit: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$fail_on" in error|warn|never) ;; *) echo "ticket-audit: bad --fail-on" >&2; exit 2 ;; esac
+
+# Offline only when BOTH inputs were given on the command line; decided before anything is fetched.
+offline=0
+[[ -n "$issues_file" && -n "$prs_file" ]] && offline=1
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+if [[ -z "$issues_file" ]]; then
+  issues_file=$tmp/issues.json
+  gh issue list --state all --limit 2000 \
+    --json number,title,state,labels,body,assignees,updatedAt >"$issues_file"
+fi
+if [[ -z "$prs_file" ]]; then
+  prs_file=$tmp/prs.json
+  gh pr list --state all --limit 1000 \
+    --json number,title,body,state,createdAt,isDraft,reviewDecision,author,labels >"$prs_file"
+fi
+
+if [[ -z "$repo" ]]; then
+  ((offline == 0)) || usage_err "offline mode (--issues-file and --prs-file) needs --repo owner/name"
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || usage_err "cannot resolve the repository (use --repo)"
+fi
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || usage_err "--repo must be owner/name"
+[[ "$now" =~ ^[0-9]+$ ]] || usage_err "--now must be epoch seconds"
+
+findings=$(jq -n -L "$here/lib" \
+  --slurpfile issues "$issues_file" --slurpfile prs "$prs_file" \
+  --arg repo "$repo" \
+  --argjson now "$now" \
+  --argjson stale_days "${STALE_DAYS:-3}" \
+  --argjson backlog_days "${BACKLOG_DAYS:-30}" \
+  --argjson pr_days "${PR_DAYS:-2}" \
+  'include "common"; $issues[0] as $issues | $prs[0] as $prs | '"$(cat "$here/lib/audit.jq")")
+
+if [[ $json -eq 1 ]]; then
+  echo "$findings"
+else
+  count=$(jq length <<<"$findings")
+  if [[ $count -eq 0 ]]; then
+    echo "ticket-audit: clean"
+  else
+    jq -r '.[] | "\(.severity | ascii_upcase | .[0:5] | . + "     " | .[0:5]) #\(.number) [\(.rule)] \(.message) — \(.title)"' <<<"$findings"
+    echo "ticket-audit: $count finding(s)"
+  fi
+fi
+
+case "$fail_on" in
+  never) exit 0 ;;
+  warn)  jq -e 'any(.[]; .severity == "error" or .severity == "warn") | not' <<<"$findings" >/dev/null || exit 1 ;;
+  error) jq -e 'any(.[]; .severity == "error") | not' <<<"$findings" >/dev/null || exit 1 ;;
+esac

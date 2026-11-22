@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# SHA-bound Opus verification gate. Requires: gh, jq, git.
+#
+#   verify mark PR DIM pass|fail SHA   record a verdict as commit status verify/DIM on SHA;
+#                                      the verify:DIM label is updated only if SHA is the PR head
+#   verify check PR                    succeed (print head SHA) only if verify/quality, verify/security
+#                                      and verify/adversarial are all success on the PR head SHA and
+#                                      every other check passes; otherwise list gaps on stderr, exit 1
+#   verify carry PR FROM_SHA           copy success verify/* statuses from FROM_SHA to the PR head,
+#                                      allowed only if the diff touches nothing but test paths
+#
+# DIM is exactly one of: quality security adversarial. Labels are display-only; statuses are the gate.
+# Trust: a verify/* status counts only if its creator is the operator (`gh api user`), is not a Bot, and
+# its description starts with "Opus <dim> verification". Everything else is ignored. The latest status
+# per context is the one with the highest id. CI must be real: every REQUIRED_CHECKS name must pass,
+# reported by the workflow named "CI" (same-named checks from other workflows do not count).
+# Merge with: sha=$(scripts/verify check PR) && gh pr merge PR --squash --delete-branch --match-head-commit "$sha"
+set -euo pipefail
+export LC_ALL=C
+
+DIMS="quality security adversarial"
+# Must equal the job names in .github/workflows/ci.yml (a test asserts this).
+CI_WORKFLOW="CI"
+REQUIRED_CHECKS=(
+  "fmt · clippy · test · doc"
+  "cargo-deny"
+  "scripts (shellcheck + tooling tests + audit)"
+)
+
+die() { echo "verify: $*" >&2; exit 1; }
+for dep in gh jq git; do command -v "$dep" >/dev/null || die "missing dependency: $dep"; done
+
+valid_pr()  { [[ "${1:-}" =~ ^[0-9]+$ ]] || die "PR must be a number: '${1:-}'"; }
+valid_dim() {
+  case "${1:-}" in quality|security|adversarial) ;; *) die "DIM must be one of: $DIMS (got '${1:-}')" ;; esac
+}
+valid_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]] || die "SHA must be 40 lowercase hex chars: '${1:-}'"; }
+
+head_sha() {
+  local sha
+  sha=$(gh pr view "$1" --json headRefOid -q .headRefOid) || die "cannot read PR #$1"
+  valid_sha "$sha"
+  printf '%s' "$sha"
+}
+
+operator() {
+  local op
+  op=$(gh api user -q .login) || die "cannot resolve the operator login"
+  [[ "$op" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die "unexpected operator login '$op'"
+  printf '%s' "$op"
+}
+
+# Trusted verify/* statuses of a commit as a JSON array sorted by id (oldest first).
+trusted_statuses() {  # SHA OPERATOR
+  gh api --paginate "repos/{owner}/{repo}/commits/$1/statuses?per_page=100" \
+    | jq -s --arg op "$2" '
+        add // []
+        | map(. as $s | select((.context | type) == "string" and (.context | startswith("verify/"))
+                     and ((.creator.login // "") | ascii_downcase) == ($op | ascii_downcase)
+                     and (.creator.type // "") != "Bot"
+                     and (($s.description // "") | startswith("Opus \($s.context | ltrimstr("verify/")) verification"))))
+        | sort_by(.id)'
+}
+
+# {context: {state, description}} of the latest (highest id) trusted status per context.
+latest_of() { jq 'map({key: .context, value: {state, description}}) | from_entries'; }
+
+post_status() {  # SHA DIM STATE DESCRIPTION
+  gh api -X POST "repos/{owner}/{repo}/statuses/$1" \
+    -f "state=$3" -f "context=verify/$2" -f "description=$4" >/dev/null
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  mark)
+    [[ $# -eq 4 ]] || die "usage: verify mark PR DIM pass|fail SHA"
+    pr=$1 dim=$2 verdict=$3 sha=$4
+    valid_pr "$pr"; valid_dim "$dim"; valid_sha "$sha"
+    case "$verdict" in pass) state=success ;; fail) state=failure ;; *) die "verdict must be pass or fail" ;; esac
+    cur=$(head_sha "$pr") || exit 1
+    post_status "$sha" "$dim" "$state" "Opus $dim verification"
+    if [[ "$cur" == "$sha" ]]; then
+      if [[ "$verdict" == pass ]]; then
+        gh pr edit "$pr" --add-label "verify:$dim" >/dev/null
+      else
+        gh pr edit "$pr" --remove-label "verify:$dim" >/dev/null || true
+      fi
+    else
+      echo "verify: $sha is not the head of PR #$pr; status recorded, label untouched" >&2
+    fi
+    echo "verify/$dim=$state on ${sha:0:12}"
+    ;;
+  check)
+    [[ $# -eq 1 ]] || die "usage: verify check PR"
+    valid_pr "$1"
+    sha=$(head_sha "$1")
+    op=$(operator)
+    statuses=$(trusted_statuses "$sha" "$op" | latest_of)
+    missing=()
+    for dim in $DIMS; do
+      state=$(jq -r --arg c "verify/$dim" '.[$c].state // "missing"' <<<"$statuses")
+      [[ "$state" == success ]] || missing+=("verify/$dim is $state on ${sha:0:12}")
+    done
+    checks=$(gh pr checks "$1" --json name,bucket,workflow 2>/dev/null || true)
+    jq -e 'type == "array"' <<<"$checks" >/dev/null 2>&1 || checks='[]'
+    checks=$(jq -c 'map(select((.name | startswith("verify/")) | not))' <<<"$checks")
+    for req in "${REQUIRED_CHECKS[@]}"; do
+      state=$(jq -r --arg n "$req" --arg w "$CI_WORKFLOW" '[.[] | select(.name == $n and .workflow == $w) | .bucket] | if length == 0 then "missing" elif all(. == "pass") then "pass" else (map(select(. != "pass")) | first) end' <<<"$checks")
+      [[ "$state" == pass ]] || missing+=("required check '$req' is $state")
+    done
+    while IFS= read -r line; do missing+=("check $line"); done < <(
+      jq -r '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) is \(.bucket)"' <<<"$checks")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+      printf 'verify: not mergeable:\n' >&2
+      printf '  - %s\n' "${missing[@]}" >&2
+      exit 1
+    fi
+    echo "$sha"
+    ;;
+  carry)
+    [[ $# -eq 2 ]] || die "usage: verify carry PR FROM_SHA"
+    pr=$1 from=$2
+    valid_pr "$pr"; valid_sha "$from"
+    head=$(head_sha "$pr")
+    git cat-file -e "$from^{commit}" 2>/dev/null || git fetch -q origin "$from" 2>/dev/null || die "cannot find commit $from locally"
+    git cat-file -e "$head^{commit}" 2>/dev/null || git fetch -q origin "$head" 2>/dev/null || die "cannot find commit $head locally"
+    # Only added or modified regular files (modes 100644/100755: no symlinks, no gitlinks) under test
+    # paths may differ. Fail closed if git cannot compute the diff.
+    diff=$(git diff-tree -r --raw --no-renames --no-relative --ignore-submodules=none "$from" "$head") || die "git diff-tree failed; cannot verify the diff"
+    bad=()
+    while IFS=$'\t' read -r meta f extra; do
+      [[ -z "$meta" ]] && continue
+      read -r _ dmode _ _ st <<<"${meta#:}"
+      if [[ ! "$st" =~ ^[AM]$ || ! "$dmode" =~ ^100(644|755)$ || -n "${extra:-}" \
+            || ! ( "$f" =~ ^crates/[^/]+/tests/ || "$f" =~ ^scripts/tests/ ) ]]; then
+        bad+=("${st:-?} $f (mode ${dmode:-?})")
+      fi
+    done <<<"$diff"
+    if [[ ${#bad[@]} -gt 0 ]]; then
+      echo "verify: cannot carry verification; changes since ${from:0:12} other than added/modified test files:" >&2
+      printf '  %s\n' "${bad[@]}" >&2
+      exit 1
+    fi
+    op=$(operator)
+    head_all=$(trusted_statuses "$head" "$op")
+    if jq -e 'any(.[]; .state != "success")' <<<"$head_all" >/dev/null; then
+      die "the PR head ${head:0:12} already has a non-success verify/* status; refusing to carry over it"
+    fi
+    statuses=$(trusted_statuses "$from" "$op" | latest_of)
+    carried=0
+    for dim in $DIMS; do
+      if [[ "$(jq -r --arg c "verify/$dim" '.[$c].state // ""' <<<"$statuses")" == success ]]; then
+        post_status "$head" "$dim" success "Opus $dim verification (carried from ${from:0:12}, test-only changes)"
+        gh pr edit "$pr" --add-label "verify:$dim" >/dev/null
+        carried=$((carried + 1))
+      fi
+    done
+    echo "carried $carried verification(s) from ${from:0:12} to ${head:0:12}"
+    ;;
+  ""|-h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0" ;;
+  *) die "unknown command '$cmd' (see --help)" ;;
+esac

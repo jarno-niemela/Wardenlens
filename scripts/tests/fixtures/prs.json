@@ -1,0 +1,13 @@
+[
+  {"number": 20, "title": "Fix thing", "body": "Closes #11", "state": "OPEN", "createdAt": "2026-11-21T12:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 21, "title": "Unlinked", "body": "no refs", "state": "OPEN", "createdAt": "2026-11-10T00:00:00Z", "isDraft": false, "reviewDecision": "REVIEW_REQUIRED", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 22, "title": "Bump serde", "body": "deps", "state": "OPEN", "createdAt": "2026-11-21T20:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "app/dependabot", "is_bot": true}},
+  {"number": 26, "title": "Work for the blocker", "body": "Closes #12", "state": "OPEN", "createdAt": "2026-11-21T12:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 27, "title": "Bad ref", "body": "Closes #500", "state": "OPEN", "createdAt": "2026-11-21T12:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 31, "title": "Owner/repo ref", "body": "Closes jarno-niemela/Wardenlens#28", "state": "OPEN", "createdAt": "2026-11-21T12:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 32, "title": "URL ref", "body": "Resolves https://github.com/jarno-niemela/Wardenlens/issues/29", "state": "OPEN", "createdAt": "2026-11-21T12:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 34, "title": "fix #30 in the title only", "body": "n/a", "state": "OPEN", "createdAt": "2026-11-21T12:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 35, "title": "Old merged PR", "body": "no refs", "state": "MERGED", "createdAt": "2026-10-01T00:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [], "author": {"login": "dev", "is_bot": false}},
+  {"number": 36, "title": "Old but fully verified", "body": "Closes #12", "state": "OPEN", "createdAt": "2026-11-10T00:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [{"name": "verify:quality"}, {"name": "verify:security"}, {"name": "verify:adversarial"}], "author": {"login": "dev", "is_bot": false}},
+  {"number": 37, "title": "Old, unverified", "body": "Closes #12", "state": "OPEN", "createdAt": "2026-11-10T00:00:00Z", "isDraft": false, "reviewDecision": "", "labels": [{"name": "verify:quality"}, {"name": "verify:security"}], "author": {"login": "dev", "is_bot": false}}
+]
