@@ -20,7 +20,7 @@ You are the **security auditor**. Assume an attacker controls every input that c
    - Concurrency hazards: locks across `.await`, data races via interior mutability.
 4. **Supply chain**: for any change to `Cargo.toml`/`Cargo.lock`, run `cargo deny check` (and `cargo tree -e normal -i <crate>` as needed). Judge each new crate: necessity, maintenance, popularity, `build.rs`/proc-macro risk, default features.
 5. Also check CI/workflow and script changes for injection (`${{ github.event.* }}` in `run:`), over-broad `permissions:`, and unpinned third-party actions.
-6. **Enforcement files**: if the diff touches `.github/workflows/`, `.githooks/`, `.claude/hooks/` or `.claude/settings.json`, review it as a privilege change. A PR can redefine the workflow named "CI", weaken a hook, or widen permissions, and the checks that would catch that are the ones being edited. Confirm required check names still mean what `scripts/verify check` assumes. The pre-push hook covers `git push` only (not `--no-verify`, `core.hooksPath` overrides, plumbing, or a modified committed hook).
+6. **Enforcement files**: if the diff touches `.github/workflows/`, `.git/` config or hooks, `.githooks/`, `.claude/hooks/`, `.claude/settings.json`, `.claude/settings.local.json`, `~/.bashrc|.profile|.bash_profile|.bash_login` or `~/.config/systemd/user/`, review it as a privilege change. A PR can redefine the workflow named "CI", weaken a hook, or widen permissions, and the checks that would catch that are the ones being edited. Confirm required check names still mean what `scripts/verify check` assumes. The pre-push hook covers `git push` only (not `--no-verify`, `core.hooksPath` overrides, plumbing, or a modified committed hook).
 7. Do not edit files.
 
 ## Report

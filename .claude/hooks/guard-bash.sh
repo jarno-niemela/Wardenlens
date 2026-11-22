@@ -4,8 +4,9 @@
 #
 # How it works: heredoc bodies that feed a non-interpreter (file contents, PR bodies) are dropped, then
 # the command is tokenised quote-aware, split into simple commands at ; & | ( ) newline, and each `git`
-# / `gh` invocation is checked (git global options such as -C, -c and --git-dir are parsed; redirections
-# glued to a token are stripped). Quoted arguments of shells and wrappers (bash -c '...', eval, xargs,
+# / `gh` invocation is checked (git global options such as -C, -c and --git-dir are parsed).
+# Redirections (N>, >>, >|, &>, <>, >&, <<<; glued or not) are split off and removed from the segment before
+# analysis; their targets are kept for the tamper check. Quoted arguments of shells and wrappers (bash -c '...', eval, xargs,
 # sudo ...), $(...) substitutions and here-strings fed to a shell are scanned too. Heredoc detection
 # ignores << inside quotes, comments and arithmetic ((...)).
 #
@@ -21,17 +22,24 @@
 #    removing/renaming the core section), and unknown git global options in front of
 #    push/commit/merge/rebase.
 #  - any assignment or export of WARDENLENS_ALLOW_REWRITE (the human-only switch of .githooks/pre-push).
-#  - directory tracking fails closed: a cd/pushd/popd in a subshell, pipeline, background job,
-#    backticks or nested shell scan, `env -C`, and GIT_DIR/GIT_WORK_TREE assignments make the working
-#    directory unknown, and a bare push with an unknown directory is refused.
+#  - directory tracking fails closed: only a cd/pushd that is the very first command of the whole input
+#    is followed. Any other cd/pushd/popd (later, in a subshell, pipeline, background job, backticks,
+#    nested shell scan, if/{/case body), `env -C`, and GIT_DIR/GIT_WORK_TREE assignments make the
+#    working directory unknown, and a bare push with an unknown directory is refused.
 #  - gh pr merge only with --match-head-commit <40-hex SHA or one $variable>, never --admin; no
 #    repo/issue deletion; gh api: no merges, no DELETE on repos, no branch-protection/ruleset changes,
 #    no writes to */statuses/* (forging verification; scripts/verify is the only writer and its internal
-#    calls are not inspected), no write to a percent-encoded endpoint, no contents write to
-#    main/master, and no GraphQL mutation (reading through graphql is fine).
-#  - tamper protection: a redirect, tee, cp, mv, install, ln, rm, unlink, chmod, sed -i, truncate, dd or
-#    touch aimed at .githooks/, .git/hooks, .git/config, ~/.bashrc, ~/.profile or ~/.bash_profile is
-#    refused (also when the working directory is one of those). `git config` keeps its own rules.
+#    calls are not inspected), no write to a percent-encoded endpoint, a contents write
+#    needs an explicit branch= field that is not main/master (and never --input), and no GraphQL
+#    mutation (reading through graphql is fine).
+#  - tamper protection: a redirect (any form), tee, cp, mv, install, ln, rm, unlink, chmod, chown, truncate,
+#    dd, touch, rsync, sed -i, perl -i, find -delete/-exec, or git checkout/restore aimed at anything
+#    under .git/, .githooks/, .claude/hooks/, .claude/settings(.local).json, ~/.bashrc, ~/.profile,
+#    ~/.bash_profile, ~/.bash_login or ~/.config/systemd/user/ is refused. Paths are resolved against
+#    the tracked directory (// and /./ and .. normalised); when the directory is unknown, a relative
+#    target named config, pre-push, settings.json, .bashrc ... is refused. git apply and patch are
+#    refused (the patch cannot be inspected), as are extensions.worktreeConfig and git config
+#    --worktree writes. Reading with a writer word (cp .githooks/x /tmp/y) is a known false positive.
 #  - piping into a shell (`| bash`, `| sh -s`, `source /dev/stdin`) hides commands: blocked.
 #
 # The authoritative push control is .githooks/pre-push; this guard is the first, best-effort line.
@@ -55,6 +63,7 @@ input=$(cat) || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook 
 cmd=$(jq -r '.tool_input.command // ""' <<<"$input") || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook input" >&2; exit 2; }
 cwd=$(jq -r '.cwd // ""' <<<"$input") || { echo "Blocked by .claude/hooks/guard-bash.sh: unreadable hook input" >&2; exit 2; }
 cwd_unknown=0
+cmd_seen=0   # set once the first command of the input has been seen (only that cd is tracked)
 
 block() { echo "Blocked by .claude/hooks/guard-bash.sh: $1" >&2; exit 2; }
 
@@ -130,8 +139,8 @@ strip_heredocs() {
 
 # Quote-aware tokeniser. Emits one line per token ("t"+text, or "q"+text if any part was quoted) and an
 # "s" line at every simple-command separator (; && || newline), "s&" for a single & (background), "s`" at
-# a backtick, "o"/"c" at ( and ), "p" at a pipe (| or |&). & glued to > or < (2>&1, >&2) or before > (&>)
-# belongs to a redirection.
+# a backtick, "o"/"c" at ( and ), "p" at a pipe (| or |&). A redirection operator (2>, >>, >|, &>, <>, >&,
+# <<<, ...) is emitted as "r"+operator and split from its neighbours; the next token is its target.
 # Unquoted # starts a comment.
 tokenize() {
   CMD=$1 awk '
@@ -157,9 +166,26 @@ tokenize() {
           else { if (substr(s, i + 1, 1) == "&") i++; print "p" }
           continue
         }
-        if (c == "&") {   # part of a redirection (2>&1, >&2, &>file) or a separator
+        if (c == ">" || c == "<") {   # redirection operator: split off its word, emit "r"+[fd]operator
+          if (substr(s, i + 1, 1) == "(") { tok = tok c; intok = 1; continue }   # <(...) / >(...)
+          pre = ""
+          if (intok && !quoted && (tok ~ /^[0-9]+$/ || tok == "&")) { pre = tok; tok = ""; intok = 0 } else flush()
+          op = c; n2 = substr(s, i + 1, 1)
+          if (c == ">") {
+            if (n2 == ">") { op = ">>"; i++ }
+            n2 = substr(s, i + 1, 1)
+            if (n2 == "|" || n2 == "&") { op = op n2; i++ }
+          } else if (n2 == ">") { op = "<>"; i++ }
+          else if (n2 == "&") { op = "<&"; i++ }
+          else if (n2 == "<") {
+            op = "<<"; i++; n2 = substr(s, i + 1, 1)
+            if (n2 == "<" || n2 == "-") { op = op n2; i++ }
+          }
+          print "r" pre op
+          continue
+        }
+        if (c == "&") {   # &> is a redirection (handled above); otherwise a separator
           pc = (i > 1) ? substr(s, i - 1, 1) : ""
-          if (pc == ">" || pc == "<") { tok = tok c; intok = 1; continue }
           if (substr(s, i + 1, 1) == ">") { flush(); tok = "&"; intok = 1; continue }
           flush(); print (pc == "&" || substr(s, i + 1, 1) == "&") ? "s" : "s&"; continue
         }
@@ -218,7 +244,7 @@ is_main_ref() {  # [+]src:dst | name | refs/heads/name | heads/name -> true if t
 
 bad_key() {  # true for config keys that bypass hooks, hide commands or change what a push updates
   case "${1,,}" in
-    remote.*.mirror|push.default|remote.*.push|alias.*|core.hookspath|include.path|includeif.*) return 0 ;;
+    remote.*.mirror|push.default|remote.*.push|alias.*|core.hookspath|include.path|includeif.*|extensions.worktreeconfig) return 0 ;;
   esac
   return 1
 }
@@ -249,32 +275,69 @@ is_push_plumbing() {  # is_push_plumbing NAME ARGS...: NAME without the git- pre
 
 # --- tamper protection --------------------------------------------------------------------------
 
-tamper_path() {  # true if the path names the hooks, the repository config or a shell rc file
-  [[ "$1" =~ (^|/)\.githooks(/|$) || "$1" =~ (^|/)\.git/(hooks(/|$)|config$) || "$1" =~ (^|/)\.(bashrc|profile|bash_profile)$ ]]
+TAMPER_RE='(^|/)(\.git|\.githooks)(/|$)|(^|/)\.claude/(hooks(/|$)|settings(\.local)?\.json$)|(^|/)\.(bashrc|profile|bash_profile|bash_login)$|(^|/)\.config/systemd/user(/|$)'
+TAMPER_MSG="writing to .git/, .githooks/, .claude/hooks, .claude/settings*.json or shell rc files is for the user (they are the push and tool controls); use the Edit/Write tools for repository files"
+NP=""
+
+norm_path() {  # NP = P with //, /./, a trailing / and .. resolved lexically
+  local p=$1 lead="" part
+  local -a parts=() out=()
+  [[ "$p" == /* ]] && lead=/
+  local IFS=/
+  read -ra parts <<<"$p" || true
+  for part in "${parts[@]}"; do
+    case "$part" in
+      ""|.) ;;
+      ..) if ((${#out[@]} > 0)) && [[ "${out[-1]}" != .. ]]; then unset 'out[-1]'; elif [[ -z "$lead" ]]; then out+=(..); fi ;;
+      *) out+=("$part") ;;
+    esac
+  done
+  NP="$lead${out[*]:-}"
 }
 
-check_tamper() {  # redirects, tee, cp, mv, install, ln, rm, chmod, sed -i, truncate ... aimed at protected paths
-  local n=${#seg_t[@]} i k t p writer=0 hit=0 want=0
-  local msg="writing to .githooks/, .git/hooks, .git/config or shell rc files is for the user (the hooks are the push control)"
+tamper_hit() {  # tamper_hit PATH [BASE UNKNOWN]: true if PATH (resolved against BASE, default the tracked cwd) is protected
+  local p=$1 base=${2-${cwd:-.}} unk=${3-$cwd_unknown} e
+  [[ -n "$p" ]] || return 1
+  if e=$(expand_home "$p"); then p=$e; fi
+  norm_path "$p"; p=$NP
+  if [[ "$p" != /* ]]; then
+    if ((unk)); then
+      case "${p##*/}" in
+        config|config.worktree|pre-push|pre-commit|guard-bash.sh|settings.json|settings.local.json|.bashrc|.profile|.bash_profile|.bash_login) return 0 ;;
+      esac
+    else
+      norm_path "$base/$p"; p=$NP
+    fi
+  fi
+  [[ "$p" =~ $TAMPER_RE ]]
+}
+
+check_tamper() {  # redirects (rd_op/rd_tgt) and writer commands aimed at protected paths; reads seg_t
+  local n=${#seg_t[@]} i k t p writer=0 hit=0 cmdword=""
+  for ((i = 0; i < ${#rd_op[@]}; i++)); do
+    if [[ "${rd_op[i]}" == *'>'* ]] && tamper_hit "${rd_tgt[i]}"; then block "$TAMPER_MSG"; fi
+  done
   for ((i = 0; i < n; i++)); do
     t=${seg_t[i]}
-    if ((want)); then want=0; tamper_path "$t" && block "$msg"; continue; fi
-    if [[ "$t" =~ ^([0-9]*|\&)\>\>?\|?(.*)$ ]]; then   # > FILE, >> FILE, >FILE, &>FILE
-      p=${BASH_REMATCH[2]}
-      if [[ -z "$p" ]]; then want=1; else tamper_path "$p" && block "$msg"; fi
-      continue
+    if [[ -z "$cmdword" && ! "$t" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      case "${t##*/}" in sudo|env|command|exec|nohup|time|nice|setsid|builtin|xargs|timeout|'{'|'!') ;; *) cmdword=${t##*/} ;; esac
     fi
     case "${t##*/}" in
       tee|cp|mv|install|ln|rm|unlink|chmod|chown|truncate|dd|touch|rsync) writer=1 ;;
-      sed) for ((k = i + 1; k < n; k++)); do
-             case "${seg_t[k]}" in -i*|--in-place*|-[a-zA-Z]*i*) [[ "${seg_t[k]}" == -* ]] && writer=1 ;; esac
-           done ;;
+      sed|perl) for ((k = i + 1; k < n; k++)); do
+                  if [[ "${seg_t[k]}" =~ ^-[a-zA-Z]*i || "${seg_t[k]}" == --in-place* ]]; then writer=1; fi
+                done ;;
+      find) for ((k = i + 1; k < n; k++)); do
+              case "${seg_t[k]}" in -delete|-exec|-execdir|-ok|-okdir|-fprint|-fprint0|-fprintf|-fls) writer=1 ;; esac
+            done ;;
     esac
     p=${t#of=}
-    if tamper_path "$p"; then hit=1; fi
+    [[ "$p" == --*=* ]] && p=${p#*=}
+    if [[ "$p" != -* ]] && tamper_hit "$p"; then hit=1; fi
   done
-  if ((writer && hit)); then block "$msg"; fi
-  if ((writer && !cwd_unknown)) && tamper_path "${cwd:-.}"; then block "$msg"; fi
+  if [[ "$cmdword" == patch ]]; then block "patch cannot be inspected and can rewrite protected files; use the Edit/Write tools"; fi
+  if ((writer && hit)); then block "$TAMPER_MSG"; fi
+  if ((writer && !cwd_unknown)) && tamper_hit .; then block "$TAMPER_MSG"; fi
   return 0
 }
 
@@ -296,18 +359,27 @@ check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flag
 }
 
 check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks; never unset
-  local a key="" val="" have_val=0 np=0 unset_=0 skip=0 section=0 sec
+  local a key="" val="" have_val=0 np=0 unset_=0 skip=0 section=0 sec wt=0 rd=0 fl=0
   local -a pos=()
   for a in "$@"; do
-    if ((skip)); then skip=0; continue; fi
+    if ((skip)); then
+      skip=0
+      if ((fl)) && tamper_hit "$a"; then block "$TAMPER_MSG"; fi
+      fl=0; continue
+    fi
     case "$a" in
       --unset|--unset-all) unset_=1 ;;
       --remove-section|--rename-section) section=1 ;;
-      -f|--file|--blob|--default|--type|--comment) skip=1 ;;
+      --worktree) wt=1 ;;
+      --get|--get-all|--get-regexp|--get-urlmatch|-l|--list) rd=1 ;;
+      -f|--file) skip=1; fl=1 ;;
+      --file=*) if tamper_hit "${a#--file=}"; then block "$TAMPER_MSG"; fi ;;
+      --blob|--default|--type|--comment) skip=1 ;;
       -*) ;;
       *) pos+=("$a") ;;
     esac
   done
+  if ((wt && !rd)); then block "writing the per-worktree git config can bypass hooks (extensions.worktreeConfig); use plain git config"; fi
   if [[ "${pos[0]:-}" == set || "${pos[0]:-}" == unset || "${pos[0]:-}" == remove-section || "${pos[0]:-}" == rename-section ]]; then
     [[ "${pos[0]}" == unset ]] && unset_=1 || true
     [[ "${pos[0]}" == remove-section || "${pos[0]}" == rename-section ]] && section=1 || true
@@ -315,7 +387,7 @@ check_config() {  # git config ARGS: core.hooksPath may only be set to .githooks
   fi
   if ((section)); then  # removing/renaming a whole section drops core.hooksPath, aliases, push settings
     sec=${pos[0]:-}; case "${sec,,}" in
-      core|alias|include|includeif.*|push|remote|remote.*) block "removing or renaming the '${pos[0]}' config section bypasses the git hooks" ;;
+      core|alias|include|includeif.*|push|remote|remote.*|extensions) block "removing or renaming the '${pos[0]}' config section bypasses the git hooks" ;;
     esac
     return 0
   fi
@@ -424,19 +496,7 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
   done
   ((j < n)) || return 0
   local sub=${seg_t[j]}
-  # arguments with unquoted redirections removed (a glued `main>/dev/null` is just `main`)
-  local -a args=()
-  local skipnext=0
-  for ((k = j + 1; k < n; k++)); do
-    tok=${seg_t[k]}
-    if ((skipnext)); then skipnext=0; continue; fi
-    if [[ "${seg_q[k]}" == t ]]; then
-      if [[ "$tok" =~ ^([0-9]*|\&)(\>\>?|\<)\&?$ ]]; then skipnext=1; continue; fi
-      if [[ "$tok" =~ ^([0-9]*|\&)(\>|\<) ]]; then continue; fi
-      if [[ "$tok" == *[\<\>]* ]]; then tok=${tok%%[<>]*}; [[ -n "$tok" ]] || continue; fi
-    fi
-    args+=("$tok")
-  done
+  local -a args=("${seg_t[@]:j+1}")
   if is_push_plumbing "$sub" "${args[@]}"; then block "$plumbing_msg"; fi
   case "$sub" in
     commit|push|merge|rebase|pull|am|cherry-pick|revert)
@@ -449,6 +509,13 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
     commit) check_commit_flags "${args[@]}" ;;
     push) check_push "$d" "$gd" "$unk" "${args[@]}" ;;
     config) check_config "${args[@]}" ;;
+    apply) block "git apply writes files from a patch that cannot be inspected (it can rewrite the hooks); use the Edit/Write tools" ;;
+    checkout|restore)
+      local a2
+      if ((!unk)) && tamper_hit . "$d" 0; then block "$TAMPER_MSG"; fi
+      for a2 in "${args[@]}"; do
+        if tamper_hit "$a2" "$d" "$unk"; then block "git $sub of a protected path: $TAMPER_MSG"; fi
+      done ;;
   esac
 }
 
@@ -467,10 +534,6 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       -R|--repo) skip=1; continue ;;
       -*) continue ;;
     esac
-    if [[ "${seg_q[k]}" == t && "$a" =~ ^([0-9]*|\&)(\>\>?|\<)\&?[^[:space:]]*$ ]]; then  # redirection, not an argument
-      [[ "$a" =~ ^([0-9]*|\&)(\>\>?|\<)\&?$ ]] && skip=1 || true
-      continue
-    fi
     if [[ -z "$a1" ]]; then a1=$a; idx1=$k; elif [[ -z "$a2" ]]; then a2=$a; fi
   done
   case "$a1 $a2" in
@@ -494,7 +557,7 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       ((have)) || block "gh pr merge needs --match-head-commit \"\$sha\" with sha=\$(scripts/verify check PR) so only the verified SHA merges" ;;
     "repo delete"|"issue delete") block "deleting repos/issues requires the user" ;;
     "api "*)
-      local method="" ep="" prev="" haswrite=0 all="" fld c rest ci
+      local method="" ep="" prev="" haswrite=0 hasinput=0 all="" fld c rest ci br okbranch=0
       local -a fields=()
       for ((k = idx1 + 1; k < n; k++)); do
         a=${seg_t[k]}
@@ -514,11 +577,12 @@ check_gh() {  # check_gh INDEX ; reads seg_t
           -X=*) method=${a#-X=} ;;
           -X?*) method=${a#-X} ;;
           --method=*) method=${a#--method=} ;;
-          -f|-F|--field|--raw-field|--input) haswrite=1; prev=$a ;;
+          --input) haswrite=1; hasinput=1; prev=$a ;;
+          -f|-F|--field|--raw-field) haswrite=1; prev=$a ;;
           -f?*) haswrite=1; fields+=("${a#-f}") ;;
           -F?*) haswrite=1; fields+=("${a#-F}") ;;
           --field=*|--raw-field=*) haswrite=1; fields+=("${a#*=}") ;;
-          --input=*) haswrite=1 ;;
+          --input=*) haswrite=1; hasinput=1 ;;
           -H|--header|-q|--jq|-t|--template|--hostname|--cache|--preview|-p) prev=$a ;;
           -[A-Za-z][A-Za-z]*)
             # a cluster of short flags (-iX DELETE, -iXPOST): the first flag that takes a value ends it
@@ -547,11 +611,17 @@ check_gh() {  # check_gh INDEX ; reads seg_t
       if [[ "$method" != GET && "$method" != HEAD ]]; then
         [[ "$ep" == *%* ]] && block "percent-encoded endpoint on a write request cannot be checked" || true
         if [[ "$ep" == repos/*/contents/* ]]; then
+          ((hasinput)) && block "contents writes with --input cannot be checked; the branch is hidden in the body"
           for fld in "${fields[@]}"; do
-            case "${fld,,}" in branch=main|branch=master|branch=refs/heads/main|branch=refs/heads/master) block "writing files to main/master through the API requires the user" ;; esac
+            case "${fld,,}" in
+              branch=*) br=${fld#*=}; br=${br,,}; br=${br#refs/}; br=${br#heads/}
+                        if [[ "$br" == main || "$br" == master ]]; then block "writing files to main/master through the API requires the user"; fi
+                        okbranch=1 ;;
+            esac
           done
+          ((okbranch)) || block "a contents write through the API needs an explicit branch=<feature branch> field (the default branch is main)"
         fi
-        [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
+                [[ "$method" == DELETE && "$ep" == repos/* ]] && block "DELETE on repos requires the user" || true
         case "$ep" in
           */branches/*/protection*) block "changing branch protection requires the user" ;;
           */rulesets*) block "changing rulesets requires the user" ;;
@@ -645,17 +715,43 @@ scan() {  # scan TEXT DEPTH
   check_segment "$depth" "$pending" $((subdepth > 0 || bt))
 }
 
+scan_redirects() {  # scan_redirects DEPTH WRAPPED: here-strings fed to a shell and $(...) in quoted targets are code
+  local depth=$1 wrapped=$2 i t
+  ((depth < 4)) || return 0
+  for ((i = 0; i < ${#rd_op[@]}; i++)); do
+    t=${rd_tgt[i]}
+    [[ "${rd_q[i]}" == q ]] || continue
+    # shellcheck disable=SC2016  # matching the literal text $(
+    if [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "$t" $((depth + 1))
+    elif [[ "${rd_op[i]}" == *'<<<' ]] && ((wrapped)); then scan "$t" $((depth + 1)); fi
+  done
+}
+
 check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: runs in a subshell)
-  local depth=$1 piped=$2 sub=$3 n=${#seg_t[@]} i k t pn wrapped=0
-  ((n > 0)) || return 0
-  # cwd tracking: a cd in a subshell, pipeline, background job or nested scan does not carry over reliably
-  # a cd/pushd/popd anywhere but as the first word (after {, if, then, do, command, builtin, time, !, ...)
-  # is not followed; neither is one that only runs after a ||
+  local depth=$1 piped=$2 sub=$3 n i k t pn wrapped=0 first=0
+  local -a rd_op=() rd_tgt=() rd_q=() nt=() nq=()
+  n=${#seg_t[@]}
+  # redirections are removed here, before any analysis: `git 2>/dev/null push` is `git push`. Their
+  # targets are kept for the tamper check.
+  for ((i = 0; i < n; i++)); do
+    if [[ "${seg_q[i]}" == r ]]; then
+      rd_op+=("${seg_t[i]}"); rd_tgt+=("${seg_t[i + 1]:-}"); rd_q+=("${seg_q[i + 1]:-}"); i=$((i + 1))
+    else
+      nt+=("${seg_t[i]}"); nq+=("${seg_q[i]}")
+    fi
+  done
+  seg_t=("${nt[@]}"); seg_q=("${nq[@]}"); n=${#seg_t[@]}
+  if ((n == 0)); then check_tamper; scan_redirects "$depth" 0; return 0; fi
+  if ((depth == 0 && !cmd_seen)); then first=1; fi
+  if ((depth == 0)); then cmd_seen=1; fi
+  # cwd tracking: only a cd/pushd that is the very first command of the whole input is followed (and not
+  # in a subshell, pipeline, background job or after a ||). Any other cd/pushd/popd makes the directory
+  # unknown for the rest of the input; a bare push with an unknown directory is refused.
   for ((i = 1; i < n; i++)); do
     case "${seg_t[i]}" in cd|pushd|popd) cwd_unknown=1 ;; esac
   done
   case "${seg_t[0]}" in
-    cd|pushd) if ((depth > 0 || sub || cond)); then cwd_unknown=1; else track_cd; fi ;;
+    cd|pushd) if ((depth > 0 || sub || cond || !first)); then cwd_unknown=1; else track_cd; fi ;;
     popd) cwd_unknown=1 ;;
   esac
   if ((piped)); then check_pipe_target; fi
@@ -680,7 +776,7 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
     esac
     if [[ "${seg_q[i]}" == q && "$depth" -lt 4 ]]; then
       # shellcheck disable=SC2016  # matching the literal text $(
-      if ((wrapped)) || [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "${t#<<<}" $((depth + 1)); fi
+      if ((wrapped)) || [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "$t" $((depth + 1)); fi
     fi
     case "${t##*/}" in
       git-send-pack|git-http-push|git-receive-pack|git-remote-*|git-upload-pack|git-fetch-pack)
@@ -692,6 +788,7 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
     esac
     [[ "$WRAPPERS" == *" ${t##*/} "* ]] && wrapped=1 || true
   done
+  scan_redirects "$depth" "$wrapped"
   return 0
 }
 

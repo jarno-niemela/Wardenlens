@@ -52,7 +52,13 @@ We need durable state, independent verification and neglect detection.
   - brace expansion (`git push origin {feat/x,main}`);
   - heredoc logical-line edge cases (`<<EOF \` continuation, quotes spanning lines) and
     `${x//<<X/}` being read as a heredoc;
-  - `GIT_CONFIG_*` exported in an earlier command than the git invocation.
+  - `GIT_CONFIG_*` exported in an earlier command than the git invocation;
+  - the same interpreter, brace-expansion and `/usr/lib/git-core/git` gaps apply to tamper
+    protection of the enforcement files (`.git/`, `.githooks/`, `.claude/hooks/`,
+    `.claude/settings*.json`, shell rc files); `git apply` and `patch` are denied outright because
+    their patches cannot be inspected, and a read such as `cp .githooks/x /tmp/y` is a known false
+    positive. The enforcement files are additionally protected by `permissions.deny` on the Edit
+    and Write tools; the guard is best effort throughout.
 - **Neglect detection**: `scripts/ticket-audit` (pure jq rules with offline tests)
   runs every `/work` iteration and daily in CI.
 - **Tooling in bash + jq** for bootstrap; a Rust port is tracked as a ticket.
