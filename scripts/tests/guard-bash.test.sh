@@ -176,6 +176,27 @@ allow_in "cd $tmp/onfeat && git push" "$tmp/onmain"
 allow_in "(cd /tmp); git push origin feat/x" "$tmp/onmain"
 deny  $'bash<<EOF\ngit push -f\nEOF'
 
+# --- push plumbing (skips pre-push) -----------------------------------------
+deny  "git send-pack origin refs/heads/main:refs/heads/main"
+deny  "git -C x send-pack origin main"
+deny  "git --weird send-pack origin main"
+deny  "git http-push https://example.com/r.git main"
+deny  "git receive-pack /tmp/r.git"
+deny  "git remote-https origin https://example.com/r.git"
+deny  "git remote-ext origin 'ssh x'"
+deny  "git remote-fd origin 3,4"
+deny  "git upload-pack --stateless-rpc /tmp/r.git"
+deny  "git fetch-pack --stateless-rpc /tmp/r.git"
+deny  "git-send-pack /tmp/r.git main"
+deny  "/usr/lib/git-core/git-send-pack /tmp/r.git main"
+deny  "/usr/lib/git-core/git-remote-https origin https://example.com/r.git"
+deny  "/usr/lib/git-core/git-receive-pack /tmp/r.git"
+deny  "env git-http-push https://example.com/r.git main"
+allow "git remote -v"
+allow "git remote add up https://example.com/r.git"
+allow "git fetch-pack /tmp/r.git main"
+allow "git upload-pack /tmp/r.git"
+
 # --- fail closed ---------------------------------------------------------
 # With jq unavailable the guard must block (exit 2), not allow.
 mkdir -p "$tmp/nojq"

@@ -227,6 +227,23 @@ bad_cfg() {  # bad_cfg "key=value" | "-ckey=value" | "--config-env=key=ENV": tru
   bad_key "${s%%=*}"
 }
 
+plumbing_msg="git plumbing that pushes or serves pushes skips .githooks/pre-push; use git push"
+is_push_plumbing() {  # is_push_plumbing NAME ARGS...: NAME without the git- prefix; true for write-capable plumbing
+  local name=$1 a; shift
+  case "$name" in
+    send-pack|http-push|receive-pack|remote-*) return 0 ;;
+    upload-pack|fetch-pack)
+      for a in "$@"; do
+        case "$a" in
+          --stateless-rpc) return 0 ;;
+          --advertise-refs|--http-backend-info-refs) [[ "$name" == upload-pack ]] && return 0 ;;
+          *receive-pack*|*send-pack*|*push*) [[ "$name" == upload-pack ]] && return 0 ;;
+        esac
+      done ;;
+  esac
+  return 1
+}
+
 check_commit_flags() {  # for `git commit`: -n / --no-verify; message/value flags consume the next token
   local skip=0 a
   for a in "$@"; do
@@ -363,6 +380,7 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
       --*)
         for ((k = j + 1; k < n; k++)); do
           case "${seg_t[k]}" in
+            send-pack|http-push|receive-pack|remote-*|upload-pack|fetch-pack) block "unknown git global option '$opt' before ${seg_t[k]}; remove it so the command can be checked" ;;
             push|commit|merge|rebase) block "unknown git global option '$opt' before ${seg_t[k]}; remove it so the command can be checked" ;;
           esac
         done
@@ -385,6 +403,7 @@ check_git() {  # check_git INDEX ; reads seg_t, seg_q, cwd
     fi
     args+=("$tok")
   done
+  if is_push_plumbing "$sub" "${args[@]}"; then block "$plumbing_msg"; fi
   case "$sub" in
     commit|push|merge|rebase|pull|am|cherry-pick|revert)
       if [[ "$sub" != commit ]]; then
@@ -588,7 +607,7 @@ scan() {  # scan TEXT DEPTH
 }
 
 check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: runs in a subshell)
-  local depth=$1 piped=$2 sub=$3 n=${#seg_t[@]} i k t wrapped=0
+  local depth=$1 piped=$2 sub=$3 n=${#seg_t[@]} i k t pn wrapped=0
   ((n > 0)) || return 0
   # cwd tracking: a cd in a subshell, pipeline, background job or nested scan does not carry over reliably
   case "${seg_t[0]}" in
@@ -615,6 +634,10 @@ check_segment() {  # check_segment DEPTH PIPED SUB ; reads seg_t, seg_q (SUB=1: 
       # shellcheck disable=SC2016  # matching the literal text $(
       if ((wrapped)) || [[ "$t" == *'$('* || "$t" == *'`'* ]]; then scan "${t#<<<}" $((depth + 1)); fi
     fi
+    case "${t##*/}" in
+      git-send-pack|git-http-push|git-receive-pack|git-remote-*|git-upload-pack|git-fetch-pack)
+        pn=${t##*/}; if is_push_plumbing "${pn#git-}" "${seg_t[@]:i+1}"; then block "$plumbing_msg"; fi ;;
+    esac
     case "$t" in
       git|*/bin/git) check_git "$i" ;;
       gh|*/bin/gh) check_gh "$i" ;;
