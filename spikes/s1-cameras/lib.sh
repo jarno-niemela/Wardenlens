@@ -47,6 +47,22 @@ cam_onvif_url() {
   printf 'http://%s%s/onvif/device_service' "$(cam_host "$1")" "${port:+:$port}"
 }
 
+# pullpoint_ok <addr> <origin> -> 0 only if <addr> is an http(s) URL on exactly the host of <origin> (any port, no
+# userinfo). The camera chooses the pull-point address; curl would send the WS-Security digest to whatever it names.
+pullpoint_ok() {
+  local re='^https?://([^/?#]*)' a o
+  [[ $1 =~ $re ]] || return 1
+  a="${BASH_REMATCH[1]}"
+  [[ $2 =~ $re ]] || return 1
+  o="${BASH_REMATCH[1]}"
+  [[ $a != *@* && $o != *@* ]] || return 1
+  [[ $o =~ ^(\[[0-9A-Fa-f:.]+\]|[^:]+)(:[0-9]+)?$ ]] || return 1
+  local host="${BASH_REMATCH[1]}" port_re='^(:[0-9]+)?$' rest
+  [[ $a == "$host"* ]] || return 1
+  rest="${a#"$host"}"
+  [[ $rest =~ $port_re ]]
+}
+
 # cam_creds <name> -> sets CAM_USER and CAM_PASS (shell variables only).
 cam_creds() {
   CAM_USER="" CAM_PASS=""

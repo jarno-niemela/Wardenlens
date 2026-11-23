@@ -1,6 +1,9 @@
-//! Read-only Reolink Baichuan probe: login, device info, service-port state, event push.
+//! Reolink Baichuan probe: login, device info, service-port state, event push (all read-only by default).
 //! Credentials come from the BC_USER / BC_PASS environment variables (set by run_baichuan.sh).
-//! Usage: baichuan-probe <ip> <listen-seconds>
+//! Usage: baichuan-probe <ip> <listen-seconds> [abilities|https-on|https-off]
+//! The optional action modes: `abilities` is read-only; `https-on` and `https-off` WRITE the camera's HTTPS
+//! service port setting and need the camera owner's explicit approval (https-off disables HTTPS; it does not
+//! restore any earlier state, so read `HTTPS_BEFORE` first).
 use neolink_core::bc_protocol::{
     BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods,
 };
@@ -10,9 +13,15 @@ use std::time::Duration;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(ip), Some(secs)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: baichuan-probe <ip> <seconds>");
+        eprintln!("usage: baichuan-probe <ip> <seconds> [abilities|https-on|https-off]");
         return;
     };
+    // Validate the action before any connection so a typo never reaches the camera.
+    let action = args.get(3).map(String::as_str);
+    if !matches!(action, None | Some("abilities" | "https-on" | "https-off")) {
+        eprintln!("unknown action (expected abilities, https-on or https-off)");
+        std::process::exit(2);
+    }
     let secs: u64 = secs.parse().unwrap_or(60);
     let (Ok(user), Ok(pass)) = (std::env::var("BC_USER"), std::env::var("BC_PASS")) else {
         eprintln!("BC_USER / BC_PASS not set");
@@ -31,7 +40,10 @@ async fn main() {
         protocol: ConnectionProtocol::Tcp,
         discovery: DiscoveryMethods::None,
         max_discovery_retries: 1,
-        credentials: Credentials { username: user, password: Some(pass) },
+        credentials: Credentials {
+            username: user,
+            password: Some(pass),
+        },
         debug: false,
     };
     let cam = match BcCamera::new(&opts).await {
@@ -56,6 +68,31 @@ async fn main() {
     println!("RTSP {:?}", cam.get_rtsp().await);
     println!("RTMP {:?}", cam.get_rtmp().await);
     println!("ONVIF {:?}", cam.get_onvif().await);
+
+    // Optional third argument: one owner-approved action, then exit.
+    //   abilities   - read-only: print ability info and support XML
+    //   https-on    - WRITE (owner-approved for #27): enable the HTTPS API port
+    //   https-off   - WRITE: disable the HTTPS API port (does not restore any earlier state)
+    match action {
+        Some("abilities") => {
+            println!("ABILITY {:?}", cam.get_abilityinfo().await);
+            println!("SUPPORT {:?}", cam.get_support().await);
+            return;
+        }
+        Some("https-on") => {
+            println!("HTTPS_BEFORE {:?}", cam.get_https().await);
+            println!("SET {:?}", cam.set_https(Some(true), None).await);
+            println!("HTTPS_AFTER {:?}", cam.get_https().await);
+            return;
+        }
+        Some("https-off") => {
+            println!("HTTPS_BEFORE {:?}", cam.get_https().await);
+            println!("SET {:?}", cam.set_https(Some(false), None).await);
+            println!("HTTPS_AFTER {:?}", cam.get_https().await);
+            return;
+        }
+        _ => {}
+    }
 
     match cam.listen_on_motion().await {
         Ok(mut m) => {
