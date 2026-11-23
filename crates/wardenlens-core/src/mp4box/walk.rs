@@ -4,7 +4,7 @@ use super::error::Mp4BoxError;
 use super::header::{BoxHeader, HEADER_LEN, parse_header};
 use super::moof::parse_moof;
 use super::source::ByteSource;
-use super::tree::{Reader, find_path};
+use super::tree::{Children, Reader, find_path};
 
 /// Largest `moov` or `moof` payload that is read (1 MiB).
 pub const MAX_PAYLOAD_LEN: u64 = 1024 * 1024;
@@ -13,10 +13,10 @@ pub const MAX_FILE_LEN: u64 = 1024 * 1024 * 1024;
 /// Most fragments (`moof` boxes) a file may hold.
 pub const MAX_FRAGMENTS: u64 = 100_000;
 /// Backstop on nesting depth for fixed-path descent.
-pub const MAX_DEPTH: usize = 8;
+pub(crate) const MAX_DEPTH: usize = 8;
 
 /// Slack for `ftyp`, `moov` and any `free` boxes on top of two boxes per fragment.
-const MAX_TOP_LEVEL_BOXES: u64 = MAX_FRAGMENTS * 2 + 16;
+pub(super) const MAX_TOP_LEVEL_BOXES: u64 = MAX_FRAGMENTS * 2 + 16;
 
 /// What the adoption walk learns about a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,7 @@ pub struct Mp4Summary {
 
 #[derive(Default)]
 struct Walk {
+    seen_any: bool,
     seen_ftyp: bool,
     timescale: Option<u32>,
     pending_moof: bool,
@@ -41,6 +42,14 @@ struct Walk {
 }
 
 /// Walk the top-level boxes of an fMP4 file and summarise it.
+///
+/// The file must start with exactly one `ftyp`, then one `moov` with exactly one `trak`
+/// (our writer emits a single video track; files with more are rejected), then `moof`/`mdat`
+/// pairs, with at least one sample overall.
+///
+/// The result is **not** range-checked: `frame_count` and `duration_ms` can be huge (a
+/// `trun` may declare billions of samples via a default duration). Callers must range-check
+/// both before trusting them.
 ///
 /// Reads one 8-byte header at a time, skips `mdat` by offset and reads `moov`/`moof`
 /// payloads only when at most [`MAX_PAYLOAD_LEN`] bytes.
@@ -70,7 +79,7 @@ pub fn summarize<S: ByteSource>(source: &mut S) -> Result<Mp4Summary, Mp4BoxErro
         let header = parse_header(&head, remaining)?;
         walk.visit(source, offset, &header)?;
         offset = offset
-            .checked_add(header.size)
+            .checked_add(header.size())
             .ok_or(Mp4BoxError::Overflow)?;
     }
     walk.finish()
@@ -83,14 +92,26 @@ impl Walk {
         offset: u64,
         header: &BoxHeader,
     ) -> Result<(), Mp4BoxError> {
-        let is_mdat = &header.fourcc == b"mdat";
+        let is_mdat = &header.fourcc() == b"mdat";
         if self.pending_moof {
             if !is_mdat {
                 return Err(Mp4BoxError::IncompleteFragment);
             }
             self.complete_fragment()?;
+        } else if is_mdat {
+            return Err(Mp4BoxError::MisplacedBox("mdat"));
         }
-        match &header.fourcc {
+        let is_ftyp = &header.fourcc() == b"ftyp";
+        if !self.seen_any {
+            // Only the very first box may (and must) be the `ftyp`.
+            if !is_ftyp {
+                return Err(Mp4BoxError::MissingBox("ftyp"));
+            }
+        } else if is_ftyp {
+            return Err(Mp4BoxError::DuplicateBox("ftyp"));
+        }
+        self.seen_any = true;
+        match &header.fourcc() {
             b"ftyp" => self.seen_ftyp = true,
             b"moov" => self.visit_moov(source, offset, header)?,
             b"moof" => self.visit_moof(source, offset, header)?,
@@ -109,8 +130,21 @@ impl Walk {
             return Err(Mp4BoxError::DuplicateBox("moov"));
         }
         let payload = read_payload(source, offset, header)?;
-        let mdhd = find_path(&payload, &[*b"trak", *b"mdia", *b"mdhd"], 1)?
-            .ok_or(Mp4BoxError::MissingBox("mdhd"))?;
+        // Header-validate every `moov` child, including those after the `trak`.
+        let mut mdhd = None;
+        let mut seen_trak = false;
+        let mut children = Children::new(&payload);
+        while let Some(child) = children.next_child()? {
+            if &child.header.fourcc() != b"trak" {
+                continue;
+            }
+            if seen_trak {
+                return Err(Mp4BoxError::DuplicateBox("trak"));
+            }
+            seen_trak = true;
+            mdhd = find_path(child.body, &[*b"mdia", *b"mdhd"], 2)?;
+        }
+        let mdhd = mdhd.ok_or(Mp4BoxError::MissingBox("mdhd"))?;
         self.timescale = Some(parse_mdhd_timescale(mdhd)?);
         Ok(())
     }
@@ -164,6 +198,9 @@ impl Walk {
         if self.fragments == 0 {
             return Err(Mp4BoxError::MissingBox("moof+mdat"));
         }
+        if self.frames == 0 {
+            return Err(Mp4BoxError::NoSamples);
+        }
         Ok(Mp4Summary {
             duration_ms: ticks_to_ms_ceil(self.ticks, timescale)?,
             frame_count: self.frames,
@@ -197,7 +234,7 @@ fn read_payload<S: ByteSource>(
     }
     let mut buf = vec![0u8; usize::try_from(len).map_err(|_| Mp4BoxError::Overflow)?];
     let start = offset
-        .checked_add(header.header_len)
+        .checked_add(header.header_len())
         .ok_or(Mp4BoxError::Overflow)?;
     source.read_exact_at(start, &mut buf)?;
     Ok(buf)

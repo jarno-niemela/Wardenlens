@@ -8,15 +8,30 @@ pub const HEADER_LEN: u64 = 8;
 /// A validated box header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoxHeader {
-    /// The four-character box type.
-    pub fourcc: [u8; 4],
-    /// Header length in bytes (always 8: `largesize` is rejected).
-    pub header_len: u64,
-    /// Total box size including the header; at least 8 and within the parent.
-    pub size: u64,
+    fourcc: [u8; 4],
+    header_len: u64,
+    size: u64,
 }
 
 impl BoxHeader {
+    /// The four-character box type.
+    #[must_use]
+    pub fn fourcc(&self) -> [u8; 4] {
+        self.fourcc
+    }
+
+    /// Header length in bytes (always 8: `largesize` is rejected).
+    #[must_use]
+    pub fn header_len(&self) -> u64 {
+        self.header_len
+    }
+
+    /// Total box size including the header; at least 8 and within the parent.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Payload length (total size minus header).
     #[must_use]
     pub fn payload_len(&self) -> u64 {

@@ -56,6 +56,10 @@ pub enum Mp4BoxError {
     MissingBox(&'static str),
     /// A box that must appear once appears again.
     DuplicateBox(&'static str),
+    /// A box appears where it is not allowed (for example an `mdat` with no `moof` before it).
+    MisplacedBox(&'static str),
+    /// The file holds no samples at all.
+    NoSamples,
     /// A `moof` is not directly followed by an `mdat`, or the file ends after a `moof`.
     IncompleteFragment,
     /// A `moof` appears before the `moov`, so the timescale is unknown.
@@ -91,6 +95,8 @@ impl fmt::Display for Mp4BoxError {
             Self::DepthExceeded => f.write_str("box nesting depth exceeded"),
             Self::MissingBox(b) => write!(f, "missing required box {b}"),
             Self::DuplicateBox(b) => write!(f, "duplicate box {b}"),
+            Self::MisplacedBox(b) => write!(f, "misplaced box {b}"),
+            Self::NoSamples => f.write_str("file holds no samples"),
             Self::IncompleteFragment => f.write_str("moof without a following mdat"),
             Self::FragmentBeforeMoov => f.write_str("moof before moov"),
             Self::TruncatedBox(b) => write!(f, "truncated {b} box"),

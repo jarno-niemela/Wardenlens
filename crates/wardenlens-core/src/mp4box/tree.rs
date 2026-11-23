@@ -31,8 +31,8 @@ impl<'a> Children<'a> {
         }
         let remaining = u64::try_from(rest.len()).map_err(|_| Mp4BoxError::Overflow)?;
         let header = parse_header(rest, remaining)?;
-        let size = usize::try_from(header.size).map_err(|_| Mp4BoxError::Overflow)?;
-        let head = usize::try_from(header.header_len).map_err(|_| Mp4BoxError::Overflow)?;
+        let size = usize::try_from(header.size()).map_err(|_| Mp4BoxError::Overflow)?;
+        let head = usize::try_from(header.header_len()).map_err(|_| Mp4BoxError::Overflow)?;
         let body = rest.get(head..size).ok_or(Mp4BoxError::TruncatedHeader)?;
         self.pos = self.pos.checked_add(size).ok_or(Mp4BoxError::Overflow)?;
         Ok(Some(Child { header, body }))
@@ -40,6 +40,10 @@ impl<'a> Children<'a> {
 }
 
 /// Find the first box reachable along the fixed `path`, returning its payload.
+///
+/// Every sibling at every level of the path is header-validated, including those after the
+/// match, so a malformed box anywhere beside the path is rejected (ADR 0005 section 9).
+/// Non-path boxes are never descended into.
 ///
 /// Recursion depth is at most `path.len()`, and `path` is a compile-time constant at every
 /// call site; `MAX_DEPTH` is a backstop.
@@ -54,20 +58,20 @@ pub(super) fn find_path<'a>(
     let Some((first, rest)) = path.split_first() else {
         return Ok(None);
     };
+    let mut found = None;
     let mut children = Children::new(payload);
     while let Some(child) = children.next_child()? {
-        if child.header.fourcc != *first {
+        if found.is_some() || child.header.fourcc() != *first {
             continue;
         }
         if rest.is_empty() {
-            return Ok(Some(child.body));
-        }
-        let next_depth = depth.checked_add(1).ok_or(Mp4BoxError::Overflow)?;
-        if let Some(found) = find_path(child.body, rest, next_depth)? {
-            return Ok(Some(found));
+            found = Some(child.body);
+        } else {
+            let next_depth = depth.checked_add(1).ok_or(Mp4BoxError::Overflow)?;
+            found = find_path(child.body, rest, next_depth)?;
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Big-endian reader over a byte slice with checked bounds.

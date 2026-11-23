@@ -30,7 +30,7 @@ pub(super) fn parse_moof(payload: &[u8]) -> Result<FragmentStats, Mp4BoxError> {
     let mut total = FragmentStats::default();
     let mut children = Children::new(payload);
     while let Some(child) = children.next_child()? {
-        if &child.header.fourcc != b"traf" {
+        if &child.header.fourcc() != b"traf" {
             continue;
         }
         let t = parse_traf(child.body)?;
@@ -48,7 +48,7 @@ fn parse_traf(payload: &[u8]) -> Result<FragmentStats, Mp4BoxError> {
     let mut total = FragmentStats::default();
     let mut children = Children::new(payload);
     while let Some(child) = children.next_child()? {
-        if &child.header.fourcc != b"trun" {
+        if &child.header.fourcc() != b"trun" {
             continue;
         }
         let t = parse_trun(child.body, default_duration)?;
@@ -126,6 +126,9 @@ fn sum_entry_durations(
     entry_size: usize,
     sample_count: u64,
 ) -> Result<u64, Mp4BoxError> {
+    if entry_size == 0 {
+        return Err(Mp4BoxError::InvalidField("trun"));
+    }
     let mut sum = 0u64;
     let mut seen = 0u64;
     for entry in entries.chunks_exact(entry_size) {

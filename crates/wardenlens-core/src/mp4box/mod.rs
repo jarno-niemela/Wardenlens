@@ -11,8 +11,8 @@
 //!
 //! let bytes = [0, 0, 0, 16, b'f', b't', b'y', b'p', 0, 0, 0, 0, 0, 0, 0, 0];
 //! let header: BoxHeader = parse_header(&bytes, 16).unwrap();
-//! assert_eq!(&header.fourcc, b"ftyp");
-//! assert_eq!(header.size, 16);
+//! assert_eq!(&header.fourcc(), b"ftyp");
+//! assert_eq!(header.size(), 16);
 //! ```
 
 mod error;
@@ -28,4 +28,4 @@ mod tests;
 pub use error::{Mp4BoxError, SourceError};
 pub use header::{BoxHeader, HEADER_LEN, parse_header};
 pub use source::{ByteSource, SliceSource};
-pub use walk::{MAX_DEPTH, MAX_FILE_LEN, MAX_FRAGMENTS, MAX_PAYLOAD_LEN, Mp4Summary, summarize};
+pub use walk::{MAX_FILE_LEN, MAX_FRAGMENTS, MAX_PAYLOAD_LEN, Mp4Summary, summarize};

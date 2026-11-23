@@ -3,6 +3,11 @@
 use super::error::SourceError;
 
 /// Random-access read access to a file's bytes.
+///
+/// Implementors must keep [`byte_len`](Self::byte_len) constant for the whole walk, and it
+/// must come from `fstat` on the same handle that
+/// [`read_exact_at`](Self::read_exact_at) reads (never from a path lookup), so a file that is
+/// swapped or grown mid-walk cannot make the parser trust a stale length.
 pub trait ByteSource {
     /// Total length in bytes.
     fn byte_len(&self) -> u64;

@@ -5,6 +5,8 @@
     reason = "fourcc literals are b\"..\" references"
 )]
 
+use super::tree::find_path;
+use super::walk::{MAX_DEPTH, MAX_TOP_LEVEL_BOXES};
 use super::*;
 use proptest::prelude::*;
 
@@ -100,8 +102,8 @@ fn golden_minimal_fmp4_is_summarised() {
 #[test]
 fn header_returns_fourcc_and_sizes() {
     let h = parse_header(&[0, 0, 0, 12, b'm', b'o', b'o', b'v', 1, 2, 3, 4], 12).unwrap();
-    assert_eq!(&h.fourcc, b"moov");
-    assert_eq!((h.header_len, h.size, h.payload_len()), (8, 12, 4));
+    assert_eq!(&h.fourcc(), b"moov");
+    assert_eq!((h.header_len(), h.size(), h.payload_len()), (8, 12, 4));
 }
 
 #[test]
@@ -432,7 +434,7 @@ fn deep_nesting_of_container_headers_terminates_with_an_error() {
 }
 
 #[test]
-fn deep_nesting_along_the_fixed_path_is_bounded() {
+fn nested_trak_chain_without_mdia_reports_missing_mdhd() {
     let mut inner = mdhd_v0(1000);
     for _ in 0..50 {
         inner = mk_box(b"trak", &inner);
@@ -461,19 +463,21 @@ fn source_failure_is_a_typed_error() {
 proptest! {
     #[test]
     fn arbitrary_bytes_never_panic_in_summarize(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
+        // Only the absence of a panic is under test.
         let _ = run(&bytes);
     }
 
     #[test]
     fn arbitrary_bytes_never_panic_in_parse_header(bytes in proptest::collection::vec(any::<u8>(), 0..32), rem in any::<u64>()) {
+        // Only the absence of a panic is under test.
         let _ = parse_header(&bytes, rem);
     }
 
     #[test]
     fn parsed_header_is_always_within_parent(bytes in proptest::collection::vec(any::<u8>(), 0..32), rem in any::<u64>()) {
         if let Ok(h) = parse_header(&bytes, rem) {
-            prop_assert!(h.size >= 8 && h.size <= rem);
-            prop_assert_eq!(h.header_len, 8);
+            prop_assert!(h.size() >= 8 && h.size() <= rem);
+            prop_assert_eq!(h.header_len(), 8);
         }
     }
 
@@ -489,6 +493,7 @@ proptest! {
             }
         }
         f.truncate(f.len().saturating_sub(cut % 8));
+        // Only the absence of a panic is under test.
         let _ = run(&f);
     }
 
@@ -507,6 +512,101 @@ proptest! {
             moof_with(&[tfhd(Some(1)), mk_box(b"trun", &p)]),
             mk_box(b"mdat", &[]),
         ]);
+        // Only the absence of a panic is under test.
         let _ = run(&f);
     }
+}
+
+fn file_with_free_boxes(n: u64) -> Vec<u8> {
+    let mut f = cat(&[ftyp(), moov(1000)]);
+    let free = mk_box(b"free", &[]);
+    for _ in 0..n {
+        f.extend_from_slice(&free);
+    }
+    f
+}
+
+#[test]
+fn rejects_more_top_level_boxes_than_the_cap() {
+    // ftyp + moov + cap + 1 - 2 free boxes is cap + 1 boxes in total.
+    let f = file_with_free_boxes(MAX_TOP_LEVEL_BOXES - 1);
+    assert_eq!(run(&f), Err(Mp4BoxError::TooManyBoxes));
+}
+
+#[test]
+fn exactly_the_top_level_box_cap_is_not_rejected_as_too_many() {
+    let f = file_with_free_boxes(MAX_TOP_LEVEL_BOXES - 2);
+    // No fragment, so it fails later for another reason, but not on the box cap.
+    assert_eq!(run(&f), Err(Mp4BoxError::MissingBox("moof+mdat")));
+}
+
+#[test]
+fn find_path_rejects_depth_at_the_backstop() {
+    assert_eq!(
+        find_path(&[], &[*b"trak"], MAX_DEPTH),
+        Err(Mp4BoxError::DepthExceeded)
+    );
+}
+
+#[test]
+fn find_path_rejects_a_path_longer_than_the_backstop() {
+    let mut inner = mk_box(b"mdhd", &[]);
+    for _ in 0..MAX_DEPTH {
+        inner = mk_box(b"trak", &inner);
+    }
+    let path = vec![*b"trak"; MAX_DEPTH + 1];
+    assert_eq!(find_path(&inner, &path, 0), Err(Mp4BoxError::DepthExceeded));
+}
+
+#[test]
+fn rejects_duplicate_ftyp() {
+    let f = cat(&[
+        ftyp(),
+        ftyp(),
+        moov(1000),
+        moof_with(&[tfhd(Some(1)), trun_default(1)]),
+        mk_box(b"mdat", &[]),
+    ]);
+    assert_eq!(run(&f), Err(Mp4BoxError::DuplicateBox("ftyp")));
+}
+
+#[test]
+fn rejects_ftyp_that_is_not_first() {
+    let f = cat(&[
+        mk_box(b"free", &[]),
+        ftyp(),
+        moov(1000),
+        moof_with(&[tfhd(Some(1)), trun_default(1)]),
+        mk_box(b"mdat", &[]),
+    ]);
+    assert_eq!(run(&f), Err(Mp4BoxError::MissingBox("ftyp")));
+}
+
+#[test]
+fn rejects_mdat_without_a_preceding_moof() {
+    let f = cat(&[ftyp(), moov(1000), mk_box(b"mdat", &[1, 2])]);
+    assert_eq!(run(&f), Err(Mp4BoxError::MisplacedBox("mdat")));
+}
+
+#[test]
+fn rejects_a_file_with_zero_samples() {
+    let f = cat(&[
+        ftyp(),
+        moov(1000),
+        moof_with(&[tfhd(Some(1)), trun_default(0)]),
+        mk_box(b"mdat", &[]),
+    ]);
+    assert_eq!(run(&f), Err(Mp4BoxError::NoSamples));
+}
+
+#[test]
+fn rejects_more_than_one_trak() {
+    let trak = mk_box(b"trak", &mk_box(b"mdia", &mdhd_v0(1000)));
+    let f = cat(&[
+        ftyp(),
+        mk_box(b"moov", &cat(&[trak.clone(), trak])),
+        moof_with(&[tfhd(Some(1)), trun_default(1)]),
+        mk_box(b"mdat", &[]),
+    ]);
+    assert_eq!(run(&f), Err(Mp4BoxError::DuplicateBox("trak")));
 }
