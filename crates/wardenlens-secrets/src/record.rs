@@ -24,6 +24,9 @@ pub const MAX_VALUE_LEN: usize = 4096;
 /// Shortest possible record: version, nonce and tag.
 pub const MIN_RECORD_LEN: usize = 1 + NONCE_LEN + TAG_LEN;
 /// Longest accepted plaintext (a credential: length prefix plus two maximal values).
+///
+/// This limit is per record; the vault (#74) enforces the 4096-byte per-kind limit of ADR 0006
+/// section 1.
 const MAX_PLAINTEXT_LEN: usize = 2 + 2 * MAX_VALUE_LEN;
 /// Longest accepted record.
 pub const MAX_RECORD_LEN: usize = MIN_RECORD_LEN + MAX_PLAINTEXT_LEN;
@@ -91,7 +94,8 @@ fn aad(kind: RecordKind, id: &str) -> Vec<u8> {
 /// Encrypts `plaintext` for entry `entry_id` of `kind` under a fresh random nonce.
 ///
 /// # Errors
-/// [`SecretsError::InvalidId`], [`SecretsError::TooLarge`] or [`SecretsError::Random`].
+/// [`SecretsError::InvalidId`], [`SecretsError::TooLarge`], [`SecretsError::Random`] or
+/// [`SecretsError::Encrypt`].
 pub fn seal(
     key: &KeyFile,
     kind: RecordKind,
@@ -114,7 +118,7 @@ pub fn seal(
                 aad: &aad,
             },
         )
-        .map_err(|_| SecretsError::Authentication)?;
+        .map_err(|_| SecretsError::Encrypt)?;
     let mut out = Vec::with_capacity(MIN_RECORD_LEN.saturating_add(sealed.len()));
     out.push(VERSION);
     out.extend_from_slice(&nonce);

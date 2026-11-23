@@ -51,6 +51,9 @@ pub enum SecretsError {
     /// A value or record exceeds the size limits.
     #[error("value exceeds the size limit")]
     TooLarge,
+    /// The cipher failed to encrypt (not expected for inputs within the size limits).
+    #[error("encryption failed")]
+    Encrypt,
     /// The record is shorter than version, nonce and tag.
     #[error("record is truncated")]
     Truncated,

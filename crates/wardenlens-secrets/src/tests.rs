@@ -352,7 +352,8 @@ fn generate_refuses_symlink_target() {
     symlink(&target, &p).unwrap();
     assert!(matches!(
         KeyFile::generate(&p),
-        Err(SecretsError::KeyFileSymlink)
+        // O_EXCL reports a dangling symlink as an existing path.
+        Err(SecretsError::KeyFileExists)
     ));
     assert!(!target.exists());
 }

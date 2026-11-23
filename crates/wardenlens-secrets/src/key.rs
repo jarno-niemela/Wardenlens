@@ -1,14 +1,14 @@
 //! The key file: a raw 32-byte file with strict permission rules (ADR 0006 section 6).
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use rustix::fs::OFlags;
+use rustix::fs::{Mode, OFlags};
 use zeroize::Zeroizing;
 
 use crate::error::SecretsError;
@@ -33,9 +33,22 @@ fn io_err(operation: &'static str) -> impl FnOnce(std::io::Error) -> SecretsErro
     move |source| SecretsError::Io { operation, source }
 }
 
-fn nofollow_flag() -> i32 {
-    // Bit flags from a safe crate; the value fits i32 on every supported platform.
-    i32::try_from(OFlags::NOFOLLOW.bits()).unwrap_or(0)
+/// Opens `path` with typed rustix flags; `O_NOFOLLOW` and `O_CLOEXEC` are always set, so they
+/// cannot be dropped by a conversion.
+fn open_nofollow(path: &Path, flags: OFlags, mode: Mode) -> std::io::Result<File> {
+    let fd = rustix::fs::open(path, flags | OFlags::NOFOLLOW | OFlags::CLOEXEC, mode)?;
+    Ok(File::from(fd))
+}
+
+/// Flushes the directory entry of a freshly created file so the only key survives a crash.
+fn sync_parent(path: &Path) -> Result<(), SecretsError> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(parent)
+        .and_then(|d| d.sync_all())
+        .map_err(io_err("syncing directory"))
 }
 
 fn is_symlink_error(err: &std::io::Error) -> bool {
@@ -43,6 +56,9 @@ fn is_symlink_error(err: &std::io::Error) -> bool {
 }
 
 /// Refuses a path inside a git work tree (a `.git` entry in any ancestor of the parent directory).
+///
+/// This only detects a `.git` entry in an ancestor; a work tree with a separate git dir, or a bare
+/// "dotfiles" work tree, is not detected.
 fn refuse_work_tree(path: &Path) -> Result<(), SecretsError> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -71,17 +87,20 @@ impl KeyFile {
     /// The matching [`SecretsError`] variant for the rule that failed.
     pub fn load(path: &Path) -> Result<Self, SecretsError> {
         refuse_work_tree(path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(nofollow_flag())
-            .open(path)
-            .map_err(|e| {
-                if is_symlink_error(&e) {
-                    SecretsError::KeyFileSymlink
-                } else {
-                    io_err("opening")(e)
-                }
-            })?;
+        // NONBLOCK and NOCTTY: opening a FIFO or terminal must not block; the fstat below then
+        // refuses it as not regular.
+        let mut file = open_nofollow(
+            path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            if is_symlink_error(&e) {
+                SecretsError::KeyFileSymlink
+            } else {
+                io_err("opening")(e)
+            }
+        })?;
         let meta = file.metadata().map_err(io_err("inspecting"))?;
         if !meta.is_file() {
             return Err(SecretsError::KeyFileNotRegular);
@@ -127,19 +146,20 @@ impl KeyFile {
 
     fn create(path: &Path, bytes: Zeroizing<[u8; KEY_LEN]>) -> Result<Self, SecretsError> {
         refuse_work_tree(path)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(nofollow_flag())
-            .open(path)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::AlreadyExists => SecretsError::KeyFileExists,
-                _ if is_symlink_error(&e) => SecretsError::KeyFileSymlink,
-                _ => io_err("creating")(e),
-            })?;
-        if let Err(e) = write_and_sync(&mut file, bytes.as_slice()) {
-            // Never leave a partial key behind.
+        let mut file = open_nofollow(
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOCTTY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => SecretsError::KeyFileExists,
+            _ if is_symlink_error(&e) => SecretsError::KeyFileSymlink,
+            _ => io_err("creating")(e),
+        })?;
+        if let Err(e) = write_and_sync(&mut file, bytes.as_slice()).and_then(|()| sync_parent(path))
+        {
+            // Never leave a partial key behind. The path is removed by name, so a concurrent
+            // rename of the path between create and cleanup could remove a different file.
             drop(file);
             let _ = std::fs::remove_file(path);
             return Err(e);
@@ -149,15 +169,10 @@ impl KeyFile {
 
     /// The key as base64 text for a password manager (`vault key export`).
     pub fn to_base64(&self) -> Zeroizing<String> {
-        let mut buf = Zeroizing::new([0u8; KEY_B64_LEN]);
-        let written = STANDARD
-            .encode_slice(self.bytes.as_slice(), buf.as_mut_slice())
-            .unwrap_or(0);
-        let text = buf
-            .get(..written)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or_default();
-        Zeroizing::new(text.to_owned())
+        // Pre-reserved so the encoder never reallocates and leaves key copies behind.
+        let mut text = Zeroizing::new(String::with_capacity(KEY_B64_LEN));
+        STANDARD.encode_string(self.bytes.as_slice(), &mut text);
+        text
     }
 
     /// Builds a key from base64 text without touching the filesystem.
