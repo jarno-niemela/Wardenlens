@@ -125,8 +125,8 @@ longer ones raise crash loss and the unit of eviction.
 
 - *Index (wall clock):* `started_at_ms` is the **arrival** time of the segment's first frame (the frame that starts the
   segment), from the `Clock` trait (#46), as UTC Unix milliseconds. Camera clocks and RTP wall-clock mappings are never
-  used. `started_at_ms = arrival`, plus 1 ms **only on an exact key collision** with the camera's
-  previous segment or an existing row, which keeps the file name unique (section 3); a forward clock step therefore
+  used. `started_at_ms = arrival`, plus 1 ms **repeated until neither a row in the index nor a known file
+  (the walk's keys, section 9) has that key** (an exact key collision), which keeps the file name unique (section 3); a forward clock step therefore
   does not compress the index. A health warning is raised when `arrival < previous` (the clock stepped back). At
   start-up the recorder seeds `previous` per camera from `SELECT MAX(started_at_ms) FROM segments WHERE camera_id = ?`
   **and** from the maximum key found by the reconciliation walk (orphan files that were quarantined or left are not in
@@ -250,7 +250,7 @@ all rows took 20 ms.
 ### 5. SQLite configuration, migrations and schema
 
 **File and open.** The index is `/var/lib/wardenlens/index.db` (a volume, on neither recordings volume; ticket #69), with
-its `-wal` and `-shm` files, **separate from the vault file** (ADR 0006). It is created and opened with the **same open helper as the vault file** (ADR 0006 section 4): mode `0600` created before
+its `-wal` and `-shm` files, **separate from the vault file** (ADR 0006). It is created and opened with the **secure open helper of `wardenlens-fsutil`**, the one ADR 0006 section 4 describes and that the vault also uses (section 11): mode `0600` created before
 SQLite opens it, our own `O_NOFOLLOW` descriptor with `fstat`, SQLite opened by path with `SQLITE_OPEN_NOFOLLOW`, and
 the device and inode compared; a symlink or a wrong owner is refused. Pragmas on every connection: `journal_mode = WAL`,
 `synchronous = FULL`, `foreign_keys = ON`, `busy_timeout = 5000`, `journal_size_limit = 67108864`. `synchronous = FULL`
@@ -374,8 +374,10 @@ depth of history; Phase 2 adds retention by event and age):
    by tier only. Archive rows and files are **not touched** while the archive is unavailable.
 3. A move that is **impossible** because a single segment is larger than the archive's capacity above its floor
    (`archive.capacity * (1 - floor) < segment.bytes`): `PlanError`, never a panic; hot segments are then deleted as in 2.
-4. Even deleting every segment cannot restore a floor (something else fills the volume): `PlanError::Unsatisfiable`;
-   the recorder keeps retrying on ENOSPC (#57) and the storage endpoint reports `below_floor`. Recording does not stop
+4. Even deleting every segment cannot restore a floor (something else fills the volume): `PlanError::Unsatisfiable`,
+   and the planner **returns it without planning any hot deletion**: deleting video that cannot restore the floor
+   only loses recordings. It first checks whether `hot.free + sum(deletable hot bytes) >= target`; if not, it plans
+   nothing. The recorder keeps retrying on ENOSPC (#57) and the storage endpoint reports `below_floor`. Recording does not stop
    by itself for a floor breach; it stops only when the OS refuses the write.
 
 Bounds: one tick executes at most `max_actions_per_tick` (default **64**) actions; it re-probes after each one. The
@@ -396,18 +398,38 @@ latest successful probe (section 8), never one cached from start-up.
 
 | step | action | durable effect |
 |---|---|---|
-| M1 | `lstat(H/R)`: regular file, size equals the row's `bytes`. A **missing** hot file (ENOENT only): check `A/R` first; if it is valid, set `tier = archive` (the table cell hot/none/valid), otherwise delete the row, count `missing`. A **wrong-size** or non-regular hot file: quarantine it (into `H/_quarantine/...`), delete the row, count `size_mismatch`. Either way the mover skips S and goes on with the next segment, so one bad segment never stalls the loop | none |
+| M1 | open `H/R` **once** with `openat2` (read-only, `BENEATH`, `NO_SYMLINKS`) and `fstat` the **handle**: regular file, size equals the row's `bytes`. M4 copies from this same descriptor, so the file checked is the file copied. A non-ENOENT open error (EIO, EACCES, ...) skips the segment and marks it `unverified` (no conclusion).  A **missing** hot file (ENOENT only): check `A/R` first; if it is valid, fsync `A/R` and its directory, then set `tier = archive` (the table cell hot/none/valid), otherwise delete the row, count `missing`. A **wrong-size** or non-regular hot file: quarantine it (into `H/_quarantine/...`), delete the row, count `size_mismatch`. Either way the mover skips S and goes on with the next segment, so one bad segment never stalls the loop | none |
 | M2 | create the archive directory chain; fsync each parent of a directory this step created | directories |
 | M3 | unlink a stale `A/R.part` if one exists (only the mover writes archive `.part` files), then create `A/R.part` with `O_CREAT`, `O_EXCL`, `O_NOFOLLOW` | an empty `.part` |
-| M4 | copy `H/R` to `A/R.part` in 1 MiB chunks; the copied length must equal `bytes` | a `.part` |
+| M4 | copy from the M1 descriptor to `A/R.part` in 1 MiB chunks; the copied length must equal `bytes` | a `.part` |
 | M5 | `fsync(A/R.part)` | the data is durable |
 | M6 | `renameat2(A/R.part, A/R, RENAME_NOREPLACE)` (rustix; atomic, one filesystem; an existing `A/R` is an error, never silently replaced) | `A/R` appears complete, because M5 came first |
 | M7 | fsync the archive directory that contains `R` | the rename is durable |
 | M8 | `UPDATE segments SET tier = 1 WHERE id = ? AND tier = 0`, exactly one row (WAL, `synchronous = FULL`: committed and durable on return) | **the commit point** |
 | M9 | `unlink(H/R)` (`ENOENT` is fine), then fsync `H`'s directory (best effort: correctness does not depend on it) | the hot copy is gone |
 
-An I/O error at M2-M8 abandons the move (the `.part` is unlinked best effort) and counts a **move failure**; three
-consecutive move failures make the archive unavailable (section 8). A successful move resets the count.
+**Which errors blame the archive.** Only **archive-side** errors count as a **move failure**: M2 (directory creation on
+`A`), M3 (creating `A/R.part`), the **write half** of M4 (a `write`, `ENOSPC` or `EIO` on the archive file), and M5-M7
+(`fsync`, `renameat2`, directory fsync on `A`). Three consecutive move failures make the archive unavailable (section 8);
+a successful move resets the count. Everything else is **not** the archive's fault and must not flap its availability
+(which would delete hot video needlessly):
+
+- a **read error on the source** (EIO reading `H/R` in M4): quarantine that hot segment (and drop its row, as in M1)
+  and continue;
+- an **index error** (M8, or reading the row): skip the segment for this tick; after 3 consecutive ticks with index
+  errors raise a health error (the index is the problem, not the archive);
+- **`EEXIST` at M6** (`RENAME_NOREPLACE` found an `A/R`): if `A/R` has the row's size, **roll forward** (it is a
+  stale complete copy from an earlier attempt: fsync it and its directory, delete `A/R.part`, continue with M8);
+  otherwise quarantine the stale `A/R` and retry M6 once.
+
+The mover **never retries the same failed segment within a tick** and runs the rest of the plan. Required #58 tests:
+an M4 **read** failure leaves the archive available and deletes no hot video; a stale complete `A/R` at M6 is rolled
+forward.
+
+**Durability before the only copy.** Before any index write that makes one copy the only one, the surviving copy and
+its directory are fsynced: the roll-forward cells of section 9 (fsync `A` and its directory, then `set_tier`, then
+delete `H`), the M1 runtime rule (a valid `A/R` becomes the row's tier only after `A/R` and its directory are fsynced),
+and adoption (the adopted file and its directory are fsynced before the row is inserted and any twin is deleted).
 
 **Crash points** (state = what exists after the power cut or `kill -9`; "recovers" = the cell of the section 9 decision
 table that matches, `H`, `A` = hot and archive file, `R` = row; a `.part` is handled first by the `.part` rule):
@@ -454,8 +476,9 @@ when any of these holds, and **available** otherwise:
 4. the marker file `<archive>/.wardenlens-archive` is missing. The operator creates it once on the mounted archive
    (`wardenlens storage mark-archive`, #64/#68). It is what tells our archive from an empty replacement disk or a stale
    mount point;
-5. three consecutive move failures (section 7), cleared by the next probe that can create, fsync and remove a small
-   `<archive>/.wl-probe` file.
+5. three consecutive **archive-side** move failures (section 7; source read errors, index errors and an `EEXIST` at M6
+   do not count), cleared by the next probe that can create, fsync and remove a small `<archive>/.wl-probe` file; a
+   stale `.wl-probe` left by a crash is unlinked first (`ENOENT` accepted).
 
 **Every probe opens a fresh handle.** A directory handle opened at start-up keeps pointing at the empty directory that
 a later mount **covers**, so a path probe would say "available" while every `fstat` through the old handle still sees
@@ -490,7 +513,8 @@ file untouched, evaluates only what the hot root shows, and reports `archive_una
 **Walk.** It walks both roots to depth 4, never follows symlinks (`lstat`; anything that is not a regular file or
 directory is reported as `unknown_left` and left, and the key it would belong to is skipped), and treats only paths that
 match the section 3 patterns as ours. **Anything else is left in place and reported** (it may be the owner's). The
-walk is bounded in entries (default 5,000,000) and fails with a typed error beyond that (SEC-2). Reports contain
+walk is bounded in entries (default 5,000,000); **when the cap is exceeded at start-up the service starts anyway**: it stops walking, reports the affected tier as
+`unverified`, raises a health error and concludes nothing from the part it did not see (SEC-2). Reports contain
 **counts and the tier only, never a file name or a path** (the names carry camera ids and times).
 
 **`.part` files first.** `*.mp4.part` in the hot root: **delete** (an interrupted segment, at most one per camera per
@@ -515,10 +539,13 @@ another. Definitions:
   a deleted row's id is never reused (`AUTOINCREMENT`, section 5).
 - *quarantine X*: `renameat2` with `RENAME_NOREPLACE` into `<its root>/_quarantine/<camera>/<day>/<name>` (the same
   relative path, same filesystem). If the target exists (`EEXIST`), the name gets a numeric suffix, `<name>.1`,
-  `<name>.2`, and so on, up to a bound of 1,000; the quarantine evictor (section 6) accepts these names, and the walk
+  `<name>.2`, and so on, up to a bound of 1,000; **when the bound is exhausted the file is left in place and counted `unverified`: nothing is
+  overwritten and nothing loops**; the quarantine evictor (section 6) accepts these names, and the walk
   treats `_quarantine` contents as ours only when they match `<name>(\.[0-9]+)?`. The `_quarantine` directory name can never equal a `CameraId` (a camera id must start with a letter), so
   it cannot collide with a camera directory.
 - *adopt X as tier T*: insert a row from the file (below) with `tier = T`.
+
+(Every roll-forward, adoption and "file is the truth" cell follows the durability rule of section 7: fsync the surviving file and its directory **before** the row changes or a twin is deleted.)
 
 **Archive available.** 26 cells are listed; the 27th, (none, none, none), is the implicit "no key, nothing to do".
 (`-` = nothing to do.)
@@ -528,7 +555,7 @@ another. Definitions:
 | none | none | valid | adopt A as archive |
 | none | none | invalid | quarantine A |
 | none | valid | none | adopt H as hot (a crash between the recorder's rename and `Index::insert`) |
-| none | valid | valid | adopt A as archive, delete H (keep the archive copy) |
+| none | valid | valid | adopt A as archive; delete H **only when H and A have equal sizes**, otherwise quarantine H |
 | none | valid | invalid | adopt H as hot, quarantine A |
 | none | invalid | none | quarantine H |
 | none | invalid | valid | adopt A as archive, quarantine H |
@@ -570,7 +597,7 @@ it. Every archive row is kept; archive files are not touched.
 **The "archive returned" pass** (runtime, after the archive changes from unavailable to available, with a fresh handle,
 section 8). The recorders are running, so this pass has a **strictly limited scope**: it evaluates only keys that have
 an archive file, a `tier = archive` row, or a `tier = hot` row **whose hot file is missing**, using the "archive
-available" table. It applies only the **archive** `.part` rule. It **never** touches a hot `.part` file (it may be a
+available" table. It applies only the **archive** `.part` rule. For a key **without a row** it adopts the archive file and **never touches H** (a hot file there may be in the recorder's rename-to-insert window; the equal-size delete and the quarantine of H in the (none, valid, valid) cell apply at start-up only). It **never** touches a hot `.part` file (it may be a
 segment the recorder is writing right now), and it **never adopts a hot-only key** (a hot `.mp4` without a row may be
 in the recorder's rename-to-insert window); those two rules run only at start-up, before the recorders start. It runs
 **on the storage-loop task, serialised with the mover**, so no move is in flight. Required test (#58/#59): the pass
@@ -671,21 +698,69 @@ that keyframe. If hdipc
 sent no keyframe for 120 s the segment would be closed at 120 s on a delta frame and the frames up to the next keyframe
 dropped and counted as a gap.
 
+### 11. Code placement and the one new dependency (amends ADR 0004 section 8 and ADR 0006 section 4 by reference)
+
+ADR 0004's crate map has no home for three things this ADR needs: a secure file-open helper that both the vault and
+the index use (ADR 0004: `index` never depends on `vault` or `secrets`), a root-directory handle that storage and the
+recorder share while `api` depends on neither, and the fMP4 box walk used by the `mp4` tests and by the adoption
+parser. **This ADR amends ADR 0004 section 8 (crate map) and ADR 0006 section 4 (the open helper) by reference; those
+documents are not edited here.**
+
+- **New crate `wardenlens-fsutil`** (depends on `core` and `rustix` only; no SQLite, no async). It owns:
+  1. the **secure SQLite-file open helper** of ADR 0006 section 4 (create with mode `0600` before SQLite opens it, our
+     own `O_NOFOLLOW` descriptor and `fstat`, owner and mode checks, and the device and inode comparison after SQLite
+     has opened the path). It performs the file checks; the `rusqlite` open call with `SQLITE_OPEN_NOFOLLOW` stays in
+     `index` and `vault`. **The vault and the index both use it**, so neither depends on the other;
+  2. **`RootDir`**: a root directory handle opened with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`), parent
+     descriptors opened the same way, and **single-component** `renameat2`, `unlinkat` and `mkdirat` on them (sections 3
+     and 7), plus `fstat`/`fstatvfs` helpers for the probe (section 8);
+  3. the **quarantine rename** (`RENAME_NOREPLACE`, numeric suffix, bound of 1,000, section 9).
+  `index`, `vault`, `storage` and `recorder` may depend on `fsutil`; it is a leaf, so the rule "adapters do not depend on
+  each other except `recorder` to `mp4`" gains one allowed edge target, not a cycle.
+- **The API reaches segment files only through a core port**, `SegmentFiles` (open a segment for reading **by id**,
+  returning a read-only handle, its length and its tier). `storage` implements it with the archive handle of the latest
+  successful probe (section 8) and `fsutil`; `cli` wires it in as a generic. `api` therefore still depends on `core`
+  only (ADR 0004 section 8), and #62 holds no path and no root.
+- **The fMP4 box *parser* is pure byte parsing in `core::mp4box`** (a bounded box-header walk over `&[u8]`/a reader:
+  size 0 or below 8, `largesize`, children inside parents, checked sums, `sample_count * entry_size <= payload`),
+  shared by the `mp4` writer's tests (replacing a private test-only parser) and by the `storage` adoption walk. The
+  **writer** stays in `wardenlens-mp4`.
+
+Resulting edges: `index -> core, fsutil`; `vault -> core, secrets, fsutil`; `storage -> core, fsutil`; `recorder -> core,
+mp4, fsutil`; `mp4 -> core`; `api -> core`; `fsutil -> core`; `cli -> all`.
+
+**`rustix`** (the only new external crate of this section; #58 and #68 already name it for `statvfs` and `RLIMIT_NOFILE`).
+Observed 2026-11-23 with `cargo info` and the crates.io API:
+
+| crate | version | licence | `rust-version` | last release | owner | downloads (recent) | features used |
+|---|---|---|---|---|---|---|---|
+| `rustix` | 1.1.6 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.65 | 2026-10-27 | `sunfishcode` | 1,454,053,218 (388,521,252) | `std`, `fs` (default features off) |
+
+A scratch project with `default-features = false, features = ["std", "fs"]` resolves to **3 crates** (`rustix`,
+`bitflags` 2.13.2, which `rusqlite` already needs, and `linux-raw-sys` 0.12.1), passes `cargo deny check` against the
+repository's `deny.toml`, and **compiles calls** to `openat2` (with `ResolveFlags::BENEATH | NO_SYMLINKS`),
+`renameat_with` (`RenameFlags::NOREPLACE`), `unlinkat`, `mkdirat`, `fstat` and `fstatvfs` (`StatVfsMountFlags::RDONLY`);
+it was not run against a mount. **Platform requirements:** `openat2` needs **Linux 5.6 or later** (the host runs 7.0), and
+the container's **seccomp profile must allow `openat2` and `renameat2`**; `RENAME_NOREPLACE` also needs filesystem
+support (ext4 has it; `EINVAL` from a filesystem without it makes that volume unavailable). #69 tests both inside the
+image.
+
 ## Decision
 
 | question | decision |
 |---|---|
 | muxer | in-house minimal fMP4 box writer in `wardenlens-mp4`, no dependency; `mp4-atom` 0.17.1 is the documented fallback; `mp4` 0.14.0 rejected (no fragmented writer, last release 2023-08-01) |
 | segment | target 60 s, cut only at a keyframe, hard maximum 120 s (closed on the frame, resume at next keyframe; `segment_target_secs` 10-290), first segment at the first keyframe, fragment = one GOP, caps 16 MiB per fragment, 1 GiB per segment, 8 MiB per frame; `mvhd`/`mehd` duration patched before the fsync |
-| timestamps | index: arrival wall clock UTC ms, `started_at_ms` strictly increasing per camera, `duration_ms` = media duration (ticks to ms rounded up, min 1), `started_at_ms` seeded from `MAX` in the index, wall clock before 2000 holds recording off; file: 90 kHz media time from 0 per file, `dts = max(rtp - rtp0, prev + 1)`, 10 s re-base |
+| timestamps | index: arrival wall clock UTC ms, `started_at_ms` = arrival, +1 ms repeated until neither a row nor a known file has the key, so a backward clock step gives overlapping times and a health warning (forward steps do not compress the index); recording is held off for a wall clock before 2000 or after 2099; seeded per camera from the index `MAX` and from the reconciliation walk; `duration_ms` = media duration (ticks to ms rounded up, min 1); file: 90 kHz media time from 0 per file, `dts = max(rtp - rtp0, prev + 1)`, 10 s re-base |
 | layout | `<root>/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4`, UTC, identical relative path on both tiers, `.part` while writing, quarantine under `<root>/_quarantine/` (cannot be a `CameraId`); paths derived from validated id and time, **not stored**; opened with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through a root handle |
 | segment close | write, patch durations, `fsync(file)`, `renameat2(RENAME_NOREPLACE)`, `fsync(dir)`, then `Index::insert`; an insert failure quarantines the file |
-| SQLite | `rusqlite` 0.43.0, `default-features = false`, `bundled` (SQLite 3.54.1); WAL, `synchronous = FULL`, `foreign_keys = ON`, `application_id`; the file is opened with the ADR 0006 open helper; synchronous API with `spawn_blocking` callers |
+| SQLite | `rusqlite` 0.43.0, `default-features = false`, `bundled` (SQLite 3.54.1); WAL, `synchronous = FULL`, `foreign_keys = ON`, `application_id`; the file is opened with the `wardenlens-fsutil` secure open helper (section 11); synchronous API with `spawn_blocking` callers |
 | migrations | in-house ordered scripts, `PRAGMA user_version` in the same transaction; newer version is an error |
 | tables | `segments` (`AUTOINCREMENT` id), `cameras` (no credential, host or name columns, ADR 0006; length checks), `api_tokens` (ADR 0004; length checks); indexes as in section 5 |
 | tier policy | floor arithmetic on available space (`capacity = (blocks - bfree + bavail) x frsize`); move on hot floor (to floor + 1 pp) or hot age (12 h); evict archive oldest first before a move that would breach its floor; floor wins over video when the archive is unavailable; defaults 25 %, 12 h, 64 actions per tick |
 | move protocol | copy to `.part`, fsync, `renameat2(RENAME_NOREPLACE)`, fsync dir, `UPDATE tier` (durable), then unlink hot; delete = unlink then `DELETE` row; a bad hot file is quarantined at run time so the mover never stalls |
-| archive state | one definition at boot and every tick: unavailable when missing, same filesystem, `ST_RDONLY`, marker `.wardenlens-archive` missing, or 3 consecutive move failures; then the service **still starts and records**, deleting the oldest hot to hold the floor; only a bad **hot** root refuses to start |
+| code placement | new crate `wardenlens-fsutil` (core + `rustix` `fs`): secure SQLite-file open helper (vault and index), `RootDir` (`openat2` handles, single-component `*at` ops), quarantine rename; core port `SegmentFiles` for the API; `core::mp4box` pure box parser shared by `mp4` tests and the storage adoption walk; amends ADR 0004 section 8 and ADR 0006 section 4 by reference |
+| archive state | one definition at boot and every tick: unavailable when missing, same filesystem, `ST_RDONLY`, marker `.wardenlens-archive` missing, or 3 consecutive **archive-side** move failures; then the service **still starts and records**, deleting the oldest hot to hold the floor; only a bad **hot** root refuses to start |
 | reconciliation | volumes probed **first**; a per-key `(camera_id, started_at_ms)` decision table over hot file, archive file and row (27 cells with the archive available, 26 listed plus the implicit none/none/none, and 9 without); with the archive unavailable nothing is concluded from an absent archive file and archive rows are kept; counts and tier only in reports |
 
 ## Downstream tickets
@@ -696,23 +771,26 @@ bodies read on 2026-11-23.
 
 | ticket | what it must do, and what it overrides |
 |---|---|
+| new crate `wardenlens-fsutil` (a new ticket, before #49/#58) | depends on `core` and `rustix` 1.1.6 (`std`, `fs`) only; `RootDir`, the secure SQLite-file open helper (used by #49 `index` and #74 `vault`; ADR 0006 section 4 is amended by reference), the NOREPLACE quarantine rename with numeric suffixes; tests of `openat2` refusal of `..`, absolute paths and symlinks, and of single-component operations |
+| `SegmentFiles` core port (in #44/#45's recording module or its own small ticket) | `open_segment(id)` for reading, returning a read-only handle, length and tier; implemented by `storage` (#58) with the latest probe handle, wired in `cli` (#68); **#62 uses only this port**, never a path or a root |
+| `core::mp4box` (a new small ticket, with #54) | pure bounded box-header parser (rejections listed in section 9); used by #54's golden tests and by #59's adoption walk; the writer stays in `wardenlens-mp4` |
 | #43 (core camera model) | `CameraId` is also the path component (SEC-4) and the `segments.camera_id` value; no change to the type |
-| #44 (core planner) | `Policy { hot_min_free, archive_min_free, hot_max_age }` and a fixed 1 pp headroom; actions are moves and deletes in the order of section 6 (archive deletions first, then moves), `now` is an input; hot deletes only when the archive is unavailable (an input `ArchiveState`) or a move is impossible; `PlanError` for the unsatisfiable cases; the unit test reproduces the worked example of section 10 to the byte, plus the proptest |
+| #44 (core planner) | `Policy { hot_min_free, archive_min_free, hot_max_age }` and a fixed 1 pp headroom; actions are moves and deletes in the order of section 6 (archive deletions first, then moves), `now` is an input; hot deletes only when the archive is unavailable (an input `ArchiveState`) or a move is impossible; `PlanError` for the unsatisfiable cases, and `Unsatisfiable` is returned **without planning hot deletions** that cannot restore the floor (check `free + deletable bytes >= target` first); the unit test reproduces the worked example of section 10 to the byte, plus the proptest |
 | #45 (core segmenter, media clock) | the rules of section 2: target 60 s (10-**290**, so the hard maximum stays under the 600 s `CHECK`), hard maximum 2x target closed on the frame, ticks to ms rounded **up** (min 1), byte and fragment caps, `dts = max(rtp - rtp0, prev + 1)` (clamp, not accumulate), 32-bit unwrap, 10 s re-base; `SegmentRecord { camera, started_at_ms, duration_ms, bytes, frame_count }` (`ended_at_ms` derived); also the pure `RelPath` (`new(&CameraId, started_at_ms)` and a strict `FromStr`) shared by recorder, storage, index and api; tests from the ADR 0002 jitter patterns; the `MediaClock` is not trusted before the #55 reordering check passes |
 | #46 (Clock) | returns UTC Unix milliseconds (a newtype); the recorder uses it for `started_at_ms`; a value before the year 2000 (946,684,800,000 ms) is reported as an error the recorder holds off on, as is a value after 4,102,444,799,999 ms (year 2099); `arrival < previous` is a health warning |
 | #47 (service config) | keys `storage.hot_root`, `storage.archive_root`, `storage.hot_min_free_percent`, `storage.archive_min_free_percent` (0-90, default 25), `storage.hot_max_age` (default 12 h), `recording.segment_target_secs` (10-**290**, default 60), `storage.max_actions_per_tick` (default 64); roots must be absolute |
-| #49 (index) | **overrides:** no `schema_version` table: `PRAGMA user_version` with in-house scripts; **no `rel_path` column**: `insert(SegmentRecord, tier)` and `set_tier(id, tier)` carry no path; `synchronous = FULL`, `application_id`; the file open **reuses the ADR 0006 open helper** (`O_NOFOLLOW` + `fstat` + `SQLITE_OPEN_NOFOLLOW` + device/inode compare); `segments.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`; schema and indexes as in section 5; `MAX(started_at_ms)` per camera is available for the recorder's seed; `rusqlite` 0.43.0 `default-features = false`, `bundled`; the `EXPLAIN QUERY PLAN` test asserts the plans of section 5; sync API |
+| #49 (index) | **overrides:** no `schema_version` table: `PRAGMA user_version` with in-house scripts; **no `rel_path` column**: `insert(SegmentRecord, tier)` and `set_tier(id, tier)` carry no path; `synchronous = FULL`, `application_id`; the file open uses the **secure open helper of `wardenlens-fsutil`** (`O_NOFOLLOW` + `fstat` + device/inode compare; the `rusqlite` open with `SQLITE_OPEN_NOFOLLOW` stays in `index`); `index` depends on `core` and `fsutil` only; `segments.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`; schema and indexes as in section 5; `MAX(started_at_ms)` per camera is available for the recorder's seed; `rusqlite` 0.43.0 `default-features = false`, `bundled`; the `EXPLAIN QUERY PLAN` test asserts the plans of section 5; sync API |
 | #50 (cameras table) | columns exactly as in section 5 (ADR 0006 authoritative) with the length `CHECK`s on `model` (64), `main_path` and `sub_path` (512); **rejects** a camera path containing `@`, or a query parameter named (case-insensitive) `pass`, `password`, `pwd`, `user`, `usr`, `token`, `auth`, `key` or `secret`, or any query string the catalogue does not allow for that model, at parse and on read; no foreign key from `segments`; `remove` leaves segments (orphans by `LEFT JOIN`) |
-| #54 (mp4 crate) | in-house writer, no new dependency; the layout of section 3 (`default-base-is-moof`, `tfdt` v1, `trun` flags `0x000701`, sample flags `0x02000000`/`0x01010000`, SPS/PPS only in `avcC`, no composition offsets), fragment per GOP, checked `u32` sizes; golden-structure tests and the `#[ignore]` ffprobe/ffmpeg decode test (frame hashes equal to the source, as in this ADR's prototype); a documented fallback to `mp4-atom` |
+| #54 (mp4 crate) | in-house writer, no new external dependency; the golden tests use `core::mp4box` instead of a private test-only parser; the layout of section 3 (`default-base-is-moof`, `tfdt` v1, `trun` flags `0x000701`, sample flags `0x02000000`/`0x01010000`, SPS/PPS only in `avcC`, no composition offsets), fragment per GOP, checked `u32` sizes; golden-structure tests and the `#[ignore]` ffprobe/ffmpeg decode test (frame hashes equal to the source, as in this ADR's prototype); a documented fallback to `mp4-atom` |
 | #55, #56 (ingest) | deliver the RTP timestamp, the arrival time from `Clock`, SPS/PPS and a discontinuity flag per frame; #55 verifies on the five main streams that there is no frame reordering (`has_b_frames`/`pic_order_cnt_type`), see open risk 1; that check **blocks both the #45 `MediaClock` and #57** |
-| #57 (recorder) | layout and close sequence of sections 2 and 3 (`.part`, patch `mvhd`/`mehd` duration with `pwrite`, fsync, `renameat2(RENAME_NOREPLACE)`, fsync dir, `Index::insert`); **any insert failure quarantines the file**; `started_at_ms = arrival` plus 1 ms only on an exact key collision (forward clock steps do not compress the index), a health warning when `arrival < previous`, **seeded from `MAX(started_at_ms)` and from the reconciliation walk's maximum key** at start-up; a clock before 2000 or after 2099 holds recording off with a health warning; a crash leaves at most one `.part` **per camera**; the path is `RelPath` opened with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through a root handle (overrides "containment asserted") then `fstat`; files `0600`, directories `0700`; blocked by the #55 reordering check |
-| #58 (storage) | the move sequence M1-M9 of section 7 (hot `unlink` last; `set_tier(id, tier)`; M6 is `renameat2(RENAME_NOREPLACE)` via rustix); **M1 with a missing hot file checks `A/R` first (valid: `set_tier(archive)`; otherwise drop the row), with a wrong-size one quarantines it and drops the row, and either way continues**, so the mover never stalls; delete = unlink **then** `Index::delete` (overrides "Index::delete and unlinks"); floor arithmetic on `capacity` and `f_bavail` (section 6); **every probe opens a fresh `O_DIRECTORY` + `O_NOFOLLOW` handle on the archive root and runs `fstat` (`st_dev`), `fstatvfs` (`ST_RDONLY`) and the marker `openat` on it; the mover and the API use only the handle from the latest successful probe, swapped when `(st_dev, st_ino)` changes** (a start-up handle goes stale when a mount later covers the directory); `renameat2`, `unlinkat` and `mkdirat` act on an `openat2`-opened parent descriptor with a single-component name; quarantine renames use `RENAME_NOREPLACE` with `.1`, `.2` suffixes on `EEXIST`; "none" means ENOENT only, any other error is `unverified`; `ArchiveState` of section 8: unavailable on missing root, same `st_dev`, `ST_RDONLY`, missing `.wardenlens-archive` marker or 3 consecutive move failures, re-probed every tick, **replaces "errors if hot and archive resolve to the same filesystem"** (unavailable mode, not an error); the "archive returned" pass runs on the storage-loop task, serialised with the mover, with the limited scope of section 9; test: start unmounted, mount while running (every archive row kept, moves land on the HDD); `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through root handles (overrides "canonicalize"); quarantine files evicted first; fault-injection tests at every crash point of the table |
-| #59 (reconciliation) | runs **after the volume probe**; the per-key decision table of section 9 (27 cells with the archive available, 26 listed plus the implicit none/none/none, and 9 without), one test per cell and per crash-table row; **required tests: archive unmounted, every archive row is kept; archive mounted *while running* (start unmounted), every archive row kept; the "archive returned" pass runs while a recorder is mid-segment and mid-rename and touches no hot file** (and no archive file touched); "both tiers, no row": keep the archive copy if it is a valid fMP4, else the hot copy, delete the other; ids never reassigned while a row exists; an **invalid file is always quarantined, never deleted** (every "delete A" or "delete H" cell for an invalid copy is now a quarantine; only valid duplicates and `.part` files are deleted); quarantine uses `RENAME_NOREPLACE` with numeric suffixes; "none" means ENOENT only, any other error leaves the key `unverified`; the "archive returned" pass evaluates only keys with an archive file, a `tier = archive` row or a `tier = hot` row whose hot file is missing, applies only the archive `.part` rule, never touches hot `.part` files and never adopts hot-only keys (those run only at start-up, before the recorders); quarantine into `_quarantine/` (not `quarantine/`); overrides "indexed with duration read from moof headers or quarantined" (**adopt, else quarantine**) and "`.part` files in either root are deleted" (archive `.part` only when the archive is available); **the adoption parser treats files as untrusted** (reject box size 0 or below 8, `largesize` handled or rejected, each box inside its parent, `sample_count * entry_size <= payload`, checked `u64` sums, caps of 100,000 fragments and 1 GiB), ticks to ms rounded up (min 1), any index-insert failure quarantines; walk depth 4 and an entry cap; reports hold **counts and tier only, never file names**; also the "archive returned" pass used by #58 |
+| #57 (recorder) | layout and close sequence of sections 2 and 3 (`.part`, patch `mvhd`/`mehd` duration with `pwrite`, fsync, `renameat2(RENAME_NOREPLACE)`, fsync dir, `Index::insert`); **any insert failure quarantines the file**; `started_at_ms = arrival` plus 1 ms only on an exact key collision (forward clock steps do not compress the index), a health warning when `arrival < previous`, **seeded from `MAX(started_at_ms)` and from the reconciliation walk's maximum key** at start-up; a clock before 2000 or after 2099 holds recording off with a health warning; a crash leaves at most one `.part` **per camera**; the path is `RelPath` opened through `wardenlens-fsutil`'s `RootDir` with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through a root handle (overrides "containment asserted") then `fstat`; files `0600`, directories `0700`; blocked by the #55 reordering check |
+| #58 (storage) | the move sequence M1-M9 of section 7 (hot `unlink` last; `set_tier(id, tier)`; M6 is `renameat2(RENAME_NOREPLACE)` via rustix); **M1 with a missing hot file checks `A/R` first (valid: `set_tier(archive)`; otherwise drop the row), with a wrong-size one quarantines it and drops the row, and either way continues**, so the mover never stalls; delete = unlink **then** `Index::delete` (overrides "Index::delete and unlinks"); floor arithmetic on `capacity` and `f_bavail` (section 6); **every probe opens a fresh `O_DIRECTORY` + `O_NOFOLLOW` handle on the archive root and runs `fstat` (`st_dev`), `fstatvfs` (`ST_RDONLY`) and the marker `openat` on it; the mover and the API use only the handle from the latest successful probe, swapped when `(st_dev, st_ino)` changes** (a start-up handle goes stale when a mount later covers the directory); `renameat2`, `unlinkat` and `mkdirat` act on an `openat2`-opened parent descriptor with a single-component name; quarantine renames use `RENAME_NOREPLACE` with `.1`, `.2` suffixes on `EEXIST` and, when the 1,000 bound is used up, leave the file in place as `unverified`; **only archive-side errors (M2, M3, the write half of M4, M5-M7) count toward the 3 failures**: a source read error quarantines that hot segment and continues, an index error skips the segment this tick (a health error after 3 ticks), `EEXIST` at M6 rolls forward if `A/R` has the row's size, otherwise quarantines it; the mover never retries a failed segment within a tick and runs the rest of the plan; **M1 opens `H/R` once with `openat2`, `fstat`s the handle and M4 copies from that descriptor**, a non-ENOENT error marks the segment `unverified`; a stale `.wl-probe` is unlinked first; fsync of the surviving file and its directory before any index write that makes it the only copy; tests: an M4 **read** failure leaves the archive available and deletes no hot video, a stale complete `A/R` at M6 is rolled forward; "none" means ENOENT only, any other error is `unverified`; `ArchiveState` of section 8: unavailable on missing root, same `st_dev`, `ST_RDONLY`, missing `.wardenlens-archive` marker or 3 consecutive move failures, re-probed every tick, **replaces "errors if hot and archive resolve to the same filesystem"** (unavailable mode, not an error); the "archive returned" pass runs on the storage-loop task, serialised with the mover, with the limited scope of section 9 (for keys without a row it never touches H); test: start unmounted, mount while running (every archive row kept, moves land on the HDD); `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through root handles (overrides "canonicalize"); quarantine files evicted first; fault-injection tests at every crash point of the table |
+| #59 (reconciliation) | runs **after the volume probe**; the per-key decision table of section 9 (27 cells with the archive available, 26 listed plus the implicit none/none/none, and 9 without), one test per cell and per crash-table row; **required tests: archive unmounted, every archive row is kept; archive mounted *while running* (start unmounted), every archive row kept; the "archive returned" pass runs while a recorder is mid-segment and mid-rename and touches no hot file** (and no archive file touched); "both tiers, no row": keep the archive copy if it is a valid fMP4, else the hot copy, delete the other; ids never reassigned while a row exists; the (none, valid, valid) cell deletes H only when the sizes are equal, otherwise quarantines H; fsync before any index write that makes a copy the only one; **the walk cap (default 5,000,000 entries), when exceeded at start-up, does not stop the service: it reports `unverified` and raises a health error**; an **invalid file is always quarantined, never deleted** (every "delete A" or "delete H" cell for an invalid copy is now a quarantine; only valid duplicates and `.part` files are deleted); quarantine uses `RENAME_NOREPLACE` with numeric suffixes; "none" means ENOENT only, any other error leaves the key `unverified`; the "archive returned" pass evaluates only keys with an archive file, a `tier = archive` row or a `tier = hot` row whose hot file is missing, applies only the archive `.part` rule, never touches hot `.part` files and never adopts hot-only keys (those run only at start-up, before the recorders); quarantine into `_quarantine/` (not `quarantine/`); overrides "indexed with duration read from moof headers or quarantined" (**adopt, else quarantine**) and "`.part` files in either root are deleted" (archive `.part` only when the archive is available); **the adoption parser treats files as untrusted** (reject box size 0 or below 8, `largesize` handled or rejected, each box inside its parent, `sample_count * entry_size <= payload`, checked `u64` sums, caps of 100,000 fragments and 1 GiB), ticks to ms rounded up (min 1), any index-insert failure quarantines; walk depth 4 and an entry cap; the adoption box walk is `core::mp4box`; reports hold **counts and tier only, never file names**; also the "archive returned" pass used by #58 |
 | #62 (recordings API) | the path comes from `RelPath::new(camera_id, started_at_ms)` of the row, **not from a stored path** (overrides "root + relative path from the index"); one re-read of the row after `ENOENT`; the file is opened through the root handle with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` (overrides "canonicalised") and `fstat`ed; range requests; uses only the archive handle from the latest successful probe; a `tier = archive` row with the archive unavailable is a 503, not a 404 |
 | #63 (storage endpoint) | adds `archive_unavailable` (and its cause class) to the state; `free_percent` is `f_bavail * 100 / capacity` with `capacity = (f_blocks - f_bfree + f_bavail) * f_frsize`; `unverified` and quarantine counts |
 | #65 (token CLI) | the `api_tokens` DDL of section 5 (migration 3) with the `CHECK (length(name) BETWEEN 1 AND 64)`; `last_used_at_ms` nullable; rows never deleted |
 | #68 (serve) | order at start-up: take the process lock, open and migrate the index, **probe both volumes**, run reconciliation, then start the storage loop and recorders; refuse a second instance; **one boot behaviour:** a missing, same-filesystem, read-only or unmarked archive starts in `archive_unavailable` mode (recording continues, oldest hot is deleted to hold the floor); only a missing or unusable **hot** root or an unopenable index refuses to start (overrides "refuses to start if hot or archive is missing or both are on one filesystem") |
-| #69 (Docker) | volumes for the hot root, the archive root and `/var/lib/wardenlens` (index and vault, which are not on a recordings volume); a C compiler in the build stage for `rusqlite` `bundled`; the archive bind mount uses `rslave` propagation (so a mount made after the container started becomes visible) **or** the container is started after the archive is mounted, documented in `docs/deploy.md`; the archive mount must be a separate filesystem and carries the `.wardenlens-archive` marker file (created once with `wardenlens storage mark-archive`, a small subcommand for #64/#68) |
+| #69 (Docker) | volumes for the hot root, the archive root and `/var/lib/wardenlens` (index and vault, which are not on a recordings volume); a C compiler in the build stage for `rusqlite` `bundled`; the container seccomp profile allows `openat2` and `renameat2`, the kernel is 5.6 or later, and both are **tested inside the image** (`RootDir` refuses `..` and symlinks, `RENAME_NOREPLACE` works on the archive filesystem); the archive bind mount uses `rslave` propagation (so a mount made after the container started becomes visible) **or** the container is started after the archive is mounted, documented in `docs/deploy.md`; the archive mount must be a separate filesystem and carries the `.wardenlens-archive` marker file (created once with `wardenlens storage mark-archive`, a small subcommand for #64/#68) |
 | #70 (48 h gate) | the restart and hard-kill checks use the reconciliation report counts of section 9 and expect `quarantined = 0`, `size_mismatch = 0`; the restart test includes an archive-unmounted restart that keeps every archive row |
 | ADR 0006 / #74 | unchanged: follows `rusqlite` `bundled` (this ADR agrees) and keeps its own file |
 
@@ -720,7 +798,8 @@ bodies read on 2026-11-23.
 
 - Easier: a crash loses at most the open segment of each camera (up to 120 s) and never the only copy of a finished one;
   recovery is deterministic and rule-based; the index is small, rebuildable from the files and queried with planned
-  indexes; no muxer or ORM dependency, only 6 new crates (`rusqlite` set) plus a C compiler in the build.
+  indexes; no muxer or ORM dependency, only **8 new crates** (the 6 of the `rusqlite` set plus `rustix` and `linux-raw-sys`; `bitflags` is shared) and a C compiler
+  in the build.
 - Harder / accepted:
   - We own the MP4 box layout (golden tests and ffprobe tests are mandatory) and the migration runner.
   - A hot `.part` is discarded after a crash (up to 120 s per camera); salvage is a follow-up.
@@ -748,5 +827,17 @@ bodies read on 2026-11-23.
 6. **`mp4-atom` was not prototyped end to end**; the fallback decision rests on its type list and metadata only.
 7. **The plan document could not be read**; the volume sizes are the measured ones. If the plan states other sizes or a
    dedicated SSD volume, only the worked example's numbers change.
-8. **Clock steps** (NTP) can make `started_at_ms` jump; the strictly-increasing rule keeps names unique, but the index
-   may show an overlap or a gap that did not occur in media time.
+8. **Clock steps** (NTP) can make `started_at_ms` jump. Names stay unique because the +1 ms rule repeats until neither a
+   row nor a known file has the key, but a **backward** step gives overlapping `started_at_ms`/`ended_at_ms` ranges
+   (reported with a health warning) and a forward step a gap that did not occur in media time. Recording is held off
+   below 2000 and above 2099; the seed comes from the index `MAX` and the walk.
+9. **Known limit: archive orphans are invisible to the seed while the archive is unavailable at start-up.** The
+   per-camera `started_at_ms` seed (index `MAX` and the walk) cannot see an archive file that has no row until the archive
+   returns; a +1 ms collision with such a file is then possible and is resolved by the "archive returned" pass
+   (the new row is adopted under a free key or the file is quarantined).
+10. **Known limit: a hot file whose row says archive is invisible to eviction while the archive is unavailable** (the row
+    is kept and the file is not counted as a hot candidate). Bounded to about one such segment per crash.
+11. **Known limit: retention can be lost to a line-rate camera.** One camera sending at a very high bitrate shortens
+    every camera's retention, because eviction is global oldest-first. Phase 2: a per-camera bitrate or quota alarm.
+12. **Follow-up (after merge, not part of this ADR):** change `docs/CODING_GUIDELINES.md` SEC-4 to prefer handle-relative
+    `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) over canonicalise-and-check.
