@@ -150,9 +150,11 @@ Rules:
   index then contains no sensitive value at all, and the key is never stored in either file.
 - The dev vault lives **outside every repository**. `vault init` and every open refuse a path that is inside a git work
   tree (walk the canonical path's ancestors for `.git`; SEC-4) and a symlink.
-- **Opening.** SQLite is opened with `SQLITE_OPEN_NOFOLLOW` (so SQLite itself refuses a symlink), and afterwards the
-  `fstat` of the opened descriptor (device and inode, owner, mode) is compared with the checks below, so a path swapped
-  between the check and the open is detected.
+- **Opening (safe Rust only).** SQLite's own file descriptor is not used for checks (the `rusqlite` accessor for it is an
+  `unsafe` function, SEC-1). Instead: (1) open **our own** descriptor on the path with `O_NOFOLLOW` and `fstat` it
+  (regular file, owner, mode, device and inode); (2) open SQLite **by path** with `SQLITE_OPEN_NOFOLLOW`; (3) `stat` the path
+  again and **compare device and inode** with step 1 (or, equivalently, re-open and compare). A path swapped between the
+  check and the open makes the comparison fail and the open is refused.
 - The file is created with mode 0600 (created before SQLite opens it, so it never exists with a wider mode) and opened
   only if it is owned by the current user and not group- or world-accessible.
 - The vault uses `journal_mode = DELETE` and `synchronous = FULL`: it is tiny and rarely written, and no `-wal`
@@ -177,8 +179,8 @@ Rules:
 - **Refusing a value that is already public (`vault set`, `import-legacy`).** Before storing a value, the command
   builds the section 7 matcher for that value alone and scans the tracked files of the work tree it is run in
   (`git ls-files`; outside a work tree it prints a notice and skips). For kinds other than `credential` and
-  `secret`, a hit **refuses** the value with one of two messages, chosen by the owner reading it: "already in tracked
-  files: rotate it if it is a secret" or "public text: do not store it". For `credential` and `secret`, a hit does
+  `secret`, a hit **refuses** the value with the single message "remove or replace the tracked occurrence, then store it" (the
+  tracked text is what must change; there is no "store it anyway"). For `credential` and `secret`, a hit does
   **not** refuse: the value is stored as **`unscannable`** (it would match its own public occurrences on every scan) with a
   warning, "this value already appears in tracked files; rotate it". The location follows the redaction rules of section 8. **There is no allowlist in v1.** A value that
   is below the minimum length, or a single-label host shorter than 8 characters, is stored but marked **`unscannable`**
@@ -231,7 +233,7 @@ row above.
   holds both and then gives no protection. **The key path must be excluded from backups** (#69 documents this for the
   service key, #76 for the dev key) and the key is kept in the password manager instead (`vault key export`, below).
 - **Permission checks (refuse, do not warn).** `KeyFile::load` refuses a file that is not a regular file (symlinks are
-  refused, `O_NOFOLLOW` plus `fstat` on the opened descriptor, not a path check followed by an open), not owned by the
+  refused, `O_NOFOLLOW` plus `fstat` on our own opened descriptor, not a path check followed by an open), not owned by the
   current user, readable or writable by group or others (`mode & 0o077 != 0`), or not exactly 32 bytes. The same
   checks apply to the vault file. The error says which rule failed, never the contents.
 - **No environment variables for key material.** The key is never read from an environment variable. If
@@ -250,9 +252,10 @@ row above.
   strict check needs (0600/0400, the container user's uid) or as world-readable 0444. **#69 tests both the uid and the
   mode** of the bind-mounted secret on the real compose version. If it fails the check, the options are the long-syntax
   `mode:`/`uid:` or a documented, explicit exception for the single path `/run/secrets/` (inside the container only),
-  not weakening the check for other paths. Until #69 settles it, the strict check stays. **`rekey` runs on the host**
-  against the host key and database files, then the container is restarted (the container never rotates in place).
-- **Rotation (`vault rekey`).** Generate the new key as `<key>.next` (0600, `O_EXCL`, fsynced), open a single SQLite
+  not weakening the check for other paths. Until #69 settles it, the strict check stays. **The service key is rotated as stop, rekey, start:** the container is stopped, `rekey` runs **on the host**
+  against the host key and database files, and the container is started again (the container never rotates in place).
+- **Rotation (`vault rekey`).** Generate the new key as `<key>.next` (0600, `O_EXCL`, fsynced; **the key directory is fsynced right after the file is
+  created, before the transaction starts**, so a crash cannot lose the only copy of the new key), open a single SQLite
   transaction, re-open every entry with the old key and re-seal it with the new key and a fresh nonce, write a new
   `keycheck`, commit, then atomically rename `<key>.next` over the key file and fsync the directory. A crash between
   commit and rename leaves a `.next` file. **Recovery runs only in write commands, under the write lock** (the exclusive
@@ -280,7 +283,7 @@ row above.
 
 **Principle.** The scan does not ask "does this look like a credential or an address?". It asks "does this text
 contain one of the values that are actually in the vault, in any of the listed renderings?". A vault of N values
-yields a finite, enumerable set of needles; there is no open-ended grammar to bypass, and a text with an
+yields a finite set of needles (the renderings listed below); there is no open-ended grammar to bypass, and a text with an
 address-shaped or password-shaped string that is not in the vault passes (no false positives from shape). The
 shape heuristics of `scripts/agents check` and the catalogue guard are demoted to an optional soft lint (warnings only,
 section 9).
@@ -293,7 +296,9 @@ entry and line):
    U+200F, U+202A to U+202E, U+2060 to U+2064, U+2066 to U+2069 and U+FEFF; map the fullwidth ASCII block U+FF01 to
    U+FF5E onto U+0021 to U+007E; map U+3002, U+FF61 and U+2024 to `.`; map U+2010 to U+2015 and U+2212 to `-`; map
    U+00A0, U+2000 to U+200A and U+3000 to a space. Line breaks are never touched, so line numbers stay valid;
-3. **decoded**: the squeezed view with `%XX` sequences percent-decoded once (invalid sequences left as they are).
+3. **decoded**: the squeezed view with `%XX` sequences percent-decoded once (invalid sequences left as they are); the
+   decoded **byte string is re-decoded as UTF-8, lossy** (invalid sequences become U+FFFD), so `%E2%80%93` becomes the
+   en dash U+2013.
    `%0A` and `%0D` (any case) are **not** decoded, so a decoded view never gains a line break and line numbers stay valid;
 4. **JSON-unescaped**: the squeezed view with JSON string escapes decoded once: `\uXXXX` (a surrogate pair such as
    `\uD83D\uDE00` becomes one character), `\"`, `\\` and `\/`. **Never decoded**, so the view never gains a line break:
@@ -305,17 +310,26 @@ entry and line):
 **Which view is built from which.** The squeezed view is built from the raw text; the decoded, the JSON-unescaped and the
 joined view (below) are each built from the **squeezed** text, independently of each other (the decoded view is not
 JSON-unescaped and the other way round). The decoding steps do not squeeze again, so a character of the squeeze table that
-appears only after decoding (`%E2%80%8B`, `\u200b`, `\u2013`) is not mapped; that is a gap (section 8).
+appears only after decoding is not mapped by the squeeze; the decoded and JSON-unescaped views are therefore also matched
+against the unsqueezed needles (next paragraph), which finds the encoded forms of a character *inside a stored value*.
+What stays a gap (section 8) is an invisible character **inserted** as an escape into text (`%E2%80%8B`, `\u200b`) in the
+middle of a value that does not contain it.
 
 **Needles are squeezed with the same table.** Every literal needle (the raw value, its slugs, its joined-view form, its
 compact serial form, its XML and percent forms) is built from the stored value and then passed through the **same squeeze
 table** (and the fold, where the kind uses it), and the squeezed, decoded, JSON-unescaped and joined views are matched
-against these **squeezed needles**. The **raw** view is matched against the **unsqueezed** needles (the bytes as stored).
+against these **squeezed needles**. The **raw** view is matched against the **unsqueezed** needles (the bytes as stored, in the fold
+where the kind uses it), and **the decoded and the JSON-unescaped views are matched against both the squeezed and the
+unsqueezed needles**, so that a character of the squeeze table that appears inside the stored value itself is found
+whether the text carries it literally, squeezed, percent-encoded or JSON-escaped.
 Without this a stored `Garage – Side` (en dash, U+2013) would never match `Garage - Side`, because the text view has
 the dash mapped to `-` and the needle would not. Required found examples for a stored display name `Garage – Side`
-(en dash): `Garage – Side` (raw view), `Garage - Side`, `GARAGE - SIDE` (fold) and `Garage%20-%20Side` (decoded view); for a
-stored secret `pa"ss–word` (en dash): the JSON log text `"password":"pa\"ss–word"` (the JSON-unescaped view yields
-`pa"ss-word`, the squeezed needle is `pa"ss-word`). Checked by hand against the tables above; #75 pins them in tests.
+(en dash): `Garage – Side` (raw view), `Garage - Side`, `GARAGE - SIDE` (fold), `Garage%20-%20Side` (decoded view, squeezed
+needle), **URL-encoded** `Garage%20%E2%80%93%20Side` (decoded view, unsqueezed needle) and **JSON-escaped**
+`Garage \u2013 Side` (a literal backslash-u escape; JSON view, unsqueezed needle); for a stored secret `pa"ss–word` (en dash):
+the JSON log text `"password":"pa\"ss–word"` (the JSON-unescaped view yields `pa"ss-word` after the squeeze, the squeezed
+needle is `pa"ss-word`) **and fully JSON-escaped** `"password":"pa\"ss\u2013word"` (the JSON view yields the en dash, the
+unsqueezed needle matches). Checked by hand against the tables above; #75 pins them in tests.
 
 Each view keeps an **offset map** back to the raw bytes (one entry per output character: the raw byte range it came
 from), which `vault redact` uses (section 10).
@@ -327,6 +341,12 @@ and a string can change length) and, for two kinds, a **joined** view.
 Tables, not heuristics: the same four views are applied to every file the same way, and the mapping is part of the
 tested contract. A character not in the tables (for example a Cyrillic lookalike) is not mapped; see "what the scan
 cannot catch".
+
+**Minimum length (every kind with literal needles).** A value (and so each of its needles) must be at least **7 bytes**. The
+rule is applied to the stored value **and to each needle after the squeeze table and the fold**: if any needle falls below 7
+bytes (for example a value made only of zero-width characters squeezes to an empty needle), the whole entry is **`unscannable`** and warned about on every scan; it is never partly scanned. IPv4, IPv6 and MAC
+values have fixed formats and are exempt. 7 (not 6) is chosen so that every base64 alignment of a secret is at least 8
+characters (below), and no state of the scan can reveal that a value is exactly 6 bytes.
 
 **Per-kind rules.** A "boundary" is the rule for what may touch a match; `A` means ASCII letter or digit.
 
@@ -387,11 +407,11 @@ six, three, two or one consecutive groups of a longer chain are windows. The 12 
 (14 digits), `02:00:5e:00:53:ae` (differs).
 
 *`serial`* (trimmed). Needles: the value as entered and the **compact** form (the characters `-`, `_`, `.` and space
-removed), both matched in the fold, boundary: not `A` on either side; minimum 6 characters of the compact form.
+removed), both matched in the fold, boundary: not `A` on either side; minimum 7 bytes of the compact form.
 Example, stored `SN-0042-ZQ`: found as `sn-0042-zq`, `SN0042ZQ`, `sn0042zq`, `Serial: SN-0042-ZQ.`; not found as `SN 0042 ZQ`
-(a regrouping other than the two forms; see limits), `XSN-0042-ZQ` (boundary).
+(a regrouping other than the two forms; see section 8), `XSN-0042-ZQ` (boundary).
 
-*`secret` and the password of `credential`* (case-sensitive; minimum 6 bytes). Needles, deduplicated:
+*`secret` and the password of `credential`* (case-sensitive; minimum 7 bytes). Needles, deduplicated:
 1. the raw value;
 2. **percent-encoding**: unreserved characters (`A-Z a-z 0-9 - . _ ~`) kept and every other byte as `%XX`, in upper-case and
    in lower-case hex; and the **every-byte** form (`%63%6f...`), upper and lower; and the **form-encoding** variant (space as `+`);
@@ -399,8 +419,8 @@ Example, stored `SN-0042-ZQ`: found as `sn-0042-zq`, `SN0042ZQ`, `sn0042zq`, `Se
    inside a larger base64 blob (for example an HTTP Basic `user:secret` header) is encoded at a byte offset the scan does not
    know, so for each `k` in 0, 1, 2 the value is encoded with `k` filler bytes in front, and only the characters
    fully determined by the value are kept: from character `ceil(8k / 6)` up to, not including, character
-   `floor(8(k + n) / 6)`, where `n` is the value length in bytes. A needle shorter than 8 characters is dropped (too
-   weak). No `=` can appear in a needle. Worked example, value `correct-horse-9` (15 bytes):
+   `floor(8(k + n) / 6)`, where `n` is the value length in bytes. With the 7-byte minimum (below) the shortest
+   needle is 8 characters (`k=1`, `n=7`: characters 2 to 10), so **no alignment is ever dropped**. No `=` can appear in a needle. Worked example, value `correct-horse-9` (15 bytes):
    `k=0` encodes to `Y29ycmVjdC1ob3JzZS05` and all 20 characters are kept; `k=1` encodes to
    `AGNvcnJlY3QtaG9yc2UtOQ` and the needle is `NvcnJlY3QtaG9yc2UtO` (characters 2 to 20); `k=2` encodes to
    `AABjb3JyZWN0LWhvcnNlLTk` and the needle is `jb3JyZWN0LWhvcnNlLT` (characters 3 to 21). The dropped characters depend
@@ -408,7 +428,7 @@ Example, stored `SN-0042-ZQ`: found as `sn-0042-zq`, `SN0042ZQ`, `sn0042zq`, `Se
 4. **lower-case and upper-case hex** of the bytes (log hex dumps);
 5. the **XML escape** (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`) when it differs from the raw value (JSON escapes are
    handled by the fourth view, not by a needle).
-No boundary rule: a substring hit on a password is a leak. A secret shorter than 6 bytes is **unscannable** (section 8).
+No boundary rule: a substring hit on a password is a leak. A secret shorter than 7 bytes is **unscannable** (section 8).
 The username of a `credential` is **not scanned** (usernames such as `admin` are generic and would flood every text; a
 sensitive username belongs in an `other` entry).
 
@@ -416,7 +436,7 @@ sensitive username belongs in an `other` entry).
 becomes one space). They are matched in a **joined** view of each text, in addition to the four views: every line
 break (`\n`, `\r\n` or a lone `\r`) and the spaces and tabs that follow it become one space, and any run of spaces, tabs and NBSP becomes one space, so
 a name wrapped across lines or indented is found; a hit is reported at the line where it starts. Boundary: not `A`. Minimum
-6 bytes. `display-name` additionally gets the **slug** needles with each space replaced by `-`, by `_`, and removed.
+7 bytes. `display-name` additionally gets the **slug** needles with each space replaced by `-`, by `_`, and removed.
 Example, stored `Back Door North`: found in `back   door north`, `BACK DOOR NORTH`, `back-door-north`,
 `back_door_north`, `BackDoorNorth`, and `Back Door` newline plus four spaces `North`; not found as `Door North`. Not
 handled: comment or quote markers at the start of the wrapped line (`# North`, `> North`).
@@ -438,8 +458,10 @@ the redaction rule of section 8, a path; it is also item 5 of the gap list). A t
   the location would print the value. The tool first runs the matcher over every path, ref name and message it is about to
   print, in every report, error and notice. Locations are: `path:line` for a clean path in the tree or the index;
   `<redacted-path> blob <sha>` (blob id, then `:line` for a content hit) when the path contains a hit or a hit is in
-  a blob whose path does; `commit:<sha>:message`, `commit:<sha>:author` and `commit:<sha>:committer` for hits in a commit message, author line
-  or committer line; `tag:<sha>:message` and `tag:<sha>:tagger` for a tag message or tagger line; `ref:<index>` (the zero-based position of the ref in the pre-push
+  a blob whose path does; `commit:<sha>:message` for a hit in a commit message, `commit:<sha>:author` and `commit:<sha>:committer` for the author and
+  committer lines, and `commit:<sha>:header` for any other commit header (`mergetag`, `gpgsig`, `encoding`, ...);
+  `tag:<sha>:message` and `tag:<sha>:tagger` for a tag message or tagger line, and `tag:<sha>:header` for any other tag
+  header (including the tag's `tag` name header); `ref:<index>` (the zero-based position of the ref in the pre-push
   input) when a ref name contains a hit; `ref:<index>` is also used for every ref when the name was not clean. #75 tests
   a vault value in a file name and in a branch name, in an unchanged file renamed to a value-bearing name, and in a new
   blob that appears at one clean path and one value-bearing path (both are reported).
@@ -447,9 +469,9 @@ the redaction rule of section 8, a path; it is also item 5 of the gap list). A t
   permissions, wrong key, corrupt entry, a file over the size cap). **Failing to scan is never a pass.**
 - The report also lists, on **every** scan, the `unscannable` entries by id and kind (value below the minimum length, a
   single-label host under 8 characters, or a `credential` or `secret` stored as `unscannable` because it equals public
-  text, see section 4), so the gap is visible instead of silent. A **dropped base64 alignment** (needle under 8 characters)
-  is reported **separately**, as `partial` with the entry id and the alignments dropped: the entry is still scanned in
-  its other forms, so it is not "unscannable".
+  text, see section 4), so the gap is visible instead of silent. There is **no `partial` state**: an earlier draft reported
+  a dropped base64 alignment as `partial`, but with the 7-byte minimum no alignment is ever dropped (the shortest needle,
+  `k=1` with `n=7`, is 8 characters), and reporting it would have revealed that a value is exactly 6 bytes long.
 
 **What the scan cannot catch** (residual risk; **the list below is illustrative, not exhaustive**: anything that
 is not a listed rendering of a vault value is outside the guarantee):
@@ -466,8 +488,9 @@ is not a listed rendering of a vault value is outside the guarantee):
    inside the blob), regrouped phone numbers (`555 0100` against `5550100`), **spaced hex dumps** (`63 6f 72 ...`), a display name encoded
    with `+` for spaces (`Back+Door+North`), **defanged hostnames** (`nvr-1[.]example[.]invalid`), and **IDN (Unicode) forms of `xn--` hostnames**, **an IPv6 address with a trailing word glued on** (`2001:db8::1:<hex word>`), **a hex word or a dotted prefix glued on in
    front** (`cafe2001:db8::1`, `1.2001:db8::1`), **IPv4-compatible, NAT64 and translated forms** of an address, the
-   **unbracketed port form** `2001:db8::1:554`, **percent- or JSON-encoded characters of the squeeze table** (`%E2%80%8B`,
-   `\u200b`, `\u2013` inside a value: the decoding steps run after the squeeze step and do not squeeze again).
+   **unbracketed port form** `2001:db8::1:554`, **invisible characters inserted as escapes** into the middle of a value (`%E2%80%8B`, `\u200b`: the decoding steps run after the
+   squeeze step and do not squeeze again), **Rust renderings** of a value such as `Ipv4Addr::new(192, 0, 2, 10)` and `[192, 0, 2, 10]`, and **byte-array MACs**
+   (`[0x02, 0x00, 0x5e, 0x00, 0x53, 0xaf]`).
 4. Lookalike characters: Cyrillic or other homoglyphs, NFD vs NFC forms, transliteration (`ä` to `a`) of display names
    and `other` text.
 5. Non-text content: images, screenshots, video thumbnails, compressed archives, binary blobs. A snapshot of a camera
@@ -520,8 +543,9 @@ environment can also unset it (see residual risk).
    `git diff-tree -r --name-only --root -m -z` over **every new commit** (recursive, names only, `--root` so the root
    commit is included, and `-m` so each parent of a merge is diffed separately; see its man page). The `rev-list` listing
    gives one path per new blob and so misses a rename of unchanged content (the blob is not new, the path is) and a second
-   path for the same new blob. Also scanned: the **commit messages, the author lines and the committer lines**, the messages
-   and **`tagger` lines** of annotated tags, and the ref names: all of it becomes public on push. "New to the remote" is
+   path for the same new blob. Also scanned: the **full raw content of every new commit and annotated tag object, read with `git cat-file`**: every
+   header (`author`, `committer`, `encoding`, `gpgsig`, `mergetag`, and for a tag the `tag`, `tagger` and `object` headers) plus
+   the message, so nothing a header can carry is skipped; and the ref names: all of it becomes public on push. "New to the remote" is
    computed against `--remotes=<destination remote>` (that remote's tracking refs only, not every remote, so a commit another
    remote already has is not wrongly treated as published here). **The hooks also run the literal needles (passwords,
    hostnames, serials, display names) and the IPv4, IPv6 and MAC tokenisers over binary blobs**, which the gate skips
@@ -689,7 +713,7 @@ describe rooms and people); the owner's PII.
    cameras (`reolink-1`) are public. `vault set` refuses an id in which the matcher finds the entry's own value
    (section 1); an id built from some other sensitive text is caught only by review.
 7. **Heap, swap, core dumps** (section 10).
-8. **A weak or short secret** below 6 bytes, a single-label host under 8 characters, and generic usernames, are not
+8. **A weak or short secret** below 7 bytes, a single-label host under 8 characters, and generic usernames, are not
    scanned (marked `unscannable`).
 9. **Text that reaches GitHub without passing a git hook.** Issue and PR bodies and comments (`gh issue comment`,
    `gh pr create --body`), commit status descriptions and anything written through the GitHub contents API never
@@ -705,15 +729,16 @@ describe rooms and people); the owner's PII.
 **Why exact match beats shape match.** A shape rule has to predict every way a secret can be written; PR #71 needed
 five rounds and three more were queued in #72, and each round fixed what the previous adversary found, while every fix
 added false positives (version strings, resolutions, WS-Discovery multicast, model names). An exact match has a finite
-needle set derived from data that exists. Its false-negative classes are enumerable and written down (section 8), and
-its false positives are limited to the real values (and the 6-byte minimum). It also removes the guesswork from the
+needle set derived from data that exists. Its false-negative classes are illustrative and written down, not exhaustive (section 8), and
+its false positives are limited to the real values (and the 7-byte minimum). It also removes the guesswork from the
 reviewers: "does the text contain a value from the store" is decidable.
 
 ## Consequences
 
 Each of the eight tickets below carries an **"Amended by ADR 0006" section** (added 2026-11-23 on the PR #77
-verification rounds). The amendments **summarise** this ADR and can lag it; **where an amendment or an older ticket text
-differs from this ADR, this ADR wins**, and the implementer reads the ADR first.
+verification rounds). The amendments **mirror this ADR at the merged commit** (they were brought in line with it when the owner approved the
+round-5 fold-in) and summarise it; **where an amendment or an older ticket text differs from this ADR, this ADR wins**, and
+the implementer reads the ADR first.
 
 - **#48 (`wardenlens-secrets`).** The cipher only, no SQLite and no scan: XChaCha20-Poly1305 with a key file; record
   = version byte, 24-byte random nonce, ciphertext, tag. `seal(&key, kind, &EntryId, plaintext)` and `open(...)` with
@@ -740,7 +765,7 @@ differs from this ADR, this ADR wins**, and the implementer reads the ADR first.
   scans new blobs, takes paths from `git diff-tree -r --name-only --root -m` over every new commit, and scans commit
   (message, author, committer) and tag messages, with tests for an unchanged file renamed to a value-bearing name and for
   one new blob at a clean and a value-bearing path; IPv6 sub-runs always checked (`Source:2001:db8::1`,
-  `Interface:fe80::1`, `beef:2001:db8::1`, `dead:fe80::1`); files with a UTF-16 BOM decoded as text; binary files skipped with a notice (the hooks still run the literal needles over binary blobs); pre-push uses `--remotes=<destination remote>` and scans the tag `tagger` line; the JSON-unescaped view; SQLite opened with `SQLITE_OPEN_NOFOLLOW` plus an `fstat` comparison; `vault redact` offset maps with whole-line fallback; tracked files over the limit fail,
+  `Interface:fe80::1`, `beef:2001:db8::1`, `dead:fe80::1`); files with a UTF-16 BOM decoded as text; binary files skipped with a notice (the hooks still run the literal needles and the tokenisers over binary blobs); raw commit and tag objects scanned with `git cat-file` (all headers, `commit:<sha>:header`, `tag:<sha>:header`); the 7-byte minimum applied to the value and every squeezed needle, with no `partial` state; the decoded and JSON views matched against squeezed and unsqueezed needles; the refusal message "remove or replace the tracked occurrence, then store it"; pre-push uses `--remotes=<destination remote>` and scans the tag `tagger` line; the JSON-unescaped view; SQLite opened with `SQLITE_OPEN_NOFOLLOW` plus an `fstat` comparison; `vault redact` offset maps with whole-line fallback; tracked files over the limit fail,
   untracked ones warn; no allowlist. Proptest (TEST-3) that the matcher finds a value after each listed transformation.
 - **#76 (spikes and docs).** `spikes/s1-cameras/lib.sh` and `spikes/s2-gpu` read through `vault get` with ids; adds
   `wardenlens vault redact` (an exact-match stdin filter) and replaces the shape-based `redact()` in `lib.sh` with it;
@@ -762,7 +787,7 @@ differs from this ADR, this ADR wins**, and the implementer reads the ADR first.
 - **#69 (Docker).** The compose secret source for the vault key is a host path outside every work tree, by default
   `/etc/wardenlens/vault.key` (`WARDENLENS_KEY_FILE_HOST` in `.env`); `/secrets/` and `*.key` go into `.dockerignore`
   (and are already in `.gitignore`); a test that the container user's uid and the file mode of the bind-mounted secret
-  pass the strict key check; the container runs `wardenlens vault check-key` at startup; `rekey` runs on the host followed by a container restart; documents
+  pass the strict key check; the container runs `wardenlens vault check-key` at startup; the service key is rotated as stop the container, `rekey` on the host, start the container; documents
   excluding the key path from backups.
 - **#32 (catalogue).** Keeps structural validation and the generated README; the site-data guarantee is #75's exact-match
   scan (the exact-match catalogue test lives in `crates/wardenlens-cli/tests/` and calls `vault scan` when a vault is present); the shape
