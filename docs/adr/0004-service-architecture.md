@@ -163,6 +163,8 @@ Rules: `api` does not depend on `index`, `storage` or `recorder`; it receives th
 core types, so neither depends on the other. Crates are created by the ticket that first needs them, not up front, and
 the map is enforced by review of each crate's `Cargo.toml` (a mechanical check is a follow-up). Choice of `retina`,
 `rusqlite`, an MP4 crate and the encryption crate belong to the tickets/ADRs 0005 and 0006 and are not decided here.
+ADR 0006 (proposed) decides the encryption crate and adds a `vault` crate (depends on core and secrets; only `cli` depends on it)
+and narrows `secrets` to key handling and seal/open; `index` never depends on `vault` or `secrets`.
 
 ### 9. API authentication
 
