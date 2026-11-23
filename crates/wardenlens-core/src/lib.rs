@@ -4,8 +4,10 @@
 //! threads. Adapters (CLI, network, storage) live in their own crates and
 //! depend on this one, never the other way round.
 
+pub mod connection;
 pub mod entry;
 pub mod mp4box;
+pub mod time;
 
 /// Crate version, taken from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

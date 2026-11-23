@@ -708,6 +708,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardenlens-mp4"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "tempfile",
+ "thiserror",
+ "wardenlens-core",
+]
+
+[[package]]
 name = "wardenlens-secrets"
 version = "0.1.0"
 dependencies = [
