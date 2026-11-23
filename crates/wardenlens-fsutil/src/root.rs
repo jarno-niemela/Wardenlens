@@ -1,7 +1,9 @@
 //! `RootDir`: a directory handle with kernel-enforced containment (ADR 0005 sections 3, 7, 8).
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use rustix::fs::{
@@ -119,20 +121,54 @@ fn join<S: AsRef<str>>(comps: &[S]) -> Result<String, FsError> {
 const BENEATH: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
 
 impl RootDir {
-    /// Open `path` as a directory handle (`O_DIRECTORY | O_NOFOLLOW`). Intermediate components
-    /// of `path` are resolved normally (operator configuration), but the final component must
-    /// not be a symlink (ADR 0005 section 8).
+    /// Open `path` as a directory handle. The path is split structurally into a parent and a
+    /// last segment: trailing `/` characters are stripped first, so `link`, `link/`, `link//`
+    /// and `link/.` all name the same last segment as far as the check is concerned. The parent
+    /// is opened normally (it is operator configuration, symlinks in it are followed), then the
+    /// last segment is opened with `openat(parent, last, O_DIRECTORY | O_NOFOLLOW)`. A symlink
+    /// in the last position is therefore refused whatever the spelling of the path (ADR 0005
+    /// section 8).
+    ///
+    /// The path is refused with [`FsError::InvalidComponent`] if it is empty, consists only of
+    /// slashes (the filesystem root `/` is refused: a recordings root is never `/`), or its last
+    /// segment is `.`, `..`, or not valid UTF-8.
     ///
     /// Recommendation: mount the recordings volumes `nodev,nosuid,noexec`. A read open of a
     /// device node runs the driver's open routine before `fstat` can refuse it; the volume
     /// probe ticket is where this is enforced.
     ///
     /// # Errors
-    /// A failed `open` (`ELOOP` for a symlinked root), or the path is not a directory.
+    /// [`FsError::InvalidComponent`] as above, or a failed `open` (for a symlink as last segment
+    /// the kernel reports an errno such as `ENOTDIR` or `ELOOP`; callers must not depend on which),
+    /// or the path is not a directory.
     pub fn open(path: &Path) -> Result<Self, FsError> {
-        let fd = openat(
+        let mut bytes = path.as_os_str().as_bytes();
+        while let Some(rest) = bytes.strip_suffix(b"/") {
+            bytes = rest;
+        }
+        let (parent, last): (&[u8], &[u8]) = match bytes.iter().rposition(|&b| b == b'/') {
+            // `split_at(i)` leaves the slash at the head of `tail`; `split_first` drops it.
+            Some(i) => {
+                let (head, tail) = bytes.split_at(i);
+                (
+                    if head.is_empty() { b"/" } else { head },
+                    tail.split_first().map_or(&[][..], |(_, t)| t),
+                )
+            }
+            None => (b".", bytes),
+        };
+        let last = std::str::from_utf8(last).map_err(|_| FsError::InvalidComponent)?;
+        let last = component(last)?;
+        let parent_fd = openat(
             rustix::fs::CWD,
-            path,
+            Path::new(OsStr::from_bytes(parent)),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(FsError::io("open root parent"))?;
+        let fd = openat(
+            &parent_fd,
+            last,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
@@ -196,6 +232,30 @@ impl RootDir {
             file: File::from(fd),
             len: st.size,
         })
+    }
+
+    /// Check that the entry named by `comps` is a regular file, without opening it for reading:
+    /// an `O_PATH` descriptor needs no read permission, does not update `atime` and does not
+    /// run a device's open routine. Symlinks anywhere are refused by the kernel.
+    ///
+    /// # Errors
+    /// Invalid component, kernel refusal, or [`FsError::NotRegular`].
+    pub(crate) fn ensure_regular<S: AsRef<str>>(&self, comps: &[S]) -> Result<(), FsError> {
+        let rel = join(comps)?;
+        let fd = openat2(
+            &self.fd,
+            rel.as_str(),
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            BENEATH,
+        )
+        .map_err(FsError::io("open path"))?;
+        let st = FileStat::from_stat(&fstat(&fd).map_err(FsError::io("fstat"))?);
+        if st.kind == FileKind::Regular {
+            Ok(())
+        } else {
+            Err(FsError::NotRegular)
+        }
     }
 
     /// Create the directory `name` (mode `0700`) in this directory.
@@ -429,5 +489,66 @@ mod tests {
         let v = root.statvfs().unwrap();
         assert!(v.blocks > 0 && v.block_size > 0);
         assert!(v.blocks_available <= v.blocks);
+    }
+
+    #[test]
+    fn open_refuses_symlinked_root_in_every_spelling() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        symlink(d.path().join("real"), d.path().join("link")).unwrap();
+        let link = d.path().join("link");
+        for suffix in ["", "/", "//", "/.", "/.."] {
+            let mut p = link.clone().into_os_string();
+            p.push(suffix);
+            assert!(RootDir::open(Path::new(&p)).is_err(), "{suffix:?}");
+        }
+    }
+
+    #[test]
+    fn open_accepts_real_directory_with_and_without_trailing_slash() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        let real = d.path().join("real");
+        let ino = std::fs::metadata(&real).unwrap().ino();
+        for suffix in ["", "/", "//"] {
+            let mut p = real.clone().into_os_string();
+            p.push(suffix);
+            let root = RootDir::open(Path::new(&p)).unwrap();
+            assert_eq!(root.stat().unwrap().ino, ino, "{suffix:?}");
+        }
+    }
+
+    #[test]
+    fn open_refuses_degenerate_paths() {
+        for p in ["", "/", "//", ".", "..", "a/..", "a/."] {
+            assert!(RootDir::open(Path::new(p)).is_err(), "{p:?}");
+        }
+        assert!(matches!(
+            RootDir::open(Path::new("/")),
+            Err(FsError::InvalidComponent)
+        ));
+    }
+
+    #[test]
+    fn open_resolves_a_bare_relative_name_against_cwd() {
+        // Parent "." for a single segment: a missing name is a plain ENOENT, not a refusal.
+        let e = RootDir::open(Path::new("definitely-missing-wardenlens-dir")).unwrap_err();
+        assert!(e.is_not_found());
+    }
+
+    #[test]
+    fn ensure_regular_needs_no_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, root) = setup();
+        std::fs::write(d.path().join("f"), b"x").unwrap();
+        std::fs::set_permissions(d.path().join("f"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        root.ensure_regular(&["f"]).unwrap();
+        std::fs::create_dir(d.path().join("dir")).unwrap();
+        assert!(matches!(
+            root.ensure_regular(&["dir"]),
+            Err(FsError::NotRegular)
+        ));
     }
 }

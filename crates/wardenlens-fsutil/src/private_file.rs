@@ -27,6 +27,10 @@ impl FileIdentity {
 }
 
 /// A checked, private, regular file opened without following symlinks.
+///
+/// Keep the descriptor open until [`PrivateFile::verify_path_unchanged`] has run: once it is
+/// dropped the inode can be freed and the `(dev, ino)` pair reused by another file, which would
+/// make the identity comparison meaningless.
 #[derive(Debug)]
 pub struct PrivateFile {
     file: File,
@@ -85,10 +89,10 @@ pub fn path_identity(path: &Path) -> Result<FileIdentity, FsError> {
 
 /// Open `path`, creating it with mode `0600` (`O_EXCL|O_NOFOLLOW`) if it is missing, then
 /// `fstat` the descriptor: it must be a regular file, owned by the effective uid, with no group
-/// or other permission bits.
+/// or other permission bits and no setuid, setgid or sticky bit.
 ///
 /// # Errors
-/// Symlink (`ELOOP`), non-regular file, wrong owner, mode bits `& 0o077`, or any I/O error.
+/// Symlink (`ELOOP`), non-regular file, wrong owner, mode bits `& 0o7077`, or any I/O error.
 pub fn open_private_file(path: &Path) -> Result<PrivateFile, FsError> {
     let (fd, created) = match open_existing(path) {
         Ok(fd) => (fd, false),
@@ -139,7 +143,7 @@ fn check_stat(st: &Stat) -> Result<(), FsError> {
             expected,
         });
     }
-    if st.st_mode & 0o077 != 0 {
+    if st.st_mode & 0o7077 != 0 {
         return Err(FsError::InsecureMode {
             mode: st.st_mode & 0o7777,
         });
@@ -212,6 +216,20 @@ mod tests {
     fn refuses_group_only_and_other_only_bits() {
         let dir = tempfile::tempdir().unwrap();
         for m in [0o640, 0o604, 0o660, 0o606] {
+            let p = dir.path().join(format!("db{m:o}"));
+            std::fs::write(&p, b"").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(m)).unwrap();
+            assert!(
+                matches!(open_private_file(&p), Err(FsError::InsecureMode { .. })),
+                "{m:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_setuid_setgid_and_sticky_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in [0o4600, 0o2600, 0o1600] {
             let p = dir.path().join(format!("db{m:o}"));
             std::fs::write(&p, b"").unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(m)).unwrap();

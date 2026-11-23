@@ -36,6 +36,12 @@ pub enum QuarantineOutcome {
 /// A name of 255 bytes yields `ENAMETOOLONG` (the suffix does not fit) rather than
 /// [`QuarantineOutcome::Exhausted`].
 ///
+/// Time-of-check gap: the regular-file check and the rename (by name) are separate steps, so an
+/// attacker with write access to the source directory can swap the checked file for a directory
+/// or symlink in between. `RENAME_NOREPLACE` never overwrites anything and `renameat2` does not
+/// follow a symlink in the final position, so nothing escapes the root and nothing is replaced,
+/// but the swapped-in directory or symlink itself could be moved into `_quarantine`.
+///
 /// If the rename succeeded but a later directory `fsync` failed, `Err` is returned although the
 /// file has already moved into quarantine.
 pub fn quarantine<S: AsRef<str>>(root: &RootDir, rel: &[S]) -> Result<QuarantineOutcome, FsError> {
@@ -69,7 +75,7 @@ pub fn quarantine_with_bound<S: AsRef<str>>(
         root.open_dir(parents)?
     };
     // Refuse a directory, FIFO, symlink or device before creating anything.
-    drop(source_dir.open_read(&[name])?);
+    source_dir.ensure_regular(&[name])?;
     let target_dir = ensure_quarantine_dir(root, parents)?;
 
     let mut candidate = name.to_owned();

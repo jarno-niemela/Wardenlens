@@ -45,22 +45,20 @@ fn root_open_accepts_real_directory_with_trailing_slash() {
     RootDir::open(&with_suffix(d.path(), "/")).unwrap();
 }
 
-/// The quarantine pre-check opens the source read-only; a mode-000 source owned by us gives
-/// EACCES (for non-root). That must be an error, not a silent move or a panic.
+/// The quarantine source check uses `O_PATH`, so a mode-000 regular file still moves.
 #[test]
-fn quarantine_of_unreadable_source_is_typed() {
+fn quarantine_of_unreadable_source_succeeds() {
     use std::os::unix::fs::PermissionsExt;
-    if rustix::process::geteuid().is_root() {
-        return;
-    }
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("f"), b"x").unwrap();
     std::fs::set_permissions(d.path().join("f"), std::fs::Permissions::from_mode(0o000)).unwrap();
     let root = RootDir::open(d.path()).unwrap();
-    let r = quarantine(&root, &["f"]);
-    assert!(matches!(r, Err(FsError::Io { .. })), "{r:?}");
-    assert!(d.path().join("f").exists());
-    assert!(!d.path().join("_quarantine").exists());
+    assert_eq!(
+        quarantine(&root, &["f"]).unwrap(),
+        QuarantineOutcome::Moved { suffix: None }
+    );
+    assert!(!d.path().join("f").exists());
+    assert!(d.path().join("_quarantine/f").exists());
 }
 
 /// A quarantine source that is itself a symlink is refused (not moved, not followed).

@@ -1,10 +1,5 @@
 //! Adversarial tests for the filesystem trust boundary (ticket #84).
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    reason = "test code"
-)]
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -43,7 +38,13 @@ fn root_open_refuses_a_symlinked_root() {
     std::fs::create_dir(d.path().join("real")).unwrap();
     symlink(d.path().join("real"), d.path().join("archive")).unwrap();
     let r = RootDir::open(&d.path().join("archive"));
-    assert!(r.is_err(), "RootDir::open followed a symlinked root");
+    let errno = r
+        .expect_err("RootDir::open followed a symlinked root")
+        .errno();
+    assert!(
+        errno == Some(Errno::NOTDIR) || errno == Some(Errno::LOOP),
+        "{errno:?}"
+    );
 }
 
 #[test]
