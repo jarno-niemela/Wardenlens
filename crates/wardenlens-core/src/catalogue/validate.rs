@@ -24,10 +24,17 @@ pub fn validate(entry: &CatalogueEntry) -> Result<(), CatalogueError> {
         return Err(CatalogueError::Missing("evidence"));
     }
     if entry
+        .evidence
+        .iter()
+        .any(|e| e.section.as_deref().is_some_and(|s| s.trim().is_empty()))
+    {
+        return Err(CatalogueError::Missing("evidence section"));
+    }
+    if entry
         .protocols
         .iter()
         .flat_map(|p| &p.paths)
-        .any(|p| !p.starts_with('/') || p.contains("://"))
+        .any(|p| !p.starts_with('/') || p.starts_with("//") || p.contains("://"))
     {
         return Err(CatalogueError::Malformed("protocol path"));
     }
@@ -248,6 +255,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blank_evidence_section() {
+        for blank in ["", "  "] {
+            let mut e = base();
+            e.evidence = vec![Evidence {
+                reference: "x".to_owned(),
+                section: Some(blank.to_owned()),
+            }];
+            assert_eq!(
+                validate(&e),
+                Err(CatalogueError::Missing("evidence section")),
+                "{blank:?}"
+            );
+        }
+    }
+
+    #[test]
     fn requires_vendor_and_model() {
         let mut e = base();
         e.vendor = " ".to_owned();
@@ -265,6 +288,7 @@ mod tests {
             ("11", false),
             ("", false),
             ("rtsp://host/x", false),
+            ("//host/x", false),
             ("/x?u=http://h", false),
         ] {
             let mut e = base();

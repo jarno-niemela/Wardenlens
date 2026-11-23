@@ -90,22 +90,42 @@ const MAC_SEPARATORS: &[u8; 4] = b":- _";
 pub fn check_source(text: &str) -> Result<(), CatalogueError> {
     for (index, line) in text.lines().enumerate() {
         // Model names are structured like serials (`IPC-HDBW2431EP-S-0280B`), so the lines that
-        // carry them get the model rule; everything else is free text.
+        // carry them get the model rule; everything else is free text, including a trailing
+        // comment on such a line.
         let key = line.trim_start();
-        let mode = if ["model", "aliases"].iter().any(|k| {
+        let is_model_line = ["model", "aliases"].iter().any(|k| {
             key.strip_prefix(k)
                 .is_some_and(|r| r.trim_start().starts_with('='))
-        }) {
-            Mode::Model
+        });
+        let found = if is_model_line {
+            let (code, comment) = split_comment(line);
+            site_data(code, Mode::Model).or_else(|| comment.and_then(|c| site_data(c, Mode::Text)))
         } else {
-            Mode::Text
+            site_data(line, Mode::Text)
         };
-        if let Some(kind) = site_data(line, mode) {
+        if let Some(kind) = found {
             let field = format!("line {}", index.saturating_add(1));
             return Err(CatalogueError::SiteData { field, kind });
         }
     }
     Ok(())
+}
+
+/// Splits a TOML line at the first `#` outside a string.
+fn split_comment(line: &str) -> (&str, Option<&str>) {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return (line.get(..i).unwrap_or_default(), line.get(i..)),
+            Some(_) | None => {}
+        }
+    }
+    (line, None)
 }
 
 /// What kind of text is being checked.
@@ -227,14 +247,36 @@ fn has_credentials(text: &str) -> bool {
         || has_secret_pair(text)
 }
 
+/// Keys that are secret wherever they occur in an identifier (`adminPassword`, `loginpassword`).
+const LONG_KEYS: [&str; 6] = [
+    "password",
+    "passwd",
+    "username",
+    "passphrase",
+    "accesstoken",
+    "apikey",
+];
+
+/// Whether `value` (text after a key) is exempt from being a secret.
+fn exempt_value(key: &str, word: &str, spaced_colon: bool, quoted: bool) -> bool {
+    (key == "auth" && AUTH_SCHEMES.contains(&word))
+        || (key == "token" && word == "none")
+        || (spaced_colon && !quoted && PROSE_WORDS.contains(&word))
+}
+
+/// `key=value`, `key: value` and `"key": "value"` pairs, plus XML elements (`<Key>value</Key>`).
 fn has_secret_pair(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    SECRET_KEYS.iter().any(|key| {
+    let original = text.as_bytes();
+    let by_separator = SECRET_KEYS.iter().any(|key| {
         lower.match_indices(key).any(|(i, _)| {
-            let boundary = i
-                .checked_sub(1)
-                .and_then(|p| lower.as_bytes().get(p))
-                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            let prev = i.checked_sub(1).and_then(|p| original.get(p));
+            let here = original.get(i);
+            // A word boundary: start, non-alphanumeric, or a lower-to-upper camelCase step.
+            let camel = prev.is_some_and(u8::is_ascii_lowercase)
+                && here.is_some_and(u8::is_ascii_uppercase);
+            let boundary =
+                prev.is_none_or(|c| !c.is_ascii_alphanumeric()) || camel || LONG_KEYS.contains(key);
             let after = lower.get(i.saturating_add(key.len())..).unwrap_or_default();
             // A JSON key is quoted: `"password": "x"`.
             let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
@@ -250,11 +292,34 @@ fn has_secret_pair(text: &str) -> bool {
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .next()
                 .unwrap_or_default();
-            let exempt = (*key == "auth" && AUTH_SCHEMES.contains(&word))
-                || (*key == "token" && word == "none")
-                || (spaced_colon && !quoted && PROSE_WORDS.contains(&word));
-            boundary && !value.is_empty() && !exempt
+            boundary && !value.is_empty() && !exempt_value(key, word, spaced_colon, quoted)
         })
+    });
+    by_separator || has_secret_element(&lower)
+}
+
+/// `<[ns:]key[ attrs]>text`: a secret key as an XML element with non-empty text before the next
+/// `<`. Empty and self-closing elements carry no secret.
+fn has_secret_element(lower: &str) -> bool {
+    lower.match_indices('<').any(|(i, _)| {
+        let tag = lower.get(i.saturating_add(1)..).unwrap_or_default();
+        let Some((open, rest)) = tag.split_once('>') else {
+            return false;
+        };
+        if open.ends_with('/') {
+            return false;
+        }
+        let name = open
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let key = name.rsplit(':').next().unwrap_or_default();
+        let text = rest.split('<').next().unwrap_or_default().trim();
+        let word = text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or_default();
+        SECRET_KEYS.contains(&key) && !text.is_empty() && !exempt_value(key, word, false, false)
     })
 }
 
@@ -637,6 +702,70 @@ mod tests {
         assert_eq!(site_data(&format!("commit {sha1}")), None);
         assert_eq!(site_data(&format!("commit {}", "ab".repeat(32))), None);
         assert!(site_data(&format!("commit {}", &sha1[..39])).is_some());
+    }
+
+    #[test]
+    fn rejects_camel_case_and_prefixed_keys() {
+        for t in [
+            "newPassword=x",
+            "adminPassword=x",
+            "onvifPwd: x",
+            "rtspPass=x",
+            "loginPassword=x",
+            "myUsername=bob",
+            "apiToken=abc",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
+        }
+        for t in [
+            "cloud account password",
+            "bypass: yes",
+            "authentication: x",
+            "auth: digest",
+            "Camera Account password is needed",
+            "the Passport: valid",
+            "Compass=north",
+        ] {
+            assert_eq!(site_data(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn rejects_xml_secret_elements_but_not_empty_ones() {
+        for t in [
+            "<Password>hunter2</Password>",
+            "<wsse:Password Type=\"#PasswordText\">hunter2</wsse:Password>",
+            "<userName>admin</userName>",
+            "<token>abc</token>",
+            "<tt:Password>x",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
+        }
+        for t in [
+            "<wsse:Password Type=\"PasswordDigest\"/>",
+            "<Password></Password>",
+            "<Password>  </Password>",
+            "<Password/>",
+            "<auth>digest</auth>",
+            "<UserLevel>Administrator</UserLevel>",
+            "</Password>",
+        ] {
+            assert_eq!(site_data(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn comments_on_model_lines_get_the_strict_text_rule() {
+        let ok = "model = \"IPC-HDBW2431EP-S-0280B\"\n";
+        assert_eq!(check_source(ok), Ok(()));
+        assert_eq!(check_source("model = \"A#B\" # fine\n"), Ok(()));
+        for bad in [
+            "model = \"IPC-HDBW2431EP-S-0280B\" # sn ABCD-EFGHIJKLMN1\n",
+            "aliases = [\"X\"] # camera at 10.0.0.1\n",
+            "model = \"X\" # DS-2CD2T87G2P-LSU\n",
+        ] {
+            assert!(check_source(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

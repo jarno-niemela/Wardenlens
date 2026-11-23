@@ -11,7 +11,7 @@ pub enum SiteDataKind {
     Ipv4,
     /// An IPv6 address.
     Ipv6,
-    /// A MAC address or a bare run of twelve or more hex digits.
+    /// A MAC address: six hex pairs with separators, or three dotted hex quads.
     Mac,
     /// A serial-number-like token.
     Serial,
@@ -21,7 +21,8 @@ pub enum SiteDataKind {
     Email,
     /// A private-network hostname such as `*.lan`.
     Hostname,
-    /// Invisible, fullwidth or non-ASCII digit characters, which can disguise other site data.
+    /// A character outside the allow-list (ASCII without controls, plus alphabetic letters), such
+    /// as invisible, fullwidth or non-ASCII digit characters that can disguise other site data.
     Encoding,
 }
 
