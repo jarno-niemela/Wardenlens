@@ -2,7 +2,7 @@
 
 Throwaway probes behind `docs/adr/0002-camera-integration.md`. **Read-only** toward the cameras, with one exception:
 `run_baichuan.sh <camera> <secs> https-on|https-off` **WRITES** the camera's HTTPS service-port setting and needs the
-camera owner's explicit approval each time (`https-off` reverts it). The default mode and `abilities` only read.
+camera owner's explicit approval each time (`https-off` disables it). The default mode and `abilities` only read.
 
 Inputs (outside the repo, never committed):
 
@@ -11,7 +11,7 @@ Inputs (outside the repo, never committed):
 
 | script | purpose |
 |---|---|
-| `lib.sh` | shared helpers: inventory and credential lookup, RTSP URL builder, `redact` (masks userinfo, IPv4/IPv6, MAC, serials) |
+| `lib.sh` | shared helpers: inventory and credential lookup, RTSP URL builder, `redact` (masks userinfo, IPv4/IPv6, MAC, serials; it does NOT mask DNS hostnames) |
 | `probe_streams.sh` | one-shot ffprobe of every main/sub stream |
 | `stream_soak.sh <dir> [secs]` | all streams in parallel for 30 min: frames, warning lines, restarts |
 | `gop_sample.sh [secs]` | fps, bitrate and GOP per stream |

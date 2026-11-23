@@ -2,7 +2,8 @@
 //! Credentials come from the BC_USER / BC_PASS environment variables (set by run_baichuan.sh).
 //! Usage: baichuan-probe <ip> <listen-seconds> [abilities|https-on|https-off]
 //! The optional action modes: `abilities` is read-only; `https-on` and `https-off` WRITE the camera's HTTPS
-//! service port setting and need the camera owner's explicit approval (https-off reverts https-on).
+//! service port setting and need the camera owner's explicit approval (https-off disables HTTPS; it does not
+//! restore any earlier state, so read `HTTPS_BEFORE` first).
 use neolink_core::bc_protocol::{
     BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods,
 };
@@ -12,9 +13,15 @@ use std::time::Duration;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(ip), Some(secs)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: baichuan-probe <ip> <seconds>");
+        eprintln!("usage: baichuan-probe <ip> <seconds> [abilities|https-on|https-off]");
         return;
     };
+    // Validate the action before any connection so a typo never reaches the camera.
+    let action = args.get(3).map(String::as_str);
+    if !matches!(action, None | Some("abilities" | "https-on" | "https-off")) {
+        eprintln!("unknown action (expected abilities, https-on or https-off)");
+        std::process::exit(2);
+    }
     let secs: u64 = secs.parse().unwrap_or(60);
     let (Ok(user), Ok(pass)) = (std::env::var("BC_USER"), std::env::var("BC_PASS")) else {
         eprintln!("BC_USER / BC_PASS not set");
@@ -65,8 +72,8 @@ async fn main() {
     // Optional third argument: one owner-approved action, then exit.
     //   abilities   - read-only: print ability info and support XML
     //   https-on    - WRITE (owner-approved for #27): enable the HTTPS API port
-    //   https-off   - WRITE: disable the HTTPS API port again (revert)
-    match args.get(3).map(String::as_str) {
+    //   https-off   - WRITE: disable the HTTPS API port (does not restore any earlier state)
+    match action {
         Some("abilities") => {
             println!("ABILITY {:?}", cam.get_abilityinfo().await);
             println!("SUPPORT {:?}", cam.get_support().await);
@@ -79,12 +86,12 @@ async fn main() {
             return;
         }
         Some("https-off") => {
+            println!("HTTPS_BEFORE {:?}", cam.get_https().await);
             println!("SET {:?}", cam.set_https(Some(false), None).await);
             println!("HTTPS_AFTER {:?}", cam.get_https().await);
             return;
         }
-        Some(other) => return println!("unknown action {other}"),
-        None => {}
+        _ => {}
     }
 
     match cam.listen_on_motion().await {

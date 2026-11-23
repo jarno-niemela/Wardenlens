@@ -15,9 +15,8 @@ if [[ -z "$addr" ]]; then echo "no pullpoint address"; exit 1; fi
 source "$here/lib.sh"
 base="$(cam_onvif_url "$name")"
 origin="${base%/onvif/*}"
-# Compare scheme and host only: Tapo hands out the pull point on a different port of the same camera.
-hostpart() { sed -E 's#^(https?://)(\[[^]]+\]|[^/:]+).*#\1\2#' <<<"$1"; }
-if [[ "$(hostpart "$addr")" != "$(hostpart "$origin")" ]]; then echo "pullpoint address does not point at the configured camera host; refusing"; exit 1; fi
+# Host must match exactly (Tapo uses another port); userinfo is refused. See pullpoint_ok in lib.sh.
+if ! pullpoint_ok "$addr" "$origin"; then echo "pullpoint address does not point at the configured camera host; refusing"; exit 1; fi
 echo "subscribed: pullpoint created"
 end=$(( $(date +%s) + total ))
 while (( $(date +%s) < end )); do
@@ -29,12 +28,13 @@ while (( $(date +%s) < end )); do
     | sed -E -e 's#^>([^<]*)</wsnt:Topic>$# \1#' \
       -e '/SimpleItem /{s#.*Name="([^"]*)".*Value="([^"]*)".*# \1=\2#;t;s#.*Value="([^"]*)".*Name="([^"]*)".*# \2=\1#}' \
     | tr -d '\n' | tr -d '[:cntrl:]' | cut -c1-400 || true)"
-  printf '%s %s %s\n' "$(date -u +%T)" "$status" "$items" | sed -E 's#[0-9]{1,3}(\.[0-9]{1,3}){3}#<host>#g'
+  printf '%s %s %s\n' "$(date -u +%T)" "$status" "$items" | redact
   # Optional: keep the first few raw notification bodies (redacted) as evidence.
   if [[ -n "${ONVIF_PULL_RAW_DIR:-}" ]] && grep -q 'NotificationMessage' <<<"$body"; then
     n=$(( ${n:-0} + 1 ))
     if (( n <= ${ONVIF_PULL_RAW_MAX:-20} )); then
-      printf '%s\n' "$body" | sed -n '/<?xml\|Envelope/,$p' | redact >"$ONVIF_PULL_RAW_DIR/notification-$n.xml"
+      printf '%s\n' "$body" | sed -n '/<?xml\|Envelope/,$p' | grep -v '^HTTP [0-9]' \
+        | sed -E 's#(<wsa5?:Address>)[^<]*#\1#' | redact >"$ONVIF_PULL_RAW_DIR/notification-$n.xml"
     fi
   fi
 done

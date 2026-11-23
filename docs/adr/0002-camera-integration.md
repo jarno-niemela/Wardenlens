@@ -86,7 +86,6 @@ The first RTSP connection to hdipc main failed once (25 s timeout in `probe_stre
 
 Criterion "Baichuan login + event push proven": **login MET; event subscription MET; push of motion transitions MET (#27);
 AI person push NOT observed** (see below).
-transition NOT observed** (see below).
 
 - Tool: `spikes/s1-cameras/baichuan-probe` (standalone, not a workspace member), a thin wrapper over
   `neolink_core` (AGPL-3.0, so it is for the spike only and must not be linked into Wardenlens; a
@@ -118,10 +117,10 @@ transition NOT observed** (see below).
   `AItype` (`people` while a person is detected; per neolink `none` otherwise), `recording`, `timeStamp`.
   The subscription was accepted on both cameras and the camera immediately pushed the initial
   state message (`status=none`, `AItype=none`).
-- **Live capture (#27, reolink-2... see `results/events/reolink-msg33-excerpt.log`):** three walks in front of one
-  RLC-520A (listening 900 s, 1000 s and 1500 s) produced 32 MSG 33 pushes, 15 `status="MD"` starts, each followed by a
+- **Live capture (#27, see `results/events/reolink-msg33-excerpt.log`):** three walks in front of one
+  RLC-520A (listening 900 s, 1000 s and 1500 s) produced 32 MSG 33 pushes (17 + 7 + 8), 15 `status="MD"` starts, each followed by a
   `status="none"` stop. The probe prints the fields as `status`, `ai_type`, `channel_id`, `recording`, `timeStamp`.
-  - Cadence: one push per transition only (no periodic repeats); `MD` to `none` took 2 to 12 s (2, 2, 3, 4, 4, 5, 10, 12 s
+  - Cadence: one push per transition only (no periodic repeats); `MD` to `none` took 2 to 12 s (2, 2, 3, 4, 4, 5, 11, 12 s
     in the first walk). `recording` and `timeStamp` were always 0, so the camera supplies no event time and Wardenlens
     must stamp arrivals itself.
   - **`ai_type` stayed `"none"` in all 32 pushes, including all 15 motion events.** No `people`, `vehicle` or `dog_cat`
@@ -134,7 +133,7 @@ transition NOT observed** (see below).
     angle or posture, or detection needs a person-shaped target for several frames) while the pixel motion detector did;
     (b) AI alarms arrive on a different Baichuan message than MSG 33 (or only with a different subscription);
     (c) the AI state must be polled (`GetAiState` over HTTPS, or the Baichuan equivalent) instead of being pushed.
-    Follow-up spike needed; until then do not rely on Baichuan for person events.
+    Follow-up spike: #78; until then do not rely on Baichuan for person events.
 
 ### 3. Dahua (xr)
 
@@ -279,8 +278,11 @@ Option 2.
 ## Open risks and follow-ups
 
 1. Reolink AI person events were not seen on Baichuan MSG 33 (`ai_type` always `none` in 15 motion events, though `GetAiCfg`
-   people=1 and `GetAiState` support=1). Needs a follow-up spike (see the Reolink section); #27 captured motion only.
-2. Tapo `PropertyOperation` was `Initialized` for every captured notification; a `Changed` transition was not captured.
+   people=1 and `GetAiState` support=1). Follow-up spike: #78 (see the Reolink section); #27 captured motion only.
+2. Tapo `PropertyOperation` was `Initialized` for every captured notification; a `Changed` transition was not captured
+   (also tracked with the Reolink AI question in #78).
+   The pull-point address the camera returns is untrusted input: Phase 1 must parse it with a real URL parser, reject
+   userinfo, and require the configured host (any port) before sending credentials to it.
 3. Dahua `heartbeat` not honoured; dead-connection detection must be built and tested.
 4. The 2-client test did not find the maximum client count; Wardenlens plus AgentDVR plus a probe worked, which is the
    Phase 1 migration scenario, but a third concurrent consumer on Reolink was only briefly exercised.
