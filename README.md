@@ -14,7 +14,7 @@ pipeline for adding new hardware is planned (epics #33 and #34).
 
 > **Status:** early development, not usable yet. The Phase 0 spikes are done (camera spike S1, GPU spike S2, live
 > event captures), and a few follow-up spikes are still open. Phase 1 (record everything) has its design decisions
-> merged (ADRs 0004-0006); implementation has not started. The binary only prints its version. See
+> merged as proposed ADRs (0004-0006); implementation has not started. The binary only prints its version. See
 > [Roadmap](#roadmap).
 
 ---
@@ -133,8 +133,8 @@ Design principles (from [`docs/CODING_GUIDELINES.md`](docs/CODING_GUIDELINES.md)
 - **Code safety:** no `unsafe` (`forbid` across the workspace), no panics in non-test code, and typed errors.
 - **Untrusted input:** everything from a camera, the network or the disk is treated as untrusted, and is bounded and
   validated.
-- **File paths:** derived only from validated ids and timestamps (SEC-4); ADR 0005 adds opening them beneath a root
-  handle with `openat2`.
+- **File paths:** never joined from untrusted segments, and containment is verified (SEC-4). ADR 0005 goes further:
+  paths are derived from validated ids and timestamps and opened beneath a root handle with `openat2`.
 - **Tests and dependencies:** tests first, with property tests for parsers. Dependencies are justified and checked by
   `cargo-deny`.
 
@@ -143,8 +143,9 @@ Design principles (from [`docs/CODING_GUIDELINES.md`](docs/CODING_GUIDELINES.md)
 Wardenlens is written almost entirely by AI agents under a strict, auditable process. The human owner sets
 direction, answers design questions and approves anything that touches physical hardware. Agents do everything
 else: planning, implementation, review, security audit, adversarial testing and merging. The process is designed
-so that **no change reaches `main` without independent verification bound to the exact commit**. That rule is
-enforced by the project's own tooling and agent guard; GitHub itself does not enforce the verification statuses.
+so that **no change reaches `main` without independent verification bound to the exact commit**. GitHub branch
+protection on `main` requires the three `verify/*` statuses and the CI jobs, with no admin bypass.
+`scripts/verify check` also accepts a status only if the operator created it, because any writer can post a status.
 
 ### Roles
 
@@ -181,20 +182,20 @@ Implementer (Sonnet) ── tests first ── code ── scripts/gate ── c
  gh pr merge --squash --match-head-commit <verified SHA>   (only if all three statuses + CI are green)
 ```
 
-- **Tickets are the source of truth.** No work happens without a GitHub issue. Every open issue carries exactly one
-  `status:*` label, maintained by `scripts/ticket` and CI automation. `scripts/ticket-audit` finds neglected or
-  mislabelled tickets.
+- **Tickets are the source of truth.** No work happens without a GitHub issue. Every open issue must carry exactly
+  one `status:*` label, maintained by `scripts/ticket` and CI automation. `scripts/ticket-audit` reports any that
+  don't, and any neglected tickets.
 - **Merges are bound to the commit.** The verification gate is a set of commit statuses bound to the exact SHA
   that was verified. A later push invalidates them. `scripts/verify check` refuses a head that is not fully
   verified, and the agent guard requires the merge to name that SHA with `--match-head-commit`. Adversary tests worth
   keeping are added afterwards as test-only commits, and `scripts/verify carry` refuses anything else.
-- **Owner overrides are recorded.** When the cap is reached, the owner decides: rethink, fold in a fix and re-verify,
-  or merge and track the gap in a ticket. The decision is written on the PR.
 - **Findings are graded.** Only blocker and major findings fail a round. Minor findings are filed as follow-up
   tickets, so reviews converge instead of looping.
 - **The round cap is a design signal.** If a change still fails after 5 rounds, it stops and goes to the human.
   Hitting the cap means "rethink the design", not "try harder". A heuristic secret filter that never converged in
   five rounds is being replaced by the exact-match vault scan of ADR 0006 (designed, not built yet).
+  The ticket is labelled `agent:human`, with a summary on the PR. In practice the owner then chooses to rethink, to
+  fold in a fix and re-verify, or to merge and track the gap in a ticket, and that decision is recorded on the PR.
 - **Design before code.** Significant decisions (crates, formats, protocols, security) are made in ADR spikes that
   go through the same three-verifier process as code. Scratch prototypes and probes back their claims: a
   throwaway fMP4 writer, `cargo deny` checks, live captures of camera events.
@@ -207,8 +208,9 @@ Implementer (Sonnet) ── tests first ── code ── scripts/gate ── c
   - A Claude Code hook blocks force-pushes, pushes to `main`, `--no-verify`, `--admin` and merges without
     `--match-head-commit`.
   - The `.githooks/pre-push` hook is the authoritative block on rewriting `main`.
-  - Enforcement files (hooks, settings, workflows) are protected by permission rules, the best-effort Bash guard
-    and the pre-push hook. A change to them is treated as a privilege change for a human to make.
+  - Enforcement files (hooks, settings, workflows) are protected by permission deny rules and the best-effort Bash
+    guard, and the pre-push hook also refuses workflow changes. A change to them is treated as a privilege change
+    for a human to make.
 - **Sensitive data.** The repository is public. Camera credentials, LAN addresses, MACs, serials and names are kept
   outside the repo by policy. The controller screens every agent prompt with `scripts/agents check`, and the
   verifiers re-check committed evidence, which is redacted. An exact-match leak scan in the gate and git hooks is
@@ -239,7 +241,7 @@ Wardenlens installs would become tickets, and the same pipeline would turn them 
 | Phase | Epic | Goal |
 |---|---|---|
 | 0 | #15 | Foundations: host setup, camera spike (S1), GPU spike (S2), live event captures. **Spikes done; follow-ups open** (#28, #78) |
-| 1 | #16 | Record everything: ingest, fMP4 segments, SQLite index, hot and archive tiers, API, vault, Docker. 48 h soak gate. **Design merged (ADRs 0004-0006); implementation next** |
+| 1 | #16 | Record everything: ingest, fMP4 segments, SQLite index, hot and archive tiers, API, vault, Docker. 48 h soak gate. **Design ADRs merged (0004-0006, status proposed); implementation next** |
 | 2 | #17 | Native camera events and the web UI. Cut-over from the previous NVR |
 | 3 | #18 | GPU intelligence: motion, false-alarm filtering, object detection |
 | 4 | #19 | Polish and the camera optimizer |
