@@ -350,7 +350,10 @@ fn generate_refuses_symlink_target() {
     let target = d.path().join("target");
     let p = key_path(&d);
     symlink(&target, &p).unwrap();
-    assert!(KeyFile::generate(&p).is_err());
+    assert!(matches!(
+        KeyFile::generate(&p),
+        Err(SecretsError::KeyFileSymlink)
+    ));
     assert!(!target.exists());
 }
 
@@ -412,9 +415,7 @@ fn load_refuses_directory_and_missing_file() {
     let d = dir();
     assert!(matches!(
         KeyFile::load(d.path()),
-        Err(SecretsError::KeyFileNotRegular
-            | SecretsError::KeyFilePermissions
-            | SecretsError::Io { .. })
+        Err(SecretsError::KeyFileNotRegular)
     ));
     assert!(matches!(
         KeyFile::load(&key_path(&d)),
