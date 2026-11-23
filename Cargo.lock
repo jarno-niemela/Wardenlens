@@ -568,6 +568,9 @@ dependencies = [
 [[package]]
 name = "wardenlens-core"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "wardenlens-fsutil"
