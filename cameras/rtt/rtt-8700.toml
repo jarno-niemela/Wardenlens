@@ -3,6 +3,7 @@ model = "RTT-8700"
 aliases = ["HDIPC"]
 support = "partial"
 quirks = [
+  "The vendor name is inferred from the model name; it has not been confirmed.",
   "ONVIF is flaky: about 40 percent of TCP connection attempts timed out, in runs of up to 8 in a row; allow a retry budget of at least 3 minutes and never block video on ONVIF.",
   "The first RTSP connection can be slow or fail once; retry.",
   "RTSP paths are not guessable (the root path returns 400); discover them with ONVIF GetStreamUri and cache.",

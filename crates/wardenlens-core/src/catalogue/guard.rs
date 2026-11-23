@@ -3,38 +3,70 @@
 //!
 //! Heuristics, deliberately conservative (a false positive is fixed by rewording the text):
 //!
-//! - **Encodings**: non-ASCII digits and numerals, non-ASCII whitespace, the fullwidth forms
-//!   block U+FF00..U+FFEF, and the common invisible format characters (soft hyphen, zero-width
-//!   and bidi controls, word joiner, BOM, tag characters). They are used to disguise the other
-//!   kinds. No Unicode normalisation is attempted; the characters are simply refused.
+//! - **Encodings** (allow-list): ASCII without control characters (tab is fine), plus non-ASCII
+//!   characters that are alphabetic. Everything else (non-ASCII digits, spaces, punctuation,
+//!   format and zero-width characters) is refused, as are the fullwidth block U+FF00..U+FFEF and
+//!   the invisible Hangul/Khmer fillers. No Unicode normalisation is attempted.
 //! - **IPv4**: any dotted quad (four dot-separated groups of one to three digits, each at most
 //!   255), so private, loopback, link-local and public addresses are all refused; a partial
 //!   address whose last group is `x` or `*` (`10.0.0.x`); and a `0x` literal with exactly eight
 //!   hex digits.
 //! - **IPv6**: any token that parses as an IPv6 address, or has three or more colons and only
 //!   hex groups.
-//! - **MAC**: six hex pairs separated by `:` `-` space or `_` (separators may be mixed), three
-//!   dotted hex quads, or a run of twelve or more hex digits.
-//! - **Serial-like**: a maximal run of at least ten characters from `[A-Z0-9]`; a run of at
-//!   least eight digits; an alphanumeric token of twelve or more characters with at least two
-//!   digits and two letters (catches lowercase serials); or three or more consecutive
-//!   hyphen-separated groups of four to six alphanumerics that each contain a digit
-//!   (`2J0A-1B2C-3D4E`). Model names stay below all of these: `IPC-HFW4431R-Z` has runs of at
-//!   most eight, `RLC-520A` and `RTT-8700` have two groups.
-//! - **Credentials**: a `scheme://user:pass@host` URL, any whitespace-delimited token with `:`
-//!   before an `@`, or a `key=value` / `key: value` pair whose key (case-insensitive, at a word
-//!   boundary) is `password`, `passwd`, `pwd`, `pass`, `user`, `username`, `token`, `auth` or
-//!   `secret`. Prose such as "needs the cloud account password" is fine.
+//! - **MAC**: six hex pairs separated by `:` `-` space or `_` (separators may be mixed), or three
+//!   dotted hex quads. Plain long hex (a 40 or 64 digit commit hash) is not a MAC; tokens of
+//!   exactly 40 or 64 hex digits are ignored by every rule.
+//! - **Serial-like**: in a whitespace-delimited token, a run of at least ten characters from
+//!   `[A-Z0-9]`; a run of at least eight digits; an alphanumeric group of twelve or more
+//!   characters with at least two digits and two letters (lowercase serials); or three or more
+//!   consecutive hyphen-separated groups of four to six alphanumerics that each contain a digit
+//!   (`2J0A-1B2C-3D4E`). In the `model` and `aliases` fields (and the lines carrying them in raw
+//!   source) a token containing a hyphen is exempt from the capital/digit run rule, so
+//!   `DS-2CD2T87G2P-LSU` and `IPC-HDBW2431EP-S-0280B` pass; unhyphenated serials are still
+//!   refused there, and free text keeps the strict rule.
+//! - **Credentials**, after decoding `%3D`, `%3A`, `%40` (either case) and `&#61;`: a
+//!   `scheme://user:pass@host` URL, a token with `:` before `@`, or a `key=value` / `key: value`
+//!   pair (key case-insensitive, at a word boundary, optionally quoted as in JSON) whose key is
+//!   `password`, `passwd`, `pwd`, `pw`, `pass`, `passphrase`, `pin`, `user`, `username`,
+//!   `userpass`, `login`, `credentials`, `token`, `accesstoken`, `apikey`, `api_key`, `auth` or
+//!   `secret`. Exempt: the schemes `digest`, `basic`, `none`, `wsse` after `auth`; `none` after
+//!   `token`; and unquoted `key: <the|a|your|...>` prose. "needs the cloud account password" is
+//!   fine.
 //! - **Email**: any other token with text on both sides of an `@`.
-//! - **Hostnames**: names ending in `.lan`, `.local`, `.home`, `.home.arpa`, `.internal`,
-//!   `.localdomain`, `.intranet` or `.corp`.
+//! - **Hostnames**: a label followed by `.lan`, `.local`, `.home`, `.home.arpa`, `.internal`,
+//!   `.localdomain`, `.intranet` or `.corp`, in all-lowercase or all-uppercase (`Settings.Home`
+//!   is UI text). A bare suffix and `_tcp.local` style service names are fine.
 
 use std::net::Ipv6Addr;
 
 use super::error::{CatalogueError, SiteDataKind};
 
-const SECRET_KEYS: [&str; 9] = [
-    "password", "passwd", "pwd", "pass", "user", "username", "token", "auth", "secret",
+const SECRET_KEYS: [&str; 18] = [
+    "password",
+    "passwd",
+    "pwd",
+    "pw",
+    "pass",
+    "passphrase",
+    "pin",
+    "user",
+    "username",
+    "userpass",
+    "login",
+    "credentials",
+    "token",
+    "accesstoken",
+    "apikey",
+    "api_key",
+    "auth",
+    "secret",
+];
+/// Values that are not secrets after `auth` (authentication schemes).
+const AUTH_SCHEMES: [&str; 4] = ["digest", "basic", "none", "wsse"];
+/// First words that make `user: <words>` prose rather than a value.
+const PROSE_WORDS: [&str; 20] = [
+    "the", "a", "an", "your", "you", "it", "its", "this", "that", "these", "those", "of", "is",
+    "are", "was", "not", "no", "to", "from", "for",
 ];
 const PRIVATE_SUFFIXES: [&str; 8] = [
     ".lan",
@@ -57,7 +89,18 @@ const MAC_SEPARATORS: &[u8; 4] = b":- _";
 /// [`CatalogueError::SiteData`] naming `line N` (never the text) for the first offending line.
 pub fn check_source(text: &str) -> Result<(), CatalogueError> {
     for (index, line) in text.lines().enumerate() {
-        if let Some(kind) = site_data(line) {
+        // Model names are structured like serials (`IPC-HDBW2431EP-S-0280B`), so the lines that
+        // carry them get the model rule; everything else is free text.
+        let key = line.trim_start();
+        let mode = if ["model", "aliases"].iter().any(|k| {
+            key.strip_prefix(k)
+                .is_some_and(|r| r.trim_start().starts_with('='))
+        }) {
+            Mode::Model
+        } else {
+            Mode::Text
+        };
+        if let Some(kind) = site_data(line, mode) {
             let field = format!("line {}", index.saturating_add(1));
             return Err(CatalogueError::SiteData { field, kind });
         }
@@ -65,12 +108,27 @@ pub fn check_source(text: &str) -> Result<(), CatalogueError> {
     Ok(())
 }
 
-pub(super) fn site_data(text: &str) -> Option<SiteDataKind> {
+/// What kind of text is being checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// Free text: quirks, evidence, paths, vendor.
+    Text,
+    /// A model name or alias: hyphen-structured tokens may contain long runs of capitals and
+    /// digits.
+    Model,
+}
+
+pub(super) fn site_data(text: &str, mode: Mode) -> Option<SiteDataKind> {
     if has_odd_encoding(text) {
-        Some(SiteDataKind::Encoding)
-    } else if has_credentials(text) {
+        return Some(SiteDataKind::Encoding);
+    }
+    // A git commit hash is long hex but not site data.
+    let text = redact_hashes(text);
+    let text = text.as_str();
+    let decoded = decode_escapes(text);
+    if has_credentials(&decoded) {
         Some(SiteDataKind::Credentials)
-    } else if has_email(text) {
+    } else if has_email(&decoded) {
         Some(SiteDataKind::Email)
     } else if has_ipv4(text) {
         Some(SiteDataKind::Ipv4)
@@ -81,23 +139,74 @@ pub(super) fn site_data(text: &str) -> Option<SiteDataKind> {
         Some(SiteDataKind::Ipv6)
     } else if has_private_hostname(text) {
         Some(SiteDataKind::Hostname)
-    } else if has_serial(text) {
+    } else if has_serial(text, mode) {
         Some(SiteDataKind::Serial)
     } else {
         None
     }
 }
 
+/// Replaces tokens that are exactly 40 or 64 hex digits (SHA-1 / SHA-256) with a space.
+fn redact_hashes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        let hash = matches!(token.len(), 40 | 64) && token.bytes().all(|b| b.is_ascii_hexdigit());
+        out.push_str(if hash { " " } else { token.as_str() });
+        token.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// Decodes `%3D`, `%3A`, `%40` (either case) and `&#61;` so encoded credentials are visible.
+fn decode_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let percent = rest.get(..3).map(str::to_ascii_lowercase);
+        let (decoded, len) = match percent.as_deref() {
+            Some("%3d") => ('=', 3),
+            Some("%3a") => (':', 3),
+            Some("%40") => ('@', 3),
+            _ if rest.starts_with("&#61;") => ('=', 5),
+            _ => (c, c.len_utf8()),
+        };
+        out.push(decoded);
+        rest = rest.get(len..).unwrap_or_default();
+    }
+    out
+}
+
+/// Allow-list: ASCII (no control characters except tab) and alphabetic non-ASCII letters. That
+/// refuses every non-ASCII digit, space, punctuation, format and invisible character, which are
+/// the means of disguising addresses. A few letters render as nothing (Hangul fillers) and the
+/// fullwidth block imitates ASCII, so those are refused as well.
 fn has_odd_encoding(text: &str) -> bool {
     text.chars().any(|c| {
-        !c.is_ascii()
-            && (c.is_numeric()
-                || c.is_whitespace()
-                || matches!(c,
-                    '\u{FF00}'..='\u{FFEF}'
-                    | '\u{00AD}' | '\u{061C}' | '\u{180E}'
-                    | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
-                    | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}'))
+        if c.is_ascii() {
+            c.is_ascii_control() && c != '\t'
+        } else {
+            !c.is_alphabetic()
+                || matches!(
+                    c,
+                    '\u{FF00}'
+                        ..='\u{FFEF}'
+                            | '\u{115F}'
+                            | '\u{1160}'
+                            | '\u{3164}'
+                            | '\u{17B4}'
+                            | '\u{17B5}'
+                )
+        }
     })
 }
 
@@ -127,11 +236,24 @@ fn has_secret_pair(text: &str) -> bool {
                 .and_then(|p| lower.as_bytes().get(p))
                 .is_none_or(|c| !c.is_ascii_alphanumeric());
             let after = lower.get(i.saturating_add(key.len())..).unwrap_or_default();
+            // A JSON key is quoted: `"password": "x"`.
+            let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
             let after = after.trim_start_matches([' ', '\t']);
-            let value = after
-                .strip_prefix(['=', ':'])
-                .map(|v| v.trim_start_matches([' ', '\t']));
-            boundary && value.is_some_and(|v| !v.is_empty())
+            let Some(value) = after.strip_prefix(['=', ':']) else {
+                return false;
+            };
+            let spaced_colon = after.starts_with(':') && value.starts_with([' ', '\t']);
+            let value = value.trim_start_matches([' ', '\t']);
+            let quoted = value.starts_with(['"', '\'']);
+            let value = value.strip_prefix(['"', '\'']).unwrap_or(value);
+            let word = value
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or_default();
+            let exempt = (*key == "auth" && AUTH_SCHEMES.contains(&word))
+                || (*key == "token" && word == "none")
+                || (spaced_colon && !quoted && PROSE_WORDS.contains(&word));
+            boundary && !value.is_empty() && !exempt
         })
     })
 }
@@ -220,36 +342,53 @@ fn has_mac(text: &str) -> bool {
             c.iter().take(4).all(u8::is_ascii_hexdigit) && (i == 2 || c.get(4) == Some(&b'.'))
         })
     });
-    pairs || dotted || max_run(b, u8::is_ascii_hexdigit) >= 12
+    pairs || dotted
 }
 
+/// A name ending in a private suffix with a label before it. All-lowercase or all-uppercase
+/// only: `Settings.Home` is a UI path, not a host. Labels starting with `_` (`_tcp.local`, mDNS
+/// service types) are fine.
 fn has_private_hostname(text: &str) -> bool {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*')))
         .any(|token| {
-            let token = token.trim_end_matches('.').to_ascii_lowercase();
-            PRIVATE_SUFFIXES.iter().any(|s| token.ends_with(s))
-        })
-}
-
-fn has_serial(text: &str) -> bool {
-    let b = text.as_bytes();
-    max_run(b, |c| c.is_ascii_uppercase() || c.is_ascii_digit()) >= 10
-        || max_run(b, u8::is_ascii_digit) >= 8
-        || text.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| {
-            let digits = t.bytes().filter(u8::is_ascii_digit).count();
-            let letters = t.bytes().filter(u8::is_ascii_alphabetic).count();
-            t.len() >= 12 && digits >= 2 && letters >= 2
-        })
-        || text
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-            .any(|token| {
-                let groups: Vec<&str> = token.split('-').collect();
-                groups.windows(3).any(|w| {
-                    w.iter().all(|g| {
-                        (4..=6).contains(&g.len()) && g.bytes().any(|b| b.is_ascii_digit())
+            let token = token.trim_end_matches('.');
+            let single_case = !token.bytes().any(|b| b.is_ascii_lowercase())
+                || !token.bytes().any(|b| b.is_ascii_uppercase());
+            let lower = token.to_ascii_lowercase();
+            single_case
+                && PRIVATE_SUFFIXES.iter().any(|suffix| {
+                    lower.strip_suffix(suffix).is_some_and(|head| {
+                        let label = head.rsplit('.').next().unwrap_or_default();
+                        !label.is_empty() && !label.starts_with('_')
                     })
                 })
+        })
+}
+
+fn has_serial(text: &str, mode: Mode) -> bool {
+    // In a model name a hyphen-structured token (`IPC-HDBW2431EP-S-0280B`) may hold long runs of
+    // capitals and digits; the grouped-serial and long-token rules below still apply to it.
+    text.split_whitespace().any(|token| {
+        let structured = mode == Mode::Model && token.contains('-');
+        let b = token.as_bytes();
+        (!structured && max_run(b, |c| c.is_ascii_uppercase() || c.is_ascii_digit()) >= 10)
+            || max_run(b, u8::is_ascii_digit) >= 8
+            || token.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| {
+                let digits = t.bytes().filter(u8::is_ascii_digit).count();
+                let letters = t.bytes().filter(u8::is_ascii_alphabetic).count();
+                t.len() >= 12 && digits >= 2 && letters >= 2
             })
+            || token
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .any(|part| {
+                    let groups: Vec<&str> = part.split('-').collect();
+                    groups.windows(3).any(|w| {
+                        w.iter().all(|g| {
+                            (4..=6).contains(&g.len()) && g.bytes().any(|b| b.is_ascii_digit())
+                        })
+                    })
+                })
+    })
 }
 
 /// Length of the longest run of bytes satisfying `pred`.
@@ -270,6 +409,14 @@ fn max_run(bytes: &[u8], pred: impl Fn(&u8) -> bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn site_data(text: &str) -> Option<SiteDataKind> {
+        super::site_data(text, Mode::Text)
+    }
+
+    fn model_data(text: &str) -> Option<SiteDataKind> {
+        super::site_data(text, Mode::Model)
+    }
 
     #[test]
     fn accepts_clean_text() {
@@ -352,7 +499,6 @@ mod tests {
             "AA-BB-CC-DD-EE-FF",
             "a4:5e:60:00:11:22",
             "aabb.ccdd.eeff",
-            "a45e60001122",
             "a4 5e 60 00 11 22",
             "a4_5e_60_00_11_22",
             "a4:5e-60_00 11:22",
@@ -411,7 +557,7 @@ mod tests {
             "Password = x",
             "api_token=abc",
             "SECRET: s",
-            "auth=basic",
+            "auth=bearer",
             "passwd:x",
             "username = bob",
             "pass=1",
@@ -431,6 +577,69 @@ mod tests {
     }
 
     #[test]
+    fn rejects_quoted_encoded_and_more_secret_keys() {
+        for t in [
+            r#"{"password":"hunter2"}"#,
+            r#"{"user": "admin", "pwd": "x"}"#,
+            r"'token': 'abc'",
+            r#"[{"cmd":"Login","param":{"User":{"userName":"admin","password":"hunter2"}}}]"#,
+            r#"{"method":"login","params":{"username":"admin","password":"hunter2"}}"#,
+            "passphrase=x",
+            "apikey=x",
+            "api_key=x",
+            "pin=4711",
+            "login=admin",
+            "credentials=a",
+            "accesstoken=a",
+            "userpass=x",
+            "pw=x",
+            "/x?q=password%3Dhunter2",
+            "password%3adx",
+            "password&#61;hunter2",
+            "admin%3Ax%40cam",
+            "a%3Ab%40host",
+            "auth=evil",
+            "token=abc",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
+        }
+    }
+
+    #[test]
+    fn model_names_pass_as_models_but_serials_do_not() {
+        for m in [
+            "DS-2CD2T87G2P-LSU",
+            "DS-2CD2387G2P-LSU",
+            "IPC-HDBW2431EP-S-0280B",
+            "IPC-HFW3849T1P-AS-PV",
+            "IPC-HFW4431R-Z",
+            "RLC-520A",
+            "RTT-8700",
+            "Tapo C110",
+        ] {
+            assert_eq!(model_data(m), None, "{m}");
+        }
+        for m in [
+            "ABCD1234EFGH",
+            "9C8E99123456",
+            "2J0A-1B2C-3D4E-5F6G",
+            "1234567890-AB",
+        ] {
+            assert!(model_data(m).is_some(), "{m}");
+        }
+        // The same names in free text keep the strict rule.
+        assert!(site_data("DS-2CD2T87G2P-LSU").is_some());
+    }
+
+    #[test]
+    fn commit_hashes_are_not_site_data_but_other_long_hex_is() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(site_data(&format!("commit {sha1}")), None);
+        assert_eq!(site_data(&format!("commit {}", "ab".repeat(32))), None);
+        assert!(site_data(&format!("commit {}", &sha1[..39])).is_some());
+    }
+
+    #[test]
     fn rejects_email_addresses() {
         for t in [
             "mail me@example.com",
@@ -446,7 +655,7 @@ mod tests {
     fn rejects_private_hostnames() {
         for t in [
             "cam.lan",
-            "NVR.Local.",
+            "NVR.LOCAL.",
             "x.home",
             "a.b.home.arpa",
             "host.internal",
@@ -456,6 +665,43 @@ mod tests {
             assert_eq!(site_data(t), Some(SiteDataKind::Hostname), "{t}");
         }
         assert_eq!(site_data("localhost lan local home"), None);
+        for t in [
+            ".local domain",
+            "_onvif._tcp.local",
+            "Settings.Home",
+            "the .lan suffix",
+            "x._udp.local",
+        ] {
+            assert_eq!(site_data(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn encoding_allow_list_refuses_invisible_letters_and_controls() {
+        for t in [
+            "a\u{034F}b",
+            "a\u{FE0F}b",
+            "a\u{180B}b",
+            "a\u{3164}b",
+            "a\u{115F}b",
+            "a\u{1D173}b",
+            "a\u{E0100}b",
+            "a\u{3002}b",
+            "a\u{2024}b",
+            "a\u{FE52}b",
+            "a\u{FE6B}b",
+            "a\u{2236}b",
+            "a\u{0000}b",
+            "a\u{001B}b",
+            "a\u{007F}b",
+            "a\rb",
+            "\u{FF21}",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Encoding), "{t:?}");
+        }
+        for t in ["tab\there", "Ünïcödé", "漢字", "עברית", "ñ"] {
+            assert_eq!(site_data(t), None, "{t:?}");
+        }
     }
 
     #[test]

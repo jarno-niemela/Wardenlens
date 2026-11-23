@@ -92,7 +92,9 @@ fn join_or_dash(items: impl Iterator<Item = String>) -> String {
 
 /// Makes text safe inside a Markdown table cell.
 fn cell(text: &str) -> String {
-    text.replace('|', "\\|").replace(['\n', '\r'], " ")
+    text.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
 }
 
 #[cfg(test)]

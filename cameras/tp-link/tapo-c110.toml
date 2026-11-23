@@ -5,7 +5,7 @@ firmware = ["1.5"]
 quirks = [
   "ONVIF PullMessages with Timeout=PT10S returns an empty reply; PT5S works.",
   "ONVIF needs the Camera Account created in the Tapo app, not the cloud account.",
-  "The local HTTPS API needs the cloud account password; Wardenlens does not use it.",
+  "Community implementations report that the local HTTPS API needs the cloud account password, not the Camera Account; this was not verified here and Wardenlens does not use that API.",
   "Person and motion notifications have not been observed live, only advertised by GetEventProperties.",
   "Camera RTP timestamps are jittery; use an own arrival clock.",
 ]

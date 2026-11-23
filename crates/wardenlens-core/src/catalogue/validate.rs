@@ -2,9 +2,9 @@
 //! every string of the parsed entry (which also covers TOML `\u` escapes). The text heuristics
 //! live in [`guard`](super::guard).
 
-use super::entry::{CatalogueEntry, Evidence, Protocol};
+use super::entry::{CatalogueEntry, Event, Evidence, Protocol, Stream};
 use super::error::CatalogueError;
-use super::guard::site_data;
+use super::guard::{Mode, site_data};
 
 /// Checks an entry for completeness and for site-specific data in any string field.
 ///
@@ -44,18 +44,18 @@ pub fn validate(entry: &CatalogueEntry) -> Result<(), CatalogueError> {
             return Err(CatalogueError::OutOfRange("stream gop"));
         }
     }
-    for (field, value) in strings(entry) {
-        if let Some(kind) = site_data(value) {
+    for (field, value, mode) in strings(entry) {
+        if let Some(kind) = site_data(value, mode) {
             return Err(CatalogueError::SiteData { field, kind });
         }
     }
     Ok(())
 }
 
-/// Every string in the entry with a field label. Exhaustive destructuring (of the entry and of
+/// Every string in the entry with a field label and the rule that applies to it. Exhaustive destructuring (of the entry and of
 /// every nested struct that holds strings) means adding a string field without deciding how to
 /// check it fails to compile.
-fn strings(entry: &CatalogueEntry) -> Vec<(String, &str)> {
+fn strings(entry: &CatalogueEntry) -> Vec<(String, &str, Mode)> {
     let CatalogueEntry {
         vendor,
         model,
@@ -65,31 +65,49 @@ fn strings(entry: &CatalogueEntry) -> Vec<(String, &str)> {
         protocols,
         support: _,
         firmware: _,
-        streams: _,
-        events: _,
+        streams,
+        events,
         configurable: _,
     } = entry;
+    // `Stream` and `Event` hold only enums and numbers; destructuring them here makes adding a
+    // string field to either a compile error until it is checked below.
+    for Stream {
+        role: _,
+        codec: _,
+        width: _,
+        height: _,
+        fps: _,
+        gop: _,
+    } in streams
+    {}
+    for Event {
+        kind: _,
+        source: _,
+        status: _,
+    } in events
+    {}
+    let text = Mode::Text;
     let mut out = vec![
-        ("vendor".to_owned(), vendor.as_str()),
-        ("model".to_owned(), model.as_str()),
+        ("vendor".to_owned(), vendor.as_str(), text),
+        ("model".to_owned(), model.as_str(), Mode::Model),
     ];
     out.extend(
         aliases
             .iter()
             .enumerate()
-            .map(|(i, s)| (format!("aliases[{i}]"), s.as_str())),
+            .map(|(i, s)| (format!("aliases[{i}]"), s.as_str(), Mode::Model)),
     );
     out.extend(
         quirks
             .iter()
             .enumerate()
-            .map(|(i, s)| (format!("quirks[{i}]"), s.as_str())),
+            .map(|(i, s)| (format!("quirks[{i}]"), s.as_str(), text)),
     );
     for (i, e) in evidence.iter().enumerate() {
         let Evidence { reference, section } = e;
-        out.push((format!("evidence[{i}].reference"), reference.as_str()));
+        out.push((format!("evidence[{i}].reference"), reference.as_str(), text));
         if let Some(section) = section {
-            out.push((format!("evidence[{i}].section"), section.as_str()));
+            out.push((format!("evidence[{i}].section"), section.as_str(), text));
         }
     }
     for (i, p) in protocols.iter().enumerate() {
@@ -102,7 +120,7 @@ fn strings(entry: &CatalogueEntry) -> Vec<(String, &str)> {
             paths
                 .iter()
                 .enumerate()
-                .map(|(j, s)| (format!("protocols[{i}].paths[{j}]"), s.as_str())),
+                .map(|(j, s)| (format!("protocols[{i}].paths[{j}]"), s.as_str(), text)),
         );
     }
     out
