@@ -5,5 +5,5 @@
 .claude/settings.local.json
 .claude/worktrees/
 *.profraw
-secrets/
+/secrets/
 *.key

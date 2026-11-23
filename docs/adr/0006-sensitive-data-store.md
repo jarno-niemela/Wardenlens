@@ -172,9 +172,11 @@ Rules:
   remove the exposure.
 - **Refusing a value that is already public (`vault set`, `import-legacy`).** Before storing a value, the command
   builds the section 7 matcher for that value alone and scans the tracked files of the work tree it is run in
-  (`git ls-files`; outside a work tree it prints a notice and skips). A hit **refuses** the value with one of two
-  messages, chosen by the owner reading it: "already in tracked files: rotate it if it is a secret" or "public text:
-  do not store it". The location follows the redaction rules of section 8. **There is no allowlist in v1.** A value that
+  (`git ls-files`; outside a work tree it prints a notice and skips). For kinds other than `credential` and
+  `secret`, a hit **refuses** the value with one of two messages, chosen by the owner reading it: "already in tracked
+  files: rotate it if it is a secret" or "public text: do not store it". For `credential` and `secret`, a hit does
+  **not** refuse: the value is stored as **`unscannable`** (it would match its own public occurrences on every scan) with a
+  warning, "this value already appears in tracked files; rotate it". The location follows the redaction rules of section 8. **There is no allowlist in v1.** A value that
   is below the minimum length, or a single-label host shorter than 8 characters, is stored but marked **`unscannable`**
   (it would otherwise match public text), `list` shows the mark and every scan prints a warning naming its id.
 
@@ -218,7 +220,7 @@ row above.
   `/etc/wardenlens/vault.key` by default (overridable through `WARDENLENS_KEY_FILE_HOST` in the compose `.env`), seen inside
   the container at `/run/secrets/wardenlens_vault_key`, the path in `WARDENLENS_VAULT_KEY_FILE`.
   **Normative: a compose secret source is never inside a git work tree.** `wardenlens vault check-key <path>` applies the
-  key checks below plus this rule and is run by #69's setup and tests. As a backstop only, `secrets/` and `*.key` are
+  key checks below plus this rule and is run by #69's setup and tests. As a backstop only, `/secrets/` and `*.key` are
   in `.gitignore` (done with this ADR) and in `.dockerignore` (#69 creates it).
 - **Backups: the protection is conditional.** The database and the key are separate files, but the dev key
   (`~/.config`) and the dev database (`~/.local/share`) are both under `$HOME`, so a whole-home or whole-disk backup
@@ -231,8 +233,10 @@ row above.
 - **No environment variables for key material.** The key is never read from an environment variable. If
   `WARDENLENS_VAULT_KEY` (or any variable that is not a path) is set, startup fails with an error telling the user to
   use a file (an environment is inherited by every child, shows in `/proc/<pid>/environ` and in `docker inspect`).
-  Only the *path* variables `WARDENLENS_VAULT` and `WARDENLENS_VAULT_KEY_FILE` exist (plus `WARDENLENS_KEY_FILE_HOST`,
-  read by compose from `.env`, never by the binary).
+  **The binary reads exactly these variables and no others:** `WARDENLENS_VAULT` (path), `WARDENLENS_VAULT_KEY_FILE`
+  (path), `WARDENLENS_REQUIRE_VAULT` (a flag) and, for default paths, `HOME`, `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
+  `WARDENLENS_KEY_FILE_HOST` is read by compose from `.env`, never by the binary. **`WARDENLENS_VAULT_KEY` is the
+  rejected name** (it looks like key material); setting it is an error.
 - **Docker.** Compose `secrets:` with a file source **outside the work tree** (`secrets: { wardenlens_vault_key: {
   file: ${WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/vault.key} } }`; `./secrets/vault.key` would sit inside the repository
   and is not allowed), mounted at `/run/secrets/wardenlens_vault_key`. Environment variables are rejected as above.
@@ -249,7 +253,8 @@ row above.
   SQLite write transaction, so two processes cannot race): if the vault does not open with the current key but opens
   with `.next`, the rename is completed; if it opens with the current key, a stale `.next` is deleted. Read commands
   (`scan`, `get`, `list`) never rename or delete a key file: on a mismatch they fail (exit 2) and point to the write
-  command that recovers. The old key is
+  command that recovers. **`rekey` ends with a mandatory step: it prints "re-export the key now" and runs `vault key
+  export`** (a TTY is required), because the previous password-manager copy no longer opens the database. The old key is
   overwritten by the rename; backups of it still decrypt older copies of the database, which is why backups of key and
   database are kept separately and rotated together.
 - **Key loss.** There is no recovery path by design. A lost key means the database is unreadable: delete it, `vault
@@ -283,7 +288,8 @@ entry and line):
    `%0A` and `%0D` (any case) are **not** decoded, so a decoded view never gains a line break and line numbers stay valid.
 
 Matching is done on these views for every kind; the per-kind rules below only add a **fold** (the view lowercased with
-`char::to_lowercase`, Unicode simple case folding, applied to the needles too) and, for two kinds, a **joined** view.
+the full lowercase mapping, `char::to_lowercase`, applied to the needles too; this is not Unicode case folding
+and a string can change length) and, for two kinds, a **joined** view.
 
 Tables, not heuristics: the same three views are applied to every file the same way, and the mapping is part of the
 tested contract. A character not in the tables (for example a Cyrillic lookalike) is not mapped; see "what the scan
@@ -310,14 +316,17 @@ string set explode.
   `192.0.2.x`.
 
 *`host`, IPv6* (value parses with std `Ipv6Addr`; stored as its 128-bit value). Candidate runs are maximal runs of hex
-digits, `:` and `.` containing at least two colons. For each run: (1) try the whole run with std `Ipv6Addr::from_str`;
-(2) if that fails, trim `:` and `.` at **both ends** and try again; (3) if that fails (a hex-looking word glued to the
-address), try the **longest parseable sub-run starting at each group boundary** (the start of the run and the position
-after every `:`; a run is examined in windows of at most 45 bytes, SEC-2). Equal 128-bit value is a hit; an IPv4-mapped
+digits, `:` and `.` containing at least two colons. **All of the following always run for every run; a later step is
+never skipped because an earlier one parsed.** A word glued to an address can itself parse as a different, valid address
+(the run `ce:2001:db8::1` from `Source:2001:db8::1` parses as `ce:2001:db8::1`), so "the whole run parsed" proves nothing.
+(1) Try the whole run with std `Ipv6Addr::from_str`. (2) Trim `:` and `.` at **both ends** and try that. (3) Try **every
+parseable sub-run that starts at a group boundary** (the start of the run, and the position after every `:`), at every end
+position (a run is examined in windows of at most 45 bytes, SEC-2), after the same trimming of `:`/`.`. **A hit is any
+sub-run, from any step, whose value equals a stored value.** Equal 128-bit value is a hit; an IPv4-mapped
 address (`::ffff:a.b.c.d` or `::ffff:c000:20a`) is also looked up among the IPv4 values. A zone suffix (`%eth0`) ends the
 run and is ignored. Required **found** examples for a stored `2001:db8::1`: `2001:db8::1`, `2001:0DB8:0:0:0:0:0:1`,
-`2001:db8::0.0.0.1`, `2001:db8::1.`, `addr:2001:db8::1`, `Source:2001:db8::1`, `[2001:db8::1]:8080`; for a stored
-`fe80::1`: `fe80::1:`. For a stored IPv4 `192.0.2.10`: `::ffff:c000:20a` and `::ffff:192.0.2.10`. **Not found:**
+`2001:db8::0.0.0.1`, `2001:db8::1.`, `addr:2001:db8::1`, `Source:2001:db8::1`, `beef:2001:db8::1`,
+`[2001:db8::1]:8080`; for a stored `fe80::1`: `fe80::1:`, `Interface:fe80::1`, `dead:fe80::1`. For a stored IPv4 `192.0.2.10`: `::ffff:c000:20a` and `::ffff:192.0.2.10`. **Not found:**
 `2001:db8::10`, `2001:db8::1:2`.
 
 *`host`, DNS name* (labels as in section 1, lower-case, no trailing dot). Matched in the fold, left boundary: not `A`,
@@ -365,7 +374,7 @@ sensitive username belongs in an `other` entry).
 
 *`display-name`* and *`other`* (matched in the fold; the value is whitespace-collapsed: any run of Unicode whitespace
 becomes one space). They are matched in a **joined** view of each text, in addition to the three views: every line
-break and the spaces and tabs that follow it become one space, and any run of spaces, tabs and NBSP becomes one space, so
+break (`\n`, `\r\n` or a lone `\r`) and the spaces and tabs that follow it become one space, and any run of spaces, tabs and NBSP becomes one space, so
 a name wrapped across lines or indented is found; a hit is reported at the line where it starts. Boundary: not `A`. Minimum
 6 bytes. `display-name` additionally gets the **slug** needles with each space replaced by `-`, by `_`, and removed.
 Example, stored `Back Door North`: found in `back   door north`, `BACK DOOR NORTH`, `back-door-north`,
@@ -376,7 +385,8 @@ handled: comment or quote markers at the start of the wrapped line (`# North`, `
 checked against the boundary rule). IPv4, IPv6 and MAC use single-pass tokenisers and hash sets. Cost is linear in the
 text for a fixed vault. The target of #75 is under 1 s for 1 MB.
 
-**Files.** A file with a NUL byte in its first 8 KiB is **binary and skipped, with a notice** (a count and, subject to
+**Files.** A file that starts with a UTF-16 byte order mark (`FF FE` or `FE FF`) is **decoded as UTF-16 text** and scanned (its NUL
+bytes are not a binary marker). Otherwise a file with a NUL byte in its first 8 KiB is **binary and skipped, with a notice** (a count and, subject to
 the redaction rule of section 8, a path; it is also item 5 of the gap list). A tracked or staged text file larger than
 8 MiB **fails** the scan (exit 2); an untracked file larger than 8 MiB only **warns**. No allowlist exists in v1.
 
@@ -388,14 +398,18 @@ the redaction rule of section 8, a path; it is also item 5 of the gap list). A t
   the location would print the value. The tool first runs the matcher over every path, ref name and message it is about to
   print, in every report, error and notice. Locations are: `path:line` for a clean path in the tree or the index;
   `<redacted-path> blob <sha>` (blob id, then `:line` for a content hit) when the path contains a hit or a hit is in
-  a blob whose path does; `commit:<sha>:message` and `commit:<sha>:author` for hits in a commit message or author
-  line; `tag:<sha>:message` for a tag message; `ref:<index>` (the zero-based position of the ref in the pre-push
+  a blob whose path does; `commit:<sha>:message`, `commit:<sha>:author` and `commit:<sha>:committer` for hits in a commit message, author line
+  or committer line; `tag:<sha>:message` for a tag message; `ref:<index>` (the zero-based position of the ref in the pre-push
   input) when a ref name contains a hit; `ref:<index>` is also used for every ref when the name was not clean. #75 tests
-  a vault value in a file name and in a branch name.
+  a vault value in a file name and in a branch name, in an unchanged file renamed to a value-bearing name, and in a new
+  blob that appears at one clean path and one value-bearing path (both are reported).
 - Exit codes: `0` no hit; `1` at least one hit; `2` the scan could not run (vault present but key missing, wrong
   permissions, wrong key, corrupt entry, a file over the size cap). **Failing to scan is never a pass.**
-- The report also lists `unscannable` entries by id and kind (value below the minimum length, a single-label host under
-  8 characters, or a base64 alignment dropped as too weak) on **every** scan, so the gap is visible instead of silent.
+- The report also lists, on **every** scan, the `unscannable` entries by id and kind (value below the minimum length, a
+  single-label host under 8 characters, or a `credential` or `secret` stored as `unscannable` because it equals public
+  text, see section 4), so the gap is visible instead of silent. A **dropped base64 alignment** (needle under 8 characters)
+  is reported **separately**, as `partial` with the entry id and the alignments dropped: the entry is still scanned in
+  its other forms, so it is not "unscannable".
 
 **What the scan cannot catch** (residual risk; **the list below is illustrative, not exhaustive**: anything that
 is not a listed rendering of a vault value is outside the guarantee):
@@ -409,7 +423,9 @@ is not a listed rendering of a vault value is outside the guarantee):
    two table cells, a prefix or fragment of a value, IPv4 written with spaces, per-octet hex (`c0.00.02.0a`),
    octal octets, IPv6 embedded MACs (EUI-64 / SLAAC addresses), entity-encoded markup (`&#46;`), double percent-encoding,
    **shell escapes** (`\$`, `'\''` in a quoted password), JSON `\/`, **MIME base64 wrapped at 76 columns** (a line break
-   inside the blob), regrouped phone numbers (`555 0100` against `5550100`).
+   inside the blob), regrouped phone numbers (`555 0100` against `5550100`), **spaced hex dumps** (`63 6f 72 ...`), a display name encoded
+   with `+` for spaces (`Back+Door+North`), **defanged hostnames** (`nvr-1[.]example[.]invalid`), and **percent-encoded
+   invisible characters** (`%E2%80%8B` inside a value, which the decoded view produces only after the squeeze step has run).
 4. Lookalike characters: Cyrillic or other homoglyphs, NFD vs NFC forms, transliteration (`ä` to `a`) of display names
    and `other` text.
 5. Non-text content: images, screenshots, video thumbnails, compressed archives, binary blobs. A snapshot of a camera
@@ -421,9 +437,12 @@ is not a listed rendering of a vault value is outside the guarantee):
 
 ### 9. Where the scan runs
 
-**Locating the vault and key.** Every surface calls the same command, `wardenlens vault scan`, which resolves the vault
-as `WARDENLENS_VAULT` (a path) or the default dev path, and the key as `WARDENLENS_VAULT_KEY_FILE` (a path) or the
-default dev key path (section 6). The checks of section 6 apply (outside work trees, 0600, owned). There are four
+**Locating the vault and key.** Every surface calls the same command, `wardenlens vault scan`. The gate,
+`scripts/agents check` and the catalogue test resolve the vault as `WARDENLENS_VAULT` (a path) or the default dev path, and
+the key as `WARDENLENS_VAULT_KEY_FILE` (a path) or the default dev key path (section 6). **The git hooks resolve both from
+the fixed default paths only** (`$HOME/.local/share/wardenlens/dev-vault.db`, `$HOME/.config/wardenlens/dev-vault.key`;
+the hook passes `--default-paths`) **and ignore `WARDENLENS_VAULT*` and `XDG_*`**, so a variable set for one `git commit` cannot
+point the hook at an empty vault. (`HOME` itself can still be set by a process; the guard rule of residual risk 1 names it.) The checks of section 6 apply (outside work trees, 0600, owned). There are four
 outcomes, and the first is the only one that skips:
 
 | situation | gate / agents check / test | git hooks |
@@ -453,8 +472,12 @@ environment can also unset it (see residual risk).
    runs `vault scan --range <remote_sha>..<local_sha>` for every updated ref it receives on stdin (a new branch uses
    the range against the remote-tracking refs, as the existing hook does). It scans **the blobs that are new to the remote**
    (`git rev-list --objects` over the range, so a merge resolution that exists only in the merge commit is covered, which
-   a per-commit patch scan would miss), the paths of those blobs, the **commit messages and author lines and the messages of
-   annotated tags**, and the ref names: all of it becomes public on push. The hooks
+   a per-commit patch scan would miss), but **takes the paths from `git diff-tree`**, not from the `rev-list` listing:
+   `git diff-tree -r --name-only --root -m -z` over **every new commit** (recursive, names only, `--root` so the root
+   commit is included, and `-m` so each parent of a merge is diffed separately; see its man page). The `rev-list` listing
+   gives one path per new blob and so misses a rename of unchanged content (the blob is not new, the path is) and a second
+   path for the same new blob. Also scanned: the **commit messages, the author lines and the committer lines**, the messages
+   of annotated tags, and the ref names: all of it becomes public on push. The hooks
    use a binary installed by the human (`cargo install --locked --path crates/wardenlens-cli`) at the **fixed path**
    `$HOME/.cargo/bin/wardenlens`; there is **no `WARDENLENS_BIN` override**. It is **not** a build from the working tree, because a hook that
    runs code from the tree being checked can be edited out of the way by the change it checks. If the vault exists and
@@ -587,7 +610,7 @@ describe rooms and people); the owner's PII.
 | a value in a prompt to an agent | `scripts/agents check` scans the prompt before dispatch; with the proposed hooks, the owner's own prompt too |
 | a value in a log | values are redacting types (`Debug`), the service logs ids not hosts or names, and the scan can be run on log files (`vault scan PATH...`) |
 | a value in a tracked doc or the catalogue | gate and the catalogue test scan the tree; the structural checks remain in public CI |
-| a camera's credentials in a process list | values never travel on argv (CLI and scripts) |
+| a camera's credentials in a process list | values never travel on argv (CLI and scripts), with the one accepted spike-only exception of the `ffmpeg`/`ffprobe` RTSP URL (section 10) |
 
 **Residual risk (not prevented)**
 
@@ -632,7 +655,8 @@ reviewers: "does the text contain a value from the store" is decidable.
 ## Consequences
 
 Each of the eight tickets below carries an **"Amended by ADR 0006" section** (added 2026-11-23 on the PR #77
-verification round) that matches this list; where the old ticket text and this ADR differ, **this ADR wins**.
+verification rounds). The amendments **summarise** this ADR and can lag it; **where an amendment or an older ticket text
+differs from this ADR, this ADR wins**, and the implementer reads the ADR first.
 
 - **#48 (`wardenlens-secrets`).** The cipher only, no SQLite and no scan: XChaCha20-Poly1305 with a key file; record
   = version byte, 24-byte random nonce, ciphertext, tag. `seal(&key, kind, &EntryId, plaintext)` and `open(...)` with
@@ -651,22 +675,26 @@ verification round) that matches this list; where the old ticket text and this A
 - **#75 (scan).** The `scan` module of the vault crate with the views, per-kind rules, exit codes and report of
   sections 7 and 8; `wardenlens vault scan [--staged | --range A..B | PATH... | -]`; the `scripts/gate` step; the
   `scripts/agents check` replacement with the no-vault regex fallback; the staged `.githooks/pre-commit` and
-  `.githooks/pre-push` for the owner (fixed installed binary, no `WARDENLENS_BIN`, `GITHUB_ACTIONS` never skips a scan
-  when a vault is present). The report never prints a path, ref or message that contains a hit (the `<redacted-path>`,
+  `.githooks/pre-push` for the owner (fixed installed binary, no `WARDENLENS_BIN`; the hooks resolve the vault from the
+  fixed default paths only and ignore `WARDENLENS_VAULT*`; `GITHUB_ACTIONS` never skips a scan when a vault is present). The report never prints a path, ref or message that contains a hit (the `<redacted-path>`,
   `commit:<sha>:message|author`, `ref:<index>` forms), with tests that put a vault value in a file name and in a branch
   name. IPv6 trimming and sub-runs with the four required found examples, IPv4-mapped hex, MACs without leading zeros
-  and any single non-hex separator, Unicode simple case folding, the joined view, no `%0A`/`%0D` decoding; pre-push
-  scans new blobs plus commit and tag messages; binary files skipped with a notice; tracked files over the limit fail,
+  and any single non-hex separator, the `char::to_lowercase` fold, the joined view, no `%0A`/`%0D` decoding; pre-push
+  scans new blobs, takes paths from `git diff-tree -r --name-only --root -m` over every new commit, and scans commit
+  (message, author, committer) and tag messages, with tests for an unchanged file renamed to a value-bearing name and for
+  one new blob at a clean and a value-bearing path; IPv6 sub-runs always checked (`Source:2001:db8::1`,
+  `Interface:fe80::1`, `beef:2001:db8::1`, `dead:fe80::1`); files with a UTF-16 BOM decoded as text; binary files skipped with a notice; tracked files over the limit fail,
   untracked ones warn; no allowlist. Proptest (TEST-3) that the matcher finds a value after each listed transformation.
 - **#76 (spikes and docs).** `spikes/s1-cameras/lib.sh` and `spikes/s2-gpu` read through `vault get` with ids; adds
   `wardenlens vault redact` (an exact-match stdin filter) and replaces the shape-based `redact()` in `lib.sh` with it;
   the ffmpeg/ffprobe RTSP URL on argv stays the accepted spike-only exception (ADR 0002); documents excluding the vault
   key path from backups; the README and the agent memory notes name ids, not paths; legacy files deleted by the owner
-  after a key backup (section 6).
+  only after the key is backed up with `vault key export` (section 6).
 - **#50 (camera registry).** The `cameras` table has **no credential, host or display-name column**: those are vault
   entries `cam:<id>:credential`, `cam:<id>:host`, `cam:<id>:name` (#74). The table keeps id, model, port, main/sub path
   templates, created and updated. The index depends on core only; the `cli` builds core `Camera` values from an index
-  row and the vault entries. The ticket **no longer depends on #48 for credential blobs**. Its test becomes "the index
+  row and the vault entries. The ticket **no longer depends on #48 for credential blobs** (its `Blocked by` line is updated; it still needs the
+  core camera model and the index crate, #43 and #49). Its test becomes "the index
   file contains none of the synthetic host, name or credential values" (a byte grep after inserting a camera through the
   registry); the encrypted-at-rest assertion belongs to #74 (vault file).
 - **#43 (core camera model).** Core may depend on `secrecy` and `zeroize` (pure crates). Core defines `Credential {
@@ -675,12 +703,12 @@ verification round) that matches this list; where the old ticket text and this A
   camera id with the URL stripped. Also `EntryId` and `EntryKind`, and a redacting `Debug`/`Display` for host and display
   name.
 - **#69 (Docker).** The compose secret source for the vault key is a host path outside every work tree, by default
-  `/etc/wardenlens/vault.key` (`WARDENLENS_KEY_FILE_HOST` in `.env`); `secrets/` and `*.key` go into `.dockerignore`
+  `/etc/wardenlens/vault.key` (`WARDENLENS_KEY_FILE_HOST` in `.env`); `/secrets/` and `*.key` go into `.dockerignore`
   (and are already in `.gitignore`); a test that the container user's uid and the file mode of the bind-mounted secret
-  pass the strict key check (`vault check-key`); `rekey` runs on the host followed by a container restart; documents
+  pass the strict key check; the container runs `wardenlens vault check-key` at startup; `rekey` runs on the host followed by a container restart; documents
   excluding the key path from backups.
 - **#32 (catalogue).** Keeps structural validation and the generated README; the site-data guarantee is #75's exact-match
-  scan (the catalogue test in `crates/wardenlens-cli/tests/` calls `vault scan` when a vault is present); the shape
+  scan (the exact-match catalogue test lives in `crates/wardenlens-cli/tests/` and calls `vault scan` when a vault is present); the shape
   check becomes an optional soft lint and is not required. Its blocker remains #75.
 - **Also touched, without an amendment section:** #66 (`import agentdvr`) writes credentials, host and name to the service
   vault, not to the index; #72 is superseded for the site-data classes it lists, except the catalogue's structural items.
