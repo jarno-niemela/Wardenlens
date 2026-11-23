@@ -1,0 +1,44 @@
+vendor = "RTT"
+model = "RTT-8700"
+aliases = ["HDIPC"]
+support = "partial"
+quirks = [
+  "ONVIF is flaky: about 40 percent of TCP connection attempts timed out, in runs of up to 8 in a row; allow a retry budget of at least 3 minutes and never block video on ONVIF.",
+  "The first RTSP connection can be slow or fail once; retry.",
+  "RTSP paths are not guessable (the root path returns 400); discover them with ONVIF GetStreamUri and cache.",
+  "The sub stream delivered fewer frames than nominal in a 30 minute run; the cause is unexplained.",
+  "No ONVIF event subscription was attempted; motion needs Wardenlens' own detection on the sub stream.",
+]
+
+[[streams]]
+role = "main"
+codec = "h264"
+width = 1920
+height = 1080
+fps = 8.6
+gop = 30
+
+[[streams]]
+role = "sub"
+codec = "h264"
+width = 640
+height = 360
+fps = 25.0
+gop = 25
+
+[[protocols]]
+kind = "rtsp"
+port = 554
+paths = ["/11", "/12"]
+
+[[protocols]]
+kind = "onvif"
+port = 1018
+
+[[evidence]]
+reference = "docs/adr/0002-camera-integration.md"
+section = "5. HDIPC"
+
+[[evidence]]
+reference = "docs/adr/0002-camera-integration.md"
+section = "1. Two-client RTSP tolerance"

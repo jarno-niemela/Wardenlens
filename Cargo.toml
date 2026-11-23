@@ -11,6 +11,8 @@ repository = "https://github.com/jarno-niemela/Wardenlens"
 
 [workspace.dependencies]
 wardenlens-core = { path = "crates/wardenlens-core" }
+serde = { version = "1", default-features = false, features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
