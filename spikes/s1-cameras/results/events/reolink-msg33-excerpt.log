@@ -1,0 +1,36 @@
+# Reolink RLC-520A Baichuan MSG 33 pushes (baichuan-probe, redacted). Excerpt of the first 17 messages of one 900 s walk.
+# EVENT lines are the probe's own Start/Stop with its monotonic clock (tv_sec); AlarmEvent.timeStamp is always 0.
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67268, tv_nsec: 461880191 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67294, tv_nsec: 317113079 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67306, tv_nsec: 62513445 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67318, tv_nsec: 317348497 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67321, tv_nsec: 671791008 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67327, tv_nsec: 49515883 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67337, tv_nsec: 705193482 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67348, tv_nsec: 467100031 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67353, tv_nsec: 281524332 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67357, tv_nsec: 49529649 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67361, tv_nsec: 49744512 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67363, tv_nsec: 864601943 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67367, tv_nsec: 839499557 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67397, tv_nsec: 924493778 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67399, tv_nsec: 825360941 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "MD", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Start(Instant { tv_sec: 67405, tv_nsec: 248440061 }))
+BC_MSG33 AlarmEventList { version: "1.1", alarm_events: [AlarmEvent { version: "1.1", channel_id: 0, status: "none", ai_type: Some("none"), recording: 0, timeStamp: 0 }] }
+EVENT Ok(Stop(Instant { tv_sec: 67407, tv_nsec: 223893478 }))
