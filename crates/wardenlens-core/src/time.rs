@@ -1,4 +1,12 @@
-//! The `Clock` trait and the time newtypes (ADR 0005: UTC Unix milliseconds).
+//! The clock traits and the time newtypes.
+//!
+//! Two clocks, used for different things:
+//!
+//! * **Wall clock** ([`Clock`], [`Timestamp`], [`UnixMs`]): UTC Unix
+//!   milliseconds (ADR 0005). It can step. Used for recording `started_at_ms`
+//!   and for reports, never for deadlines.
+//! * **Monotonic clock** ([`MonotonicClock`], [`MonoMs`]): never goes backwards.
+//!   Used by the connection state machine for every timeout and deadline.
 
 use core::fmt;
 
@@ -66,6 +74,35 @@ impl Timestamp {
         } else {
             DurationMs(0)
         }
+    }
+}
+
+/// A point on a monotonic clock: milliseconds since an arbitrary origin (for
+/// example process start) that never goes backwards. Meaningless as a date; use
+/// [`Timestamp`] for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MonoMs(u64);
+
+impl MonoMs {
+    /// A monotonic instant `ms` milliseconds after the origin.
+    pub const fn from_millis(ms: u64) -> Self {
+        Self(ms)
+    }
+
+    /// Milliseconds since the origin.
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+
+    /// This instant plus `d`, saturating at the maximum.
+    #[must_use]
+    pub const fn saturating_add(self, d: DurationMs) -> Self {
+        Self(self.0.saturating_add(d.0))
+    }
+
+    /// Time elapsed since `earlier`; zero if `earlier` is not earlier.
+    pub const fn saturating_duration_since(self, earlier: Self) -> DurationMs {
+        DurationMs(self.0.saturating_sub(earlier.0))
     }
 }
 
@@ -146,6 +183,13 @@ impl core::error::Error for WallClockError {}
 pub trait Clock {
     /// The current time.
     fn now(&self) -> Timestamp;
+}
+
+/// A source of monotonic time. Adapters implement it (for example from
+/// `std::time::Instant` relative to a process origin); tests use fakes.
+pub trait MonotonicClock {
+    /// The current monotonic time.
+    fn now(&self) -> MonoMs;
 }
 
 #[cfg(test)]
@@ -232,6 +276,34 @@ mod tests {
                 .as_millis(),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn mono_ms_arithmetic_saturates() {
+        let a = MonoMs::from_millis(10);
+        let b = MonoMs::from_millis(25);
+        assert_eq!(b.saturating_duration_since(a), DurationMs::from_millis(15));
+        assert_eq!(a.saturating_duration_since(b), DurationMs::from_millis(0));
+        assert_eq!(
+            MonoMs::from_millis(u64::MAX)
+                .saturating_add(DurationMs::from_millis(1))
+                .as_millis(),
+            u64::MAX
+        );
+        assert!(a < b);
+    }
+
+    struct FakeMono(Cell<u64>);
+    impl MonotonicClock for FakeMono {
+        fn now(&self) -> MonoMs {
+            MonoMs::from_millis(self.0.get())
+        }
+    }
+
+    #[test]
+    fn fake_monotonic_clock_reports_its_value() {
+        let c = FakeMono(Cell::new(3));
+        assert_eq!(c.now().as_millis(), 3);
     }
 
     #[test]

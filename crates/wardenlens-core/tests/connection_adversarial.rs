@@ -5,7 +5,7 @@ use wardenlens_core::connection::{
     Backoff, ConnectionPolicy, ConnectionState, Event, FailureKind, JitterSource, Outage,
     transition,
 };
-use wardenlens_core::time::{DurationMs, Timestamp};
+use wardenlens_core::time::{DurationMs, MonoMs, Timestamp};
 
 struct Fixed(u64);
 impl JitterSource for Fixed {
@@ -23,11 +23,17 @@ impl JitterSource for Seq {
     }
 }
 
-fn ts(ms: i64) -> Timestamp {
-    Timestamp::from_unix_millis(1_700_000_000_000_i64.saturating_add(ms))
+const ORIGIN: u64 = 1_000_000;
+
+fn rel(t: MonoMs) -> i64 {
+    i64::try_from(t.as_millis().saturating_sub(ORIGIN)).unwrap_or(i64::MAX)
 }
 
-fn step(s: ConnectionState, e: Event, now: Timestamp) -> ConnectionState {
+fn ts(ms: i64) -> MonoMs {
+    MonoMs::from_millis(ORIGIN.saturating_add_signed(ms))
+}
+
+fn step(s: ConnectionState, e: Event, now: MonoMs) -> ConnectionState {
     transition(s, e, now, &ConnectionPolicy::DEFAULT, &mut Fixed(0))
 }
 
@@ -40,49 +46,6 @@ fn outage(attempt: u32, start: i64) -> Outage {
 }
 
 const MAX_DELAY_MS: i64 = 5_000;
-
-// ---------- liveness under wall-clock steps ----------
-
-/// The Clock is a wall clock (ADR 0005). If it steps back by an hour while a camera is in
-/// Backoff, the retry must not be postponed by that hour: a retry is never more than the
-/// backoff cap away from the time it was scheduled.
-#[test]
-fn backward_clock_step_during_backoff_does_not_stall_retries() {
-    let s = step(
-        ConnectionState::INITIAL,
-        Event::Failed(FailureKind::Timeout),
-        ts(0),
-    );
-    // Clock steps back one hour; ticks keep arriving for 10 s of real time.
-    let stepped = -3_600_000;
-    let mut cur = s;
-    let mut retried_at = None;
-    for real in (0..=10_000).step_by(500) {
-        let now = ts(stepped + real);
-        cur = step(cur, Event::Tick, now);
-        if retried_at.is_none() && matches!(cur, ConnectionState::Connecting { .. }) {
-            retried_at = Some(real);
-        }
-    }
-    // The retry starts at the first tick (and has since timed out into a new backoff).
-    assert_eq!(retried_at, Some(0), "no retry: {cur:?}");
-}
-
-/// Forward step: an NTP step right after boot must not mark a camera degraded after one
-/// real failure-retry cycle of a few seconds; the gap is not counted against the budget.
-#[test]
-fn forward_clock_step_does_not_degrade_after_one_retry() {
-    let mut s = step(
-        ConnectionState::INITIAL,
-        Event::Failed(FailureKind::Timeout),
-        ts(0),
-    );
-    // NTP step +1 day.
-    let now = ts(86_400_000);
-    s = step(s, Event::Tick, now);
-    s = step(s, Event::Failed(FailureKind::Timeout), now);
-    assert!(matches!(s, ConnectionState::Backoff { .. }), "{s:?}");
-}
 
 // ---------- state x event table ----------
 
@@ -128,8 +91,8 @@ fn connected_always_streams() {
 #[test]
 fn tick_never_panics_or_streams() {
     for s in all_states() {
-        for t in [i64::MIN, -1, 0, 1, i64::MAX] {
-            let now = Timestamp::from_unix_millis(t);
+        for t in [0, 1, 1_000_000, u64::MAX] {
+            let now = MonoMs::from_millis(t);
             let n = step(s, Event::Tick, now);
             assert_eq!(
                 matches!(n, ConnectionState::Streaming { .. }),
@@ -173,7 +136,7 @@ fn budget_is_not_reset_by_retry_cycles() {
         let ConnectionState::Backoff { until, .. } = s else {
             panic!("expected backoff, got {s:?}");
         };
-        t = until.as_unix_millis() - 1_700_000_000_000;
+        t = rel(until);
         s = step(s, Event::Tick, ts(t));
         t += 1; // the attempt fails 1 ms later
     }
@@ -199,7 +162,7 @@ fn adr_0002_worst_case_with_real_timings_recovers_without_degrading() {
         let ConnectionState::Backoff { until, .. } = s else {
             unreachable!()
         };
-        let resume = until.as_unix_millis() - 1_700_000_000_000;
+        let resume = rel(until);
         s = step(s, Event::Tick, ts(resume));
         t = resume + 10_000;
     }
@@ -230,7 +193,7 @@ fn zero_budget_degrades_on_first_failure() {
         ConnectionState::Degraded {
             since: ts(0),
             last_error_kind: FailureKind::Auth,
-            next_retry: ts(5000)
+            next_retry: ts(3750)
         }
     );
 }
@@ -246,7 +209,7 @@ fn infinite_budget_never_degrades_even_across_the_whole_timeline() {
     let c = ConnectionState::Connecting {
         outage: Some(Outage {
             attempt: 5,
-            start: Timestamp::from_unix_millis(i64::MIN + 1),
+            start: MonoMs::from_millis(1),
             degraded_since: None,
         }),
         attempt_started: None,
@@ -254,7 +217,7 @@ fn infinite_budget_never_degrades_even_across_the_whole_timeline() {
     let n = transition(
         c,
         Event::Failed(FailureKind::Timeout),
-        Timestamp::from_unix_millis(i64::MAX),
+        MonoMs::from_millis(u64::MAX),
         &p,
         &mut Fixed(u64::MAX),
     );
@@ -263,7 +226,7 @@ fn infinite_budget_never_degrades_even_across_the_whole_timeline() {
 
 #[test]
 fn backoff_until_saturates_at_end_of_time_and_tick_still_fires() {
-    let now = Timestamp::from_unix_millis(i64::MAX - 10);
+    let now = MonoMs::from_millis(u64::MAX - 10);
     let s = step(
         ConnectionState::Streaming {
             since: ts(0),
@@ -275,8 +238,8 @@ fn backoff_until_saturates_at_end_of_time_and_tick_still_fires() {
     let ConnectionState::Backoff { until, .. } = s else {
         panic!("{s:?}")
     };
-    assert_eq!(until.as_unix_millis(), i64::MAX);
-    let end = Timestamp::from_unix_millis(i64::MAX);
+    assert_eq!(until.as_millis(), u64::MAX);
+    let end = MonoMs::from_millis(u64::MAX);
     assert!(matches!(
         step(s, Event::Tick, end),
         ConnectionState::Connecting { .. }
@@ -284,8 +247,8 @@ fn backoff_until_saturates_at_end_of_time_and_tick_still_fires() {
 }
 
 #[test]
-fn backoff_from_negative_time_works() {
-    let now = Timestamp::from_unix_millis(i64::MIN);
+fn backoff_from_time_zero_works() {
+    let now = MonoMs::from_millis(0);
     let s = step(
         ConnectionState::Streaming {
             since: ts(0),
@@ -297,7 +260,7 @@ fn backoff_from_negative_time_works() {
     let ConnectionState::Backoff { until, .. } = s else {
         panic!("{s:?}")
     };
-    assert_eq!(until.as_unix_millis(), i64::MIN + 2000);
+    assert_eq!(until.as_millis(), 2000);
 }
 
 // ---------- duration arithmetic ----------
@@ -435,7 +398,7 @@ proptest! {
                     prop_assert!(outage.attempt >= 1);
                     prop_assert!(outage.start <= until);
                     prop_assert!(outage.degraded_since.is_none());
-                    prop_assert!(until.as_unix_millis().saturating_sub(now.as_unix_millis()) <= 5000);
+                    prop_assert!(until.as_millis().saturating_sub(now.as_millis()) <= 5000);
                 }
                 ConnectionState::Degraded { since, next_retry, .. } => {
                     prop_assert!(next_retry >= since);
@@ -445,7 +408,7 @@ proptest! {
                         _ => None,
                     };
                     if let Some(o) = prior_outage.filter(|o| o.degraded_since.is_none()) {
-                        prop_assert!(since.as_unix_millis().saturating_sub(o.start.as_unix_millis()) >= 180_000);
+                        prop_assert!(since.as_millis().saturating_sub(o.start.as_millis()) >= 180_000);
                     }
                 }
                 _ => {}

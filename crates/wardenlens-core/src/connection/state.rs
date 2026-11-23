@@ -1,25 +1,27 @@
 //! Per-camera connection state and its pure transition function.
 //!
-//! # Clock steps
+//! # Clock
 //!
-//! Time is a wall clock (ADR 0005), so it can step. The state machine treats
-//! every event time as untrusted and applies three rules:
+//! The state machine runs on a **monotonic** clock ([`MonoMs`]), so there are
+//! no clock steps to handle: time never goes backwards and an NTP or manual
+//! wall-clock change cannot stall or shorten a retry. Wall-clock time
+//! ([`crate::time::Timestamp`]) is for recording timestamps and reports only.
 //!
-//! * **Backward step.** A wait whose deadline is further away than the backoff
-//!   cap (`until - now > cap`) can only be the result of the clock going back;
-//!   the wait counts as elapsed. An outage that appears to start in the future
-//!   (`outage_start > now`) restarts at `now`. A streaming or attempt anchor in
-//!   the future is re-anchored at `now`.
-//! * **Forward step.** The gap between consecutive events of one cycle is
-//!   bounded by `backoff cap + connect_timeout` (the *max gap*): a backoff
-//!   expires within `cap` and an attempt ends within `connect_timeout`. A
-//!   larger gap is a forward step (or a stalled adapter); the gap is not
-//!   counted against the budget and the outage clock restarts at `now`.
+//! # Adapter contract
+//!
+//! * Pass monotonic time, for example `std::time::Instant` measured from a
+//!   process-wide origin, as the `now` of every [`transition`] call.
+//! * Send an [`Event::Tick`] at least every `backoff.cap`. A coarser cadence
+//!   only delays actions (retry, attempt timeout, degrading) by up to one tick
+//!   period; it never stalls them and never prevents degrading.
+//! * A `now` earlier than a time the state already stores is a contract
+//!   violation. It is handled with saturating arithmetic (the elapsed time is
+//!   zero), never panics and never stalls: a later, correct tick resolves it.
 //! * **Stability.** A `Connected` only counts as recovery after the stream has
 //!   stayed up for `min_stable`; see [`Outage`].
 
 use super::backoff::{Backoff, JitterSource};
-use crate::time::{DurationMs, Timestamp};
+use crate::time::{DurationMs, MonoMs};
 
 /// Why a connection attempt failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,6 +50,10 @@ pub enum Event {
     Failed(FailureKind),
     /// Time passed. Drives backoff expiry, attempt timeouts, background
     /// retries while degraded and the stability check.
+    ///
+    /// The adapter sends one at least every `backoff.cap`, with monotonic
+    /// `now`. A `Tick` in `Connecting` at or after `attempt_started +
+    /// connect_timeout` always fails the attempt, however late it arrives.
     Tick,
 }
 
@@ -73,11 +79,6 @@ impl ConnectionPolicy {
         min_stable: DurationMs::from_secs(30),
         connect_timeout: DurationMs::from_secs(10),
     };
-
-    /// The longest legitimate gap between two events of one retry cycle.
-    fn max_gap(&self) -> DurationMs {
-        self.backoff.cap().saturating_add(self.connect_timeout)
-    }
 }
 
 impl Default for ConnectionPolicy {
@@ -93,9 +94,9 @@ pub struct Outage {
     /// Failures in this outage so far.
     pub attempt: u32,
     /// First failure of the outage.
-    pub start: Timestamp,
+    pub start: MonoMs,
     /// When the camera became degraded, if it has.
-    pub degraded_since: Option<Timestamp>,
+    pub degraded_since: Option<MonoMs>,
 }
 
 /// Where a camera connection is in its life cycle.
@@ -107,12 +108,12 @@ pub enum ConnectionState {
         /// The outage being retried (`None` for the very first attempt).
         outage: Option<Outage>,
         /// When this attempt began; `None` until the first event tells us.
-        attempt_started: Option<Timestamp>,
+        attempt_started: Option<MonoMs>,
     },
     /// Connected and receiving.
     Streaming {
         /// When the stream came up.
-        since: Timestamp,
+        since: MonoMs,
         /// The outage this connection ended, kept until the stream has been up
         /// for `min_stable`; a drop before then continues it.
         prior: Option<Outage>,
@@ -122,17 +123,17 @@ pub enum ConnectionState {
         /// The outage in progress (`attempt >= 1`).
         outage: Outage,
         /// Retry no earlier than this.
-        until: Timestamp,
+        until: MonoMs,
     },
     /// The retry budget is spent. The state machine keeps scheduling retries,
-    /// one per backoff cap, and the adapter serves cached data meanwhile.
+    /// one per (jittered) backoff cap, and the adapter serves cached data meanwhile.
     Degraded {
         /// When the camera became degraded.
-        since: Timestamp,
+        since: MonoMs,
         /// The most recent failure.
         last_error_kind: FailureKind,
         /// The next background retry is due at this time.
-        next_retry: Timestamp,
+        next_retry: MonoMs,
     },
 }
 
@@ -144,17 +145,17 @@ impl ConnectionState {
     };
 }
 
-/// Pure transition: the next state after `event`, observed at `now`.
+/// Pure transition: the next state after `event`, observed at monotonic `now`.
 ///
 /// A failure moves to `Backoff` until the budget (measured from the outage's
 /// first failure) is spent, then to `Degraded`. `Connected` moves to
 /// `Streaming`, remembering the outage until the stream proves stable. Jitter
-/// for the backoff delay comes from `jitter`. See the module docs for how
-/// clock steps are handled.
+/// for backoff delays (including degraded background retries) comes from
+/// `jitter`. See the module docs for the adapter contract.
 pub fn transition(
     state: ConnectionState,
     event: Event,
-    now: Timestamp,
+    now: MonoMs,
     policy: &ConnectionPolicy,
     jitter: &mut impl JitterSource,
 ) -> ConnectionState {
@@ -182,24 +183,18 @@ pub fn transition(
             } else {
                 prior
             };
-            fail(outage, None, kind, now, policy, jitter)
+            fail(outage, kind, now, policy, jitter)
         }
-        (
-            Connecting {
-                outage,
-                attempt_started,
-            },
-            Event::Failed(kind),
-        ) => fail(outage, attempt_started, kind, now, policy, jitter),
+        (Connecting { outage, .. }, Event::Failed(kind)) => fail(outage, kind, now, policy, jitter),
         (_, Event::Tick) => tick(state, now, policy, jitter),
     }
 }
 
-fn streaming(now: Timestamp, prior: Option<Outage>) -> ConnectionState {
+fn streaming(now: MonoMs, prior: Option<Outage>) -> ConnectionState {
     ConnectionState::Streaming { since: now, prior }
 }
 
-fn degraded_outage(since: Timestamp) -> Outage {
+fn degraded_outage(since: MonoMs) -> Outage {
     Outage {
         attempt: 0,
         start: since,
@@ -207,41 +202,43 @@ fn degraded_outage(since: Timestamp) -> Outage {
     }
 }
 
-fn stable(since: Timestamp, now: Timestamp, policy: &ConnectionPolicy) -> bool {
+fn stable(since: MonoMs, now: MonoMs, policy: &ConnectionPolicy) -> bool {
     now.saturating_duration_since(since) >= policy.min_stable
+}
+
+/// The next background retry while degraded: the backoff at its cap, jittered.
+fn degraded_retry(
+    now: MonoMs,
+    policy: &ConnectionPolicy,
+    jitter: &mut impl JitterSource,
+) -> MonoMs {
+    now.saturating_add(policy.backoff.delay(u32::MAX, jitter))
 }
 
 fn fail(
     outage: Option<Outage>,
-    attempt_started: Option<Timestamp>,
     kind: FailureKind,
-    now: Timestamp,
+    now: MonoMs,
     policy: &ConnectionPolicy,
     jitter: &mut impl JitterSource,
 ) -> ConnectionState {
-    let mut o = outage.unwrap_or(Outage {
+    let o = outage.unwrap_or(Outage {
         attempt: 0,
         start: now,
         degraded_since: None,
     });
-    let stepped_forward =
-        attempt_started.is_some_and(|s| now.saturating_duration_since(s) > policy.max_gap());
-    if now < o.start || stepped_forward {
-        o.start = now;
-    }
-    let paced = now.saturating_add(policy.backoff.cap());
     if let Some(since) = o.degraded_since {
         return ConnectionState::Degraded {
             since,
             last_error_kind: kind,
-            next_retry: paced,
+            next_retry: degraded_retry(now, policy, jitter),
         };
     }
     if now.saturating_duration_since(o.start) >= policy.budget {
         return ConnectionState::Degraded {
             since: now,
             last_error_kind: kind,
-            next_retry: paced,
+            next_retry: degraded_retry(now, policy, jitter),
         };
     }
     let delay = policy.backoff.delay(o.attempt, jitter);
@@ -256,7 +253,7 @@ fn fail(
 
 fn tick(
     state: ConnectionState,
-    now: Timestamp,
+    now: MonoMs,
     policy: &ConnectionPolicy,
     jitter: &mut impl JitterSource,
 ) -> ConnectionState {
@@ -265,58 +262,31 @@ fn tick(
         Connecting {
             outage,
             attempt_started,
-        } => {
-            let outage = outage.map(|o| clamp_start(o, now));
-            let Some(started) = attempt_started.filter(|s| *s <= now) else {
-                // First tick, or the clock went back: (re)anchor the attempt.
-                return Connecting {
-                    outage,
-                    attempt_started: Some(now),
-                };
-            };
-            let elapsed = now.saturating_duration_since(started);
-            if elapsed > policy.max_gap() {
-                // Forward step: fresh outage clock, fresh attempt.
-                Connecting {
-                    outage: outage.map(|o| Outage { start: now, ..o }),
-                    attempt_started: Some(now),
-                }
-            } else if elapsed >= policy.connect_timeout {
-                fail(
-                    outage,
-                    Some(started),
-                    FailureKind::Timeout,
-                    now,
-                    policy,
-                    jitter,
-                )
-            } else {
-                Connecting {
-                    outage,
-                    attempt_started,
-                }
+        } => match attempt_started {
+            // First tick: anchor the attempt.
+            None => Connecting {
+                outage,
+                attempt_started: Some(now),
+            },
+            Some(started) if now.saturating_duration_since(started) >= policy.connect_timeout => {
+                fail(outage, FailureKind::Timeout, now, policy, jitter)
             }
-        }
+            Some(_) => state,
+        },
         Backoff { outage, until } => {
-            let mut outage = clamp_start(outage, now);
-            let went_back = until.saturating_duration_since(now) > policy.backoff.cap();
-            if now >= until || went_back {
-                if now.saturating_duration_since(until) > policy.max_gap() {
-                    outage.start = now;
-                }
+            if now >= until {
                 Connecting {
                     outage: Some(outage),
                     attempt_started: Some(now),
                 }
             } else {
-                Backoff { outage, until }
+                state
             }
         }
         Degraded {
             since, next_retry, ..
         } => {
-            let went_back = next_retry.saturating_duration_since(now) > policy.backoff.cap();
-            if now >= next_retry || went_back {
+            if now >= next_retry {
                 Connecting {
                     outage: Some(degraded_outage(since)),
                     attempt_started: Some(now),
@@ -326,23 +296,12 @@ fn tick(
             }
         }
         Streaming { since, prior } => {
-            if now < since {
-                Streaming { since: now, prior }
-            } else if prior.is_some() && stable(since, now, policy) {
+            if prior.is_some() && stable(since, now, policy) {
                 Streaming { since, prior: None }
             } else {
                 state
             }
         }
-    }
-}
-
-/// An outage cannot have started after `now`: if it appears to, the clock went back.
-fn clamp_start(o: Outage, now: Timestamp) -> Outage {
-    if o.start > now {
-        Outage { start: now, ..o }
-    } else {
-        o
     }
 }
 
@@ -358,11 +317,17 @@ mod tests {
         }
     }
 
-    fn ts(ms: i64) -> Timestamp {
-        Timestamp::from_unix_millis(1_700_000_000_000_i64.saturating_add(ms))
+    const ORIGIN: u64 = 1_000_000;
+
+    fn rel(t: MonoMs) -> i64 {
+        i64::try_from(t.as_millis().saturating_sub(ORIGIN)).unwrap_or(i64::MAX)
     }
 
-    fn step(s: ConnectionState, e: Event, now: Timestamp) -> ConnectionState {
+    fn ts(ms: i64) -> MonoMs {
+        MonoMs::from_millis(ORIGIN.saturating_add_signed(ms))
+    }
+
+    fn step(s: ConnectionState, e: Event, now: MonoMs) -> ConnectionState {
         transition(s, e, now, &ConnectionPolicy::DEFAULT, &mut Fixed(0))
     }
 
@@ -483,7 +448,7 @@ mod tests {
             let Bo { until, .. } = s else {
                 unreachable!("{s:?}")
             };
-            let resume = until.as_unix_millis() - 1_700_000_000_000;
+            let resume = rel(until);
             s = step(s, Event::Tick, ts(resume));
             assert!(matches!(s, Connecting { .. }));
             t = resume + 10_000;
@@ -503,7 +468,7 @@ mod tests {
             Degraded {
                 since: ts(180_000),
                 last_error_kind: FailureKind::Auth,
-                next_retry: ts(185_000)
+                next_retry: ts(183_750)
             }
         );
     }
@@ -548,7 +513,7 @@ mod tests {
             Degraded {
                 since: ts(0),
                 last_error_kind: FailureKind::Refused,
-                next_retry: ts(11_000)
+                next_retry: ts(9750)
             }
         );
     }
@@ -581,83 +546,60 @@ mod tests {
     }
 
     #[test]
-    fn backward_step_in_backoff_retries_without_stalling() {
+    fn stale_now_does_not_panic_or_stall() {
+        // A contract violation: `now` is earlier than the stored times.
         let b = Bo {
             outage: outage(1, 100_000),
             until: ts(102_000),
         };
-        // The clock jumps back an hour; the very next tick retries and the outage restarts.
-        let now = ts(-3_500_000);
-        assert_eq!(
-            step(b, Event::Tick, now),
-            Connecting {
-                outage: Some(outage(1, -3_500_000)),
-                attempt_started: Some(now)
-            }
-        );
-    }
-
-    #[test]
-    fn small_backward_step_clamps_the_outage_start_and_keeps_waiting() {
-        let b = Bo {
-            outage: outage(1, 100_000),
-            until: ts(3000),
+        assert_eq!(step(b, Event::Tick, ts(0)), b);
+        assert!(matches!(
+            step(b, Event::Tick, ts(102_000)),
+            Connecting { .. }
+        ));
+        let c = Connecting {
+            outage: Some(outage(1, 100_000)),
+            attempt_started: Some(ts(100_000)),
         };
-        assert_eq!(
-            step(b, Event::Tick, ts(0)),
-            Bo {
-                outage: outage(1, 0),
-                until: ts(3000)
-            }
-        );
+        assert_eq!(step(c, Event::Tick, ts(0)), c);
+        assert!(matches!(step(c, FAIL, ts(0)), Bo { .. }));
+        assert!(matches!(step(c, Event::Tick, ts(110_000)), Bo { .. }));
+        assert_eq!(step(up(100), Event::Tick, ts(0)), up(100));
     }
 
     #[test]
-    fn backward_step_while_degraded_retries() {
-        let d = Degraded {
-            since: ts(0),
-            last_error_kind: FailureKind::Timeout,
-            next_retry: ts(1_000_000),
-        };
-        assert!(matches!(step(d, Event::Tick, ts(10)), Connecting { .. }));
-    }
-
-    #[test]
-    fn forward_step_does_not_count_the_gap_against_the_budget() {
-        let mut s = step(ConnectionState::INITIAL, FAIL, ts(0));
-        let now = ts(86_400_000);
-        s = step(s, Event::Tick, now);
-        s = step(s, FAIL, now);
-        assert_eq!(
-            s,
-            Bo {
-                // The attempt count is kept (delays keep escalating); only the clock restarts.
-                outage: outage(2, 86_400_000),
-                until: ts(86_403_000)
-            }
-        );
-    }
-
-    #[test]
-    fn forward_step_during_an_attempt_restarts_the_outage_clock() {
+    fn late_tick_always_times_out_the_attempt() {
         let c = Connecting {
             outage: Some(outage(3, 0)),
             attempt_started: Some(ts(1000)),
         };
-        let now = ts(86_400_000);
-        let s = step(c, FAIL, now);
-        assert!(matches!(s, Bo { outage, .. } if outage.start == now && outage.attempt == 4));
-        let t = step(c, Event::Tick, now);
-        assert_eq!(
-            t,
-            Connecting {
-                outage: Some(Outage {
-                    start: now,
-                    ..outage(3, 0)
-                }),
-                attempt_started: Some(now)
-            }
-        );
+        for late in [11_000, 25_000, 100_000] {
+            assert!(
+                matches!(step(c, Event::Tick, ts(late)), Bo { .. }),
+                "{late}"
+            );
+        }
+        // Past the budget it degrades however late the tick is.
+        assert!(matches!(step(c, Event::Tick, ts(200_000)), Degraded { .. }));
+    }
+
+    #[test]
+    fn degraded_retries_are_jittered() {
+        let d = |n| {
+            let c = Connecting {
+                outage: Some(degraded_outage(ts(0))),
+                attempt_started: Some(ts(0)),
+            };
+            transition(
+                c,
+                Event::Failed(FailureKind::Timeout),
+                ts(1000),
+                &ConnectionPolicy::DEFAULT,
+                &mut Fixed(n),
+            )
+        };
+        assert_ne!(d(0), d(1));
+        assert!(matches!(d(0), Degraded { next_retry, .. } if next_retry == ts(4750)));
     }
 
     #[test]
@@ -708,7 +650,7 @@ mod tests {
             };
             assert!(o.attempt > last_attempt);
             last_attempt = o.attempt;
-            t = until.as_unix_millis() - 1_700_000_000_000;
+            t = rel(until);
             s = step(s, Event::Tick, ts(t));
             s = step(s, Event::Connected, ts(t));
             t += 1000; // up for one second, then it drops
