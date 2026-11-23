@@ -32,12 +32,13 @@ Facts this ADR builds on:
 - ADR 0006 (proposed): the `cameras` table has **no** credential, host or display-name column; the vault is a separate
   SQLite file; the vault follows this ADR's SQLite crate choice.
 - Host (2026-11-23): the hot directory `/srv/wardenlens/recordings` is **on the root filesystem** `/dev/sdb2` (SSD, non-rotational,
-  982,240,026,624 B total, 302,966,685,696 B used, 629,302,824,960 B available), not on a volume of its own. The archive
+  982,240,026,624 B total, 629,582,364,672 B available at the time of the final read; `f_bfree` is larger than `f_bavail`
+  because ext4 reserves 5 % of the blocks), not on a volume of its own. The archive
   `/srv/wardenlens/archive` is a separate ext4 mount `/dev/sda1` (1,998,980,898,816 B total, 1,998,961,995,776 B
   available, mounted `rw,noatime`; fstab has `nofail`, so it can be absent at boot). I could not open the plan
   document from the sandbox, so the volume sizes are the measured ones, not the plan's nominal "2 TB".
   Consequence: the hot floor also protects the operating system, and an unmounted archive leaves an empty directory on
-  the root filesystem (section 8).
+  the root filesystem (sections 8 and 9).
 
 ## Options and decisions
 
@@ -45,8 +46,9 @@ Facts this ADR builds on:
 
 All three candidates are measured below. What Wardenlens needs is small: one video track, H.264, `ftyp` + `moov`
 (with `mvex`/`trex`) once per file and `moof` + `mdat` per fragment (about 25 box types, see section 3). It does not
-need to read MP4 files from untrusted sources (the recorder only writes; the reconciliation walk in section 9 reads
-only box headers of its own files).
+need a general MP4 reader: the recorder only writes, and the one place that reads a file without a row (the adoption
+parser of section 9) is a small, bounded box-header walk that treats the file as **untrusted**, because a file with a
+valid name may have been planted or damaged.
 
 | | in-house box writer | `mp4-atom` 0.17.1 | `mp4` 0.14.0 |
 |---|---|---|---|
@@ -103,7 +105,7 @@ salvage such a file (section 9) but the format allows it later.
 **Rule** (pure logic in core, ticket #45; defaults are config values within the stated bounds):
 
 1. **First segment** of a stream starts at the first keyframe. Frames before it are dropped (`Decision::Drop`).
-2. **Target duration 60 s** (bounds 10-300 s). A segment is cut at the first keyframe whose media time since the segment
+2. **Target duration 60 s** (bounds 10-290 s, so that twice the target, 580 s, stays below the 600 s `CHECK` on `duration_ms`). A segment is cut at the first keyframe whose media time since the segment
    start is at least the target: the keyframe becomes the first sample of the next segment.
 3. **Hard maximum 120 s** (2x target). If no keyframe has arrived when the media time reaches the maximum, the
    segment is closed at that frame (a closed fMP4 does not need to end on a GOP boundary), and frames are dropped until
@@ -124,7 +126,12 @@ longer ones raise crash loss and the unit of eviction.
 - *Index (wall clock):* `started_at_ms` is the **arrival** time of the segment's first frame (the frame that starts the
   segment), from the `Clock` trait (#46), as UTC Unix milliseconds. Camera clocks and RTP wall-clock mappings are never
   used. Per camera `started_at_ms` must be strictly increasing: `started_at_ms = max(arrival, previous + 1)`, which
-  also makes the file name unique (section 3). `duration_ms` is the **media** duration (below) and
+  also makes the file name unique (section 3). At start-up the recorder seeds `previous` per camera from
+  `SELECT MAX(started_at_ms) FROM segments WHERE camera_id = ?` (after reconciliation, which has adopted orphan files),
+  so a wall clock that stepped back across a restart cannot collide with an existing name or row. A wall clock
+  earlier than the year 2000 (below the column's `CHECK`) **holds off recording** for that camera and raises a health
+  warning, instead of failing inserts. `duration_ms` is the **media** duration (below), converted from 90 kHz ticks
+  to milliseconds **rounding up**, minimum 1, and
   `ended_at_ms = started_at_ms + duration_ms`. A gap between two segments is therefore visible as
   `started_next - ended_prev`, and "recorded coverage" (#70) is the sum of `duration_ms`.
 - *File (monotonic media time):* timescale **90,000**; each file starts at `tfdt` base media time 0 (each file is
@@ -139,22 +146,26 @@ longer ones raise crash loss and the unit of eviction.
   Durations are clamped to 1..=900,000 ticks.
 - *B-frames:* v1 writes no composition offsets (`trun` without `sample_composition_time_offset`, so PTS = DTS). That is
   correct only for streams without frame reordering. ADR 0002 did not record `has_b_frames` for the five cameras and I
-  have no camera access here, so this is **an open risk** (see "Open risks"): #55 must verify it live before #57 is
-  trusted.
+  have no camera access here. Its soak measured about 1 non-monotonic DTS warning per 3 frames on Tapo main (8,891
+  lines for 26,991 frames), which is what RTP timestamps in decode order look like when frames are reordered, and also
+  what plain timestamp jitter looks like; the two cannot be told apart from that data. This is **an open risk** (see
+  "Open risks"): the #55 reordering check (`has_b_frames` / `pic_order_cnt_type` on the five main streams) **blocks
+  both the #45 `MediaClock` and #57**; neither is trusted before it passes.
 
 ### 3. On-disk layout, naming and the segment file
 
 ```
 <root>/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4          finished segment
 <root>/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4.part     being written (or an interrupted one)
-<root>/quarantine/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4   files reconciliation could not trust (section 9)
+<root>/_quarantine/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4   files reconciliation could not trust (section 9)
 ```
 
 `<root>` is the hot root (`/srv/wardenlens/recordings`) or the archive root (`/srv/wardenlens/archive`). The relative
 path `<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4` is **the same on both tiers**, so a move never changes it. Date and
 time are **UTC** from `started_at_ms` (a local-time directory would change meaning at a DST step); `<mmm>` is the
 milliseconds. A day directory holds at most about 1,440 files per camera (86,400 s / 60 s). The deepest file is at depth
-4 below a root (`quarantine/<camera>/<day>/<file>`), which is the bound the reconciliation walk uses.
+4 below a root (`_quarantine/<camera>/<day>/<file>`), which is the bound the reconciliation walk uses. The name `_quarantine`
+begins with an underscore, so no `CameraId` (it must start with a letter) can ever produce it.
 
 **Paths are derived, never stored, never taken from a camera (SEC-4).** There is **no `rel_path` column** (this overrides
 #49 and #62): the path is a pure function `RelPath::new(&CameraId, started_at_ms)` in core. `CameraId` is the validated
@@ -163,10 +174,13 @@ result can contain no `..`, separator or other character than the pattern allows
 therefore cannot name an arbitrary path: `camera_id` is re-parsed with `FromStr` when a row is read and a bad value is a
 typed error. File names found on disk are accepted only if they match
 `^[0-9]{6}-[0-9]{3}\.mp4(\.part)?$` under a directory `<camera_id>/<YYYY-MM-DD>` that parses, and the time must agree
-with the directory date. Joining a root and a `RelPath` is followed by the containment check of #58/#62 (canonicalise,
-must stay inside the canonical root; symlinks are never followed out of a root). Writers create files with
-`O_CREAT|O_EXCL|O_NOFOLLOW` (so an existing name, including a planted symlink, is an error), mode `0600`, directories
-`0700`. The walker uses `lstat`, never follows symlinks and ignores anything that is not a regular file.
+with the directory date. **Opening a file (SEC-4):** each root is opened once as a directory handle at start-up, and
+every file is opened **relative to that handle** with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (rustix, safe
+Rust), so `..`, absolute paths and any symlink component are refused by the kernel; the open handle is then `fstat`ed
+(regular file; its size is what the caller uses). This replaces "canonicalise and check containment" of #58/#62 (a
+check-then-open race). Writers create files the same way with `O_CREAT|O_EXCL|O_NOFOLLOW` (an existing name, including
+a planted symlink, is an error), mode `0600`, directories `0700`. The walker uses `lstat`, never follows symlinks and
+treats anything that is not a regular file or directory as `unknown_left`.
 
 **Segment file** (what `wardenlens-mp4` writes, from the prototype; all integers big-endian):
 
@@ -176,7 +190,7 @@ moov  mvhd (timescale 90000, duration 0)
       trak: tkhd (flags 3, width/height from the SPS), mdia: mdhd (90000), hdlr "vide",
             minf: vmhd, dinf/dref/url (self-contained), stbl: stsd -> avc1 + avcC (SPS and PPS only here),
                   empty stts, stsc, stsz, stco
-      mvex: trex (track 1, default sample description 1)
+      mvex: mehd (version 1, fragment duration), trex (track 1, default sample description 1)
 moof  mfhd (sequence 1, 2, ...)  traf: tfhd (flags 0x020000 default-base-is-moof), tfdt (version 1, 64-bit base time),
       trun (flags 0x000701: data offset, per-sample duration, size and flags; sync sample flags 0x02000000,
             non-sync 0x01010000)
@@ -189,11 +203,15 @@ they are copied; the SPS is parsed defensively (#54, proptest). The file has no 
 access by index, a range request plus the player's own box walk suffices.
 
 **Writing a segment (temp file, fsync, rename).** The recorder creates `<hot>/<camera_id>/<day>/<name>.mp4.part`, writes
-`ftyp`+`moov`, then each fragment with plain `write(2)` (no fsync per fragment). On close: (1) write the last
-fragment, (2) `fsync(file)`, (3) `rename` `.part` to `.mp4`, (4) `fsync` the directory, (5) only then
-`Index::insert`. The order makes a visible `.mp4` always complete, and an indexed row always point at a complete,
-durable file. When a day directory (or camera directory) is created, its parent is fsynced as well. A graceful stop
-runs steps 1-5 for the open segment. ENOSPC aborts the segment: the `.part` is unlinked and the recorder waits for the
+`ftyp`+`moov` (with `mvhd.duration` and `mehd.fragment_duration` still 0), then each fragment with plain `write(2)` (no
+fsync per fragment). On close: (1) write the last fragment, (2) **patch the total duration** into `mvhd` and `mehd` with
+`pwrite` at their known offsets, so that a browser or player that reads only `moov` can show a length and seek (the
+durations are in 90 kHz ticks and fit the 32-bit `mvhd` field: 13.25 h is far above 580 s), (3) `fsync(file)`, (4) `renameat2`
+`.part` to `.mp4` (`RENAME_NOREPLACE`), (5) `fsync` the directory, (6) only then `Index::insert`. If the insert fails for
+any reason (constraint, I/O), the file is **quarantined** (section 9), not retried in a loop. The order makes a visible
+`.mp4` always complete, and an indexed row always point at a complete, durable file. A crash before step 2 leaves a
+`.part` with duration 0, which is deleted anyway. When a day directory (or camera directory) is created, its parent is fsynced as well. A graceful stop
+runs steps 1-6 for the open segment. ENOSPC aborts the segment: the `.part` is unlinked and the recorder waits for the
 storage loop (#57).
 
 ### 4. SQLite crate
@@ -230,8 +248,9 @@ all rows took 20 ms.
 ### 5. SQLite configuration, migrations and schema
 
 **File and open.** The index is `/var/lib/wardenlens/index.db` (a volume, on neither recordings volume; ticket #69), with
-its `-wal` and `-shm` files, **separate from the vault file** (ADR 0006). It is created with mode `0600`, opened with
-`SQLITE_OPEN_NOFOLLOW` and refused if it is a symlink. Pragmas on every connection: `journal_mode = WAL`,
+its `-wal` and `-shm` files, **separate from the vault file** (ADR 0006). It is created and opened with the **same open helper as the vault file** (ADR 0006 section 4): mode `0600` created before
+SQLite opens it, our own `O_NOFOLLOW` descriptor with `fstat`, SQLite opened by path with `SQLITE_OPEN_NOFOLLOW`, and
+the device and inode compared; a symlink or a wrong owner is refused. Pragmas on every connection: `journal_mode = WAL`,
 `synchronous = FULL`, `foreign_keys = ON`, `busy_timeout = 5000`, `journal_size_limit = 67108864`. `synchronous = FULL`
 (not `NORMAL`) is required by the tier protocol: step M8 must be durable before the hot file is unlinked
 (section 7); the cost is irrelevant at this write rate. `application_id = 0x574C4958` (`WLIX`) is set at creation and
@@ -254,7 +273,7 @@ the agreed shape):
 
 ```sql
 CREATE TABLE segments (
-  id            INTEGER PRIMARY KEY,                 -- the id the API exposes
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,   -- the id the API exposes; never reused after a delete
   camera_id     TEXT    NOT NULL CHECK (length(camera_id) BETWEEN 1 AND 32),
   started_at_ms INTEGER NOT NULL CHECK (started_at_ms BETWEEN 946684800000 AND 4102444799999),  -- 2000..2099 UTC
   duration_ms   INTEGER NOT NULL CHECK (duration_ms BETWEEN 1 AND 600000),
@@ -269,7 +288,9 @@ CREATE INDEX segments_tier_end ON segments (tier, ended_at_ms, id, bytes);      
 ```
 
 `camera_id` is plain text with **no foreign key** to `cameras`: removing a camera never deletes recordings (#50);
-a segment whose camera is gone is an orphan found with a `LEFT JOIN`, not a column.
+a segment whose camera is gone is an orphan found with a `LEFT JOIN`, not a column. `AUTOINCREMENT` makes an id
+unique over the life of the file (a plain rowid could be reused after the newest row is deleted, and a client holding
+an old id would then download another segment).
 
 Queries (every one parameterised, no SQL built from data; `EXPLAIN QUERY PLAN` observed in the probe):
 
@@ -289,13 +310,15 @@ Queries (every one parameterised, no SQL built from data; `EXPLAIN QUERY PLAN` o
 - `insert(SegmentRecord, tier)` takes no path either; `delete(id)`.
 
 **`cameras`** (ADR 0006 is authoritative; migration 2, ticket #50): `id TEXT PRIMARY KEY` (a `CameraId`, length
-check), `model TEXT NOT NULL` (catalogue reference), `rtsp_port INTEGER NOT NULL CHECK (rtsp_port BETWEEN 1 AND 65535)`,
-`main_path TEXT NOT NULL`, `sub_path TEXT`, `created_at_ms INTEGER NOT NULL`, `updated_at_ms INTEGER NOT NULL`, `STRICT`.
-**No** credential, host, display-name or other site-identifying column; those are vault entries `cam:<id>:...`.
+check), `model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 64)` (catalogue reference), `rtsp_port INTEGER NOT NULL CHECK (rtsp_port BETWEEN 1 AND 65535)`,
+`main_path TEXT NOT NULL CHECK (length(main_path) BETWEEN 1 AND 512)`, `sub_path TEXT CHECK (sub_path IS NULL OR length(sub_path) BETWEEN 1 AND 512)`, `created_at_ms INTEGER NOT NULL`, `updated_at_ms INTEGER NOT NULL`, `STRICT`.
+**No** credential, host, display-name or other site-identifying column; those are vault entries `cam:<id>:...`. Because a
+vendor RTSP path can carry credentials in the query string, #50 **rejects** a `main_path` or `sub_path` that contains `@`,
+`user=`, `password=` or `pwd=` (case-insensitive), at the parse step and again as a typed error when a row is read.
 
 **`api_tokens`** (ADR 0004 section 9; migration 3, ticket #65): `id TEXT NOT NULL UNIQUE CHECK (length(id) = 8)` (8
 characters of lowercase base32), `digest BLOB NOT NULL CHECK (length(digest) = 32)` (SHA-256 of the decoded secret),
-`name TEXT NOT NULL`, `created_at_ms INTEGER NOT NULL`, `last_used_at_ms INTEGER` (nullable; written at most once a
+`name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64)`, `created_at_ms INTEGER NOT NULL`, `last_used_at_ms INTEGER` (nullable; written at most once a
 minute per token), `revoked INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))`, `STRICT`. The `id` is the primary
 lookup key, so the unique constraint creates its index. Rows are never deleted (revoked ids are never reused).
 No roles in v1. The table holds hashes only, so it needs no ADR 0006 encryption.
@@ -305,24 +328,26 @@ rebuilt from the files by the adoption rule of section 9.
 
 ### 6. When to move, what to evict (policy; the pure planner is #44)
 
-Terms: for a volume, `total = f_blocks * f_frsize` and `free = f_bavail * f_frsize` (what an unprivileged writer can
-use; `statvfs` through the `rustix` safe wrapper, #58, checked arithmetic), `free_percent = free * 100 / total`. The
-**floor** is `min_free_percent` (0-90, default 25) per volume. The **headroom** is a fixed 1 percentage point of
-`total`: a volume that dips below its floor is brought back to `floor + headroom`, not just to the floor, so the loop
-does not move one segment per tick. 1 % of the hot volume (9.8 GB) is about 70 minutes of all five cameras, against
-71 MB written per 30 s tick.
+Terms. For a volume, `statvfs` (through the `rustix` safe wrapper, #58, checked arithmetic) gives `f_blocks`, `f_bfree`,
+`f_bavail`, `f_frsize`. The floor arithmetic uses **available space**, not the raw total: ext4 reserves 5 % of blocks
+for root, which an unprivileged writer can never use, so `free = f_bavail * f_frsize` and
+`capacity = (f_blocks - f_bfree + f_bavail) * f_frsize` (used space plus available space, the space the service can
+ever occupy). `free_percent = free * 100 / capacity`. The **floor** is `min_free_percent` (0-90, default 25) per volume,
+a free amount of `capacity * floor`. The **headroom** is a fixed 1 percentage point of `capacity`: a volume that dips
+below its floor is brought back to `floor + headroom`, not just to the floor, so the loop does not move one segment per
+tick. On the hot volume 1 % is 9.3 GB, about 65 minutes of all five cameras, against 71 MB written per 30 s tick.
 
-**Hot to archive happens when either holds:**
+**Hot to archive happens when either holds** (and the archive is available, section 8):
 
-1. *Hot floor:* `hot.free < hot.total * floor`. Move the oldest hot segments (by `ended_at_ms`, then `id`, across all
-   cameras) until `hot.free >= hot.total * (floor + 1 pp)`, **regardless of age**.
+1. *Hot floor:* `hot.free < hot.capacity * floor`. Move the oldest hot segments (by `ended_at_ms`, then `id`, across all
+   cameras) until `hot.free >= hot.capacity * (floor + 1 pp)`, **regardless of age**.
 2. *Hot max age:* any hot segment with `ended_at_ms < now - hot_max_age` (default **12 h**, config
    `storage.hot_max_age`) is moved, oldest first, also without pressure. It keeps the SSD as a recent-video cache and
    lets the HDD spin up in bounded work rather than in bursts. `hot_max_age` never deletes anything.
 
-**Archive eviction (frees the HDD) happens when** `archive.free < archive.total * floor`, **or** when a planned move
-would leave `archive.free - move_bytes < archive.total * floor`. Before such a move the planner deletes the oldest
-archive segments until `archive.free - move_bytes >= archive.total * (floor + 1 pp)`; deletions are planned
+**Archive eviction (frees the HDD) happens when** `archive.free < archive.capacity * floor`, **or** when a planned move
+would leave `archive.free - move_bytes < archive.capacity * floor`. Before such a move the planner deletes the oldest
+archive segments until `archive.free - move_bytes >= archive.capacity * (floor + 1 pp)`; deletions are planned
 **before** the move that needs the room (#44).
 
 **Eviction order**, always oldest first by `ended_at_ms`, ties by `id`, across cameras (every camera keeps the same
@@ -333,18 +358,17 @@ depth of history; Phase 2 adds retention by event and age):
 2. Archive segments.
 3. Hot segments, **only** as a last resort (below).
 
-**Both volumes full or the archive missing (order of precedence):**
+**Both volumes full or the archive unavailable (order of precedence):**
 
-1. Hot below floor, archive can absorb after evicting: evict archive (oldest), then move. Net archive space is
-   conserved: every moved byte displaces an older archived byte.
-2. Archive **unavailable** (not mounted, probe error, or `st_dev` equal to the hot volume's, which also catches an
-   unmounted archive whose empty mount-point directory would otherwise fill the SSD: #58's probe error): the plan
-   becomes `Delete` of the oldest hot segments until the hot floor plus headroom holds. **The floor wins over keeping
-   video**, because the hot directory is on the root filesystem and an NVR that fills `/` takes the host down. The
-   state `archive_unavailable` is exposed and `floor_breaches_total` is increased (#63), the log names the volume by tier
-   only.
+1. Hot below floor, archive available and can absorb after evicting: evict archive (oldest), then move. Net archive
+   space is conserved: every moved byte displaces an older archived byte.
+2. Archive **unavailable** (the definition is in section 8: missing, same filesystem, read-only, unmarked or failing):
+   the plan becomes `Delete` of the oldest hot segments until the hot floor plus headroom holds. **The floor wins over
+   keeping video**, because the hot directory is on the root filesystem and an NVR that fills `/` takes the host down.
+   The state `archive_unavailable` is exposed and `floor_breaches_total` is increased (#63); the log names the volume
+   by tier only. Archive rows and files are **not touched** while the archive is unavailable.
 3. A move that is **impossible** because a single segment is larger than the archive's capacity above its floor
-   (`archive.total * (1 - floor) < segment.bytes`): `PlanError`, never a panic; hot segments are then deleted as in 2.
+   (`archive.capacity * (1 - floor) < segment.bytes`): `PlanError`, never a panic; hot segments are then deleted as in 2.
 4. Even deleting every segment cannot restore a floor (something else fills the volume): `PlanError::Unsatisfiable`;
    the recorder keeps retrying on ENOSPC (#57) and the storage endpoint reports `below_floor`. Recording does not stop
    by itself for a floor breach; it stops only when the OS refuses the write.
@@ -356,99 +380,202 @@ because writing continues meanwhile.
 ### 7. Crash-safe tier move
 
 Only the storage loop moves or deletes segments and changes `tier` (a single task, enforced by one process holding an
-exclusive lock on `/var/lib/wardenlens/wardenlens.lock`, #68); the recorder only adds hot files and rows.
+exclusive lock on `/var/lib/wardenlens/wardenlens.lock`, #68); the recorder only adds hot files and rows. All paths are
+opened relative to a root directory handle with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (rustix, section 3).
 
 **Move of segment S (row `id`, path `R`) from hot to archive**; `A` is the archive root, `H` the hot root:
 
 | step | action | durable effect |
 |---|---|---|
-| M1 | `lstat(H/R)`: regular file, size equals the row's `bytes`; otherwise stop (reconciliation will deal with it) | none |
+| M1 | `lstat(H/R)`: regular file, size equals the row's `bytes`. A **missing** hot file: delete the row, count `missing`. A **wrong-size** or non-regular hot file: quarantine it (into `H/_quarantine/...`), delete the row, count `size_mismatch`. Either way the mover skips S and goes on with the next segment, so one bad segment never stalls the loop | none |
 | M2 | create the archive directory chain; fsync each parent of a directory this step created | directories |
-| M3 | unlink a stale `A/R.part` if one exists (only the mover writes archive `.part` files), then create `A/R.part` with `O_CREAT|O_EXCL|O_NOFOLLOW` | an empty `.part` |
+| M3 | unlink a stale `A/R.part` if one exists (only the mover writes archive `.part` files), then create `A/R.part` with `O_CREAT`, `O_EXCL`, `O_NOFOLLOW` | an empty `.part` |
 | M4 | copy `H/R` to `A/R.part` in 1 MiB chunks; the copied length must equal `bytes` | a `.part` |
 | M5 | `fsync(A/R.part)` | the data is durable |
-| M6 | `rename(A/R.part, A/R)` (atomic, one filesystem) | `A/R` appears complete, because M5 came first |
+| M6 | `renameat2(A/R.part, A/R, RENAME_NOREPLACE)` (rustix; atomic, one filesystem; an existing `A/R` is an error, never silently replaced) | `A/R` appears complete, because M5 came first |
 | M7 | fsync the archive directory that contains `R` | the rename is durable |
 | M8 | `UPDATE segments SET tier = 1 WHERE id = ? AND tier = 0`, exactly one row (WAL, `synchronous = FULL`: committed and durable on return) | **the commit point** |
 | M9 | `unlink(H/R)` (`ENOENT` is fine), then fsync `H`'s directory (best effort: correctness does not depend on it) | the hot copy is gone |
 
-**Crash points** (state = what exists after the power cut or `kill -9`; "recovers" = what the reconciliation of
-section 9 does, in the order the rules are listed there):
+An I/O error at M2-M8 abandons the move (the `.part` is unlinked best effort) and counts a **move failure**; three
+consecutive move failures make the archive unavailable (section 8). A successful move resets the count.
+
+**Crash points** (state = what exists after the power cut or `kill -9`; "recovers" = the cell of the section 9 decision
+table that matches, `H`, `A` = hot and archive file, `R` = row; a `.part` is handled first by the `.part` rule):
 
 | crash after | files | row | recovery |
 |---|---|---|---|
-| before M3 / M3 | hot file | hot | nothing to do |
-| during M4 / after M4, before M5 | hot + partial `A/R.part` | hot | rule 1 deletes the `.part`; the hot copy is authoritative; the next tick moves again |
+| before M3 | hot file | hot | consistent (H valid, A none, R hot) |
+| during M3 / M4, before M5 | hot, plus an absent, empty or partial `A/R.part` | hot | the `.part` rule deletes it; consistent as above; the next tick moves again |
 | after M5, before M6 | hot + complete `A/R.part` | hot | same (the `.part` is deleted and copied again; correct, merely wasteful) |
-| after M6, before M7 | hot + `A/R` (it may or may not survive a power cut, but if present it is complete) | hot | present: rule 5 (both tiers, row hot, archive size equals `bytes`) rolls **forward**: set `tier = 1`, delete the hot file. Absent: nothing |
-| after M7, before M8 | hot + `A/R` | hot | rule 5, roll forward |
+| after M6, before M7 | hot + `A/R` (it may or may not survive a power cut, but if present it is complete) | hot | present: H valid, A valid, R hot: roll **forward** (set `tier = 1`, delete hot). Absent: consistent |
+| after M7, before M8 | hot + `A/R` | hot | H valid, A valid, R hot: roll forward |
 | during M8 | WAL commit is atomic: either the row is still hot (as above) or archive (next line) | either | as the matching line |
-| after M8, before M9 | hot + `A/R` | archive | rule 6 (both tiers, row archive): keep the archive copy, delete the hot file |
-| after M9 | `A/R` | archive | nothing to do |
+| after M8, before M9 | hot + `A/R` | archive | H valid, A valid, R archive: delete the hot file |
+| after M9 | `A/R` | archive | consistent (H none, A valid, R archive) |
 
 At every crash point at least one complete copy exists and the row points at a tier where a complete copy exists:
 before M8 the row says hot and the hot file is untouched; after M8 the row says archive and `A/R` was made durable at
 M7, which came first. Unlinking the hot file is the **last** step, so no crash can lose the only copy.
 
-**Delete (eviction) of segment S:** unlink the file(s) first (a second copy on the other tier too, if present), then
-`DELETE FROM segments WHERE id = ?`. Crash in between leaves a row without a file, which rule 3 deletes and counts. The
-opposite order would leave a file without a row, and rule 4 would adopt it again: an evicted segment would come back.
-(This **overrides** #58's "runs `Index::delete` and unlinks".)
+**Delete (eviction) of segment S:** unlink the hot copy, then the archive copy (when each exists and, for the archive,
+when it is available), then `DELETE FROM segments WHERE id = ?`. A crash in between leaves a row without a file or a
+row whose other copy still exists, which the decision table handles (H none, A none, R present: delete the row; H none,
+A valid, R archive: consistent, evicted again later). The opposite order would leave a file without a row, and the table
+would adopt it again: an evicted segment would come back. (This **overrides** #58's "runs `Index::delete` and unlinks".)
 
 **Readers during a move** (#62): the API looks up the row, joins the path for the row's tier and opens the file. A
 download that already has the file open keeps it through the unlink (POSIX semantics, #62 tests it). A request that
 read `tier = hot` but opens after M9 gets `ENOENT`: it re-reads the row once and, if the tier changed, opens the
 archive copy; otherwise it returns 404.
 
-### 8. Volume safety
+### 8. Volume safety and the archive state
 
-The probe refuses to start the storage loop or the recorder when the hot or archive root is missing, when both are
-on the same filesystem (same `st_dev`; allowed only by an explicit test switch, #58), or when the archive root is a
-plain directory on the root filesystem (this is the same `st_dev` check, because the archive is a separate mount
-point). With `nofail` in fstab, a missing HDD is therefore a reported degraded state (section 6, case 2), not a silent
-fill of the SSD. Index and vault live under `/var/lib/wardenlens`, not on a recordings volume.
+**Hot root.** A missing, non-directory, unwritable or otherwise unusable **hot** root (or an index that cannot be
+opened) is the only volume problem that makes `wardenlens serve` refuse to start.
+
+**Archive state (`ArchiveState`) has one definition, used at boot and at every tick.** The archive is **unavailable**
+when any of these holds, and **available** otherwise:
+
+1. the archive root is missing or not a directory;
+2. it is on the same filesystem as the hot root (same `st_dev`; this also catches an unmounted HDD: with `nofail` in
+   fstab the mount point is then a plain, empty directory on the root filesystem, and writing to it would fill the
+   SSD). An explicit test switch allows it in tests (#58);
+3. `statvfs` reports `ST_RDONLY` (ext4 `errors=remount-ro` after an I/O error, a read-only mount);
+4. the marker file `<archive>/.wardenlens-archive` is missing. The operator creates it once on the mounted archive
+   (`wardenlens storage mark-archive`, #64/#68). It is what tells our archive from an empty replacement disk or a stale
+   mount point;
+5. three consecutive move failures (section 7), cleared by the next probe that can create, fsync and remove a small
+   `<archive>/.wl-probe` file.
+
+Checks 1-4 cost a `stat`, a `statvfs` and a `stat` and are **re-probed every tick**, so the state recovers by itself
+when the disk comes back. **One boot behaviour for every unavailable case:** the service starts, the recorder and the
+storage loop run in `archive_unavailable` mode (section 6, case 2: delete the oldest hot segments to hold the floor),
+the state is reported (`/api/v1/storage`, #63) and logged by tier only. It does not refuse to start and it does not
+stop recording. When the state changes from unavailable to available, the storage loop first runs the section 9
+decision table for the archive side (the "archive returned" pass) and only then plans moves. Index and vault live
+under `/var/lib/wardenlens`, not on a recordings volume.
 
 ### 9. Reconciliation after a crash or restart
 
-Runs at start-up **before** any recorder or storage loop starts (#68), holding the process lock. It walks both
-roots to depth 4, never follows symlinks (`lstat`; anything that is not a regular file or directory is reported and
-left), and treats only paths that match the section 3 patterns as ours. **Anything else is left in place and reported**
-(it may be the owner's). A walk is also bounded in entries (default 5,000,000) and fails with a typed error beyond
-that (SEC-2). Rules, applied in this order; "size" is the file size compared with the row's `bytes`, which is the
-ground truth because rows are written after the final file size is known:
+**Order at start-up (#68):** take the process lock, open and migrate the index, **probe both volumes (section 8)**, run
+this reconciliation, then start the storage loop and the recorders. The probe comes first because reconciliation must
+know whether the archive can be seen at all: an unmounted HDD looks exactly like an archive with no files, and
+concluding "the file is gone" from it would delete about 7 days of index. **When the archive is unavailable,
+reconciliation never concludes anything from an absent archive file**: it keeps every archive row and every archive
+file untouched, evaluates only what the hot root shows, and reports `archive_unavailable` plus the number of
+`unverified` rows.
 
-1. `*.mp4.part` in either root: **delete** (hot: an interrupted segment, at most one per camera per crash, at most
-   about 120 s each; archive: an interrupted move). v1 does not salvage a hot `.part` (the fMP4 structure would allow
-   truncating to the last complete `moof`+`mdat` pair; see follow-ups).
-2. A `.mp4` with a row **on the same tier** and equal size: consistent, nothing to do. A different size: untrusted file,
-   **quarantine** it (rename into `<root>/quarantine/...`, same relative path), delete the row, count `size_mismatch`.
-3. A row with **no file on either tier**: delete the row, log, count `missing`.
-4. A `.mp4` with **no row** (a crash between the recorder's rename and `Index::insert`, or a file put there by hand
-   with a valid name): **adopt it**. `started_at_ms` comes from directory date and file name, `camera_id` from the
-   directory (both validated, section 3); `bytes` from the file size; `duration_ms` and `frame_count` from a bounded
-   walk of its `moof` boxes (sum of `trun` sample durations and counts, a limit of 100,000 fragments and 1 GiB). The file
-   must have `ftyp`, `moov` and at least one complete `moof`+`mdat` pair and no trailing partial box; then the row
-   is inserted. Otherwise **quarantine**. Adoption is the choice over deleting: the file was fully synced before its
-   rename (section 3), so it is real video that only lacks a row. (This settles the "indexed or quarantined" choice of #59.)
-5. Both tiers have the file, row says **hot**: if the archive size equals `bytes`, **roll forward**: set `tier = 1`,
-   delete the hot file. Otherwise (archive copy wrong): delete the archive file, keep hot.
-6. Both tiers have the file, row says **archive**: if the archive size equals `bytes`, delete the hot file. Otherwise
-   if the hot size equals `bytes`, roll **back**: set `tier = 0`, delete the archive file. Neither equal: quarantine both,
-   delete the row.
-7. File on only one tier and the row names the **other** tier: if the size equals `bytes`, set the row to the tier
-   where the file is (the file is the truth); otherwise quarantine and delete the row.
+**Walk.** It walks both roots to depth 4, never follows symlinks (`lstat`; anything that is not a regular file or
+directory is reported as `unknown_left` and left, and the key it would belong to is skipped), and treats only paths that
+match the section 3 patterns as ours. **Anything else is left in place and reported** (it may be the owner's). The
+walk is bounded in entries (default 5,000,000) and fails with a typed error beyond that (SEC-2). Reports contain
+**counts and the tier only, never a file name or a path** (the names carry camera ids and times).
 
-The result is a report with counts per category (`part_deleted`, `rolled_forward`, `rolled_back`, `missing`, `adopted`,
-`quarantined`, `size_mismatch`, `unknown_left`), logged by tier only, and the post-condition "every row has exactly one
-file on its tier and every `.mp4` has a row". Quarantined files stay out of the index, count against the floor and are
-the first eviction candidates (section 6). Periodic scrubbing and bit-rot checks are out of scope.
+**`.part` files first.** `*.mp4.part` in the hot root: **delete** (an interrupted segment, at most one per camera per
+crash, at most about 120 s each). In the archive root: delete (an interrupted move), only when the archive is
+available. v1 does not salvage a hot `.part` (the fMP4 structure would allow truncating to the last complete
+`moof`+`mdat` pair; see follow-ups).
+
+**Then per key.** A **key** is `(camera_id, started_at_ms)`: the path of a file and the unique columns of a row. For each
+key the reconciliation looks at the hot file `H`, the archive file `A` and the row `R` **together** and applies exactly
+one cell of the table. This replaces a rule list: no combination is undefined and a rule cannot be unreachable behind
+another. Definitions:
+
+- *none*: no file at that path. *valid*: a regular file; if a row exists its size equals the row's `bytes`; if there is
+  no row, it passes the adoption parser below. *invalid*: a regular file that is not valid.
+- *keep row* means the row, **and therefore its `id`, is unchanged**. An id is never reassigned while a row exists, and
+  a deleted row's id is never reused (`AUTOINCREMENT`, section 5).
+- *quarantine X*: rename the file into `<its root>/_quarantine/<camera>/<day>/<name>` (the same relative path, same
+  filesystem). The `_quarantine` directory name can never equal a `CameraId` (a camera id must start with a letter), so
+  it cannot collide with a camera directory.
+- *adopt X as tier T*: insert a row from the file (below) with `tier = T`.
+
+**Archive available.** (`-` = nothing to do.)
+
+| row | H | A | action |
+|---|---|---|---|
+| none | none | valid | adopt A as archive |
+| none | none | invalid | quarantine A |
+| none | valid | none | adopt H as hot (a crash between the recorder's rename and `Index::insert`) |
+| none | valid | valid | adopt A as archive, delete H (keep the archive copy) |
+| none | valid | invalid | adopt H as hot, delete A |
+| none | invalid | none | quarantine H |
+| none | invalid | valid | adopt A as archive, delete H |
+| none | invalid | invalid | quarantine H and A |
+| hot | none | none | delete the row, count `missing` |
+| hot | none | valid | set `tier = archive` (the file is the truth) |
+| hot | none | invalid | quarantine A, delete the row |
+| hot | valid | none | - (consistent) |
+| hot | valid | valid | roll **forward**: set `tier = archive`, delete H (crash after M6, M7 or before M8) |
+| hot | valid | invalid | delete A, keep H |
+| hot | invalid | none | quarantine H, delete the row |
+| hot | invalid | valid | set `tier = archive`, delete H |
+| hot | invalid | invalid | quarantine H and A, delete the row |
+| archive | none | none | delete the row, count `missing` |
+| archive | none | valid | - (consistent) |
+| archive | none | invalid | quarantine A, delete the row |
+| archive | valid | none | set `tier = hot` (the file is the truth) |
+| archive | valid | valid | delete H (crash after M8, before M9) |
+| archive | valid | invalid | roll **back**: set `tier = hot`, delete A |
+| archive | invalid | none | quarantine H, delete the row |
+| archive | invalid | valid | delete H, keep the row |
+| archive | invalid | invalid | quarantine H and A, delete the row |
+
+**Archive unavailable.** The archive is not observable, so `A` is *unknown*, not *none*, and nothing is concluded from
+it. Every archive row is kept; archive files are not touched.
+
+| row | H | action |
+|---|---|---|
+| none | none | - (no key) |
+| none | valid | adopt H as hot (if an archive twin exists, the "archive returned" pass resolves it by the table above) |
+| none | invalid | quarantine H |
+| hot | none | keep the row, count `unverified` (the archive may hold the file; the "archive returned" pass decides) |
+| hot | valid | - (consistent) |
+| hot | invalid | quarantine H, keep the row, count `unverified` |
+| archive | none | keep the row, count `unverified` |
+| archive | valid | keep the row and H (the archive copy is unverified, so H is not deleted) |
+| archive | invalid | quarantine H, keep the row, count `unverified` |
+
+**Checked against the move crash table (section 7):** every crash row maps to one cell: before M3 and the `.part`
+rows to (hot, valid, none); after M6 and M7 to (hot, valid, valid) or (hot, valid, none); after M8 to (archive, valid,
+valid); after M9 to (archive, none, valid). The delete protocol's crash leaves (hot or archive, none, none), (archive,
+none, valid) or the same with the archive unknown. The recorder's crash between rename and insert is (none, valid,
+none). A move that was interrupted while the archive was unmounted is only ever (hot, valid, none) in the unavailable
+table.
+
+**Adoption parser (untrusted input).** A file without a row is not trusted: it may be a tampered or foreign file with
+a valid name. `started_at_ms` comes from the directory date and file name and `camera_id` from the directory (both
+validated, section 3); `bytes` from the file size; `duration_ms` and `frame_count` from a bounded walk of the boxes,
+which must reject, with typed errors and no panic: a box size of 0 or below 8; a `largesize` (size field 1) beyond the
+file or the parent (or reject `largesize` altogether: our writer never produces it); a child that does not lie inside
+its parent; a trailing partial box; `sample_count * entry_size` greater than the box payload (checked before any
+allocation and before iterating); more than 100,000 fragments or more than 1 GiB; and every sum is a checked `u64`.
+The file must have `ftyp`, `moov` and at least one complete `moof`+`mdat` pair. The duration is the sum of `trun`
+sample durations in ticks, converted to ms **rounding up**, minimum 1, and must be within the column's `CHECK`; if it
+violates a constraint, or **any index insert fails**, the file is quarantined, never retried in a loop. The same rule
+applies to the recorder's own insert after the rename (section 3). Adoption rather than deletion is chosen because
+the file was fully synced before its rename (section 3), so it is real video that only lacks a row; this settles
+the "indexed or quarantined" choice of #59.
+
+**Result.** A report with counts per category (`part_deleted`, `rolled_forward`, `rolled_back`, `missing`, `adopted`,
+`quarantined`, `size_mismatch`, `unverified`, `unknown_left`, `archive_unavailable`), logged by tier only, and the
+post-condition (archive available) "every row has exactly one file, on its tier, and every `.mp4` has a row". Quarantined
+files stay out of the index, count against the floor and are the first eviction candidates (section 6). Periodic
+scrubbing and bit-rot checks are out of scope.
 
 ### 10. Worked example with real numbers
 
 Inputs: 5 main streams at the ADR 0002 bitrates (`reolink-1` 2.9, `reolink-2` 2.9, `xr` 4.3, `tapo` 0.19, `hdipc`
-8.6 Mbit/s); container overhead 0.53 % (measured above); hot volume 982,240,026,624 B; archive volume
-1,998,980,898,816 B (the host values above); min free 25 % on both; headroom 1 pp; `hot_max_age` 12 h; one
-segment per camera per minute. Decimal GB (10^9).
+8.6 Mbit/s); container overhead 0.53 % (measured above); min free 25 % on both; headroom 1 pp; `hot_max_age` 12 h; one
+segment per camera per minute. Decimal GB (10^9). Volumes (`stat -f`, 4,096-byte blocks, read 2026-11-23):
+
+| volume | `f_blocks` | `f_bfree` | `f_bavail` | capacity = (blocks - bfree + bavail) x 4,096 | available |
+|---|---|---|---|---|---|
+| hot (SSD, root fs) | 239,804,694 | 165,906,465 | 153,706,632 | **932,269,510,656 B** | 629,582,364,672 B |
+| archive (HDD) | 488,032,446 | 488,031,927 | 488,027,831 | **1,998,964,121,600 B** | 1,998,961,995,776 B |
+
+The hot volume's raw size is 982,240,026,624 B; 49,970,515,968 B of it is the ext4 reserve and is excluded.
 
 **Recording rate.**
 
@@ -463,39 +590,40 @@ segment per camera per minute. Decimal GB (10^9).
 
 The tapo figure was measured on a static scene and will rise with motion; hdipc alone is 46 % of the volume.
 
-**Capacity.** Floors: hot `982,240,026,624 x 25 % = 245,560,006,656` B; archive `1,998,980,898,816 x 25 % =
-499,745,224,704` B. With the hot volume as measured (629,302,824,960 B available) the headroom above the floor is
-383,742,818,304 B, which is 1.87 days of recording; the archive's usable space above its floor is 1,499,235,674,112 B,
-**7.31 days**. With `hot_max_age` 12 h the hot tier holds about 102.5 GB (12 h) and never reaches its floor at this
-rate, so steady state is: 12 h hot, then archive, and the oldest archive video is deleted once the archive reaches
-its floor. The retention a user gets today is therefore about **7.3 days + 12 h, roughly 7.8 days**. If the same
-five cameras recorded at twice the rate, the same disks hold about 3.9 days (the planner needs no change, only the
-numbers do).
+**Capacity.** Floors (25 % of capacity): hot `932,269,510,656 x 25 % = 233,067,377,664` B; archive
+`1,998,964,121,600 x 25 % = 499,741,030,400` B. With the hot volume as measured (629,582,364,672 B available) the room
+above the floor is 396,514,987,008 B, which is 1.93 days of recording; the archive's usable space above its floor is
+1,499,223,091,200 B, **7.31 days**. With `hot_max_age` 12 h the hot tier holds about 102.5 GB (12 h) and never
+reaches its floor at this rate, so steady state is: 12 h hot, then archive, and the oldest archive video is deleted
+once the archive reaches its floor. The retention a user gets today is therefore about **7.3 days + 12 h, roughly
+7.8 days**. If the same five cameras recorded at twice the rate, the same disks hold about 3.9 days (the planner needs
+no change, only the numbers do).
 
 **A floor-driven tick (both volumes at their floors).** Suppose `hot_max_age` is set high, so the hot tier fills
-until the floor, and the archive has been at its floor for a while. State at a tick:
+until the floor, and the archive has been at its floor for a while. State at a tick (available space):
 
-- hot: free 245,400,000,000 B = 24.98 % (below 25 % by 160,006,656 B);
-- archive: free 499,800,000,000 B = 25.003 % (just above the floor).
+- hot: available 232,907,377,664 B = 24.98 % of capacity (below the floor by 160,000,000 B);
+- archive: available 499,796,030,400 B = 25.003 % of capacity (just above the floor).
 
-1. Hot target = floor + 1 pp = 245,560,006,656 + 9,822,400,266 = **255,382,406,922** B free. Bytes to move out of hot:
-   255,382,406,922 - 245,400,000,000 = **9,982,406,922** B, which is about 70 minutes of the 142.42 MB-per-minute
-   stream, i.e. about 350 oldest segments (9,982,406,922 / 28.48 MB).
-2. Archive after absorbing them: 499,800,000,000 - 9,982,406,922 = 489,817,593,078 B, **below** its floor of
-   499,745,224,704. The archive target is floor + 1 pp = 499,745,224,704 + 19,989,808,988 = **519,735,033,692** B, so
-   the planner must delete 519,735,033,692 - 489,817,593,078 = **29,917,440,614** B first, which is 0.146 days (3.5 h)
-   of the oldest archived video, about 1,050 oldest segments.
+1. Hot target = floor + 1 pp = 233,067,377,664 + 9,322,695,106 = **242,390,072,770** B available. Bytes to move out of
+   hot: 242,390,072,770 - 232,907,377,664 = **9,482,695,106** B, which is about 67 minutes of the 142.42 MB-per-minute
+   stream, i.e. about 333 oldest segments (9,482,695,106 / 28.48 MB).
+2. Archive after absorbing them: 499,796,030,400 - 9,482,695,106 = 490,313,335,294 B, **below** its floor of
+   499,741,030,400. The archive target is floor + 1 pp = 499,741,030,400 + 19,989,641,216 = **519,730,671,616** B, so
+   the planner must delete 519,730,671,616 - 490,313,335,294 = **29,417,336,322** B first, which is 3.4 h of the oldest
+   archived video, about 1,033 oldest segments.
 3. Plan order: all `Delete` actions for the oldest archive segments, then `MoveToArchive` for the oldest hot segments,
    each move following M1-M9.
-4. Execution: at 64 actions per tick and 30 s ticks, this catch-up takes about 22 ticks (1,050 + 350 actions), roughly
+4. Execution: at 64 actions per tick and 30 s ticks, this catch-up takes about 22 ticks (1,033 + 333 actions), roughly
    11 minutes. In steady state the loop only handles what was recorded since the last tick: 30 s of recording is 2.5
    segments (71 MB), so one tick is a handful of actions.
-5. Copy volume: 9.98 GB moved to the HDD; at the average input of 2.37 MB/s the HDD is idle most of the time. I did not
+5. Copy volume: 9.48 GB moved to the HDD; at the average input of 2.37 MB/s the HDD is idle most of the time. I did not
    measure the HDD's write speed, so the catch-up time above is bounded by the action count, not by the disk.
 
-**Archive missing:** the same hot state with the archive unmounted gives `Delete` of the oldest hot segments totalling
-9,982,406,922 B (about 70 minutes of video) and the state `archive_unavailable`; the SSD keeps its floor and
-`floor_breaches_total` increases once.
+**Archive missing (at boot or later):** the same hot state with the archive unmounted gives `Delete` of the oldest hot
+segments totalling 9,482,695,106 B (about 67 minutes of video) and the state `archive_unavailable`; the SSD keeps its
+floor, `floor_breaches_total` increases once, and the roughly 7 days of archive rows (about 50,000 rows) stay in the
+index untouched until the disk returns, when the "archive returned" pass reconciles them.
 
 **Segment-rule example (hdipc, GOP 3.5 s):** keyframes fall at multiples of 3.5 s (59.5 s, 63 s), so the first keyframe at or after the
 60 s target is at 63 s: the segment closes with 63 s of media time (one file of about 68.1 MB) and the next file starts at
@@ -508,16 +636,17 @@ dropped and counted as a gap.
 | question | decision |
 |---|---|
 | muxer | in-house minimal fMP4 box writer in `wardenlens-mp4`, no dependency; `mp4-atom` 0.17.1 is the documented fallback; `mp4` 0.14.0 rejected (no fragmented writer, last release 2023-08-01) |
-| segment | target 60 s, cut only at a keyframe, hard maximum 120 s (closed on the frame, resume at next keyframe), first segment at the first keyframe, fragment = one GOP, caps 16 MiB per fragment, 1 GiB per segment, 8 MiB per frame |
-| timestamps | index: arrival wall clock UTC ms, `started_at_ms` strictly increasing per camera, `duration_ms` = media duration; file: 90 kHz media time from 0 per file, `dts = max(rtp - rtp0, prev + 1)`, 10 s re-base |
-| layout | `<root>/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4`, UTC, identical relative path on both tiers, `.part` while writing, quarantine under `<root>/quarantine/`; paths derived from validated id and time, **not stored** |
-| segment close | write, `fsync(file)`, `rename`, `fsync(dir)`, then `Index::insert` |
-| SQLite | `rusqlite` 0.43.0, `default-features = false`, `bundled` (SQLite 3.54.1); WAL, `synchronous = FULL`, `foreign_keys = ON`, `application_id`; synchronous API with `spawn_blocking` callers |
+| segment | target 60 s, cut only at a keyframe, hard maximum 120 s (closed on the frame, resume at next keyframe; `segment_target_secs` 10-290), first segment at the first keyframe, fragment = one GOP, caps 16 MiB per fragment, 1 GiB per segment, 8 MiB per frame; `mvhd`/`mehd` duration patched before the fsync |
+| timestamps | index: arrival wall clock UTC ms, `started_at_ms` strictly increasing per camera, `duration_ms` = media duration (ticks to ms rounded up, min 1), `started_at_ms` seeded from `MAX` in the index, wall clock before 2000 holds recording off; file: 90 kHz media time from 0 per file, `dts = max(rtp - rtp0, prev + 1)`, 10 s re-base |
+| layout | `<root>/<camera_id>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4`, UTC, identical relative path on both tiers, `.part` while writing, quarantine under `<root>/_quarantine/` (cannot be a `CameraId`); paths derived from validated id and time, **not stored**; opened with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through a root handle |
+| segment close | write, patch durations, `fsync(file)`, `renameat2(RENAME_NOREPLACE)`, `fsync(dir)`, then `Index::insert`; an insert failure quarantines the file |
+| SQLite | `rusqlite` 0.43.0, `default-features = false`, `bundled` (SQLite 3.54.1); WAL, `synchronous = FULL`, `foreign_keys = ON`, `application_id`; the file is opened with the ADR 0006 open helper; synchronous API with `spawn_blocking` callers |
 | migrations | in-house ordered scripts, `PRAGMA user_version` in the same transaction; newer version is an error |
-| tables | `segments`, `cameras` (no credential, host or name columns, ADR 0006), `api_tokens` (ADR 0004); indexes as in section 5 |
-| tier policy | move on hot floor (to floor + 1 pp) or hot age (12 h); evict archive oldest first before a move that would breach its floor; floor wins over video when the archive is unavailable; defaults 25 %, 12 h, 64 actions per tick |
-| move protocol | copy to `.part`, fsync, rename, fsync dir, `UPDATE tier` (durable), then unlink hot; delete = unlink then `DELETE` row |
-| reconciliation | rules 1-7 of section 9: delete `.part`, adopt orphan files, delete rows without files, roll forward or back by size, quarantine the untrusted, leave unknown files |
+| tables | `segments` (`AUTOINCREMENT` id), `cameras` (no credential, host or name columns, ADR 0006; length checks), `api_tokens` (ADR 0004; length checks); indexes as in section 5 |
+| tier policy | floor arithmetic on available space (`capacity = (blocks - bfree + bavail) x frsize`); move on hot floor (to floor + 1 pp) or hot age (12 h); evict archive oldest first before a move that would breach its floor; floor wins over video when the archive is unavailable; defaults 25 %, 12 h, 64 actions per tick |
+| move protocol | copy to `.part`, fsync, `renameat2(RENAME_NOREPLACE)`, fsync dir, `UPDATE tier` (durable), then unlink hot; delete = unlink then `DELETE` row; a bad hot file is quarantined at run time so the mover never stalls |
+| archive state | one definition at boot and every tick: unavailable when missing, same filesystem, `ST_RDONLY`, marker `.wardenlens-archive` missing, or 3 consecutive move failures; then the service **still starts and records**, deleting the oldest hot to hold the floor; only a bad **hot** root refuses to start |
+| reconciliation | volumes probed **first**; a per-key `(camera_id, started_at_ms)` decision table over hot file, archive file and row (27 cells with the archive available, 9 without); with the archive unavailable nothing is concluded from an absent archive file and archive rows are kept; counts and tier only in reports |
 
 ## Downstream tickets
 
@@ -529,22 +658,22 @@ bodies read on 2026-11-23.
 |---|---|
 | #43 (core camera model) | `CameraId` is also the path component (SEC-4) and the `segments.camera_id` value; no change to the type |
 | #44 (core planner) | `Policy { hot_min_free, archive_min_free, hot_max_age }` and a fixed 1 pp headroom; actions are moves and deletes in the order of section 6 (archive deletions first, then moves), `now` is an input; hot deletes only when the archive is unavailable (an input `ArchiveState`) or a move is impossible; `PlanError` for the unsatisfiable cases; the unit test reproduces the worked example of section 10 to the byte, plus the proptest |
-| #45 (core segmenter, media clock) | the rules of section 2: target 60 s (10-300), hard maximum 2x target closed on the frame, byte and fragment caps, `dts = max(rtp - rtp0, prev + 1)` (clamp, not accumulate), 32-bit unwrap, 10 s re-base; `SegmentRecord { camera, started_at_ms, duration_ms, bytes, frame_count }` (`ended_at_ms` derived); also the pure `RelPath` (`new(&CameraId, started_at_ms)` and a strict `FromStr`) shared by recorder, storage, index and api; tests from the ADR 0002 jitter patterns |
-| #46 (Clock) | returns UTC Unix milliseconds (a newtype); the recorder uses it for `started_at_ms` |
-| #47 (service config) | keys `storage.hot_root`, `storage.archive_root`, `storage.hot_min_free_percent`, `storage.archive_min_free_percent` (0-90, default 25), `storage.hot_max_age` (default 12 h), `recording.segment_target_secs` (10-300, default 60), `storage.max_actions_per_tick` (default 64); roots must be absolute |
-| #49 (index) | **overrides:** no `schema_version` table: `PRAGMA user_version` with in-house scripts; **no `rel_path` column**: `insert(SegmentRecord, tier)` and `set_tier(id, tier)` carry no path; `synchronous = FULL`, `application_id`, `SQLITE_OPEN_NOFOLLOW`; schema and indexes as in section 5; `rusqlite` 0.43.0 `default-features = false`, `bundled`; the `EXPLAIN QUERY PLAN` test asserts the plans of section 5; sync API |
-| #50 (cameras table) | columns exactly as in section 5 (ADR 0006 authoritative); no foreign key from `segments`; `remove` leaves segments (orphans by `LEFT JOIN`) |
+| #45 (core segmenter, media clock) | the rules of section 2: target 60 s (10-**290**, so the hard maximum stays under the 600 s `CHECK`), hard maximum 2x target closed on the frame, ticks to ms rounded **up** (min 1), byte and fragment caps, `dts = max(rtp - rtp0, prev + 1)` (clamp, not accumulate), 32-bit unwrap, 10 s re-base; `SegmentRecord { camera, started_at_ms, duration_ms, bytes, frame_count }` (`ended_at_ms` derived); also the pure `RelPath` (`new(&CameraId, started_at_ms)` and a strict `FromStr`) shared by recorder, storage, index and api; tests from the ADR 0002 jitter patterns; the `MediaClock` is not trusted before the #55 reordering check passes |
+| #46 (Clock) | returns UTC Unix milliseconds (a newtype); the recorder uses it for `started_at_ms`; a value before the year 2000 (946,684,800,000 ms) is reported as an error the recorder holds off on |
+| #47 (service config) | keys `storage.hot_root`, `storage.archive_root`, `storage.hot_min_free_percent`, `storage.archive_min_free_percent` (0-90, default 25), `storage.hot_max_age` (default 12 h), `recording.segment_target_secs` (10-**290**, default 60), `storage.max_actions_per_tick` (default 64); roots must be absolute |
+| #49 (index) | **overrides:** no `schema_version` table: `PRAGMA user_version` with in-house scripts; **no `rel_path` column**: `insert(SegmentRecord, tier)` and `set_tier(id, tier)` carry no path; `synchronous = FULL`, `application_id`; the file open **reuses the ADR 0006 open helper** (`O_NOFOLLOW` + `fstat` + `SQLITE_OPEN_NOFOLLOW` + device/inode compare); `segments.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`; schema and indexes as in section 5; `MAX(started_at_ms)` per camera is available for the recorder's seed; `rusqlite` 0.43.0 `default-features = false`, `bundled`; the `EXPLAIN QUERY PLAN` test asserts the plans of section 5; sync API |
+| #50 (cameras table) | columns exactly as in section 5 (ADR 0006 authoritative) with the length `CHECK`s on `model` (64), `main_path` and `sub_path` (512); **rejects** a camera path containing `@`, `user=`, `password=` or `pwd=` (case-insensitive) at parse and on read; no foreign key from `segments`; `remove` leaves segments (orphans by `LEFT JOIN`) |
 | #54 (mp4 crate) | in-house writer, no new dependency; the layout of section 3 (`default-base-is-moof`, `tfdt` v1, `trun` flags `0x000701`, sample flags `0x02000000`/`0x01010000`, SPS/PPS only in `avcC`, no composition offsets), fragment per GOP, checked `u32` sizes; golden-structure tests and the `#[ignore]` ffprobe/ffmpeg decode test (frame hashes equal to the source, as in this ADR's prototype); a documented fallback to `mp4-atom` |
-| #55, #56 (ingest) | deliver the RTP timestamp, the arrival time from `Clock`, SPS/PPS and a discontinuity flag per frame; #55 verifies on the five main streams that there is no frame reordering (`has_b_frames`/`pic_order_cnt_type`), see open risk 1 |
-| #57 (recorder) | layout and close sequence of sections 2 and 3 (`.part` -> fsync -> rename -> fsync dir -> `Index::insert`); `started_at_ms` strictly increasing per camera; a crash leaves at most one `.part` **per camera**; the path is `RelPath`, containment asserted; files `0600`, directories `0700` |
-| #58 (storage) | the move sequence M1-M9 of section 7 (hot `unlink` last; `set_tier(id, tier)`); delete = unlink **then** `Index::delete` (overrides "Index::delete and unlinks"); `rustix` for `statvfs`; same-filesystem refusal; archive-unavailable handling; quarantine files evicted first; fault-injection tests at every crash point of the table |
-| #59 (reconciliation) | rules 1-7 of section 9 (overrides "indexed with duration read from moof headers or quarantined": **adopt, else quarantine**; `.part` deleted in both roots; roll-forward/back by size); walk depth 4 and an entry cap; report categories as listed; one test per crash row |
-| #62 (recordings API) | the path comes from `RelPath::new(camera_id, started_at_ms)` of the row, **not from a stored path** (overrides "root + relative path from the index"); one re-read of the row after `ENOENT`; containment check; range requests |
-| #63 (storage endpoint) | adds `archive_unavailable` to the state; `free_percent` is `f_bavail * 100 / f_blocks`; quarantine count |
-| #65 (token CLI) | the `api_tokens` DDL of section 5 (migration 3); `last_used_at_ms` nullable; rows never deleted |
-| #68 (serve) | order at start-up: take the process lock, open and migrate the index, **run reconciliation**, then start the storage loop and recorders; refuse a second instance |
-| #69 (Docker) | volumes for the hot root, the archive root and `/var/lib/wardenlens` (index and vault, which are not on a recordings volume); a C compiler in the build stage for `rusqlite` `bundled`; the archive mount must be a separate filesystem |
-| #70 (48 h gate) | the restart and hard-kill checks use the reconciliation report counts of section 9 and expect `quarantined = 0`, `size_mismatch = 0` |
+| #55, #56 (ingest) | deliver the RTP timestamp, the arrival time from `Clock`, SPS/PPS and a discontinuity flag per frame; #55 verifies on the five main streams that there is no frame reordering (`has_b_frames`/`pic_order_cnt_type`), see open risk 1; that check **blocks both the #45 `MediaClock` and #57** |
+| #57 (recorder) | layout and close sequence of sections 2 and 3 (`.part`, patch `mvhd`/`mehd` duration with `pwrite`, fsync, `renameat2(RENAME_NOREPLACE)`, fsync dir, `Index::insert`); **any insert failure quarantines the file**; `started_at_ms` strictly increasing per camera and **seeded from `MAX(started_at_ms)`** at start-up; a clock before 2000 holds recording off with a health warning; a crash leaves at most one `.part` **per camera**; the path is `RelPath` opened with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through a root handle (overrides "containment asserted") then `fstat`; files `0600`, directories `0700`; blocked by the #55 reordering check |
+| #58 (storage) | the move sequence M1-M9 of section 7 (hot `unlink` last; `set_tier(id, tier)`; M6 is `renameat2(RENAME_NOREPLACE)` via rustix); **M1 with a missing or wrong-size hot file skips the segment, quarantines or drops the row and continues**, so the mover never stalls; delete = unlink **then** `Index::delete` (overrides "Index::delete and unlinks"); floor arithmetic on `capacity` and `f_bavail` (section 6); `ArchiveState` of section 8: unavailable on missing root, same `st_dev`, `ST_RDONLY`, missing `.wardenlens-archive` marker or 3 consecutive move failures, re-probed every tick, **replaces "errors if hot and archive resolve to the same filesystem"** (unavailable mode, not an error); the "archive returned" reconciliation pass; `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` through root handles (overrides "canonicalize"); quarantine files evicted first; fault-injection tests at every crash point of the table |
+| #59 (reconciliation) | runs **after the volume probe**; the per-key decision table of section 9 (27 cells with the archive available, 9 without), one test per cell and per crash-table row; **required test: archive unmounted, every archive row is kept** (and no archive file touched); "both tiers, no row": keep the archive copy if it is a valid fMP4, else the hot copy, delete the other; ids never reassigned while a row exists; quarantine into `_quarantine/` (not `quarantine/`); overrides "indexed with duration read from moof headers or quarantined" (**adopt, else quarantine**) and "`.part` files in either root are deleted" (archive `.part` only when the archive is available); **the adoption parser treats files as untrusted** (reject box size 0 or below 8, `largesize` handled or rejected, each box inside its parent, `sample_count * entry_size <= payload`, checked `u64` sums, caps of 100,000 fragments and 1 GiB), ticks to ms rounded up (min 1), any index-insert failure quarantines; walk depth 4 and an entry cap; reports hold **counts and tier only, never file names**; also the "archive returned" pass used by #58 |
+| #62 (recordings API) | the path comes from `RelPath::new(camera_id, started_at_ms)` of the row, **not from a stored path** (overrides "root + relative path from the index"); one re-read of the row after `ENOENT`; the file is opened through the root handle with `openat2` `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` (overrides "canonicalised") and `fstat`ed; range requests; a `tier = archive` row with the archive unavailable is a 503, not a 404 |
+| #63 (storage endpoint) | adds `archive_unavailable` (and its cause class) to the state; `free_percent` is `f_bavail * 100 / capacity` with `capacity = (f_blocks - f_bfree + f_bavail) * f_frsize`; `unverified` and quarantine counts |
+| #65 (token CLI) | the `api_tokens` DDL of section 5 (migration 3) with the `CHECK (length(name) BETWEEN 1 AND 64)`; `last_used_at_ms` nullable; rows never deleted |
+| #68 (serve) | order at start-up: take the process lock, open and migrate the index, **probe both volumes**, run reconciliation, then start the storage loop and recorders; refuse a second instance; **one boot behaviour:** a missing, same-filesystem, read-only or unmarked archive starts in `archive_unavailable` mode (recording continues, oldest hot is deleted to hold the floor); only a missing or unusable **hot** root or an unopenable index refuses to start (overrides "refuses to start if hot or archive is missing or both are on one filesystem") |
+| #69 (Docker) | volumes for the hot root, the archive root and `/var/lib/wardenlens` (index and vault, which are not on a recordings volume); a C compiler in the build stage for `rusqlite` `bundled`; the archive mount must be a separate filesystem and carries the `.wardenlens-archive` marker file (created once with `wardenlens storage mark-archive`, a small subcommand for #64/#68) |
+| #70 (48 h gate) | the restart and hard-kill checks use the reconciliation report counts of section 9 and expect `quarantined = 0`, `size_mismatch = 0`; the restart test includes an archive-unmounted restart that keeps every archive row |
 | ADR 0006 / #74 | unchanged: follows `rusqlite` `bundled` (this ADR agrees) and keeps its own file |
 
 ## Consequences
@@ -567,7 +696,7 @@ bodies read on 2026-11-23.
 1. **B-frames not verified.** v1 writes PTS = DTS. If any main stream has frame reordering, durations and playback
    order are wrong. Check `has_b_frames` (or `pic_order_cnt_type`) on the five main streams while implementing #55.
    If a camera does reorder, switch `trun` to version 1 with composition offsets (a muxer-only change) and teach the
-   `MediaClock` the reorder depth. Proposed ticket: "spike: confirm no B-frames on the five main streams" (small,
+   `MediaClock` the reorder depth. Until the check passes, neither the #45 `MediaClock` nor #57 is trusted. Proposed ticket: "spike: confirm no B-frames on the five main streams" (small,
    needs the owner's LAN).
 2. **Tapo and hdipc bitrate in the example** are static-scene or single-sample figures (ADR 0002); real retention
    will vary with motion. The example is arithmetic on measured inputs, not a forecast.
