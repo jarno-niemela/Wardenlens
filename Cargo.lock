@@ -726,6 +726,7 @@ dependencies = [
 name = "wardenlens-vault"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rusqlite",
  "rustix",
  "secrecy",

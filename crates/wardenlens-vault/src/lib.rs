@@ -13,7 +13,9 @@ mod store;
 mod validate;
 
 pub use error::VaultError;
-pub use store::{BUSY_TIMEOUT, Entry, EntryInfo, MAX_ENTRIES, MAX_VALUE_LEN, Value, Vault};
+pub use store::{
+    BUSY_TIMEOUT, Entry, EntryInfo, MAX_ENTRIES, MAX_VALUE_LEN, Scan, Scannability, Value, Vault,
+};
 pub use validate::MIN_SCANNABLE_LEN;
 
 #[cfg(test)]

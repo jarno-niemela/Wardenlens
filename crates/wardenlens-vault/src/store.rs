@@ -10,11 +10,41 @@ use secrecy::{ExposeSecret, SecretString};
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_fsutil::{PrivateFile, open_private_file};
 use wardenlens_secrets::{
-    Credentials, KeyFile, RecordKind, SecretsError, open, open_credentials, seal, seal_credentials,
+    Credentials, KeyFile, MAX_RECORD_LEN, RecordKind, SecretsError, open, open_credentials, seal,
+    seal_credentials,
 };
 
 use crate::error::VaultError;
 use crate::validate::{check_credential, is_unscannable, normalize_text};
+
+/// How `set` decides whether the leak scan can use a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Scan {
+    /// Mark the entry unscannable only when the value is too short.
+    Normal,
+    /// The value is a credential or secret that already appears in tracked files (ADR 0006
+    /// section 4): it would match its own public occurrences, so it is always unscannable.
+    PublicOccurrence,
+}
+
+/// Whether the leak scan can use a stored value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Scannability {
+    /// The scan can use every needle of the value.
+    Scannable,
+    /// The value is too short or already public; the scan warns instead.
+    Unscannable,
+}
+
+impl Scannability {
+    /// True for [`Scannability::Unscannable`].
+    #[must_use]
+    pub fn is_unscannable(self) -> bool {
+        self == Self::Unscannable
+    }
+}
 
 /// Longest value (and each credential field) in bytes.
 pub const MAX_VALUE_LEN: usize = wardenlens_secrets::MAX_VALUE_LEN;
@@ -24,6 +54,7 @@ pub const MAX_ENTRIES: usize = 10_000;
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA_VERSION: i64 = 1;
+const INVALID_ID: &str = "(invalid id)";
 const KEYCHECK_ID: &str = "meta:keycheck";
 const KEYCHECK_PLAINTEXT: &[u8] = b"wardenlens-vault-keycheck-v1";
 
@@ -151,6 +182,23 @@ fn connect(
         }
     }
     let file = open_private_file(path)?;
+    if must_exist && file.created() {
+        // Lost a race with a deletion: `open` never creates a file.
+        let _ = std::fs::remove_file(path);
+        return Err(VaultError::NotFound);
+    }
+    if !must_exist {
+        // A non-empty file is a vault or somebody's data: never initialise over it, and
+        // refuse before SQLite touches it.
+        let len = file
+            .file()
+            .metadata()
+            .map_err(VaultError::io("inspecting vault file"))?
+            .len();
+        if len > 0 {
+            return Err(VaultError::AlreadyInitialized);
+        }
+    }
     between();
     let conn = Connection::open_with_flags(
         path,
@@ -182,7 +230,7 @@ impl Vault {
     /// Creates and initialises a new vault file (mode 0600) sealed under `key`.
     ///
     /// # Errors
-    /// [`VaultError::AlreadyInitialized`] if the file already holds a vault; the open-sequence
+    /// [`VaultError::AlreadyInitialized`] if the file already holds a vault or any data; the open-sequence
     /// refusals (symlink, wrong owner or mode, identity mismatch, unsafe parent, work tree).
     pub fn create(path: &Path, key: KeyFile) -> Result<Self, VaultError> {
         Self::create_with(path, key, || {})
@@ -272,7 +320,37 @@ impl Vault {
         if vault.count()? > MAX_ENTRIES {
             return Err(VaultError::TooManyEntries);
         }
+        vault.check_rows()?;
         Ok(vault)
+    }
+
+    /// Structural check of every row (ADR 0006 section 1): a valid id, a known kind and a
+    /// record within the size bound. Nothing is decrypted.
+    fn check_rows(&self) -> Result<(), VaultError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, length(record) FROM entries")
+            .map_err(VaultError::sqlite("check rows"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(VaultError::sqlite("check rows"))?;
+        for row in rows {
+            let (id, code, len) = row.map_err(VaultError::sqlite("check rows"))?;
+            if EntryId::new(&id).is_err() {
+                return Err(VaultError::corrupt(INVALID_ID));
+            }
+            let too_big = usize::try_from(len).map_or(true, |l| l > MAX_RECORD_LEN);
+            if kind_from_column(code).is_none() || too_big {
+                return Err(VaultError::corrupt(&id));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -289,10 +367,14 @@ impl Vault {
     }
 
     /// Stores `value` under `id`, replacing an existing entry. Returns whether the entry is
-    /// marked `unscannable` (too short for the scan, or `force_unscannable`).
+    /// marked unscannable (too short for the scan, or [`Scan::PublicOccurrence`]).
     ///
-    /// `force_unscannable` is for a value that already appears in tracked files and is a
-    /// credential or secret (ADR 0006 section 4): it would match its own public occurrences.
+    /// The `unscannable` column is not covered by the record's AAD (a deviation from the
+    /// strictest reading of ADR 0006). That is acceptable: anyone who can edit the column can
+    /// equally delete the row or the file, which already defeats the scan for that value, and
+    /// the flag only ever makes the scan warn, never hide a hit. The display-name rule here
+    /// checks the collapsed form and the slug without spaces; the squeeze table belongs to the
+    /// scanner (#75), which recomputes the flag from the squeezed needles.
     ///
     /// # Errors
     /// [`VaultError::InvalidValue`], [`VaultError::ValueTooLarge`],
@@ -302,8 +384,8 @@ impl Vault {
         id: &EntryId,
         kind: EntryKind,
         value: &Value,
-        force_unscannable: bool,
-    ) -> Result<bool, VaultError> {
+        scan: Scan,
+    ) -> Result<Scannability, VaultError> {
         let (record, short) = match (kind, value) {
             (EntryKind::Credential, Value::Credential(c)) => {
                 check_credential(&c.username, c.password.expose_secret())?;
@@ -314,14 +396,14 @@ impl Vault {
                 return Err(VaultError::ValueKindMismatch { kind });
             }
             (_, Value::Text(text)) => {
-                let normalized = SecretString::from(normalize_text(kind, text.expose_secret())?);
-                let plain = normalized.expose_secret();
+                let normalized = normalize_text(kind, text.expose_secret())?;
+                let plain: &str = &normalized;
                 let short = is_unscannable(kind, plain);
                 let record = seal(&self.key, record_kind(kind)?, id.as_str(), plain.as_bytes())?;
                 (record, short)
             }
         };
-        let unscannable = short || force_unscannable;
+        let unscannable = short || scan == Scan::PublicOccurrence;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -350,7 +432,11 @@ impl Vault {
         )
         .map_err(VaultError::sqlite("write entry"))?;
         tx.commit().map_err(VaultError::sqlite("commit"))?;
-        Ok(unscannable)
+        Ok(if unscannable {
+            Scannability::Unscannable
+        } else {
+            Scannability::Scannable
+        })
     }
 
     /// Reads and decrypts one entry.
@@ -372,6 +458,9 @@ impl Vault {
             return Ok(None);
         };
         let kind = kind_from_column(code).ok_or_else(|| VaultError::corrupt(id.as_str()))?;
+        if record.len() > MAX_RECORD_LEN {
+            return Err(VaultError::corrupt(id.as_str()));
+        }
         let corrupt = |_: SecretsError| VaultError::corrupt(id.as_str());
         let value = if kind == EntryKind::Credential {
             Value::Credential(open_credentials(&self.key, id.as_str(), &record).map_err(corrupt)?)
@@ -412,7 +501,7 @@ impl Vault {
         let mut out = Vec::new();
         for row in rows {
             let (id, code, unscannable) = row.map_err(VaultError::sqlite("list"))?;
-            let parsed = EntryId::new(&id).map_err(|_| VaultError::corrupt("(invalid id)"))?;
+            let parsed = EntryId::new(&id).map_err(|_| VaultError::corrupt(INVALID_ID))?;
             let kind = kind_from_column(code).ok_or_else(|| VaultError::corrupt(&id))?;
             out.push(EntryInfo {
                 id: parsed,
@@ -462,6 +551,9 @@ impl Vault {
             return Err(VaultError::TooManyEntries);
         }
         for id in &ids {
+            if EntryId::new(id).is_err() {
+                return Err(VaultError::corrupt(INVALID_ID));
+            }
             let (code, record): (i64, Vec<u8>) = tx
                 .query_row(
                     "SELECT kind, record FROM entries WHERE id = ?1",

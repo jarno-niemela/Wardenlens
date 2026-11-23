@@ -19,6 +19,7 @@ wardenlens-secrets = { path = "../wardenlens-secrets" }
 rustix = { workspace = true }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = { workspace = true }
 
 [lints]

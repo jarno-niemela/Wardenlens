@@ -10,7 +10,7 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_fsutil::FsError;
 use wardenlens_secrets::{Credentials, KeyFile};
 
-use crate::{Value, Vault, VaultError};
+use crate::{Scan, Scannability, Value, Vault, VaultError};
 
 fn dir() -> TempDir {
     let d = tempfile::tempdir().unwrap();
@@ -62,7 +62,7 @@ fn create_makes_a_private_file_and_no_sidecars() {
         &id("cam:a:host"),
         EntryKind::Host,
         &text("192.0.2.10"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
     let mode = std::fs::metadata(db(&d)).unwrap().permissions().mode() & 0o777;
@@ -82,7 +82,7 @@ fn open_round_trips_entries() {
         &id("cam:a:host"),
         EntryKind::Host,
         &text("NVR-1.example.invalid"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
     drop(v);
@@ -273,12 +273,17 @@ fn set_refuses_the_10001st_entry_but_allows_replacing() {
             &id("cam:new:other"),
             EntryKind::Other,
             &text("anything long"),
-            false,
+            Scan::Normal,
         )
         .unwrap_err();
     assert!(matches!(e, VaultError::TooManyEntries), "{e}");
-    v.set(&id("row1"), EntryKind::Other, &text("replacement"), false)
-        .unwrap();
+    v.set(
+        &id("row1"),
+        EntryKind::Other,
+        &text("replacement"),
+        Scan::Normal,
+    )
+    .unwrap();
 }
 
 // ---- set / get / list / rm -----------------------------------------------------------------
@@ -287,8 +292,13 @@ fn set_refuses_the_10001st_entry_but_allows_replacing() {
 fn credential_round_trip() {
     let (_d, mut v) = fresh();
     let c = Value::Credential(Credentials::new("svc-reader", "Tr0ub4dor-x9"));
-    v.set(&id("cam:a:credential"), EntryKind::Credential, &c, false)
-        .unwrap();
+    v.set(
+        &id("cam:a:credential"),
+        EntryKind::Credential,
+        &c,
+        Scan::Normal,
+    )
+    .unwrap();
     let got = v.get(&id("cam:a:credential")).unwrap().unwrap();
     assert_eq!(got.kind, EntryKind::Credential);
     let Value::Credential(c) = got.value else {
@@ -311,7 +321,7 @@ fn every_text_kind_round_trips_normalised() {
     ];
     for (i, (kind, input, stored)) in cases.iter().enumerate() {
         let eid = format!("t:{i}");
-        v.set(&id(&eid), *kind, &text(input), false).unwrap();
+        v.set(&id(&eid), *kind, &text(input), Scan::Normal).unwrap();
         assert_eq!(read_text(&v, &eid), *stored);
         assert_eq!(v.get(&id(&eid)).unwrap().unwrap().kind, *kind);
     }
@@ -326,10 +336,20 @@ fn get_of_unknown_id_is_none() {
 #[test]
 fn set_replaces_and_can_change_kind() {
     let (_d, mut v) = fresh();
-    v.set(&id("x"), EntryKind::Other, &text("first value"), false)
-        .unwrap();
-    v.set(&id("x"), EntryKind::Secret, &text("second value"), false)
-        .unwrap();
+    v.set(
+        &id("x"),
+        EntryKind::Other,
+        &text("first value"),
+        Scan::Normal,
+    )
+    .unwrap();
+    v.set(
+        &id("x"),
+        EntryKind::Secret,
+        &text("second value"),
+        Scan::Normal,
+    )
+    .unwrap();
     let got = v.get(&id("x")).unwrap().unwrap();
     assert_eq!(got.kind, EntryKind::Secret);
     assert_eq!(v.list().unwrap().len(), 1);
@@ -342,10 +362,10 @@ fn list_shows_ids_kinds_and_flags_sorted() {
         &id("b"),
         EntryKind::Secret,
         &text("long enough secret"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
-    v.set(&id("a"), EntryKind::Secret, &text("short"), false)
+    v.set(&id("a"), EntryKind::Secret, &text("short"), Scan::Normal)
         .unwrap();
     let l = v.list().unwrap();
     let got: Vec<(&str, EntryKind, bool)> = l
@@ -364,8 +384,13 @@ fn list_shows_ids_kinds_and_flags_sorted() {
 #[test]
 fn rm_removes_and_reports_absence() {
     let (_d, mut v) = fresh();
-    v.set(&id("x"), EntryKind::Other, &text("some value"), false)
-        .unwrap();
+    v.set(
+        &id("x"),
+        EntryKind::Other,
+        &text("some value"),
+        Scan::Normal,
+    )
+    .unwrap();
     assert!(v.rm(&id("x")).unwrap());
     assert!(!v.rm(&id("x")).unwrap());
     assert!(v.get(&id("x")).unwrap().is_none());
@@ -376,11 +401,11 @@ fn value_shape_must_match_the_kind() {
     let (_d, mut v) = fresh();
     let cred = Value::Credential(Credentials::new("u", "p"));
     assert!(matches!(
-        v.set(&id("x"), EntryKind::Host, &cred, false),
+        v.set(&id("x"), EntryKind::Host, &cred, Scan::Normal),
         Err(VaultError::ValueKindMismatch { .. })
     ));
     assert!(matches!(
-        v.set(&id("x"), EntryKind::Credential, &text("u:p"), false),
+        v.set(&id("x"), EntryKind::Credential, &text("u:p"), Scan::Normal),
         Err(VaultError::ValueKindMismatch { .. })
     ));
 }
@@ -394,23 +419,28 @@ fn value_limit_is_4096_bytes_for_every_kind() {
         EntryKind::DisplayName,
         EntryKind::Other,
     ] {
-        v.set(&id("x"), kind, &text(&"v".repeat(4096)), false)
+        v.set(&id("x"), kind, &text(&"v".repeat(4096)), Scan::Normal)
             .unwrap();
         let e = v
-            .set(&id("x"), kind, &text(&"v".repeat(4097)), false)
+            .set(&id("x"), kind, &text(&"v".repeat(4097)), Scan::Normal)
             .unwrap_err();
         assert!(matches!(e, VaultError::ValueTooLarge { .. }), "{kind}: {e}");
     }
     let big =
         |u: usize, p: usize| Value::Credential(Credentials::new("u".repeat(u), "p".repeat(p)));
-    v.set(&id("c"), EntryKind::Credential, &big(4096, 4096), false)
-        .unwrap();
+    v.set(
+        &id("c"),
+        EntryKind::Credential,
+        &big(4096, 4096),
+        Scan::Normal,
+    )
+    .unwrap();
     assert!(
-        v.set(&id("c"), EntryKind::Credential, &big(4097, 1), false)
+        v.set(&id("c"), EntryKind::Credential, &big(4097, 1), Scan::Normal)
             .is_err()
     );
     assert!(
-        v.set(&id("c"), EntryKind::Credential, &big(1, 4097), false)
+        v.set(&id("c"), EntryKind::Credential, &big(1, 4097), Scan::Normal)
             .is_err()
     );
     let got = v.get(&id("c")).unwrap().unwrap();
@@ -434,7 +464,7 @@ fn invalid_values_are_refused_per_kind() {
         (EntryKind::Secret, ""),
     ];
     for (kind, bad) in cases {
-        let e = v.set(&id("x"), kind, &text(bad), false).unwrap_err();
+        let e = v.set(&id("x"), kind, &text(bad), Scan::Normal).unwrap_err();
         assert!(
             matches!(e, VaultError::InvalidValue { .. }),
             "{kind} {bad}: {e}"
@@ -448,18 +478,19 @@ fn errors_and_debug_never_contain_the_value() {
     let (_d, mut v) = fresh();
     let sentinel = "SENTINEL-not-a-host!";
     let e = v
-        .set(&id("x"), EntryKind::Host, &text(sentinel), false)
+        .set(&id("x"), EntryKind::Host, &text(sentinel), Scan::Normal)
         .unwrap_err();
     assert!(!format!("{e} {e:?}").contains("SENTINEL"));
     let big = "SENTINEL".repeat(1000);
     let e = v
-        .set(&id("x"), EntryKind::Other, &text(&big), false)
+        .set(&id("x"), EntryKind::Other, &text(&big), Scan::Normal)
         .unwrap_err();
     assert!(!format!("{e} {e:?}").contains("SENTINEL"));
     let val = Value::Credential(Credentials::new("SENTINEL-user", "SENTINEL-pass"));
     assert!(!format!("{val:?}").contains("SENTINEL"));
     assert!(!format!("{:?}", text("SENTINEL")).contains("SENTINEL"));
-    v.set(&id("c"), EntryKind::Credential, &val, false).unwrap();
+    v.set(&id("c"), EntryKind::Credential, &val, Scan::Normal)
+        .unwrap();
     let got = v.get(&id("c")).unwrap().unwrap();
     assert!(!format!("{got:?} {v:?}").contains("SENTINEL"));
 }
@@ -483,37 +514,41 @@ fn ids_with_the_reserved_prefix_cannot_be_built_or_listed() {
 
 #[test]
 fn short_values_are_marked_unscannable() {
+    use Scannability::{Scannable, Unscannable};
     let (_d, mut v) = fresh();
-    assert!(
-        v.set(&id("a"), EntryKind::Secret, &text("123456"), false)
-            .unwrap()
-    );
-    assert!(
-        !v.set(&id("b"), EntryKind::Secret, &text("1234567"), false)
-            .unwrap()
-    );
-    assert!(
-        v.set(&id("c"), EntryKind::Host, &text("nvr-1"), false)
-            .unwrap()
-    );
-    assert!(
-        !v.set(&id("d"), EntryKind::Host, &text("10.0.0.1"), false)
-            .unwrap()
-    );
+    let mut put = |i: &str, k: EntryKind, val: &Value| v.set(&id(i), k, val, Scan::Normal).unwrap();
+    assert_eq!(put("a", EntryKind::Secret, &text("123456")), Unscannable);
+    assert_eq!(put("b", EntryKind::Secret, &text("1234567")), Scannable);
+    assert_eq!(put("c", EntryKind::Host, &text("nvr-1")), Unscannable);
+    assert_eq!(put("d", EntryKind::Host, &text("10.0.0.1")), Scannable);
     let short_pw = Value::Credential(Credentials::new("svc-reader", "pw"));
-    assert!(
-        v.set(&id("e"), EntryKind::Credential, &short_pw, false)
-            .unwrap()
+    assert_eq!(put("e", EntryKind::Credential, &short_pw), Unscannable);
+    assert_eq!(
+        put("f", EntryKind::DisplayName, &text("Door 12")),
+        Unscannable
+    );
+    assert_eq!(
+        put("g", EntryKind::DisplayName, &text("Back Door")),
+        Scannable
+    );
+    assert_eq!(
+        put("h", EntryKind::DisplayName, &text("Door     12")),
+        Unscannable
     );
     assert!(v.get(&id("a")).unwrap().unwrap().unscannable);
     assert!(!v.get(&id("b")).unwrap().unwrap().unscannable);
+    assert!(v.get(&id("f")).unwrap().unwrap().unscannable);
 }
 
 #[test]
 fn force_unscannable_is_stored_and_survives_reopen() {
     let (d, mut v) = fresh();
     let long = text("a-perfectly-long-secret");
-    assert!(v.set(&id("a"), EntryKind::Secret, &long, true).unwrap());
+    assert!(
+        v.set(&id("a"), EntryKind::Secret, &long, Scan::PublicOccurrence)
+            .unwrap()
+            .is_unscannable()
+    );
     drop(v);
     let v = Vault::open(&db(&d), same_key(d.path(), "k1")).unwrap();
     assert!(v.list().unwrap()[0].unscannable);
@@ -522,13 +557,13 @@ fn force_unscannable_is_stored_and_survives_reopen() {
 #[test]
 fn replacing_a_value_recomputes_the_flag() {
     let (_d, mut v) = fresh();
-    v.set(&id("a"), EntryKind::Secret, &text("short"), false)
+    v.set(&id("a"), EntryKind::Secret, &text("short"), Scan::Normal)
         .unwrap();
     v.set(
         &id("a"),
         EntryKind::Secret,
         &text("a-much-longer-secret"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
     assert!(!v.list().unwrap()[0].unscannable);
@@ -547,10 +582,20 @@ fn record_of(v: &Vault, i: &str) -> Vec<u8> {
 #[test]
 fn swapping_two_records_is_detected() {
     let (_d, mut v) = fresh();
-    v.set(&id("a"), EntryKind::Other, &text("value number one"), false)
-        .unwrap();
-    v.set(&id("b"), EntryKind::Other, &text("value number two"), false)
-        .unwrap();
+    v.set(
+        &id("a"),
+        EntryKind::Other,
+        &text("value number one"),
+        Scan::Normal,
+    )
+    .unwrap();
+    v.set(
+        &id("b"),
+        EntryKind::Other,
+        &text("value number two"),
+        Scan::Normal,
+    )
+    .unwrap();
     let (ra, rb) = (record_of(&v, "a"), record_of(&v, "b"));
     v.raw()
         .execute(
@@ -573,7 +618,7 @@ fn swapping_two_records_is_detected() {
 #[test]
 fn a_kind_column_that_disagrees_with_the_record_is_corrupt() {
     let (_d, mut v) = fresh();
-    v.set(&id("a"), EntryKind::Host, &text("192.0.2.10"), false)
+    v.set(&id("a"), EntryKind::Host, &text("192.0.2.10"), Scan::Normal)
         .unwrap();
     v.raw()
         .execute("UPDATE entries SET kind = 1 WHERE id = 'a'", [])
@@ -621,7 +666,7 @@ fn stored_bytes_do_not_contain_the_plaintext() {
         &id("a"),
         EntryKind::Secret,
         &text("SENTINEL-plaintext-value"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
     drop(v);
@@ -636,21 +681,21 @@ fn populate(v: &mut Vault) {
         &id("a:host"),
         EntryKind::Host,
         &text("nvr-1.example.invalid"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
     v.set(
         &id("b:cred"),
         EntryKind::Credential,
         &Value::Credential(Credentials::new("svc-reader", "Tr0ub4dor-x9")),
-        false,
+        Scan::Normal,
     )
     .unwrap();
     v.set(
         &id("c:mac"),
         EntryKind::Mac,
         &text("02:00:5e:00:53:af"),
-        false,
+        Scan::Normal,
     )
     .unwrap();
 }
@@ -679,7 +724,7 @@ fn rekey_round_trip() {
 #[test]
 fn rekey_keeps_the_unscannable_flag() {
     let (d, mut v) = fresh();
-    v.set(&id("a"), EntryKind::Secret, &text("short"), false)
+    v.set(&id("a"), EntryKind::Secret, &text("short"), Scan::Normal)
         .unwrap();
     v.rekey(new_key(d.path(), "k2")).unwrap();
     assert!(v.list().unwrap()[0].unscannable);
@@ -715,4 +760,86 @@ fn rekey_of_an_empty_vault_changes_the_keycheck() {
     v.rekey(new_key(d.path(), "k2")).unwrap();
     drop(v);
     Vault::open(&db(&d), same_key(d.path(), "k2")).unwrap();
+}
+
+#[test]
+fn open_never_creates_a_file_and_create_refuses_foreign_data() {
+    let d = dir();
+    let key = new_key(d.path(), "k1");
+    assert!(matches!(
+        Vault::open(&db(&d), key),
+        Err(VaultError::NotFound)
+    ));
+    assert!(!db(&d).exists());
+    // A non-empty file that is not a vault is never initialised over.
+    std::fs::write(db(&d), b"not a database, but somebody's data").unwrap();
+    std::fs::set_permissions(db(&d), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let e = Vault::create(&db(&d), same_key(d.path(), "k1")).unwrap_err();
+    assert!(matches!(e, VaultError::AlreadyInitialized), "{e}");
+    assert_eq!(
+        std::fs::read(db(&d)).unwrap(),
+        b"not a database, but somebody's data"
+    );
+}
+
+#[test]
+fn open_checks_every_row_structurally() {
+    let (d, v) = fresh();
+    v.raw()
+        .execute(
+            "INSERT INTO entries(id, kind, record, created_at, updated_at) VALUES ('BAD ID', 3, X'00', 0, 0)",
+            [],
+        )
+        .unwrap();
+    drop(v);
+    let e = Vault::open(&db(&d), same_key(d.path(), "k1")).unwrap_err();
+    assert!(
+        matches!(&e, VaultError::CorruptEntry { id } if id == "(invalid id)"),
+        "{e}"
+    );
+    let (d, v) = fresh();
+    v.raw()
+        .execute(
+            "INSERT INTO entries(id, kind, record, created_at, updated_at) VALUES ('big', 3, zeroblob(20000), 0, 0)",
+            [],
+        )
+        .unwrap();
+    drop(v);
+    let e = Vault::open(&db(&d), same_key(d.path(), "k1")).unwrap_err();
+    assert!(matches!(e, VaultError::CorruptEntry { .. }), "{e}");
+}
+
+#[test]
+fn rekey_reports_a_placeholder_for_an_invalid_id() {
+    let (d, mut v) = fresh();
+    v.raw()
+        .execute(
+            "INSERT INTO entries(id, kind, record, created_at, updated_at) VALUES ('Bad Id', 3, X'00', 0, 0)",
+            [],
+        )
+        .unwrap();
+    let e = v.rekey(new_key(d.path(), "k2")).unwrap_err();
+    assert!(
+        matches!(&e, VaultError::CorruptEntry { id } if id == "(invalid id)"),
+        "{e}"
+    );
+}
+
+proptest::proptest! {
+    #[test]
+    fn entry_id_accepts_exactly_the_charset(s in "\\PC{0,140}") {
+        let allowed = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b':' | b'_' | b'.' | b'-');
+        let expected = !s.is_empty()
+            && s.len() <= 128
+            && (s.as_bytes()[0].is_ascii_lowercase() || s.as_bytes()[0].is_ascii_digit())
+            && s.bytes().all(allowed)
+            && !s.starts_with("meta:");
+        proptest::prop_assert_eq!(EntryId::new(&s).is_ok(), expected);
+    }
+
+    #[test]
+    fn entry_id_accepts_every_charset_string(s in "[a-z0-9][a-z0-9:_.-]{0,127}") {
+        proptest::prop_assume!(!s.starts_with("meta:"));
+        proptest::prop_assert!(EntryId::new(&s).is_ok());
+    }
 }
