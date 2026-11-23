@@ -174,7 +174,7 @@ Criterion "what the local API needs documented": **MET** (partly from public kno
   (connection closed) whereas `PT5S` returns a normal 200 after about 5.9 s; 150 consecutive `PT5S` polls
   (15 min) all returned 200. The pull-point address the camera returns is on a **different port of the same host** as the
   ONVIF service, so a client must compare the host only (not the port) before following it (`onvif_pull.sh` does).
-- **Live capture (#27, `results/events/tapo-*.xml`):** three watches (the controller's walks in view of the camera). Across the watches 277 `Motion` and 29 `People` notification lines
+- **Live capture (#27, `results/events/tapo-*.xml`):** three watches (the owner walked in view of the camera). Across the watches 277 `Motion` and 29 `People` notification lines
   were logged. Observed format (`wsnt:NotificationMessage` in `tev:PullMessagesResponse`):
   - `wsnt:Topic` (dialect `ConcreteSet`): `tns1:RuleEngine/CellMotionDetector/Motion` or
     `tns1:RuleEngine/PeopleDetector/People`. Only these two topics were seen.
