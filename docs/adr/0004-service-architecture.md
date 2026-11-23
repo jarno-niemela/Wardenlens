@@ -90,9 +90,9 @@ Output goes to stderr through the subscriber (`print_stdout`/`print_stderr` lint
 
 **thiserror 2** in library crates (ERR-2) and **anyhow 1** only in `wardenlens-cli` (ERR-3). Each library defines its
 own error enum; crates never expose another crate's error type in a public signature unless wrapped with `#[source]`.
-Messages follow ERR-5. `wardenlens-core` may depend on exactly three external crates, all pure parsing or derive
-crates with no I/O: `thiserror`, `serde` (derive only) and `toml` (parse only, features `parse`, `serde`, `std`; the
-`display` writer and the `unbounded` feature are not enabled). #32 (camera catalogue) will parse TOML in core and #47
+Messages follow ERR-5. `wardenlens-core` may depend on exactly five external crates, all pure parsing, derive or
+wrapper crates with no I/O: `thiserror`, `serde` (derive only), `toml` (parse only, features `parse`, `serde`, `std`; the
+`display` writer and the `unbounded` feature are not enabled) and, added by ADR 0006, `secrecy` and `zeroize`. #32 (camera catalogue) will parse TOML in core and #47
 (service config) does the same for `wardenlens.toml`, so this keeps that parsing in the functional core (ARCH-1).
 Nothing else (no async, no network, no filesystem crate) enters core as a normal dependency; the restriction does not
 apply to `[dev-dependencies]`, which are unrestricted (test helpers never ship). Rejected: `anyhow` in libraries (callers cannot match),
@@ -163,6 +163,8 @@ Rules: `api` does not depend on `index`, `storage` or `recorder`; it receives th
 core types, so neither depends on the other. Crates are created by the ticket that first needs them, not up front, and
 the map is enforced by review of each crate's `Cargo.toml` (a mechanical check is a follow-up). Choice of `retina`,
 `rusqlite`, an MP4 crate and the encryption crate belong to the tickets/ADRs 0005 and 0006 and are not decided here.
+ADR 0006 (proposed) decides the encryption crate and adds a `vault` crate (depends on core and secrets; only `cli` depends on it)
+and narrows `secrets` to key handling and seal/open; `index` never depends on `vault` or `secrets`.
 
 ### 9. API authentication
 
