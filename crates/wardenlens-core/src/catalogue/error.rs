@@ -19,6 +19,10 @@ pub enum SiteDataKind {
     Credentials,
     /// An email address.
     Email,
+    /// A private-network hostname such as `*.lan`.
+    Hostname,
+    /// Invisible, fullwidth or non-ASCII digit characters, which can disguise other site data.
+    Encoding,
 }
 
 impl SiteDataKind {
@@ -30,6 +34,8 @@ impl SiteDataKind {
             Self::Serial => "serial-like value",
             Self::Credentials => "credentials in a url",
             Self::Email => "email address",
+            Self::Hostname => "private hostname",
+            Self::Encoding => "disguising character encoding",
         }
     }
 }
@@ -45,10 +51,16 @@ pub enum CatalogueError {
         /// Maximum accepted size in bytes.
         max: usize,
     },
-    /// The input is not valid TOML or does not match the entry schema.
-    Parse(String),
+    /// The input is not valid TOML or does not match the entry schema. Only the line is
+    /// reported: the parser's own message can quote the rejected value.
+    Parse {
+        /// 1-based line of the problem, when known.
+        line: Option<usize>,
+    },
     /// A required field is empty or an evidence list is missing.
     Missing(&'static str),
+    /// A field has the wrong shape.
+    Malformed(&'static str),
     /// A numeric field is outside its accepted range.
     OutOfRange(&'static str),
     /// A string field contains site-specific data.
@@ -66,7 +78,9 @@ impl fmt::Display for CatalogueError {
             Self::TooLarge { len, max } => {
                 write!(f, "catalogue entry is {len} bytes, the limit is {max}")
             }
-            Self::Parse(msg) => write!(f, "invalid catalogue entry: {msg}"),
+            Self::Parse { line: Some(line) } => write!(f, "invalid catalogue entry at line {line}"),
+            Self::Parse { line: None } => write!(f, "invalid catalogue entry"),
+            Self::Malformed(what) => write!(f, "catalogue field {what} is malformed"),
             Self::Missing(what) => write!(f, "catalogue entry is missing {what}"),
             Self::OutOfRange(what) => write!(f, "catalogue field {what} is out of range"),
             Self::SiteData { field, kind } => {

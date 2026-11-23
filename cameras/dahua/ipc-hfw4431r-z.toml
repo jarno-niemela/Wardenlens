@@ -1,8 +1,9 @@
 vendor = "Dahua"
 model = "IPC-HFW4431R-Z"
 aliases = ["XR"]
-support = "verified"
+support = "partial"
 quirks = [
+  "ONVIF was not exercised in depth; its capabilities are unconfirmed. Video and the CGI motion events were verified.",
   "The heartbeat parameter of the eventManager attach call was not honoured; detect a dead connection with TCP keepalive and a read timeout.",
   "AI person and vehicle events are not offered on the tested firmware; only classic motion detection.",
   "eventManager getCaps and devVideoAnalyse getCaps return Invalid Request on the tested firmware.",

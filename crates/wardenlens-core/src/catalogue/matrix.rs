@@ -1,7 +1,6 @@
 //! Generation of the `cameras/README.md` support matrix.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 use super::entry::{CatalogueEntry, EventStatus, StreamRole};
 
@@ -12,8 +11,13 @@ use super::entry::{CatalogueEntry, EventStatus, StreamRole};
 /// in as `cameras/README.md`.
 #[must_use]
 pub fn render_matrix(entries: &[CatalogueEntry]) -> String {
-    let mut sorted: Vec<&CatalogueEntry> = entries.iter().collect();
-    sorted.sort_by_key(|e| (e.vendor_slug(), e.model_slug()));
+    // Sorting on the rendered row as the last key makes the order total, so equal slugs
+    // cannot fall back on input order.
+    let mut rows: Vec<(String, String, String)> = entries
+        .iter()
+        .map(|e| (e.vendor_slug(), e.model_slug(), row(e)))
+        .collect();
+    rows.sort();
 
     let mut out = String::from(
         "# Supported cameras\n\n\
@@ -21,30 +25,29 @@ pub fn render_matrix(entries: &[CatalogueEntry]) -> String {
          WARDENLENS_BLESS=1 cargo test -p wardenlens-core --test catalogue -->\n\n\
          One row per camera model. Entry format: [FORMAT.md](FORMAT.md).\n\
          Events marked `*` are advertised by the camera but not yet seen live.\n\n\
-         | Vendor | Model | Support | Firmware | Main stream | Events | Protocols |\n\
-         |---|---|---|---|---|---|---|\n",
+         | Vendor | Model | Support | Firmware | Main stream | Events | Protocols | Configurable |\n\
+         |---|---|---|---|---|---|---|---|\n",
     );
-    for e in sorted {
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} | {} | {} | {} |",
-            cell(&e.vendor),
-            model_cell(e),
-            e.support.as_str(),
-            join_or_dash(e.firmware.iter().map(ToString::to_string)),
-            main_stream(e),
-            events(e),
-            join_or_dash(
-                e.protocols
-                    .iter()
-                    .map(|p| p.kind)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(|k| k.as_str().to_owned())
-            ),
-        );
+    for (_, _, row) in rows {
+        out.push_str(&row);
     }
     out
+}
+
+fn row(e: &CatalogueEntry) -> String {
+    let protocols: BTreeSet<_> = e.protocols.iter().map(|p| p.kind).collect();
+    let configurable: BTreeSet<_> = e.configurable.iter().copied().collect();
+    format!(
+        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        cell(&e.vendor),
+        model_cell(e),
+        e.support.as_str(),
+        join_or_dash(e.firmware.iter().map(ToString::to_string)),
+        main_stream(e),
+        events(e),
+        join_or_dash(protocols.into_iter().map(|k| k.as_str().to_owned())),
+        join_or_dash(configurable.into_iter().map(|k| k.as_str().to_owned())),
+    )
 }
 
 fn model_cell(e: &CatalogueEntry) -> String {
@@ -139,12 +142,44 @@ mod tests {
              events=[{kind=\"motion\",source=\"onvif\",status=\"observed\"},{kind=\"person\",source=\"onvif\",status=\"advertised\"}]\n",
         );
         let m = render_matrix(&[e]);
-        assert!(m.contains("| V | M (aka OEM) | partial | 1.5 | 1920x1080 H.265 | motion, person* | rtsp, onvif |"), "{m}");
+        assert!(m.contains("| V | M (aka OEM) | partial | 1.5 | 1920x1080 H.265 | motion, person* | rtsp, onvif | - |"), "{m}");
     }
 
     #[test]
     fn missing_data_renders_as_dash_and_pipes_are_escaped() {
         let m = render_matrix(&[entry("A|B", "M", "")]);
-        assert!(m.contains("| A\\|B | M | partial | - | - | - | - |"), "{m}");
+        assert!(
+            m.contains("| A\\|B | M | partial | - | - | - | - | - |"),
+            "{m}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tie_tests {
+    use super::*;
+
+    #[test]
+    fn equal_slugs_render_the_same_for_any_input_order() {
+        let mk = |v: &str, alias: &str| {
+            CatalogueEntry::from_toml_str(&format!(
+                "vendor=\"{v}\"\nmodel=\"M\"\naliases=[\"{alias}\"]\nsupport=\"partial\"\n"
+            ))
+            .unwrap()
+        };
+        let (a, b) = (mk("Acme", "one"), mk("ACME", "two"));
+        assert_eq!(
+            render_matrix(&[a.clone(), b.clone()]),
+            render_matrix(&[b, a])
+        );
+    }
+
+    #[test]
+    fn configurable_column_lists_features() {
+        let e = CatalogueEntry::from_toml_str(
+            "vendor=\"V\"\nmodel=\"M\"\nsupport=\"partial\"\nconfigurable=[\"service_ports\"]\n",
+        )
+        .unwrap();
+        assert!(render_matrix(&[e]).contains("| - | service_ports |\n"));
     }
 }

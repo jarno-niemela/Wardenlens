@@ -25,6 +25,7 @@
 
 mod entry;
 mod error;
+mod guard;
 mod matrix;
 mod validate;
 
@@ -33,5 +34,6 @@ pub use entry::{
     FirmwareFamily, Protocol, ProtocolKind, Stream, StreamRole, SupportLevel,
 };
 pub use error::{CatalogueError, SiteDataKind};
+pub use guard::check_source;
 pub use matrix::render_matrix;
 pub use validate::validate;

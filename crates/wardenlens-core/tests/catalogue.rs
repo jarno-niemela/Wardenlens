@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use wardenlens_core::catalogue::{CatalogueEntry, render_matrix, validate};
+use wardenlens_core::catalogue::{CatalogueEntry, check_source, render_matrix, validate};
 
 fn cameras_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cameras")
@@ -24,6 +24,15 @@ fn load_all() -> Vec<(PathBuf, CatalogueEntry)> {
     for vendor in fs::read_dir(cameras_dir()).unwrap() {
         let vendor = vendor.unwrap().path();
         if !vendor.is_dir() {
+            let name = vendor
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            assert!(
+                name == "README.md" || name == "FORMAT.md",
+                "unexpected file directly under cameras/: {}",
+                vendor.display()
+            );
             continue;
         }
         for file in fs::read_dir(&vendor).unwrap() {
@@ -94,4 +103,14 @@ fn readme_matrix_is_up_to_date() {
         "cameras/README.md is stale; regenerate it by running: \
          WARDENLENS_BLESS=1 cargo test -p wardenlens-core --test catalogue"
     );
+}
+
+#[test]
+fn published_docs_contain_no_site_data() {
+    for name in ["README.md", "FORMAT.md"] {
+        let text = fs::read_to_string(cameras_dir().join(name)).unwrap();
+        // The bless command names an environment variable in capitals; that is not a serial.
+        let text = text.replace("WARDENLENS_BLESS", "BLESS");
+        check_source(&text).unwrap_or_else(|e| panic!("cameras/{name}: {e}"));
+    }
 }

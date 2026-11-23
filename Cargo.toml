@@ -13,6 +13,7 @@ repository = "https://github.com/jarno-niemela/Wardenlens"
 wardenlens-core = { path = "crates/wardenlens-core" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

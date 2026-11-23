@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
 use super::error::CatalogueError;
+use super::guard::check_source;
 
 /// Largest accepted entry, in bytes. Real entries are about 2 KiB; the cap bounds parser work (SEC-2).
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
@@ -263,6 +264,16 @@ pub enum ConfigFeature {
     ServicePorts,
 }
 
+impl ConfigFeature {
+    /// Stable lowercase name, as used in the TOML files.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServicePorts => "service_ports",
+        }
+    }
+}
+
 /// A pointer to the evidence behind an entry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -312,12 +323,14 @@ pub struct CatalogueEntry {
 }
 
 impl CatalogueEntry {
-    /// Parses one entry from TOML text. Unknown fields are rejected. This does not run
+    /// Parses one entry from TOML text. Unknown fields are rejected, and every raw line
+    /// (comments included) goes through [`check_source`]. This does not run
     /// [`validate`](super::validate); call it too.
     ///
     /// # Errors
-    /// [`CatalogueError::TooLarge`] above 64 KiB, [`CatalogueError::Parse`] for bad TOML,
-    /// unknown fields, unknown enum values or a malformed firmware family.
+    /// [`CatalogueError::TooLarge`] above 64 KiB, [`CatalogueError::SiteData`] naming the line,
+    /// [`CatalogueError::Parse`] (line only) for bad TOML, unknown fields, unknown enum values or
+    /// a malformed firmware family.
     pub fn from_toml_str(text: &str) -> Result<Self, CatalogueError> {
         if text.len() > MAX_ENTRY_BYTES {
             return Err(CatalogueError::TooLarge {
@@ -325,7 +338,18 @@ impl CatalogueEntry {
                 max: MAX_ENTRY_BYTES,
             });
         }
-        toml::from_str(text).map_err(|e| CatalogueError::Parse(e.message().to_owned()))
+        // Raw scan first: comments never reach the parsed value.
+        check_source(text)?;
+        toml::from_str(text).map_err(|e| {
+            let line = e.span().map(|span| {
+                let upto = text.get(..span.start).unwrap_or_default();
+                upto.bytes()
+                    .filter(|b| *b == b'\n')
+                    .count()
+                    .saturating_add(1)
+            });
+            CatalogueError::Parse { line }
+        })
     }
 
     /// Lowercase, hyphen-separated form of the vendor, used as the directory name.
@@ -379,7 +403,7 @@ support = "community"
     #[test]
     fn rejects_unknown_top_level_field() {
         let err = CatalogueEntry::from_toml_str(&format!("{MINIMAL}ip = \"x\"\n")).unwrap_err();
-        assert!(matches!(err, CatalogueError::Parse(_)), "{err}");
+        assert!(matches!(err, CatalogueError::Parse { .. }), "{err}");
     }
 
     #[test]
@@ -405,6 +429,23 @@ support = "community"
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn parse_errors_report_the_line_and_not_the_value() {
+        let text = format!("{MINIMAL}firmware = [\"secretvalue\"]\n");
+        let err = CatalogueEntry::from_toml_str(&text).unwrap_err();
+        assert_eq!(err, CatalogueError::Parse { line: Some(5) });
+        assert!(!err.to_string().contains("secretvalue"));
+    }
+
+    #[test]
+    fn rejects_site_data_in_comments_before_parsing() {
+        let text = format!("# camera at 192.168.1.20, admin:hunter2\n{MINIMAL}");
+        assert!(matches!(
+            CatalogueEntry::from_toml_str(&text),
+            Err(CatalogueError::SiteData { .. })
+        ));
     }
 
     #[test]
@@ -439,10 +480,10 @@ support = "community"
 
     #[test]
     fn firmware_with_build_number_is_a_parse_error() {
-        let text = format!("{MINIMAL}firmware = [\"3.0.0.12\"]\n");
+        let text = format!("{MINIMAL}firmware = [\"3.0.1\"]\n");
         assert!(matches!(
             CatalogueEntry::from_toml_str(&text),
-            Err(CatalogueError::Parse(_))
+            Err(CatalogueError::Parse { .. })
         ));
     }
 
