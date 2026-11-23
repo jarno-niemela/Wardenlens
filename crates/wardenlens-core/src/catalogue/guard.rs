@@ -257,27 +257,65 @@ const LONG_KEYS: [&str; 6] = [
     "apikey",
 ];
 
-/// Whether `value` (text after a key) is exempt from being a secret.
-fn exempt_value(key: &str, word: &str, spaced_colon: bool, quoted: bool) -> bool {
-    (key == "auth" && AUTH_SCHEMES.contains(&word))
-        || (key == "token" && word == "none")
+/// Whether an identifier names a secret: exactly a secret key, containing a long key anywhere
+/// (`adminPassword`), or ending in a secret key that starts at a lower-to-upper camelCase step
+/// (`onvifPwd`, `apiToken`). `Compass` and `Spin` do not qualify.
+fn is_secret_key(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if SECRET_KEYS.contains(&lower.as_str()) || LONG_KEYS.iter().any(|k| lower.contains(k)) {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    SECRET_KEYS.iter().any(|key| {
+        lower.strip_suffix(key).is_some_and(|head| {
+            let start = head.len();
+            let prev = start.checked_sub(1).and_then(|p| bytes.get(p));
+            prev.is_some_and(u8::is_ascii_lowercase)
+                && bytes.get(start).is_some_and(u8::is_ascii_uppercase)
+        })
+    })
+}
+
+/// The first word of a value, up to whitespace or a closing delimiter, without a final `.`.
+/// Exemptions compare this whole word, so `digest-hunter2` is not `digest`.
+fn value_word(value: &str) -> &str {
+    let end = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | ')' | '}' | '<');
+    value
+        .split(end)
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+}
+
+/// Whether a value after the (lowercase) key name is not a secret.
+fn exempt_value(name: &str, word: &str, spaced_colon: bool, quoted: bool) -> bool {
+    (name == "auth" && AUTH_SCHEMES.contains(&word))
+        || (name == "token" && word == "none")
         || (spaced_colon && !quoted && PROSE_WORDS.contains(&word))
 }
 
 /// `key=value`, `key: value` and `"key": "value"` pairs, plus XML elements (`<Key>value</Key>`).
 fn has_secret_pair(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    let original = text.as_bytes();
     let by_separator = SECRET_KEYS.iter().any(|key| {
         lower.match_indices(key).any(|(i, _)| {
-            let prev = i.checked_sub(1).and_then(|p| original.get(p));
-            let here = original.get(i);
-            // A word boundary: start, non-alphanumeric, or a lower-to-upper camelCase step.
-            let camel = prev.is_some_and(u8::is_ascii_lowercase)
-                && here.is_some_and(u8::is_ascii_uppercase);
-            let boundary =
-                prev.is_none_or(|c| !c.is_ascii_alphanumeric()) || camel || LONG_KEYS.contains(key);
-            let after = lower.get(i.saturating_add(key.len())..).unwrap_or_default();
+            let end = i.saturating_add(key.len());
+            let name = if key.contains('_') {
+                text.get(i..end).unwrap_or_default()
+            } else {
+                let run = text
+                    .get(..end)
+                    .unwrap_or_default()
+                    .bytes()
+                    .rev()
+                    .take_while(u8::is_ascii_alphanumeric)
+                    .count();
+                text.get(end.saturating_sub(run)..end).unwrap_or_default()
+            };
+            if !is_secret_key(name) {
+                return false;
+            }
+            let after = lower.get(end..).unwrap_or_default();
             // A JSON key is quoted: `"password": "x"`.
             let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
             let after = after.trim_start_matches([' ', '\t']);
@@ -288,38 +326,54 @@ fn has_secret_pair(text: &str) -> bool {
             let value = value.trim_start_matches([' ', '\t']);
             let quoted = value.starts_with(['"', '\'']);
             let value = value.strip_prefix(['"', '\'']).unwrap_or(value);
-            let word = value
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .next()
-                .unwrap_or_default();
-            boundary && !value.is_empty() && !exempt_value(key, word, spaced_colon, quoted)
+            let exempt = exempt_value(
+                &name.to_ascii_lowercase(),
+                value_word(value),
+                spaced_colon,
+                quoted,
+            );
+            !value.is_empty() && !exempt
         })
     });
-    by_separator || has_secret_element(&lower)
+    by_separator || has_secret_element(text)
 }
 
-/// `<[ns:]key[ attrs]>text`: a secret key as an XML element with non-empty text before the next
-/// `<`. Empty and self-closing elements carry no secret.
-fn has_secret_element(lower: &str) -> bool {
-    lower.match_indices('<').any(|(i, _)| {
-        let tag = lower.get(i.saturating_add(1)..).unwrap_or_default();
+/// Removes CDATA markers (keeping their content) and comments, so markup cannot hide a value.
+fn strip_markup(text: &str) -> String {
+    let mut out = text.replace("<![CDATA[", "").replace("]]>", "");
+    while let Some(start) = out.find("<!--") {
+        let Some(len) = out.get(start..).and_then(|r| r.find("-->")) else {
+            break;
+        };
+        out.replace_range(start..start.saturating_add(len).saturating_add(3), "");
+    }
+    out
+}
+
+/// `<[ns:]key[ attrs]>text</[ns:]key>`: a secret key as an XML element with non-empty text,
+/// closed by a matching tag. Empty, self-closing and unclosed elements carry no secret.
+fn has_secret_element(text: &str) -> bool {
+    let text = strip_markup(text);
+    text.match_indices('<').any(|(i, _)| {
+        let tag = text.get(i.saturating_add(1)..).unwrap_or_default();
         let Some((open, rest)) = tag.split_once('>') else {
             return false;
         };
         if open.ends_with('/') {
             return false;
         }
-        let name = open
-            .split(|c: char| c.is_whitespace())
-            .next()
-            .unwrap_or_default();
-        let key = name.rsplit(':').next().unwrap_or_default();
-        let text = rest.split('<').next().unwrap_or_default().trim();
-        let word = text
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .next()
-            .unwrap_or_default();
-        SECRET_KEYS.contains(&key) && !text.is_empty() && !exempt_value(key, word, false, false)
+        let name = open.split(char::is_whitespace).next().unwrap_or_default();
+        let local = name.rsplit(':').next().unwrap_or_default();
+        let (value, tail) = rest.split_once('<').unwrap_or((rest, ""));
+        let value = value.trim();
+        let closing = tail
+            .strip_prefix('/')
+            .and_then(|t| t.split_once('>'))
+            .is_some_and(|(close, _)| close.trim().eq_ignore_ascii_case(name));
+        is_secret_key(local)
+            && closing
+            && !value.is_empty()
+            && !exempt_value(&local.to_ascii_lowercase(), value, false, false)
     })
 }
 
@@ -737,7 +791,6 @@ mod tests {
             "<wsse:Password Type=\"#PasswordText\">hunter2</wsse:Password>",
             "<userName>admin</userName>",
             "<token>abc</token>",
-            "<tt:Password>x",
         ] {
             assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
         }
@@ -749,6 +802,105 @@ mod tests {
             "<auth>digest</auth>",
             "<UserLevel>Administrator</UserLevel>",
             "</Password>",
+        ] {
+            assert_eq!(site_data(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn secret_key_names_by_exact_long_or_camel_suffix() {
+        for n in [
+            "password",
+            "Pwd",
+            "loginPassword",
+            "adminPassword",
+            "newPassword",
+            "onvifPwd",
+            "rtspPass",
+            "userPassword",
+            "AdminPassword",
+            "NewPassword",
+            "adminPwd",
+            "apiToken",
+            "api_key",
+        ] {
+            assert!(is_secret_key(n), "{n}");
+        }
+        for n in [
+            "Compass",
+            "Spin",
+            "Passport",
+            "OAuth2",
+            "superuser",
+            "key",
+            "UserLevel",
+        ] {
+            assert!(!is_secret_key(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn camel_case_xml_elements_are_secret() {
+        for t in [
+            "<loginPassword>x</loginPassword>",
+            "<adminPassword>x</adminPassword>",
+            "<newPassword>x</newPassword>",
+            "<onvifPwd>x</onvifPwd>",
+            "<rtspPass>x</rtspPass>",
+            "<userPassword>x</userPassword>",
+            "<tt:AdminPassword>x</tt:AdminPassword>",
+            "<tt:NewPassword>x</tt:NewPassword>",
+            "<adminPwd>x</adminPwd>",
+            "<apiToken>abc</apiToken>",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
+        }
+        for t in [
+            "<Compass>n</Compass>",
+            "<Spin>3</Spin>",
+            "<Passport>x</Passport>",
+        ] {
+            assert_eq!(site_data(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn xml_elements_need_a_closing_tag_and_see_through_cdata_and_comments() {
+        for t in [
+            "<Password><![CDATA[x]]></Password>",
+            "<Password><!-- c -->x</Password>",
+            "<tt:Password>x</tt:Password>",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
+        }
+        for t in [
+            "the <Password> element is required",
+            "<Password>x",
+            "<Password>x</Other>",
+            "<Password><![CDATA[]]></Password>",
+            "<Password><!-- c --></Password>",
+            "<!-- unterminated <Password>",
+        ] {
+            assert_eq!(site_data(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn exemptions_compare_the_whole_value() {
+        for t in [
+            "auth=digest-hunter2",
+            "<token>none-x</token>",
+            "<auth>digest hunter2</auth>",
+            "token=none2",
+        ] {
+            assert_eq!(site_data(t), Some(SiteDataKind::Credentials), "{t}");
+        }
+        for t in [
+            "auth: digest",
+            "<auth>digest</auth>",
+            "auth=basic",
+            "token=none",
+            "RTSP auth: digest only.",
         ] {
             assert_eq!(site_data(t), None, "{t}");
         }
