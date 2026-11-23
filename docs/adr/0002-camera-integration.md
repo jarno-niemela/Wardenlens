@@ -84,7 +84,8 @@ The first RTSP connection to hdipc main failed once (25 s timeout in `probe_stre
 
 ### 2. Reolink (reolink-1, reolink-2)
 
-Criterion "Baichuan login + event push proven": **login MET; event subscription MET; push of an actual motion
+Criterion "Baichuan login + event push proven": **login MET; event subscription MET; push of motion transitions MET (#27);
+AI person push NOT observed** (see below).
 transition NOT observed** (see below).
 
 - Tool: `spikes/s1-cameras/baichuan-probe` (standalone, not a workspace member), a thin wrapper over
@@ -116,11 +117,24 @@ transition NOT observed** (see below).
   XML is `AlarmEventList/AlarmEvent` with fields `channelId`, `status` (`MD` while motion is active, `none`),
   `AItype` (`people` while a person is detected; per neolink `none` otherwise), `recording`, `timeStamp`.
   The subscription was accepted on both cameras and the camera immediately pushed the initial
-  state message (`status=none`, `AItype=none`). During the observation windows (10 min plus 25 min per camera)
-  no motion occurred, so a `status=MD` / `AItype=people` transition was **not** seen on the wire. The message
-  and the field names are therefore confirmed by neolink's parser and the initial push, not by a live
-  detection. Vehicle and dog/cat AI types are not in neolink's documented values; they must be captured
-  live in Phase 1 with the raw XML logged.
+  state message (`status=none`, `AItype=none`).
+- **Live capture (#27, reolink-2... see `results/events/reolink-msg33-excerpt.log`):** three walks in front of one
+  RLC-520A (listening 900 s, 1000 s and 1500 s) produced 32 MSG 33 pushes, 15 `status="MD"` starts, each followed by a
+  `status="none"` stop. The probe prints the fields as `status`, `ai_type`, `channel_id`, `recording`, `timeStamp`.
+  - Cadence: one push per transition only (no periodic repeats); `MD` to `none` took 2 to 12 s (2, 2, 3, 4, 4, 5, 10, 12 s
+    in the first walk). `recording` and `timeStamp` were always 0, so the camera supplies no event time and Wardenlens
+    must stamp arrivals itself.
+  - **`ai_type` stayed `"none"` in all 32 pushes, including all 15 motion events.** No `people`, `vehicle` or `dog_cat`
+    value was ever seen on Baichuan MSG 33, so vehicle and animal values on this firmware remain unknown.
+  - The camera's AI configuration says person detection should work: with HTTPS temporarily enabled (owner-approved
+    write over Baichuan `MSG_ID_SET_SERVICE_PORTS`, reverted afterwards; `enable` 0 to 1 to 0, confirmed by re-reading),
+    `GetAiCfg` returned `AiDetectType` people=1, vehicle=1, dog_cat=1, face=0, and `GetAiState` returned `support`=1 for
+    people, vehicle and dog_cat (face 0) with every `alarm_state` 0 (`results/events/reolink-GetAi*.json`).
+  - **Open question for Phase 2:** why no AI type arrived. Candidates: (a) the walks did not trigger AI detection (distance,
+    angle or posture, or detection needs a person-shaped target for several frames) while the pixel motion detector did;
+    (b) AI alarms arrive on a different Baichuan message than MSG 33 (or only with a different subscription);
+    (c) the AI state must be polled (`GetAiState` over HTTPS, or the Baichuan equivalent) instead of being pushed.
+    Follow-up spike needed; until then do not rely on Baichuan for person events.
 
 ### 3. Dahua (xr)
 
@@ -155,10 +169,24 @@ Criterion "what the local API needs documented": **MET** (partly from public kno
   `WSPullPointSupport` and `WSSubscriptionPolicySupport` true. Responses take 6-9 ms.
 - Event topics (`GetEventProperties`, all under `tns1:RuleEngine`): `Motion` (`IsMotion`), `People` (`IsPeople`), `Intrusion`
   (`IsIntrusion`), `LineCross` (`IsLineCross`), `Tamper` (`IsTamper`) and `TPSmartEvent` (`IsTPSmartEvent`).
+  **No vehicle or animal topic is offered.**
 - PullPoint: `CreatePullPointSubscription` works. `PullMessages` with `Timeout=PT10S` returns an empty reply
   (connection closed) whereas `PT5S` returns a normal 200 after about 5.9 s; 150 consecutive `PT5S` polls
-  (15 min) all returned 200. No event was generated in that window (quiet scene), so an actual
-  `IsPeople`/`IsMotion` notification was **not** observed; topics and fields are from `GetEventProperties`.
+  (15 min) all returned 200. The pull-point address the camera returns is on a **different port of the same host** as the
+  ONVIF service, so a client must compare the host only (not the port) before following it (`onvif_pull.sh` does).
+- **Live capture (#27, `results/events/tapo-*.xml`):** three watches (the controller's walks in view of the camera). Across the watches 277 `Motion` and 29 `People` notification lines
+  were logged. Observed format (`wsnt:NotificationMessage` in `tev:PullMessagesResponse`):
+  - `wsnt:Topic` (dialect `ConcreteSet`): `tns1:RuleEngine/CellMotionDetector/Motion` or
+    `tns1:RuleEngine/PeopleDetector/People`. Only these two topics were seen.
+  - `tt:Message` attributes `PropertyOperation` (always `Initialized` in the captured raw set: 14 People, 6 Motion; no
+    `Changed` was captured, so confirm the transition value in Phase 1) and `UtcTime` (camera clock).
+  - `tt:Source` SimpleItems: `VideoSourceConfigurationToken`=`vsconf`, `VideoAnalyticsConfigurationToken`=`VideoAnalyticsToken`,
+    `Rule`=`MyMotionDetectorRule` (Motion) or `MyPeopleDetectorRule` (People).
+  - `tt:Data` SimpleItem: `IsMotion`=`true`, or `IsPeople`=`true`/`false` (13 true, 1 false in the raw set).
+  - **Attribute order is `Value` before `Name`** (`<tt:SimpleItem Value="true" Name="IsPeople">`), the reverse of the ONVIF
+    examples; parse by attribute name with a real XML parser, not by position or regex.
+  - `IsPeople` was seen both true and false, so the AI person state works live on the C110; vehicle and animal never
+    appeared (consistent with the topic list). Intrusion, LineCross, Tamper and TPSmartEvent were not triggered.
 - The local non-ONVIF API (HTTPS on 443, JSON `securePassthrough`/KLAP handshake, used by `pytapo`, and a
   media port 8800 that is also open) needs the **TP-Link cloud account** credentials, not the Camera Account: the account name is fixed by the firmware
   and the password is the cloud account password (newer firmware hashes it, with the KLAP/TPAP
@@ -211,9 +239,9 @@ Across both kinds, successful requests had p50 11 ms and p95 42 ms.
 | Sub resolution / fps | 640x480 / 10 | 704x576 / 25 | 640x360 / 15 | 640x360 / 25 |
 | Audio | not checked | disabled | not checked | G.711 advertised |
 | Native event channel | Baichuan push (9000) | CGI `eventManager` long-poll | ONVIF PullPoint | ONVIF (unreliable) |
-| Motion | yes (`MD`) | yes (`VideoMotion`) | yes (`IsMotion`) | not tested |
-| AI person | Baichuan `AItype=people` (unconfirmed live) | not offered (no IVS rule) | `IsPeople` (advertised, unconfirmed live) | none |
-| Other events | per neolink: none verified | `RtspSessionDisconnect`, `VideoMotionInfo` | Intrusion, LineCross, Tamper, TPSmartEvent | n/a |
+| Motion | yes (`MD`, observed live) | yes (`VideoMotion`) | yes (`IsMotion`, observed live) | not tested |
+| AI person | Baichuan `AItype=people`: **not seen live** (`ai_type` always `none`; camera AI cfg has people on), open question | not offered (no IVS rule) | `IsPeople` (observed live, true and false) | none |
+| Other events | none seen (no vehicle/animal on MSG 33) | `RtspSessionDisconnect`, `VideoMotionInfo` | Intrusion, LineCross, Tamper, TPSmartEvent | n/a |
 | ONVIF | yes (8000, enabled) | yes (80, not probed in depth) | yes (2020, works) | yes (1018, flaky) |
 | Vendor HTTP API | disabled; enable via Baichuan SET_SERVICE_PORTS | CGI with digest, works | HTTPS 443 needs cloud password | thttpd, not used |
 | Config read | Baichuan service ports | `configManager.cgi` Encode/IVS/MotionDetect | ONVIF profiles | ONVIF profiles |
@@ -250,9 +278,9 @@ Option 2.
 
 ## Open risks and follow-ups
 
-1. (#27) Reolink live motion/person push not observed in 35 min of watching; capture a real event (walk in front of a camera)
-   and record the raw `AlarmEvent` XML, including whether vehicle and animal types appear on the RLC-520A firmware.
-2. (#27) Tapo live `IsPeople` / `IsMotion` notifications not observed, same follow-up.
+1. Reolink AI person events were not seen on Baichuan MSG 33 (`ai_type` always `none` in 15 motion events, though `GetAiCfg`
+   people=1 and `GetAiState` support=1). Needs a follow-up spike (see the Reolink section); #27 captured motion only.
+2. Tapo `PropertyOperation` was `Initialized` for every captured notification; a `Changed` transition was not captured.
 3. Dahua `heartbeat` not honoured; dead-connection detection must be built and tested.
 4. The 2-client test did not find the maximum client count; Wardenlens plus AgentDVR plus a probe worked, which is the
    Phase 1 migration scenario, but a third concurrent consumer on Reolink was only briefly exercised.
