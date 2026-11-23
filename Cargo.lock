@@ -570,6 +570,15 @@ name = "wardenlens-core"
 version = "0.1.0"
 
 [[package]]
+name = "wardenlens-fsutil"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "wardenlens-secrets"
 version = "0.1.0"
 dependencies = [
