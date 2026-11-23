@@ -33,8 +33,10 @@ Constraints: workspace `unsafe_code = "forbid"` and `rust-version = 1.100` (the 
 3. Blocking threads only. Rejected: five long-lived RTSP sessions, reconnect timers and an HTTP server are I/O-bound
    fan-out where async is the clearer model.
 
-`wardenlens-core` stays synchronous and runtime-free (ARCH-1). Core traits may use `async fn` in traits (no runtime
-dependency) and are used through generics, not `dyn`.
+`wardenlens-core` stays synchronous and runtime-free (ARCH-1). Core traits that do I/O in their implementations are
+written `fn name(&self, ...) -> impl Future<Output = Result<..>> + Send` (not `async fn`, so the `Send` bound that
+tokio's multi-thread runtime needs is explicit) and are consumed through generics, never `dyn`. This is the single
+convention for every core trait, including `TokenStore`.
 
 ### 2. HTTP framework
 
@@ -75,8 +77,8 @@ untrusted args deserve a real parser). Only the `cli` crate depends on clap.
 ### 5. Logging
 
 **tracing** (libraries emit events and spans) + **tracing-subscriber** (only in the `cli` crate; features `fmt`,
-`env-filter`, `std`; the `ansi`, `tracing-log`, `smallvec` defaults are dropped, `json` can be added when a log
-collector exists). Pro: structured, async-aware, and axum/hyper-util already emit `tracing`. Rejected: `log` +
+`env-filter`, `json`, `std`; the `ansi`, `tracing-log`, `smallvec` defaults are dropped). The `json` feature is kept:
+`wardenlens-cli` offers `--log-format` (`json` or `text`) (#64). Pro: structured, async-aware, and axum/hyper-util already emit `tracing`. Rejected: `log` +
 `env_logger` (no spans, so request and per-camera context is awkward). SEC-6 applies: spans use `skip_all` unless
 fields are named explicitly, secrets are redacting newtypes (ADR 0006), and the API logs the token id, never the token.
 Output goes to stderr through the subscriber (`print_stdout`/`print_stderr` lints stay on).
@@ -85,8 +87,10 @@ Output goes to stderr through the subscriber (`print_stdout`/`print_stderr` lint
 
 **thiserror 2** in library crates (ERR-2) and **anyhow 1** only in `wardenlens-cli` (ERR-3). Each library defines its
 own error enum; crates never expose another crate's error type in a public signature unless wrapped with `#[source]`.
-Messages follow ERR-5. `wardenlens-core` may depend on `thiserror` (a proc-macro crate with no I/O); this is the
-only external dependency allowed in core (see Crate map). Rejected: `anyhow` in libraries (callers cannot match),
+Messages follow ERR-5. `wardenlens-core` may depend on exactly three external crates, all pure parsing or derive
+crates with no I/O: `thiserror`, `serde` (derive only) and `toml` (parse only, features `parse`, `serde`, `std`; the
+`display` writer is not enabled). #32 (camera catalogue) and #47 (service config) already parse TOML in core, so this
+keeps that parsing in the functional core (ARCH-1). Nothing else (no async, no network, no filesystem crate) enters core. Rejected: `anyhow` in libraries (callers cannot match),
 `eyre`/`snafu` (no gain over the two chosen crates, a third idiom).
 
 ### 7. ONVIF approach (hand-rolled)
@@ -107,7 +111,8 @@ only external dependency allowed in core (see Crate map). Rejected: `anyhow` in 
      nothing hand-rolled). `base64` is used with `default-features = false, features = ["std"]` to drop the
      `simd-unsafe` default.
    - Discovery: WS-Discovery `Probe` multicast to `239.255.255.250:3702` using `tokio::net::UdpSocket` and
-     `join_multicast_v4`; replies parsed with quick-xml, deduplicated by endpoint reference, capped at 64 replies and
+     `join_multicast_v4` (multicast does not cross Docker's default bridge network, so in a container discovery needs
+     `network_mode: host`; see the bind address rules in section 9); replies parsed with quick-xml, deduplicated by endpoint reference, capped at 64 replies and
      a 4 s window. Discovered addresses are suggestions that an operator confirms; they are never trusted blindly.
    - Camera quirks (ADR 0002): hdipc ONVIF is flaky, so every ONVIF call has a timeout and bounded retries, and ONVIF
      failure degrades a camera, it never blocks the RTSP video path.
@@ -127,9 +132,9 @@ other except `recorder -> mp4`.
 
 | crate | responsibility (one line) | depends on (workspace) |
 |---|---|---|
-| core | Pure domain types, errors, policy and the traits (ports) for store, clock, sinks; no I/O | none |
+| core | Pure domain types, errors, policy, config parsing and the traits (ports) for stores (including `TokenStore`), clock, sinks; no I/O | none |
 | secrets | Encryption at rest and redacting wrappers for camera credentials (ADR 0006) | core |
-| index | SQLite implementation of the core stores (cameras, recordings, tokens) | core |
+| index | SQLite implementation of the core stores (cameras, recordings, and `TokenStore`) | core |
 | agentdvr | Parses an AgentDVR export into camera drafts; no network, no storage | core |
 | onvif | ONVIF client and WS-Discovery (this ADR, section 7) | core |
 | ingest | RTSP ingest with reconnect; emits timestamped frames in core types | core |
@@ -137,7 +142,7 @@ other except `recorder -> mp4`.
 | recorder | Per-camera loop turning frames into segments via core traits | core, mp4 |
 | storage | Volumes, hot-to-archive mover, per-volume free-space floor, file I/O | core |
 | api | axum routes, OpenAPI, token authentication; talks to core traits only | core |
-| cli | Binary `wardenlens`: config, wiring, runtime, logging, `token` subcommands | all of the above |
+| cli | Binary `wardenlens`: config loading, wiring, runtime, logging, `token create`, `list`, `revoke` (#65) | all of the above |
 
 ```
           cli  (composition root: anyhow, clap, tracing-subscriber, tokio::main)
@@ -163,11 +168,17 @@ the map is enforced by review of each crate's `Cargo.toml` (a mechanical check i
   LAN addresses, including DNS-rebinding and cross-site requests. The Wardenlens host is not reachable from the
   internet; no port forwarding is part of this design.
 - What a token protects: read access to recordings (video of the inside and outside of the home), the camera list and
-  storage state; with the `admin` role also camera registry changes and recording deletion. The API never returns camera
-  credentials (SEC-6); a stolen token therefore reveals footage and metadata, not camera passwords.
+  storage state. Phase 1 has no mutating API routes (Phase 1 only reads cameras, recordings and storage), so in v1 a
+  token confers read access and nothing else. The API never returns camera credentials (SEC-6); a stolen token therefore
+  reveals footage and metadata, not camera passwords.
 - What plain HTTP exposes: anyone who can observe or alter LAN traffic (ARP spoofing, a compromised device on the same
   segment, Wi-Fi with a shared key) can read the video and the metadata in transit and replay the bearer token, and
   can modify responses. It does not expose camera credentials, which are never sent by the API.
+- Integrity and replay residual risk: a bearer token captured from the wire is valid until revoked, so the attacker can
+  replay it and read **historic** recordings, not only live footage, and an active attacker can alter a response in
+  transit (for example hide an event from a viewer). This is **accepted** for v1 on a private LAN because the attacker
+  must already be on the LAN, the cameras' own streams are equally exposed there, and the owner can revoke the token
+  (`wardenlens token revoke <id>`) and rotate it. It is not accepted off the LAN.
 - Why that is acceptable here: the same attackers can already read the plaintext RTSP streams from the cameras on the same
   LAN (ADR 0002 measured RTSP and ONVIF on plain ports), so plain HTTP between the NVR and a client adds no new
   confidentiality exposure beyond what the cameras already have; the stronger boundary is that the API is bound to
@@ -193,46 +204,80 @@ Alternatives rejected for v1:
 - mTLS. Rejected: needs the same CA machinery as TLS.
 
 **Bind address (LAN-only).** The default bind is `127.0.0.1:<port>` (loopback). To serve the LAN the operator sets an
-explicit address. At startup the server **refuses** an address that is not loopback, RFC 1918 private, link-local or
-IPv6 unique-local (`fc00::/7`). The unspecified addresses `0.0.0.0` and `::` are refused unless the operator also
-sets `api.allow_unspecified_bind = true`, which exists for containers (inside Docker the process must listen on all
-container interfaces; the compose file then publishes the port to one host LAN address, for example
-`192.0.2.10:<port>`). The check is a pure function in `core`/`api`, unit tested with `192.0.2.x`, `10.x`, loopback and a
-global address (which must be refused).
+explicit address (config key `api.bind`; the rules are implemented by #47). At startup the server classifies the address
+and **refuses** anything that is not in the allowed set:
 
-**Token format.** `wl_<id>_<secret>` where `<id>` is 8 random characters (lowercase base32, public; used for lookup,
-logging and revocation) and `<secret>` is 32 random bytes from the operating system CSPRNG (`getrandom::fill`) encoded
-as unpadded base64url, 43 characters, 256 bits. The `wl_` prefix lets secret scanners and humans recognise it.
-Example shape (fake): `wl_abcdefgh_` followed by 43 characters.
+- allowed: loopback (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`), IPv6 unique-local
+  (`fc00::/7`), link-local (`169.254/16`, `fe80::/10`, including addresses with a scope id such as `%eth0`, whose
+  scope is ignored for classification) and CGNAT `100.64.0.0/10`, which is allowed because VPN overlays such as
+  Tailscale assign addresses from it;
+- IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is classified by its IPv4 form, so `::ffff:` plus a public IPv4 is refused;
+- refused: TEST-NET-1 `192.0.2.0/24` (documentation space; it must never be a working config, which is also why the
+  examples in this repository use it) and every other non-private address, global unicast and multicast included;
+- the unspecified addresses `0.0.0.0` and `::` are refused unless the operator also sets
+  `api.allow_unspecified_bind = true`. That key exists for containers: on Docker's default bridge network the process
+  must listen on all container interfaces and the compose file publishes the port to one host LAN address. WS-Discovery
+  (section 7) does not work from the bridge network; if compose uses `network_mode: host` for discovery, the API must
+  instead bind a specific host LAN address and `allow_unspecified_bind` must stay `false` (#69 documents this in
+  `docs/deploy.md`).
+
+The check is a pure function in core (config validation), unit tested for each class above, including the
+TEST-NET-1 rejection, IPv4-mapped IPv6 and a scoped link-local address.
+
+**Token format.** `wl_<id>_<secret>`. `<id>` is 8 characters of lowercase base32 (alphabet `a-z2-7`, so it can never
+contain `_`), random, public; used for lookup, logging and revocation. `<secret>` is 32 bytes from the operating system
+CSPRNG (`getrandom::fill`) encoded as unpadded base64url, exactly 43 characters, which decodes to exactly 32 bytes (256
+bits). The base64url alphabet contains `_`, so a parser must not split on every underscore: it uses `splitn(3, '_')`
+(prefix, id, remainder) and then validates the remainder as the secret; anything not exactly this shape is rejected
+(wrong prefix, id length or alphabet, secret length, non-canonical base64, trailing data). The `wl_` prefix lets secret
+scanners and humans recognise it. Example shape (fake): `wl_abcdefgh_` followed by 43 characters.
 
 **Generation and storage.** Tokens are created only locally by the operator with `wardenlens token create --name
-<label> --role read|admin`, which prints the token **once** on stdout and stores
-`{id, name, role, sha256(secret), created_at, last_used_at, revoked}` in the SQLite index (the `TokenStore` trait lives
-in core). The plaintext token is never stored or logged. Because the secret has 256 bits of entropy, a fast hash
-(SHA-256, RustCrypto `sha2`) is sufficient: there is nothing to brute-force, so a slow password hash (argon2) would only
-cost CPU on every request. A copy of the database therefore cannot be turned into a working token, and the token store
-does not need ADR 0006 encryption. Rotation is create-then-revoke; `wardenlens token revoke <id>` and `list` complete
-the CLI. There is no API endpoint to mint tokens in v1 (a stolen admin token must not be able to mint more).
+<label>` (#65), which prints the token **once** on stdout. The index stores `{id, name, sha256(decoded secret bytes),
+created_at, last_used_at, revoked}`. There is **no role column in v1**: Phase 1 has no mutating API routes, so a role
+would protect nothing (CHG-3). Roles are introduced together with the first mutating route (a scheme change at that
+point means a schema change, accepted). The `TokenStore` trait is defined in **core**, the index crate implements it
+and the api crate consumes it through generics (see section 1), so api never depends on index. The plaintext token is
+never stored or logged. Because the secret has 256 bits of entropy, a fast hash (SHA-256, RustCrypto `sha2`) is
+sufficient: there is nothing to brute-force, so a slow password hash (argon2) would only cost CPU on every request. A
+copy of the database therefore cannot be turned into a working token, and the token store does not need ADR 0006
+encryption. Rotation is create-then-revoke. `token list` shows ids and names, never secrets; `token revoke <id>` sets
+`revoked` and keeps the row (audit trail; a revoked id is never reused). There is no API endpoint to mint tokens in v1
+(a stolen token must not be able to mint more).
 
 **Verification.** Clients send `Authorization: Bearer <token>`. The server rejects a header longer than 128 bytes before
-parsing (SEC-2), parses `wl_<id>_<secret>`, loads the row by `<id>`, computes `sha256(secret)` and compares the 32-byte
-digests with `subtle::ConstantTimeEq`. When the id is unknown or the token is revoked, the same hash and comparison run
-against a fixed dummy digest so the response time does not reveal which ids exist. Every failure returns the same
-`401` with `WWW-Authenticate: Bearer` and an empty-detail body; the log line records the peer address and, when
-parsed, the token id. A `read` token is rejected with `403` on mutating routes. `last_used_at` is updated at most
-once per minute per token to avoid write amplification.
+parsing (SEC-2), parses `wl_<id>_<secret>` as above, loads the row by `<id>`, decodes the secret, computes
+`sha256(secret bytes)` and compares the 32-byte digests with `subtle::ConstantTimeEq`. When the id is unknown or the
+token is revoked, the same hash and comparison run against a fixed dummy digest so the response time does not reveal
+which ids exist. Every failure returns the same `401` with `WWW-Authenticate: Bearer` and an empty-detail body; the log
+line records the peer address and, when parsed, the token id. `last_used_at` is updated at most once per minute per
+token to avoid write amplification.
 
-**Unauthenticated endpoints.** Only `GET /healthz` (liveness: `200` with `ok`, no version, no camera data). Everything
-else, including `GET /api/v1/openapi.json`, requires a valid token: the spec lists the full surface and is not
-a secret worth publishing to every device on the LAN. Request bodies are capped (default 1 MiB), requests have a
-timeout, and the number of concurrent connections is bounded, so an unauthenticated client cannot exhaust the host.
+**Unauthenticated endpoints.** Only `GET /api/v1/health` (#60): `200` with the body `{"status":"ok"}`. There is no
+version, build or camera data in it. The compose healthcheck (#69) uses this same route, so it needs no token.
+Everything else, including `GET /api/v1/openapi.json`, requires a valid token: the spec lists the full surface and is not
+a secret worth publishing to every device on the LAN.
+
+**Resource limits (api crate, #60).** Each limit is a specific mechanism, and none is described as more than it is:
+
+| threat | mechanism | what it does |
+|---|---|---|
+| large request bodies | axum `DefaultBodyLimit` / `tower-http` `RequestBodyLimitLayer`: 64 KiB | rejects bodies over 64 KiB; Phase 1 has no upload routes, so nothing legitimate is larger |
+| slow-header clients (slowloris) | hyper http1 `header_read_timeout` (set on the connection builder) | closes a connection that does not finish its request headers in time; this, not the request timeout, covers slowloris |
+| slow handlers | `tower` `TimeoutLayer` / `tower-http` `TimeoutLayer` | answers `408` or `504` and drops the handler future after the deadline |
+| request flood | `tower` `ConcurrencyLimitLayer` | caps the number of requests **in flight**; it is **not** a connection cap (idle keep-alive connections are not counted), so connection exhaustion is bounded by the OS file-descriptor limit and the LAN-only bind, not by this layer |
+| token leakage in logs | `tower-http` `SetSensitiveRequestHeadersLayer` on `Authorization`, plus `TraceLayer` | marks the header sensitive so tracing and Debug output redact it (SEC-6) |
+
+An unauthenticated client on the LAN can therefore not make the host buffer large bodies or hold header reads open
+indefinitely, and cannot create unbounded in-flight work; it can still open many idle connections up to the
+descriptor limit (accepted: LAN-only, no amplification).
 
 ### 10. New dependencies
 
 Observed 2026-11-23. "Defaults off" is the planned `default-features = false` use. The `cargo info` licence is the
 SPDX expression; every one of them contains an entry that is in the `deny.toml` allow list (`OR` expressions only need
 one allowed branch; `subtle` is `BSD-3-Clause`, `tokio`/`axum`/`quick-xml`/`hyper`/`hyper-util`/`http-body-util`/`tracing`/
-`tracing-subscriber` are `MIT`). Maintainers are the crates.io owners.
+`tracing-subscriber`/`tower`/`tower-http` are `MIT`; `toml` is `MIT OR Apache-2.0`). Maintainers are the crates.io owners.
 
 | crate | version | licence | last release | owners (crates.io) | defaults off? (features used) | deny.toml change |
 |---|---|---|---|---|---|---|
@@ -245,7 +290,10 @@ one allowed branch; `subtle` is `BSD-3-Clause`, `tokio`/`axum`/`quick-xml`/`hype
 | utoipa-axum | 0.3.0 | MIT OR Apache-2.0 | 2026-09-22 | juhaku | n/a (only feature is `debug`) | no |
 | clap | 4.6.9 | MIT OR Apache-2.0 | 2026-11-20 | kbknapp, rust-cli maintainers, clap-rs admins | no: defaults kept, plus `derive` | no |
 | tracing | 0.1.44 | MIT | 2025-12-18 | carllerche, hawkw, tokio-rs publish team | no: defaults kept (`std`, `attributes`) | no |
-| tracing-subscriber | 0.3.23 | MIT | 2026-03-13 | hawkw, davidbarsky, tokio-rs publish team | yes (`fmt`, `env-filter`, `std`) | no |
+| tracing-subscriber | 0.3.23 | MIT | 2026-03-13 | hawkw, davidbarsky, tokio-rs publish team | yes (`fmt`, `env-filter`, `json`, `std`) | no |
+| tower | 0.5.3 | MIT | 2026-01-12 | carllerche, seanmonstar, tower-rs publish team | yes (`util`, `timeout`, `limit`; default is empty) | no |
+| tower-http | 0.7.1 | MIT | 2026-08-31 | carllerche, tower-rs publish team | yes (`trace`, `sensitive-headers`, `limit`, `timeout`; default is empty) | no |
+| toml | 1.2.2 | MIT OR Apache-2.0 | 2026-11-21 | epage, toml-rs maintainers | yes (`parse`, `serde`, `std`; drops `display`); core, parse only | no |
 | thiserror | 2.0.21 | MIT OR Apache-2.0 | 2026-09-23 | dtolnay | no features | no |
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | 2026-07-18 | dtolnay | defaults kept (`std`); binary only | no |
 | quick-xml | 0.42.0 | MIT | 2026-08-22 | tafia, Mingun, dralley | yes (default is empty; none enabled) | no |
@@ -254,7 +302,7 @@ one allowed branch; `subtle` is `BSD-3-Clause`, `tokio`/`axum`/`quick-xml`/`hype
 | base64 | 0.23.1 | MIT OR Apache-2.0 | 2026-08-04 | alicemaz, marshallpierce | yes (`std` only; drops `simd-unsafe`) | no |
 | subtle | 2.6.1 | BSD-3-Clause | 2024-06-24 | isislovecruft, dalek-cryptography subtle maintainers | no features | no |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | 2026-06-17 | dhardy, rust-random maintainers | defaults (none) | no |
-| serde | 1.0.229 | MIT OR Apache-2.0 | 2026-07-18 | dtolnay, serde-rs publish team | yes (`derive` and `std`) | no |
+| serde | 1.0.229 | MIT OR Apache-2.0 | 2026-07-18 | dtolnay, serde-rs publish team | derive only in core (`derive`, `std`) | no |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 | 2026-10-11 | dtolnay, serde-rs publish team | defaults kept (`std`) | no |
 
 Maintenance notes. All crates other than `subtle` released in 2026. `subtle` (2.6.1, 2024-06-24) is stable and
@@ -264,13 +312,48 @@ but a vulnerability report would be the trigger to re-evaluate (alternative: `co
 `utoipa`/`utoipa-axum` have a single owner (bus factor 1); mitigated by the committed `docs/openapi.json` snapshot,
 which keeps the contract if the generator must be swapped. `quick-xml` 0.x may break minor to minor; pin `0.42`.
 
-**Licence and deny.toml check (executed).** In a scratch project (outside the repo) the exact set above was resolved
-(119 packages in `cargo tree`) with the repo's `deny.toml` and `cargo deny check licenses advisories bans` was run:
-`advisories ok`, `bans ok`. The licence check reported a failure for one package only, the scratch project
-itself (it had no licence field; workspace crates are `publish = false`, which `private.ignore = true` exempts). Every
-third-party crate in the resolved tree is covered by the existing allow list, so **`deny.toml` needs no change**.
-`bans.multiple-versions = "warn"` produced no deny failure. The actual dependencies are added by the tickets that use
-them, each of which re-runs `scripts/gate` (cargo-deny).
+**Licence and deny.toml check (executed, re-run after adding `tower`, `tower-http` and `toml`).** In a scratch
+project outside the repo (given `license = "MIT"` so the project itself is not reported) the exact set above, with the
+planned features, was resolved: 135 packages in `cargo tree -e normal`, none of them `reqwest`, `rustls`, `ring`,
+`openssl` or `aws-*`. Running the repo's `deny.toml` with `cargo deny check licenses advisories bans sources` gave
+`advisories ok, bans ok, licenses ok, sources ok`. The only warning was `bans.multiple-versions` for two versions of
+`syn`, which is `warn`, not `deny`. Every crate in the resolved tree is covered by the existing allow list, so
+**`deny.toml` needs no change**. (The first probe, 119 packages before `tower`, `tower-http`, `toml` and the
+tracing-subscriber `json` feature, had the same outcome apart from the scratch project's own missing licence field.)
+The actual dependencies are added by the tickets that use them, each of which re-runs `scripts/gate` (cargo-deny).
+
+## Decision
+
+Summary of what this ADR fixes (details in sections 1-10):
+
+| question | decision |
+|---|---|
+| runtime | tokio, minimal features; core stays runtime-free; core traits use `fn ... -> impl Future<Output = ..> + Send` with generics |
+| HTTP | axum 0.8, `default-features = false`, HTTP/1 only |
+| OpenAPI | utoipa 6 + utoipa-axum 0.3, spec generated from code, committed snapshot test |
+| CLI / logging | clap 4 derive; tracing in libraries, tracing-subscriber (`fmt`, `env-filter`, `json`) in the binary only, `--log-format` (`json` or `text`) |
+| errors | thiserror in libraries, anyhow only in the binary (ERR-2/3) |
+| core dependencies | `thiserror`, `serde` (derive only), `toml` (parse only); nothing else |
+| ONVIF | hand-rolled: quick-xml, hyper-util client over plain HTTP, sha1/base64 WS-Security digest, WS-Discovery on UDP 3702 |
+| crates | core, secrets, index, agentdvr, onvif, ingest, mp4, recorder, storage, api, cli; core depends on nothing; adapters do not depend on each other except recorder to mp4 |
+| transport | plain HTTP, no TLS in v1; bind loopback by default; only loopback, private, ULA, link-local and CGNAT addresses accepted; wildcard only with `api.allow_unspecified_bind` |
+| auth | `wl_<id>_<secret>` bearer token, SHA-256 of the decoded secret stored, looked up by id, constant-time comparison; no roles in v1 |
+| unauthenticated | `GET /api/v1/health` only, body `{"status":"ok"}`, no version |
+| limits | 64 KiB body, hyper `header_read_timeout`, timeout layers, `ConcurrencyLimit` on in-flight requests, `Authorization` marked sensitive |
+
+## Downstream tickets
+
+This ADR **overrides** ticket text written before it. Where a ticket and this ADR disagree, this ADR wins; the tickets
+below carry an "Amended by ADR 0004" section that matches it.
+
+| ticket | what the ADR fixes for it |
+|---|---|
+| #47 (service config in core) | config key `api.allow_unspecified_bind`; `serde` (derive) and `toml` (parse) are allowed in core; the bind classification in section 9, including TEST-NET-1 refused, CGNAT allowed, IPv4-mapped IPv6 by its IPv4 form, link-local scope ids |
+| #60 (api crate) | `GET /api/v1/health` unauthenticated with `{"status":"ok"}` and no version; `TokenStore` lives in core and api consumes it by generics; 64 KiB body limit; `tower` and `tower-http` layers as in the limits table; `openapi.json` needs a token; no roles |
+| #61 (cameras endpoints) | read-only: Phase 1 has no mutating API routes, so no roles, no write scopes and no camera credentials in any response |
+| #64 (cli skeleton) | tracing-subscriber keeps the `json` feature behind `--log-format` (`json` or `text`) |
+| #65 (token CLI) | token format and parsing (`splitn(3, '_')`), storage of id and SHA-256 of the decoded secret, lookup by id, constant-time compare with a dummy digest for unknown ids, `token revoke <id>` sets `revoked` and keeps the row, no roles, the store implements core's `TokenStore` |
+| #69 (Docker and compose) | healthcheck uses `GET /api/v1/health`; config key `api.allow_unspecified_bind`; WS-Discovery needs `network_mode: host`, in which case the API binds a specific LAN address; documented in `docs/deploy.md` |
 
 ## Consequences
 
@@ -279,13 +362,17 @@ them, each of which re-runs `scripts/gate` (cargo-deny).
   so TLS can be added later without changing clients.
 - Harder / accepted risks:
   - Plain HTTP on the LAN: a LAN eavesdropper or ARP spoofer sees video and tokens and can replay a token (residual
-    risk, equal to the existing plaintext RTSP exposure, not acceptable beyond a private network). Mitigation: private-address bind check, short
-    lifetime by rotation, revocation, per-token roles.
+    risk, equal to the existing plaintext RTSP exposure, not acceptable beyond a private network), including replay of
+    a captured token to read historic recordings and in-transit modification of responses (see the threat model).
+    Mitigation: bind-address check, rotation and revocation, read-only API in Phase 1.
   - A stolen token stays valid until revoked (no expiry in v1; add optional expiry later).
+  - No roles in v1: when the first mutating route is added, token scopes and a schema change come with it.
+  - `ConcurrencyLimit` bounds in-flight requests only; idle connections are bounded by the descriptor limit.
   - axum 0.8, utoipa 6, quick-xml 0.42 and utoipa-axum 0.3 are pre-1.0 or fresh majors; bumps need care.
   - ONVIF by hand is more code to test; mitigated by recorded real-device fixtures (ADR 0002 spike data) and fuzz-style
     tests for the XML reader.
   - No HTTPS ONVIF: a camera that requires it forces a new TLS-client decision.
-- To do (follow-up tickets, not part of this ADR): optional rustls or reverse-proxy documentation; OpenAPI snapshot test;
-  a mechanical check of the crate dependency direction; token expiry; `wardenlens token` subcommands and the
-  `TokenStore` in the index; the bind-address validation function.
+- To do: the `token` subcommands and the index-backed `TokenStore` (#65), the bind-address validation (#47) and the api
+  crate with the limits above (#60) already exist as tickets. Remaining follow-ups to be ticketed: optional rustls or
+  reverse-proxy documentation; the OpenAPI snapshot test; a mechanical check of the crate dependency direction; token
+  expiry.
