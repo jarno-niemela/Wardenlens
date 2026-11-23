@@ -2,6 +2,7 @@ use rustix::io::Errno;
 
 /// Errors from this crate. None of them carries a path (paths name cameras and times).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FsError {
     /// A path component was empty, `.`, `..`, or contained `/` or NUL. No syscall was made.
     #[error("invalid path component")]
@@ -18,9 +19,6 @@ pub enum FsError {
     /// The opened object is not a regular file.
     #[error("not a regular file")]
     NotRegular,
-    /// The opened object is not a directory.
-    #[error("not a directory")]
-    NotDirectory,
     /// The file grants group or other access.
     #[error("file mode {mode:o} grants group or other access")]
     InsecureMode {

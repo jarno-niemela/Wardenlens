@@ -13,6 +13,7 @@ use crate::error::FsError;
 
 /// Kind of a file system object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileKind {
     /// Regular file.
     Regular,
@@ -26,6 +27,7 @@ pub enum FileKind {
 
 /// The parts of `fstat` the callers use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileStat {
     /// Object kind.
     pub kind: FileKind,
@@ -62,6 +64,7 @@ impl FileStat {
 
 /// The parts of `fstatvfs` the volume probe uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VolumeStat {
     /// Fragment size in bytes.
     pub block_size: u64,
@@ -90,7 +93,7 @@ pub struct RootDir {
 }
 
 /// Check one path component: non-empty, not `.` or `..`, no `/`, no NUL.
-fn component(c: &str) -> Result<&str, FsError> {
+pub(crate) fn component(c: &str) -> Result<&str, FsError> {
     if c.is_empty() || c == "." || c == ".." || c.contains(['/', '\0']) {
         Err(FsError::InvalidComponent)
     } else {
@@ -116,16 +119,21 @@ fn join<S: AsRef<str>>(comps: &[S]) -> Result<String, FsError> {
 const BENEATH: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
 
 impl RootDir {
-    /// Open `path` as a directory handle (`O_DIRECTORY`). The root path itself is resolved
-    /// normally (it is operator configuration, not data found on the volume).
+    /// Open `path` as a directory handle (`O_DIRECTORY | O_NOFOLLOW`). Intermediate components
+    /// of `path` are resolved normally (operator configuration), but the final component must
+    /// not be a symlink (ADR 0005 section 8).
+    ///
+    /// Recommendation: mount the recordings volumes `nodev,nosuid,noexec`. A read open of a
+    /// device node runs the driver's open routine before `fstat` can refuse it; the volume
+    /// probe ticket is where this is enforced.
     ///
     /// # Errors
-    /// A failed `open`, or the path is not a directory.
+    /// A failed `open` (`ELOOP` for a symlinked root), or the path is not a directory.
     pub fn open(path: &Path) -> Result<Self, FsError> {
         let fd = openat(
             rustix::fs::CWD,
             path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(FsError::io("open root"))?;
@@ -148,7 +156,7 @@ impl RootDir {
     ///
     /// # Errors
     /// [`FsError::InvalidComponent`] before any syscall, or the kernel's refusal (`ELOOP` for a
-    /// symlink, `EXDEV` for an escape, `ENOENT`, ...).
+    /// symlink, `EXDEV` for an escape, `ENOENT`, ...), or `ENOTDIR`.
     pub fn open_dir<S: AsRef<str>>(&self, comps: &[S]) -> Result<Self, FsError> {
         let rel = join(comps)?;
         let fd = openat2(
@@ -162,7 +170,9 @@ impl RootDir {
         Ok(Self { fd })
     }
 
-    /// Open the regular file named by `comps` for reading. `O_NONBLOCK` keeps a planted FIFO
+    /// Open the regular file named by `comps` for reading. Mount recordings volumes
+    /// `nodev,nosuid,noexec`: a read open of a device node runs the driver's open routine
+    /// before the `fstat` below refuses it. `O_NONBLOCK` keeps a planted FIFO
     /// from blocking; the descriptor is then `fstat`ed and anything but a regular file is
     /// refused.
     ///
@@ -328,8 +338,9 @@ mod tests {
         std::fs::create_dir(d.path().join("real")).unwrap();
         std::fs::write(d.path().join("real/f"), b"x").unwrap();
         symlink(d.path().join("real"), d.path().join("link")).unwrap();
-        assert!(root.open_read(&["link", "f"]).is_err());
-        assert!(root.open_dir(&["link"]).is_err());
+        let loop_ = Some(rustix::io::Errno::LOOP);
+        assert_eq!(root.open_read(&["link", "f"]).unwrap_err().errno(), loop_);
+        assert_eq!(root.open_dir(&["link"]).unwrap_err().errno(), loop_);
     }
 
     #[test]
@@ -338,7 +349,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret"), b"x").unwrap();
         symlink(outside.path(), d.path().join("out")).unwrap();
-        assert!(root.open_read(&["out", "secret"]).is_err());
+        let errno = root.open_read(&["out", "secret"]).unwrap_err().errno();
+        assert!(
+            errno == Some(rustix::io::Errno::LOOP) || errno == Some(rustix::io::Errno::XDEV),
+            "{errno:?}"
+        );
     }
 
     #[test]
@@ -362,7 +377,10 @@ mod tests {
     fn open_dir_refuses_a_regular_file() {
         let (d, root) = setup();
         std::fs::write(d.path().join("f"), b"x").unwrap();
-        assert!(root.open_dir(&["f"]).is_err());
+        assert_eq!(
+            root.open_dir(&["f"]).unwrap_err().errno(),
+            Some(rustix::io::Errno::NOTDIR)
+        );
     }
 
     #[test]

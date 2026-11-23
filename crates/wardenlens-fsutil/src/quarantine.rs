@@ -1,7 +1,7 @@
 //! Quarantine rename (ADR 0005 section 9).
 
 use crate::error::FsError;
-use crate::root::RootDir;
+use crate::root::{RootDir, component};
 use rustix::io::Errno;
 
 /// Name of the quarantine directory under a root. No `CameraId` can equal it (they start with a letter).
@@ -12,6 +12,7 @@ pub const MAX_QUARANTINE_SUFFIX: u32 = 1_000;
 
 /// Result of a quarantine attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QuarantineOutcome {
     /// Moved. `suffix` is `None` for the plain name, else the numeric suffix used.
     Moved {
@@ -26,13 +27,23 @@ pub enum QuarantineOutcome {
 /// with `RENAME_NOREPLACE`, creating parent directories. Uses [`MAX_QUARANTINE_SUFFIX`].
 ///
 /// # Errors
-/// Invalid component (including a first component of `_quarantine`), or any failing syscall
-/// other than `EEXIST` on the final rename (which selects the next suffix).
+/// Invalid component (every element of `rel`, including the final name, is validated before any
+/// syscall; a first component of `_quarantine` is refused too), a source that is not a regular
+/// file ([`FsError::NotRegular`]: directories, FIFOs and symlinks are refused and nothing is
+/// created), or any failing syscall other than `EEXIST` on the final rename (which selects the
+/// next suffix).
+///
+/// A name of 255 bytes yields `ENAMETOOLONG` (the suffix does not fit) rather than
+/// [`QuarantineOutcome::Exhausted`].
+///
+/// If the rename succeeded but a later directory `fsync` failed, `Err` is returned although the
+/// file has already moved into quarantine.
 pub fn quarantine<S: AsRef<str>>(root: &RootDir, rel: &[S]) -> Result<QuarantineOutcome, FsError> {
     quarantine_with_bound(root, rel, MAX_QUARANTINE_SUFFIX)
 }
 
-/// As [`quarantine`] with an explicit suffix bound (tests use a small one).
+/// As [`quarantine`] with an explicit suffix bound (tests use a small one). The bound is clamped
+/// to [`MAX_QUARANTINE_SUFFIX`].
 ///
 /// # Errors
 /// As [`quarantine`].
@@ -44,6 +55,10 @@ pub fn quarantine_with_bound<S: AsRef<str>>(
     let Some((name, parents)) = rel.split_last() else {
         return Err(FsError::InvalidComponent);
     };
+    for c in rel {
+        component(c.as_ref())?;
+    }
+    let max_suffix = max_suffix.min(MAX_QUARANTINE_SUFFIX);
     let name = name.as_ref();
     if rel.first().is_some_and(|c| c.as_ref() == QUARANTINE_DIR) {
         return Err(FsError::InvalidComponent);
@@ -53,6 +68,8 @@ pub fn quarantine_with_bound<S: AsRef<str>>(
     } else {
         root.open_dir(parents)?
     };
+    // Refuse a directory, FIFO, symlink or device before creating anything.
+    drop(source_dir.open_read(&[name])?);
     let target_dir = ensure_quarantine_dir(root, parents)?;
 
     let mut candidate = name.to_owned();
@@ -169,8 +186,28 @@ mod tests {
     }
 
     #[test]
-    fn default_bound_is_one_thousand() {
-        assert_eq!(MAX_QUARANTINE_SUFFIX, 1_000);
+    fn oversized_bound_is_clamped() {
+        let (d, root) = setup();
+        std::fs::create_dir_all(d.path().join("_quarantine/cam/2026-01-02")).unwrap();
+        std::fs::write(qpath(&d, "000102-003.mp4"), b"q0").unwrap();
+        for i in 1..=MAX_QUARANTINE_SUFFIX {
+            std::fs::write(qpath(&d, &format!("000102-003.mp4.{i}")), b"q").unwrap();
+        }
+        assert_eq!(
+            quarantine_with_bound(&root, &REL, u32::MAX).unwrap(),
+            QuarantineOutcome::Exhausted
+        );
+        assert!(!qpath(&d, "000102-003.mp4.1001").exists());
+    }
+
+    #[test]
+    fn refuses_a_directory_source_and_creates_nothing() {
+        let (d, root) = setup();
+        std::fs::create_dir(d.path().join("cam/sub")).unwrap();
+        let e = quarantine(&root, &["cam", "sub"]).unwrap_err();
+        assert!(matches!(e, FsError::NotRegular));
+        assert!(d.path().join("cam/sub").is_dir());
+        assert!(!d.path().join("_quarantine").exists());
     }
 
     #[test]
@@ -190,7 +227,7 @@ mod tests {
 
     #[test]
     fn refuses_bad_components_and_quarantine_of_quarantine() {
-        let (_d, root) = setup();
+        let (d, root) = setup();
         assert!(matches!(
             quarantine(&root, &["cam", "..", "x"]),
             Err(FsError::InvalidComponent)
@@ -208,6 +245,7 @@ mod tests {
             quarantine(&root, &none),
             Err(FsError::InvalidComponent)
         ));
+        assert!(!d.path().join("_quarantine").exists());
     }
 
     #[test]
@@ -216,6 +254,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), d.path().join("_quarantine")).unwrap();
         assert!(quarantine(&root, &REL).is_err());
+        assert!(!d.path().join("_quarantine/cam").exists());
         assert!(d.path().join("cam/2026-01-02/000102-003.mp4").exists());
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
