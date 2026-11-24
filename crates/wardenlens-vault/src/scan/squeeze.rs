@@ -19,6 +19,14 @@ fn squeeze_char(c: char, out: &mut String) {
     }
 }
 
+/// True for a character that the joined view and the needle collapse both turn into a space
+/// (a run of them is one space): Unicode `White_Space`. This is the one definition both use, so
+/// a stored value and the same text in a file collapse alike. A line break among them is no
+/// extra line break: lines are counted on `\n` only.
+pub(super) fn is_collapsible(c: char) -> bool {
+    c.is_whitespace()
+}
+
 /// The squeezed form of `text`.
 pub(super) fn squeeze(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

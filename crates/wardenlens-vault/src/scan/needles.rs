@@ -14,7 +14,7 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use wardenlens_core::entry::EntryKind;
 
-use super::squeeze::{fold, squeeze};
+use super::squeeze::{fold, is_collapsible, squeeze};
 use crate::validate::MIN_SCANNABLE_LEN;
 
 /// Single-label hosts shorter than this are `unscannable` (ADR 0006 section 4).
@@ -31,6 +31,8 @@ pub(super) mod view {
     pub(in crate::scan) const UNSQUEEZED: u8 = RAW | DECODED | JSON;
     /// The squeezed, decoded, JSON and joined views.
     pub(in crate::scan) const SQUEEZED_SET: u8 = SQUEEZED | DECODED | JSON | JOINED;
+    /// The squeezed, decoded and JSON views: every squeezed view except the joined one.
+    pub(in crate::scan) const SQUEEZED_PLAIN: u8 = SQUEEZED | DECODED | JSON;
 }
 
 /// What may touch a match (`A` is an ASCII letter or digit).
@@ -78,8 +80,23 @@ struct Spec {
     min_len: usize,
 }
 
-fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// The needle collapse: every run of [`is_collapsible`] characters becomes one space, and the
+/// ends are trimmed. The joined view uses the same definition.
+pub(super) fn collapse(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending = false;
+    for c in text.chars() {
+        if is_collapsible(c) {
+            pending = !out.is_empty();
+        } else {
+            if pending {
+                out.push(' ');
+                pending = false;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn literals(bases: Vec<String>, spec: &Spec) -> Expansion {
@@ -105,17 +122,43 @@ fn literals(bases: Vec<String>, spec: &Spec) -> Expansion {
                 views,
             });
         };
+        // Only a kind with a joined view (`collapse`) gets that view (ADR 0006 section 7).
+        let squeezed_views = if spec.collapse {
+            view::SQUEEZED_SET
+        } else {
+            view::SQUEEZED_PLAIN
+        };
         if unsq == sq {
-            push(unsq, view::UNSQUEEZED | view::SQUEEZED_SET);
+            push(unsq, view::UNSQUEEZED | squeezed_views);
         } else {
             push(unsq, view::UNSQUEEZED);
-            push(sq, view::SQUEEZED_SET);
+            push(sq, squeezed_views);
         }
     }
     Expansion::Scannable {
         literals: out,
         net: Vec::new(),
     }
+}
+
+/// Adds the stored value itself, folded but not collapsed, as a needle of the views in which
+/// the verbatim text can match: the joined view collapses whitespace and is covered by the
+/// collapsed needle, every other view keeps the text as it is.
+fn with_verbatim(expansion: Expansion, value: &str) -> Expansion {
+    let Expansion::Scannable { mut literals, net } = expansion else {
+        return expansion;
+    };
+    let raw = fold(value);
+    let squeezed = fold(&squeeze(value));
+    for (text, views) in [(raw, view::UNSQUEEZED), (squeezed, view::SQUEEZED_PLAIN)] {
+        literals.push(Literal {
+            text,
+            boundary: Boundary::Alnum,
+            folded: true,
+            views,
+        });
+    }
+    Expansion::Scannable { literals, net }
 }
 
 fn only_net(net: Net) -> Expansion {
@@ -157,9 +200,9 @@ pub(super) fn expand(kind: EntryKind, value: &str) -> Expansion {
                 base.replace(' ', ""),
                 base,
             ];
-            literals(bases, &text)
+            with_verbatim(literals(bases, &text), value)
         }
-        EntryKind::Other => literals(vec![collapse(value)], &text),
+        EntryKind::Other => with_verbatim(literals(vec![collapse(value)], &text), value),
         EntryKind::Credential | EntryKind::Secret => {
             let spec = Spec {
                 fold: false,

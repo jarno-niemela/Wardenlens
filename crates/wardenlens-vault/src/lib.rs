@@ -15,8 +15,8 @@ mod validate;
 
 pub use error::VaultError;
 pub use scan::{
-    Content, Hit, MAX_FILE_LEN, MAX_HITS, MAX_INPUT_LEN, MAX_NEEDLE_BYTES, Matcher, ScanEntry,
-    ScanError, ScanReport, Unscannable, classify, scan,
+    BINARY_PROBE_LEN, Content, Hit, MAX_FILE_LEN, MAX_HITS, MAX_INPUT_LEN, MAX_NEEDLE_BYTES,
+    Matcher, ScanEntry, ScanError, ScanReport, Unscannable, classify, scan,
 };
 pub use store::{
     BUSY_TIMEOUT, Entry, EntryInfo, MAX_ENTRIES, MAX_VALUE_LEN, Scan, Scannability, Value, Vault,

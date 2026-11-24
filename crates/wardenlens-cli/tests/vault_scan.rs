@@ -339,3 +339,109 @@ fn the_key_variable_makes_a_scan_exit_two() {
     assert_eq!(o.status.code(), Some(2));
     assert_no_value(&o);
 }
+
+#[test]
+fn a_large_binary_file_is_skipped_and_a_large_text_file_is_refused() {
+    let s = Setup::new();
+    let size = 9 * 1024 * 1024;
+    let mut blob = vec![b'x'; size];
+    blob[0] = 0;
+    let blob = s.file("big.bin", &blob);
+    let o = s.scan(&[&blob]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("skipped binary file"), "{}", err(&o));
+    // A NUL after the probe window does not make a file binary.
+    let mut late = vec![b'x'; size];
+    late[8 * 1024] = 0;
+    let late = s.file("big-late-nul.txt", &late);
+    assert_eq!(s.scan(&[&late]).status.code(), Some(2));
+    // UTF-16 with a byte order mark is text, so it is refused over the limit even with NULs.
+    let mut wide = vec![0xFF, 0xFE];
+    wide.resize(size, 0);
+    let wide = s.file("big-wide.txt", &wide);
+    assert_eq!(s.scan(&[&wide]).status.code(), Some(2));
+    let text = s.file("big.txt", &vec![b'x'; size]);
+    let o = s.scan(&[&text]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("8 MiB"), "{}", err(&o));
+}
+
+#[test]
+fn a_fifo_found_while_walking_is_counted_and_not_opened() {
+    let s = Setup::new();
+    s.file("dir/ok.txt", b"x\n");
+    let fifo = s.work.path().join("dir/pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let o = s.scan(&[&s.work.path().join("dir")]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("1 special file(s)"), "{}", err(&o));
+}
+
+#[test]
+fn many_binary_files_are_summarised_after_twenty_notices() {
+    let s = Setup::new();
+    for i in 0..25 {
+        s.file(&format!("bin/b{i:02}.bin"), b"a\0b");
+    }
+    let o = s.scan(&[&s.work.path().join("bin")]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let e = err(&o);
+    assert_eq!(e.matches("skipped binary file").count(), 20, "{e}");
+    assert!(e.contains("25 binary files skipped in all"), "{e}");
+    // Exactly at the limit there is no summary.
+    let s = Setup::new();
+    for i in 0..20 {
+        s.file(&format!("bin/b{i:02}.bin"), b"a\0b");
+    }
+    let e = err(&s.scan(&[&s.work.path().join("bin")]));
+    assert_eq!(e.matches("skipped binary file").count(), 20, "{e}");
+    assert!(!e.contains("in all"), "{e}");
+}
+
+#[test]
+fn nesting_beyond_the_depth_limit_exits_two() {
+    let s = Setup::new();
+    let mut deep = PathBuf::from("deep");
+    for _ in 0..70 {
+        deep.push("d");
+    }
+    s.file(&format!("{}/leaf.txt", deep.display()), b"x\n");
+    let o = s.scan(&[&s.work.path().join("deep")]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(
+        err(&o).contains("nested deeper than the walk limit"),
+        "{}",
+        err(&o)
+    );
+}
+
+#[test]
+fn control_characters_in_a_path_are_escaped_not_printed() {
+    let s = Setup::new();
+    // A file name that would forge a second report line and clear the screen.
+    let name = "a\nforged secret line\u{1b}[2J\u{85}\u{2028}x.txt";
+    let f = s.file(name, format!("{SECRET}\n").as_bytes());
+    let o = s.scan(&[&f]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_no_value(&o);
+    let text = out(&o);
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+    for bad in ['\u{1b}', '\u{85}', '\u{2028}'] {
+        assert!(!text.contains(bad), "{text:?}");
+    }
+    assert!(text.contains("\\u{a}forged"), "{text:?}");
+    let missing = s.work.path().join("gone\r\nerror: forged\u{7f}");
+    let o = s.scan(&[&missing]);
+    assert_eq!(o.status.code(), Some(2));
+    let e = err(&o);
+    assert!(!e.contains('\r') && !e.contains('\u{7f}'), "{e:?}");
+    let forged: Vec<&str> = e.lines().filter(|l| l.contains("forged")).collect();
+    assert_eq!(forged.len(), 1, "{e:?}");
+    assert!(forged[0].starts_with("error: "), "{e:?}");
+}

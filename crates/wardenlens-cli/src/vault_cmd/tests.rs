@@ -1586,3 +1586,86 @@ fn adv2_a_partial_legacy_import_then_a_rerun_completes_it() {
     assert!(out.contains("imported"), "{out}");
     assert!(!out.contains("pw-synthetic"), "{out}");
 }
+
+// ---- scan exit codes ----------------------------------------------------------------------
+
+/// A terminal whose output always fails.
+struct Broken(Fails, Fails);
+
+struct Fails;
+
+impl Write for Fails {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("closed"))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Terminal for Broken {
+    fn stdin_is_tty(&self) -> bool {
+        false
+    }
+    fn stdout_kind(&self) -> StdoutKind {
+        StdoutKind::Pipe
+    }
+    fn prompt_secret(&mut self, _: &str) -> io::Result<Zeroizing<Vec<u8>>> {
+        Err(io::Error::other("no prompt"))
+    }
+    fn read_piped(&mut self, _: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(Vec::new()))
+    }
+    fn out(&mut self) -> &mut dyn Write {
+        &mut self.0
+    }
+    fn err(&mut self) -> &mut dyn Write {
+        &mut self.1
+    }
+}
+
+fn scan_args(path: &Path) -> crate::args::ScanArgs {
+    crate::args::ScanArgs {
+        paths: vec![path.to_owned()],
+    }
+}
+
+#[test]
+fn a_walk_over_the_limit_exits_two_not_one() {
+    let h = Home::new();
+    h.init();
+    let work = tempfile::tempdir().unwrap();
+    for i in 0..4 {
+        std::fs::write(work.path().join(format!("f{i}")), "x").unwrap();
+    }
+    let run_with = |limit| {
+        let mut t = Fake::pipe();
+        super::scan::run_with(&scan_args(work.path()), &h.paths(), &mut t, limit)
+    };
+    assert!(run_with(4).is_ok());
+    let e = run_with(3).unwrap_err();
+    assert!(matches!(e, CliError::CouldNotScan(_)), "{e:?}");
+    assert_eq!(e.exit_code(), 2);
+}
+
+#[test]
+fn an_output_error_exits_two_not_one() {
+    let h = Home::new();
+    h.init();
+    // The summary line goes to stderr, which fails.
+    let work = tempfile::tempdir().unwrap();
+    let e = super::scan::run(
+        &scan_args(work.path()),
+        &h.paths(),
+        &mut Broken(Fails, Fails),
+    )
+    .unwrap_err();
+    assert!(matches!(e, CliError::CouldNotScan(_)), "{e:?}");
+    assert_eq!(e.exit_code(), 2);
+    // And a hit report that cannot be written is not a "hit found" either.
+    set_text(&h, "tok:a", "secret", MARK);
+    let f = work.path().join("leak.txt");
+    std::fs::write(&f, format!("{MARK}\n")).unwrap();
+    let e = super::scan::run(&scan_args(&f), &h.paths(), &mut Broken(Fails, Fails)).unwrap_err();
+    assert_eq!(e.exit_code(), 2, "{e:?}");
+}

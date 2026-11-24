@@ -5,6 +5,8 @@
 
 use std::borrow::Cow;
 
+use super::squeeze::is_collapsible;
+
 /// Bytes of one view and the offsets at which the line number increases.
 pub(super) struct View<'a> {
     pub(super) bytes: Cow<'a, [u8]>,
@@ -168,15 +170,15 @@ pub(super) fn json_unescaped(squeezed: &str) -> String {
     out
 }
 
-/// The joined view, already folded: every run of spaces, tabs and line breaks becomes one space
-/// and the text is lowercased. A name wrapped across lines or indented is found; a hit is
+/// The joined view, already folded: every run of whitespace (`is_collapsible`, the set the needle
+/// collapse uses) becomes one space and the text is lowercased. A name wrapped across lines or indented is found; a hit is
 /// reported at the line where it starts.
 pub(super) fn joined_folded(squeezed: &str) -> View<'static> {
     let mut out = String::with_capacity(squeezed.len());
     let mut marks = Vec::new();
     let mut in_run = false;
     for c in squeezed.chars() {
-        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+        if is_collapsible(c) {
             if !in_run {
                 in_run = true;
                 out.push(' ');
@@ -267,6 +269,26 @@ mod tests {
         assert_eq!(v.line_at(0), 1);
         assert_eq!(v.line_at(10), 2);
         assert_eq!(v.line_at(16), 3);
+    }
+
+    /// The needle collapse and the joined view collapse exactly the same characters, for every
+    /// scalar value, and neither adds a line break (only `\n` is one).
+    #[test]
+    fn needle_collapse_and_joined_view_use_one_whitespace_set() {
+        use super::super::needles::collapse;
+        for n in 0..=0x0010_FFFFu32 {
+            let Some(c) = char::from_u32(n) else { continue };
+            let text = format!("a{c}b");
+            let joined = joined_folded(&text);
+            let by_view = joined.bytes.as_ref() == b"a b";
+            let by_needle = collapse(&text) == "a b";
+            assert_eq!(by_view, by_needle, "U+{n:04X}");
+            assert_eq!(by_view, is_collapsible(c), "U+{n:04X}");
+            if c != '\n' {
+                assert_eq!(joined.line_at(usize::MAX), 1, "U+{n:04X} adds a line break");
+            }
+        }
+        assert_eq!(collapse("  a \u{2028}\u{202F}b\n c  "), "a b c");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use aho_corasick::{AhoCorasick, MatchKind};
 use secrecy::ExposeSecret;
 use wardenlens_core::entry::{EntryId, EntryKind};
 
-use super::needles::{Boundary, Expansion, Literal, Net, expand};
+use super::needles::{Boundary, Expansion, Literal, Net, expand, view};
 use super::net::Owners;
 use super::{MAX_NEEDLE_BYTES, ScanEntry, ScanError, Unscannable};
 use crate::store::{MAX_ENTRIES, Value, Vault};
@@ -157,7 +157,7 @@ impl Matcher {
                     return Err(ScanError::NeedlesTooLarge);
                 }
                 if l.folded {
-                    needs_joined |= l.text.contains(' ');
+                    needs_joined |= l.views & view::JOINED != 0 && l.text.contains(' ');
                     folded.add(l, index);
                 } else {
                     exact.add(l, index);

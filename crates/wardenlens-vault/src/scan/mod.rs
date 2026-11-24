@@ -37,7 +37,7 @@ pub const MAX_NEEDLE_BYTES: usize = 16 * 1024 * 1024;
 /// Most hits one [`scan`] returns; more is reported as [`ScanReport::truncated`].
 pub const MAX_HITS: usize = 10_000;
 /// A file with a NUL byte in this many leading bytes is binary.
-const BINARY_PROBE_LEN: usize = 8 * 1024;
+pub const BINARY_PROBE_LEN: usize = 8 * 1024;
 
 /// Why a matcher could not be built or an input could not be scanned. Never carries a value.
 #[derive(Debug, thiserror::Error)]
