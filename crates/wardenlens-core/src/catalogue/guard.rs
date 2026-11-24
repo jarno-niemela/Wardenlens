@@ -103,7 +103,10 @@ impl std::fmt::Display for LintWarning {
 }
 
 /// Enforcing structural check on every raw line of a catalogue file, comments included: the
-/// character allow-list ([`SiteDataKind::Encoding`]). Shape heuristics are not enforced here;
+/// character allow-list and the ban on every backslash ([`SiteDataKind::Encoding`]). TOML escapes
+/// (`\u`, `\U`, a line-ending `\`) are plain ASCII yet decode to other text, which the exact-match
+/// scan reads raw; refusing every backslash, in strings and comments alike, leaves one spelling
+/// of each value. Shape heuristics are not enforced here;
 /// see [`lint_source`] and the exact-match `wardenlens vault scan cameras/` (ADR 0006).
 ///
 /// [`CatalogueEntry::from_toml_str`](super::CatalogueEntry::from_toml_str) calls this before
@@ -113,7 +116,7 @@ impl std::fmt::Display for LintWarning {
 /// [`CatalogueError::SiteData`] naming `line N` (never the text) for the first offending line.
 pub fn check_source(text: &str) -> Result<(), CatalogueError> {
     for (index, line) in text.lines().enumerate() {
-        if has_odd_encoding(line) {
+        if has_odd_encoding(line) || line.contains('\\') {
             let field = format!("line {}", index.saturating_add(1));
             return Err(CatalogueError::SiteData {
                 field,

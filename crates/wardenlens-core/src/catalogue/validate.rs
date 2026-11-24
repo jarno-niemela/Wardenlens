@@ -195,35 +195,44 @@ mod tests {
         assert_eq!(validate(&base()), Ok(()));
     }
 
-    #[test]
-    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
-    fn checks_every_string_field() {
-        let bad = "10.1.2.3".to_owned();
+    /// One entry per string field, each carrying `bad` (a plain `bad` for text fields, `/bad`
+    /// for protocol paths) in that field only, with the label `strings()` must give it.
+    fn one_bad_field_each(bad: &str) -> Vec<(CatalogueEntry, &'static str)> {
         let mut cases = Vec::new();
         let mut e = base();
-        e.vendor.clone_from(&bad);
+        bad.clone_into(&mut e.vendor);
         cases.push((e, "vendor"));
         let mut e = base();
-        e.model.clone_from(&bad);
+        bad.clone_into(&mut e.model);
         cases.push((e, "model"));
         let mut e = base();
-        e.aliases = vec![bad.clone()];
+        e.aliases = vec!["ok".to_owned(), bad.to_owned()];
+        cases.push((e, "aliases[1]"));
+        let mut e = base();
+        e.aliases = vec![bad.to_owned()];
         cases.push((e, "aliases[0]"));
         let mut e = base();
-        e.quirks = vec![bad.clone()];
+        e.quirks = vec![bad.to_owned()];
         cases.push((e, "quirks[0]"));
         let mut e = base();
         e.evidence = vec![Evidence {
-            reference: bad.clone(),
+            reference: bad.to_owned(),
             section: None,
         }];
         cases.push((e, "evidence[0].reference"));
         let mut e = base();
         e.evidence = vec![Evidence {
             reference: "x".to_owned(),
-            section: Some(bad.clone()),
+            section: Some(bad.to_owned()),
         }];
         cases.push((e, "evidence[0].section"));
+        let mut e = base();
+        e.protocols = vec![Protocol {
+            kind: super::super::entry::ProtocolKind::Rtsp,
+            port: None,
+            paths: vec!["/ok".to_owned(), format!("/{bad}")],
+        }];
+        cases.push((e, "protocols[0].paths[1]"));
         let mut e = base();
         e.protocols = vec![Protocol {
             kind: super::super::entry::ProtocolKind::Rtsp,
@@ -231,16 +240,27 @@ mod tests {
             paths: vec![format!("/{bad}")],
         }];
         cases.push((e, "protocols[0].paths[0]"));
-        for (e, field) in cases {
-            match validate(&e) {
-                Err(CatalogueError::SiteData {
-                    field: f,
-                    kind: SiteDataKind::Ipv4,
-                }) => {
-                    assert_eq!(f, field);
-                }
-                other => panic!("{field}: {other:?}"),
-            }
+        cases
+    }
+
+    /// A zero-width space between two digits, built from its code point.
+    fn encoding_violation() -> String {
+        let z = char::from_u32(0x200B).unwrap_or('?');
+        format!("1{z}0")
+    }
+
+    #[test]
+    fn lint_covers_every_string_field() {
+        for (e, field) in one_bad_field_each("10.1.2.3") {
+            let w = lint(&e);
+            assert_eq!(
+                w,
+                vec![LintWarning {
+                    field: field.to_owned(),
+                    kind: SiteDataKind::Ipv4
+                }],
+                "{field}"
+            );
         }
     }
 
@@ -269,15 +289,16 @@ mod tests {
 
     #[test]
     fn validate_enforces_the_encoding_allow_list_in_every_string_field() {
-        let mut e = base();
-        e.quirks = vec!["1\u{200B}0".to_owned()];
-        assert_eq!(
-            validate(&e),
-            Err(CatalogueError::SiteData {
-                field: "quirks[0]".to_owned(),
-                kind: SiteDataKind::Encoding
-            })
-        );
+        for (e, field) in one_bad_field_each(&encoding_violation()) {
+            assert_eq!(
+                validate(&e),
+                Err(CatalogueError::SiteData {
+                    field: field.to_owned(),
+                    kind: SiteDataKind::Encoding
+                }),
+                "{field}"
+            );
+        }
     }
 
     #[test]

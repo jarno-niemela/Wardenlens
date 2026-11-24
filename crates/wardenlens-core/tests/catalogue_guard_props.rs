@@ -21,7 +21,6 @@ proptest! {
     }
 
     #[test]
-
     #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn any_mac_in_text_is_rejected(
         bytes in any::<[u8; 6]>(),

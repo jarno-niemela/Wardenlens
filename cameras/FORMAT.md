@@ -22,10 +22,14 @@ a site. Those live only in the encrypted vault (ADR 0006). Three layers apply:
    the real values of the vault, including their normalised and encoded forms, so the result does
    not depend on how a value is written. `crates/wardenlens-cli/tests/catalogue_scan.rs` runs it
    against a synthetic vault (with a planted-value control) and, when a vault exists at the default
-   path, against the real one; the git hooks and `scripts/agents check` run it too.
+   path, against the real one; the git hooks and `scripts/agents check` will run it too once #117 lands (not yet).
 2. **Structure (enforced).** Unknown fields, `://` or non-`/` protocol paths, files over 64 KiB, and
    characters outside the allow-list (ASCII without controls, plus alphabetic letters; no invisible
-   or fullwidth characters) are rejected on every raw line, comments included.
+   or fullwidth characters) are rejected on every raw line, comments included. So is every
+   backslash, in strings and comments alike: TOML escapes (short and long unicode escapes, a
+   line-ending backslash in a multi-line string) decode to text that the exact-match scan reads
+   raw, so each value has exactly one spelling. The same allow-list applies to every string field
+   of a parsed entry (vendor, model, aliases, quirks, evidence, protocol paths).
 3. **Soft lint (optional, never fails anything).** `catalogue::lint` and `catalogue::lint_source`
    return warnings for text that merely looks like an address, MAC, serial, credential or private
    hostname. It is advice for authors; its rules are in the `guard` module docs.

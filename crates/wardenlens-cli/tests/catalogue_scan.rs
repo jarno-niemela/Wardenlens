@@ -130,23 +130,25 @@ fn control_a_planted_vault_value_in_an_entry_is_a_hit_and_is_never_printed() {
     }
 }
 
-/// Where the default vault lives (ADR 0006 section 4): `WARDENLENS_VAULT`, else under `HOME`.
-/// Only the existence of the file is checked here; it is never opened, read or listed.
-fn default_vault_exists() -> bool {
+/// Whether the default vault scan must run (ADR 0006 section 4). Mirrors `env.rs`: a set
+/// `WARDENLENS_VAULT` (even empty) or a `HOME` that is not an absolute path is a configuration
+/// the binary refuses, so the scan must run and fail rather than be skipped. Only the existence
+/// of the file is checked; it is never opened, read or listed.
+fn default_vault_must_be_scanned() -> bool {
     let path = match std::env::var_os("WARDENLENS_VAULT") {
         Some(p) => PathBuf::from(p),
         None => match std::env::var_os("HOME") {
             Some(h) => PathBuf::from(h).join(".local/share/wardenlens/dev-vault.db"),
-            None => return false,
+            None => return true,
         },
     };
-    path.symlink_metadata().is_ok()
+    !path.is_absolute() || path.symlink_metadata().is_ok()
 }
 
 #[test]
 fn the_real_catalogue_has_no_value_of_the_default_vault_when_there_is_one() {
     // Not skipped on CI: the only reason to skip is that no vault exists on this machine.
-    if !default_vault_exists() {
+    if !default_vault_must_be_scanned() {
         eprintln!(
             "NOTICE: no default vault on this machine; skipping the default-vault scan of cameras/ \
              (the synthetic-vault tests above still run)"

@@ -52,7 +52,7 @@ fn xml_element_credentials_are_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn compound_secret_keys_are_rejected() {
     let inputs = [
         "secret_key=abc",
@@ -66,7 +66,7 @@ fn compound_secret_keys_are_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn other_separators_and_entities_between_key_and_secret_are_rejected() {
     let inputs = [
         "password => hunter2",
@@ -82,7 +82,7 @@ fn other_separators_and_entities_between_key_and_secret_are_rejected() {
 
 /// `admin:x` in an HTTP Basic header is short enough to slip under the serial rule.
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn short_basic_auth_header_is_rejected() {
     let inputs = [
         "Authorization: Basic YWRtaW46eA==",
@@ -97,7 +97,7 @@ fn short_basic_auth_header_is_rejected() {
 /// U+A4F8 LISU LETTER TONE MYA TI looks like `.`, U+A4FD LISU LETTER TONE MYA JEU and U+02D0
 /// MODIFIER LETTER TRIANGULAR COLON look like `:`. All three are `Lm`, so `is_alphabetic`.
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn alphabetic_punctuation_lookalikes_are_rejected() {
     let inputs = [
         "camera 192\u{A4F8}168\u{A4F8}1\u{A4F8}20",
@@ -112,7 +112,7 @@ fn alphabetic_punctuation_lookalikes_are_rejected() {
 
 /// `Nl` letter numbers (Roman numerals) are alphabetic, so they pass the allow-list as digits.
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn letter_number_digits_are_rejected() {
     let inputs = ["camera \u{2160}92.\u{2160}68.\u{2160}.20"];
     let bad = accepted(&inputs, quirk);
@@ -122,7 +122,7 @@ fn letter_number_digits_are_rejected() {
 // ---- IPv4 partials ----
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn ipv4_with_wildcard_in_an_inner_group_is_rejected() {
     let inputs = ["camera 192.168.x.20", "camera 10.0.*.5"];
     let bad = accepted(&inputs, check_source);
@@ -132,7 +132,6 @@ fn ipv4_with_wildcard_in_an_inner_group_is_rejected() {
 // ---- False positives on legitimate catalogue prose ----
 
 #[test]
-#[ignore = "follow-up #72"]
 fn stream_specs_with_at_sign_are_accepted() {
     let inputs = [
         "Sub stream is 640x360@15fps.",
@@ -143,7 +142,6 @@ fn stream_specs_with_at_sign_are_accepted() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
 fn protocol_constants_are_accepted() {
     let inputs = [
         // ONVIF WS-Discovery multicast group, a protocol constant, not site data.
@@ -156,7 +154,6 @@ fn protocol_constants_are_accepted() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
 fn secret_words_in_descriptive_prose_are_accepted() {
     let inputs = [
         "Login token: expires after one hour.",

@@ -70,7 +70,7 @@ fn xml_secret_behind_cdata_or_comment_is_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn xml_secret_with_entity_escaped_brackets_is_rejected() {
     let inputs = ["&lt;Password&gt;hunter2&lt;/Password&gt;"];
     let bad = accepted(&inputs, quirk);
@@ -141,7 +141,6 @@ fn identifiers_containing_short_keys_are_accepted() {
 
 /// Quirk prose that names ONVIF or CGI operations in camelCase followed by a colon.
 #[test]
-#[ignore = "follow-up #72"]
 fn camel_case_operation_names_in_prose_are_accepted() {
     let inputs = [
         "ONVIF SetUser: fails with a SOAP fault on this firmware.",
@@ -156,7 +155,6 @@ fn camel_case_operation_names_in_prose_are_accepted() {
 // ---- XML element false positives on legitimate prose ----
 
 #[test]
-#[ignore = "follow-up #72"]
 fn angle_bracket_placeholders_in_prose_are_accepted() {
     let inputs = [
         "RTSP paths are /<channel>/<stream> on newer firmware.",
@@ -201,7 +199,6 @@ fn hash_inside_a_model_string_does_not_start_a_comment() {
 /// Multi-line alias arrays are a normal TOML layout; real model names on the continuation lines
 /// must not be refused as serials.
 #[test]
-#[ignore = "follow-up #72"]
 fn multiline_alias_array_with_real_model_names_is_accepted() {
     let toml = "vendor=\"Hikvision\"\nmodel=\"DS-2CD2387G2P-LSU\"\naliases = [\n  \"DS-2CD2T87G2P-LSU\",\n]\nsupport=\"community\"\n[[evidence]]\nreference=\"x\"\n";
     assert_eq!(full(toml), Ok(()));

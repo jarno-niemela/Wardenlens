@@ -106,11 +106,9 @@ fn readme_matrix_is_up_to_date() {
 }
 
 #[test]
-fn published_docs_contain_no_site_data() {
+fn published_docs_use_only_allowed_characters() {
     for name in ["README.md", "FORMAT.md"] {
         let text = fs::read_to_string(cameras_dir().join(name)).unwrap();
-        // The bless command names an environment variable in capitals; that is not a serial.
-        let text = text.replace("WARDENLENS_BLESS", "BLESS");
         check_source(&text).unwrap_or_else(|e| panic!("cameras/{name}: {e}"));
     }
 }

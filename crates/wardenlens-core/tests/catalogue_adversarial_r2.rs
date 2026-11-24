@@ -79,8 +79,13 @@ fn ascii_control_escapes_cannot_split_an_ipv4_in_a_parsed_string() {
 #[test]
 fn control_characters_in_vendor_do_not_reach_the_readme() {
     // An ESC sequence in a model name would be written verbatim into cameras/README.md.
+    // The escaped spelling is refused outright (every backslash is, rework 2); the entry is
+    // then built as a struct so `validate` still has to reject the control character itself.
     let toml = "vendor=\"A\\u001B[2J\"\nmodel=\"B\"\nsupport=\"verified\"\n[[evidence]]\nreference=\"x\"\n";
-    let e = CatalogueEntry::from_toml_str(toml).unwrap();
+    assert!(CatalogueEntry::from_toml_str(toml).is_err());
+    let toml = "vendor=\"A\"\nmodel=\"B\"\nsupport=\"verified\"\n[[evidence]]\nreference=\"x\"\n";
+    let mut e = CatalogueEntry::from_toml_str(toml).unwrap();
+    e.vendor = "A\u{1B}[2J".to_owned();
     assert!(
         validate(&e).is_err(),
         "control character accepted in vendor: {:?}",
@@ -130,7 +135,7 @@ fn url_encoded_secret_pair_is_rejected() {
 // ---- IPv4 / MAC / serial forms ----
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn defanged_and_alternate_separator_ipv4_is_rejected() {
     let inputs = [
         "camera 192[.]168[.]1[.]20",
@@ -144,7 +149,7 @@ fn defanged_and_alternate_separator_ipv4_is_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn mac_with_dot_pairs_or_unpadded_groups_is_rejected() {
     let inputs = ["mac a4.5e.60.0b.11.2c", "mac 0-1b-63-84-45-e6"];
     let bad = accepted(&inputs, check_source);
@@ -152,7 +157,7 @@ fn mac_with_dot_pairs_or_unpadded_groups_is_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn serial_key_value_pairs_are_rejected() {
     let inputs = ["serial=x9k2m4p7q1", "sn: x9k2m4p7q1", "uid=a1b2c3d4"];
     let bad = accepted(&inputs, check_source);
@@ -160,7 +165,7 @@ fn serial_key_value_pairs_are_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn ddns_hostnames_are_rejected() {
     let inputs = [
         "cam at myhouse.duckdns.org",
@@ -172,7 +177,7 @@ fn ddns_hostnames_are_rejected() {
 }
 
 #[test]
-#[ignore = "follow-up #72"]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn ipv4_split_across_two_comment_lines_is_rejected() {
     let toml = format!("# camera at 192.168.\n# 1.20\n{}", entry_text(""));
     assert!(full(&toml).is_err(), "split address in comments accepted");
@@ -218,8 +223,15 @@ fn legitimate_quirk_prose_is_accepted() {
 
 #[test]
 fn backslash_before_pipe_cannot_break_a_matrix_cell() {
-    let toml = "vendor='A\\|B'\nmodel=\"M\"\nsupport=\"partial\"\n";
-    let e = CatalogueEntry::from_toml_str(toml).unwrap();
+    // A backslash in the source is refused (rework 2); the renderer must still escape one that
+    // reaches it through a struct.
+    assert!(
+        CatalogueEntry::from_toml_str("vendor='A\\|B'\nmodel=\"M\"\nsupport=\"partial\"\n")
+            .is_err()
+    );
+    let toml = "vendor='A'\nmodel=\"M\"\nsupport=\"partial\"\n";
+    let mut e = CatalogueEntry::from_toml_str(toml).unwrap();
+    e.vendor = "A\\|B".to_owned();
     let m = render_matrix(&[e]);
     let row = m.lines().last().unwrap();
     // 9 unescaped pipes = 8 columns.
@@ -238,7 +250,6 @@ fn backslash_before_pipe_cannot_break_a_matrix_cell() {
 // ---- Must hold (coverage) ----
 
 #[test]
-#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn toml_escapes_hiding_ipv4_in_every_string_field_are_caught() {
     let hidden = "192\\u002e168\\u002e1\\u002e20";
     for extra in [
@@ -261,7 +272,6 @@ fn toml_escapes_hiding_ipv4_in_every_string_field_are_caught() {
 }
 
 #[test]
-#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn multiline_string_line_continuation_cannot_hide_ipv4() {
     let toml = entry_text("quirks=[\"\"\"host 192.168.\\\n   1.20\"\"\"]");
     assert!(matches!(full(&toml), Err(CatalogueError::SiteData { .. })));
