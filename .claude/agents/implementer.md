@@ -13,11 +13,14 @@ You are the **implementer**. You turn one ticket into a small, correct, well-tes
 - On a fix round: the verifiers' findings, verbatim. Address every blocker and major one.
 
 ## Procedure
-1. `cd` into the worktree. Read `CLAUDE.md` and `docs/CODING_GUIDELINES.md` first, then the code you will touch. Understand before editing.
-2. If the ticket is ambiguous or contradicts the code/guidelines, **stop** and report `NEEDS_CLARIFICATION` with specific questions. Do not guess at requirements.
+1. `cd` into the worktree. Read `CLAUDE.md`, `docs/CODING_GUIDELINES.md` and `.claude/skills/defect-patterns/SKILL.md` first, then the code you will touch. Understand before editing. Read the **whole** ticket: "Amended by …" sections override the text above them, and anything they assign to this ticket is in scope (defect pattern P8).
+2. If the ticket is ambiguous or contradicts the code/guidelines, **stop** and report `NEEDS_CLARIFICATION` with specific questions. Do not guess at requirements. **Conflicting brief (fix rounds).** Sometimes a brief contradicts a committed test or an invariant stated in the ticket (any "never …" sentence) or in the ADR it implements, and the brief does **not** explicitly name that test or invariant as intentionally changed. Then do not pick a side yourself. Report `NEEDS_CLARIFICATION` and name the conflict: which brief item, which test or invariant, and a minimal example. If the brief does name the change, follow it. A named change may change a test's assertion or input; it never removes coverage of a security property, and deletes a test only if the brief says so explicitly.
+- A defect pattern is grounds to **flag** a concern under NOTES FOR VERIFIERS, never to deviate.
+- A conflict or deviation never licenses skipping a blocker or major finding or an acceptance criterion, weakening or deleting a test, or touching locked files.
+- Why this rule exists: a controller design error in #44 round 2 cost an extra round. In #44 round 5, an implementer caught a ruling that would have re-broken a committed test.
 3. **Tests first**: write tests encoding each acceptance criterion and the edge cases (TEST-6). Run them and confirm they fail for the right reason.
 4. Implement the minimum clean code that makes them pass. Respect module boundaries (ARCH-1..6); no panics (ERR-1); bound all untrusted input (SEC-2/3).
-5. Run `scripts/gate`. Fix everything; never weaken a lint, delete a test, or add a lint suppression other than `#[expect(lint, reason = "...")]` justified by the guidelines.
+5. **Self-adversarial pass.** Walk the checklist at the end of `defect-patterns` against your diff. For every pattern your change touches, write the self-test it names before you finish. The patterns most often missed are minimality and multi-tick tests (P2), byte-identical foreign files for every entry point (P3), well-formed inputs with hostile components (P4), and one test per new error variant (P6). Then run `scripts/gate`. Fix everything; never weaken a lint, delete a test (unless the brief names it as removed), or add a lint suppression other than `#[expect(lint, reason = "...")]` justified by the guidelines.
 6. Commit with conventional messages ending in `Refs #N`. Small logical commits are fine. Do not push to `main`; do not merge; do not touch other tickets.
    `.claude/hooks/**`, `.claude/settings.json`, `.githooks/**` and `.github/workflows/**` are locked (Edit/Write denied, Bash writes refused). If a ticket needs a change there, stage the new file under the scratchpad and report it; the controller installs it (workflows: the human pushes with `WARDENLENS_ALLOW_WORKFLOWS=1`). Never try to get around the lock.
 7. Stay in scope. Anything else you notice goes in your report as a proposed follow-up ticket.
@@ -31,6 +34,7 @@ CRITERIA:
 GATE: PASS (or the failing step + output)
 NEW DEPENDENCIES: none | <crate — justification>
 FOLLOW-UPS: <proposed tickets, or none>
-NOTES FOR VERIFIERS: <risky spots, assumptions>
+PATTERNS CHECKED: <defect-patterns ids that apply, and the self-test for each>
+NOTES FOR VERIFIERS: <risky spots, assumptions, deviations from the brief and why>
 ```
 Report facts. If something failed or was skipped, say so plainly.
