@@ -165,14 +165,26 @@ Rules:
   private copy of the vault file and the journal into a `.wardenlens-probe-*` directory (mode 0700, files 0600)
   beside the vault and lets SQLite roll the copy back; the verdict is taken on the rolled-back copy. A wrong key
   gives `WrongKey`, a foreign database `NotInitialized`, an unknown schema `UnsupportedSchema`. `PendingJournal`
-  is returned only for `create`, for a copy that is still corrupt after the rollback, for a copy over the cap
-  (256 MiB per file) or for a journal that is not a regular file (checked with `O_NOFOLLOW | O_NONBLOCK`, so a
-  FIFO or symlink cannot hang or redirect the open). The directory is removed on every return path but is left
-  behind if the process is killed during the probe. Only a copy that proves to be the owner's vault lets `open`
-  proceed on the real file, so SQLite rolls back its own hot journal. The originals are never modified, the journal
-  is never deleted and a `-wal` sidecar is always refused. The safety against a journal that names a super-journal
-  (which SQLite would otherwise delete) relies on bundled SQLite (`rusqlite` with `features = ["bundled"]`,
-  3.54 or later) and must stay.
+  is returned when the state could not be judged: for `create` that meets a vault with an unfinished transaction
+  (a crashed `create` whose copy rolls back to a file with no vault is `NotEmpty`); for a copy that is still
+  corrupt after the rollback; for a raced read, after the busy timeout, that finds the file corrupt; when the
+  retry cap is exhausted (the journal or the change counter kept moving: 20 more attempts after the busy
+  timeout); for a copy over the cap (256 MiB per file); for a journal that is not a regular file (checked with
+  `O_NOFOLLOW | O_NONBLOCK`, so a FIFO or symlink cannot hang or redirect the open); and for a journal whose
+  last 8 bytes are the super-journal magic. A vault never writes a super-journal pointer, and the open does not
+  copy such a journal: SQLite would follow the pointer while rolling the copy back, and a FIFO placed under a
+  valid super-journal name (`-mj`, then 9 hex digits whose third from last is `9`) would block that read, so the
+  tail is checked first. (An earlier draft said a FIFO cannot hang the open; that held for the `-journal`
+  itself, not for the super-journal it may name.) SQLite's own guard stays as the second line: it deletes a
+  named super-journal only if its name is valid and its contents list this journal (`bSeen` in
+  `pager_delsuper`). The journal is stamped (kind, device, inode, length) before the copy and again through its
+  path after it, so a journal renamed over the path is noticed. The directory is removed on every return path
+  but is left behind if the process is killed during the probe. Only a copy that proves to be the owner's vault
+  lets `open` proceed on the real file, so SQLite rolls back its own hot journal. The originals are never
+  modified, the journal is never deleted and a `-wal` sidecar is always refused (also when it appears while a
+  verdict is being reached). The safety against a journal that names a super-journal (which SQLite would
+  otherwise delete) relies on the tail check above and on bundled SQLite (`rusqlite` with
+  `features = ["bundled"]`, 3.54 or later) and must stay.
 - Schema (version 1): `meta(key TEXT PRIMARY KEY, value BLOB)` holding `schema_version` and `keycheck` (a sealed
   constant under id `meta:keycheck`, so a wrong key is detected before any entry is touched), and
   `entries(id TEXT PRIMARY KEY, kind INTEGER NOT NULL, record BLOB NOT NULL, created_at INTEGER NOT NULL, updated_at
