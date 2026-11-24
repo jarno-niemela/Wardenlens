@@ -32,3 +32,5 @@ FINDINGS:
 DEPENDENCIES: <new/changed crates and assessment, or none>
 ```
 BLOCK on any blocker or major. Every blocker must include a concrete attack scenario; if you cannot construct one, downgrade it. Do not pad the report with generic advice.
+
+Seed list: `.claude/skills/defect-patterns/SKILL.md`, P3 (foreign files, sidecars and recovery), P4 (untrusted bytes) and P6 (error typing), lists past findings in this repository. Cite the pattern ID with your finding when one matches.

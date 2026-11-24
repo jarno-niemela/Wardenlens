@@ -15,7 +15,7 @@ Keep this file short; details live in the linked docs.
 - `crates/wardenlens-core` — pure domain logic (no I/O) · `crates/wardenlens-cli` — binary `wardenlens`
 - `docs/WORKFLOW.md` — ticket lifecycle, labels, roles, merge gate · `docs/CODING_GUIDELINES.md` · `docs/adr/`
 - `.claude/agents/` — implementer (sonnet), reviewer / security-auditor / adversary / planner (opus)
-- `.claude/skills/` — `/work`, `/plan-epic`, `/new-ticket`, `/verify`, `/ticket-audit`, `rust-guidelines`
+- `.claude/skills/` — `/work`, `/plan-epic`, `/new-ticket`, `/verify`, `/ticket-audit`, `rust-guidelines`, `defect-patterns` (read before DONE), `/retro` (`improve-skills`: turn review findings into skill updates)
 - `.claude/hooks/` — Bash guard (no force-push / push to main / `--no-verify` / `--admin` / merge without `--match-head-commit`), rustfmt on edit
 - `scripts/ticket` (create/claim/status/next/list/epic-progress/unblock), `scripts/ticket-audit`, `scripts/verify` (mark/check/carry the SHA-bound verification gate), `scripts/gate`, `scripts/labels.sh`
 

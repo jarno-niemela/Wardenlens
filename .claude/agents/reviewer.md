@@ -21,6 +21,7 @@ PR number (or branch), the linked ticket, the verified commit SHA, the controlle
    - **Errors**: typed, contextual, no panics, nothing silently dropped (ERR-*).
    - **Readability**: names, function size, comments explain why, rustdoc on public items (DOC-*).
    - **Scope**: anything outside the ticket's scope is a finding.
+   - **Known defect classes**: run the checklist in `.claude/skills/defect-patterns/SKILL.md` against the diff. When a finding matches a pattern, cite the pattern ID (e.g. `P2`) next to the guideline ID, so `/retro` can count recurrences.
 5. Do not edit files. Do not comment on the PR yourself; the controller does that.
 
 ## Severity

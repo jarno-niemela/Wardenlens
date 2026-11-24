@@ -33,7 +33,7 @@ git worktree add .claude/worktrees/N -b <branch> origin/main
 ```
 
 ## 2. Implement (Sonnet)
-Dispatch the `implementer` subagent with: ticket number, full ticket body, worktree path, branch. Outcomes:
+Dispatch the `implementer` subagent with: ticket number, full ticket body, worktree path, branch. For a high-risk ticket, name the `defect-patterns` entries that apply in the brief and the self-tests you expect for each. High risk means destructive actions, parsing untrusted bytes, touching files the program did not create, clocks or timeouts, or merging several inputs into one key space. Getting these into round 1 is the cheapest way to save rounds. Outcomes:
 - `NEEDS_CLARIFICATION`: answer from the codebase/ticket if you can, else comment the questions on the issue, label it `agent:human`, return it to `status:backlog`, remove the worktree, and move on.
 - `BLOCKED`: comment the blocker on the issue. If another ticket blocks it, `scripts/ticket status N blocked` and add a `Blocked by: #M` line to its body; otherwise label it `agent:human` and set `status:backlog`. Remove the worktree and continue with the next ticket.
 - `DONE`: verify the claims yourself. **You** run `scripts/gate` in the worktree; do not trust the report alone.
@@ -67,10 +67,22 @@ Collect verdicts:
 - Minor findings: file follow-ups now: `scripts/ticket task <epic> "<title>" -p p3 -F body.md` (bugs: `-t bug`). Link them in a PR comment.
 
 ## 5. Fix loop (max 5 rounds)
+**Writing a design ruling into a fix brief.** Most extra rounds came from rulings that fixed one case and broke another. Before sending a ruling:
+- **State the invariant** the fix must keep, quoting the ticket's "never …" sentences and the ADR principle.
+- **Apply it symmetrically.** If it holds for the archive tier, it must hold for the hot tier, and the same goes for `create` versus `open`.
+- **Check it against the committed adversary tests.** For stateful logic, simulate several ticks by hand.
+  - In #44, "delete toward the target" re-broke minimality in round 2, and "ratchet the budget unconditionally" would have re-broken the no-drain property in round 5.
+  - In #104, "refuse any sidecar" broke the vault's own crash recovery.
+- **Prefer absolute targets over per-tick amounts,** and typed distinct errors over reused ones.
+- **Tell the implementer to push back** if the ruling contradicts a committed test.
+
 1. `scripts/ticket status N changes-requested`; post the consolidated findings as a PR comment (`gh pr comment`).
 2. Re-dispatch the `implementer` with the findings verbatim and the adversary's failing tests (tell it to commit those tests: they are now regression tests).
 3. You run the gate, push, set `SHA` to the new head, and go back to step 4 with **all three** verifiers from scratch. `scripts/ticket status N in-review`. Statuses on the old SHA do not count for the new head.
 4. After round 5 still failing: stop. Comment a summary, label issue and PR `agent:human`, leave it `changes-requested`, report to user, continue with the next ticket if `--loop`.
+
+## 5b. Running verification in parallel
+Two PRs can be verified at once only if a trial merge of both onto `origin/main` is clean. Use a scratch clone with a throwaway identity, because the guard blocks `git -c`. Almost every core PR adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`, so two such PRs conflict. Verify those one after another, and merge whichever is closer to passing first. Resolve the conflict by taking the union of both module lists (sorted), then run the gate and push.
 
 ## 6. Keep adversary tests and merge
 Passing adversary tests listed under WORTH KEEPING: copy them from the adversary worktree into the PR branch, commit them (test-only), run the gate, push, then:
@@ -83,6 +95,8 @@ gh pr checks <pr> --watch --fail-fast
 sha=$(scripts/verify check <pr>) && gh pr merge <pr> --squash --delete-branch --match-head-commit "$sha"
 git worktree remove .claude/worktrees/N && git fetch -q origin
 ```
+Run `cargo fmt --all` after copying adversary files; the pre-commit hook rejects unformatted test files. If an adversary test fails only because of an accepted minor or a deferred item, mark it `#[ignore = "follow-up #N"]` and file #N; never delete it.
+If CodeQL fails on synthetic test credentials (`rust/hard-coded-cryptographic-value`, `rust/cleartext-logging`), check that every alert is in test code or is a verified false positive. Dismiss each one with a reason (`used in tests` / `false positive`) and a comment, and note it on the PR.
 Remove the adversary worktree as its own step, only after its tests have been copied out: `git worktree remove --force .claude/worktrees/N-adv` (it holds untracked files, so `--force` is needed).
 `scripts/verify check` succeeds only when all three `verify/*` statuses are `success` on the current head and every other check is green; the guard hook blocks `gh pr merge` without `--match-head-commit`. Never merge with a red or pending check, an unticked acceptance criterion or a head that changed after verification. Never use `--admin`.
 
@@ -91,4 +105,5 @@ Remove the adversary worktree as its own step, only after its tests have been co
 - `scripts/ticket epic-progress <epic>`; if all tasks closed, verify the epic's acceptance criteria and close it.
 - `scripts/ticket-audit --fail-on never`.
 - Report: ticket, PR link, rounds needed, findings fixed, follow-ups filed.
+- If the ticket needed 3 or more rounds, or a finding matched an existing `defect-patterns` entry, run `/retro` (the `improve-skills` skill) on the PR, or queue it for the next retro.
 - With `--loop`, go to step 0.
