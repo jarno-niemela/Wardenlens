@@ -1,0 +1,26 @@
+[package]
+name = "wardenlens-vault"
+description = "Sensitive-data vault: SQLite store of sealed entries, per-kind validation, rekey and legacy-import mapping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+secrecy = "0.10"
+serde_json = "1"
+thiserror = { workspace = true }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+wardenlens-core = { workspace = true }
+wardenlens-fsutil = { path = "../wardenlens-fsutil" }
+wardenlens-secrets = { path = "../wardenlens-secrets" }
+rustix = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

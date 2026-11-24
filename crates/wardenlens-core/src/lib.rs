@@ -5,7 +5,9 @@
 //! depend on this one, never the other way round.
 
 pub mod connection;
+pub mod entry;
 pub mod mp4box;
+pub mod recording;
 pub mod storage;
 pub mod time;
 
