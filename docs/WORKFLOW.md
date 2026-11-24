@@ -129,6 +129,8 @@ with the remaining defect tracked. A merge override is valid only when all of th
   the failing adversary tests (kept outside the repo, not committed to the branch);
 - a PR comment headed **"Owner override"** quotes the owner's choice, the independent
   verdicts (BLOCK/BROKEN) and the follow-up number;
+- an acceptance criterion the remaining defect breaks stays unticked in the PR body, marked
+  "deferred to #M under owner override" (this satisfies merge rule 3 for that criterion);
 - only after that comment does the controller set the `verify/*` statuses to success. Those
   statuses record the override, not an independent pass; the PR comment is the audit trail.
 

@@ -68,13 +68,14 @@ Collect verdicts:
 
 ## 5. Fix loop (max 5 rounds)
 **Writing a design ruling into a fix brief.** Most extra rounds came from rulings that fixed one case and broke another. Before sending a ruling:
+- **Ask for the class, not the instance.** When a finding is one case of a rule (one subcommand skipping a refusal, one error kind echoing input), the brief asks for the rule at its choke point, as an allowlist, with a test over every case (P10).
 - **State the invariant** the fix must keep, quoting the ticket's "never …" sentences and the ADR principle.
 - **Apply it symmetrically.** If it holds for the archive tier, it must hold for the hot tier, and the same goes for `create` versus `open`.
 - **Check it against the committed adversary tests.** For stateful logic, simulate several ticks by hand.
   - In #44, "delete toward the target" re-broke minimality in round 2, and "ratchet the budget unconditionally" would have re-broken the no-drain property in round 5.
   - In #104, "refuse any sidecar" broke the vault's own crash recovery.
 - **Prefer absolute targets over per-tick amounts,** and typed distinct errors over reused ones.
-- **Name every committed test or invariant the ruling intentionally changes.** The implementer reports `NEEDS_CLARIFICATION` for any contradiction you did not name. In a fix round, resolve that by correcting and re-issuing the brief (the PR stays open, the ticket stays `changes-requested`); do not use the step-2 backlog path.
+- **Name every committed test or invariant the ruling intentionally changes.** The implementer reports `NEEDS_CLARIFICATION` for any contradiction you did not name. In a fix round, resolve that by correcting and re-issuing the brief (the PR stays open, the ticket stays `changes-requested`); do not use the step-2 backlog path. If it is a real spec question you cannot answer, ask the owner with the ticket still `changes-requested` and the PR open.
 
 1. `scripts/ticket status N changes-requested`; post the consolidated findings as a PR comment (`gh pr comment`).
 2. Re-dispatch the `implementer` with the findings verbatim and the adversary's failing tests (tell it to commit those tests: they are now regression tests).
@@ -90,7 +91,7 @@ Collect verdicts:
   - Only then set the `verify/*` statuses to success. They record the override, not an independent pass.
 
 ## 5b. Running verification in parallel
-Two PRs can be verified at once only if a trial merge of both onto `origin/main` is clean. Use a scratch clone (`/tmp/claude-1000/mt`) with a throwaway identity (`git -c user.name=t -c user.email=t@example.invalid merge …`) for the trial only. **Never push from the scratch clone**: it has no `core.hooksPath`, so `.githooks/pre-push` would not run. Almost every core PR adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`, so two such PRs conflict. Verify those one after another, and merge whichever is closer to passing first. Resolve the real conflict in the PR's own hooked worktree (`git merge origin/main`, the union of both module lists, sorted), then run the gate and push. The new head needs all three verifiers again. That re-verification is not a fix round and does not count toward the cap, but it costs as much as one, so prefer merging the closer PR first over verifying both.
+Two PRs can be verified at once only if a trial merge of both onto `origin/main` is clean. Use a scratch clone (`/tmp/claude-1000/mt`) with a throwaway identity (`git -c user.name=t -c user.email=t@example.invalid merge …`) for the trial only. **Never push from the scratch clone**: it has no `core.hooksPath`, so `.githooks/pre-push` would not run. Almost every core PR adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`, so two such PRs conflict. Verify those one after another, and merge whichever is closer to passing first. Resolve the real conflict in the PR's own hooked worktree (`git merge origin/main`, the union of both module lists, sorted), then run the gate and push. The new head needs all three verifiers again. That re-verification is not a fix round and does not count toward the cap; name its briefs `<ticket>-<role>-rN-reverify.md` so `/retro` does not count them. It costs as much as a round, so prefer merging the closer PR first over verifying both.
 
 ## 6. Keep adversary tests and merge
 Passing adversary tests listed under WORTH KEEPING: copy them from the adversary worktree into the PR branch, commit them (test-only), run the gate, push, then:
@@ -113,5 +114,5 @@ Remove the adversary worktree as its own step, only after its tests have been co
 - `scripts/ticket epic-progress <epic>`; if all tasks closed, verify the epic's acceptance criteria and close it.
 - `scripts/ticket-audit --fail-on never`.
 - Report: ticket, PR link, rounds needed, findings fixed, follow-ups filed.
-- If the ticket needed 3 or more rounds, or a finding matched an existing `defect-patterns` entry, run `/retro` (the `retro` skill) on the PR, or queue it for the next retro.
+- Run `/retro` (the `retro` skill) when the ticket needed 3 or more rounds or hit the cap, when the same finding appeared in two PRs, or when the user asks. Otherwise note the PR for the next `/retro recent`.
 - With `--loop`, go to step 0.
