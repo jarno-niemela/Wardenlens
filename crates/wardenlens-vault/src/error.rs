@@ -29,10 +29,14 @@ pub enum VaultError {
     /// this (see [`VaultError::PendingJournal`]).
     #[error("file is not an initialised vault")]
     NotInitialized,
-    /// The vault has a non-empty `-journal` that did not go away within the busy timeout (another
-    /// process is writing, or a previous write was interrupted) and the file could not be proven
-    /// to be the caller's vault. Do not delete the `-journal` file: it holds the data needed to
-    /// roll the vault back.
+    /// The vault has a non-empty `-journal` that did not go away within the busy timeout and the
+    /// state could not be judged: `create` met it, or a copy of the vault with its journal rolled
+    /// back in a private scratch directory is still corrupt. Nothing was modified. The owner can
+    /// wait for a running writer to finish and retry; if no writer is running, restore the vault
+    /// from a backup. Do not delete the `-journal` file: it holds the data needed to roll the
+    /// vault back. A wrong key, a foreign database or an unknown schema in that state is
+    /// reported as [`VaultError::WrongKey`], [`VaultError::NotInitialized`] or
+    /// [`VaultError::UnsupportedSchema`] instead.
     #[error(
         "vault has an unfinished transaction (another process is writing, or a previous write was interrupted); do not delete the -journal file"
     )]

@@ -348,9 +348,10 @@ fn crash_with_hot_journal(tmp: &TempDir, db: &Path) -> (Vec<u8>, Vec<u8>) {
     (snap_main, snap_j)
 }
 
-/// A crash halfway through a `rekey`-shaped write still opens with the OLD key, data intact.
+/// A crash after entry pages (but not the keycheck page) were rewritten still opens with the
+/// old key, data intact.
 #[test]
-fn crash_halfway_through_rekey_opens_with_the_old_key() {
+fn crash_with_only_entry_pages_rewritten_opens_with_the_old_key() {
     let tmp = dir();
     let db = new_vault(&tmp);
     let journal = tmp.path().join("v.db-journal");
@@ -396,27 +397,21 @@ fn foreign_db_with_a_hot_journal_is_refused_and_unchanged() {
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
     let kf = KeyFile::generate(&tmp.path().join("k")).unwrap();
     let res = Vault::open(&db, kf);
-    assert!(
-        matches!(
-            res,
-            Err(VaultError::PendingJournal | VaultError::NotInitialized)
-        ),
-        "{res:?}"
-    );
+    assert!(matches!(res, Err(VaultError::NotInitialized)), "{res:?}");
     assert_eq!(std::fs::read(&db).unwrap(), m);
     assert_eq!(std::fs::read(&journal).unwrap(), j);
 }
 
-/// The wrong key on a real vault with a hot journal is `PendingJournal` (never `WrongKey`),
-/// and both files stay unchanged.
+/// The wrong key on a real vault with a hot journal is `WrongKey` (judged on a rolled-back
+/// private copy), and both files stay unchanged: the real file is never opened read-write.
 #[test]
-fn wrong_key_with_a_hot_journal_is_pending_journal_and_unchanged() {
+fn wrong_key_with_a_hot_journal_is_wrong_key_and_unchanged() {
     let tmp = dir();
     let db = new_vault(&tmp);
     let (m, j) = crash_with_hot_journal(&tmp, &db);
     let other = KeyFile::generate(&tmp.path().join("k2")).unwrap();
     let res = Vault::open(&db, other);
-    assert!(matches!(res, Err(VaultError::PendingJournal)), "{res:?}");
+    assert!(matches!(res, Err(VaultError::WrongKey)), "{res:?}");
     assert_eq!(std::fs::read(&db).unwrap(), m);
     assert_eq!(std::fs::read(tmp.path().join("v.db-journal")).unwrap(), j);
 }
@@ -431,4 +426,49 @@ fn create_with_a_hot_journal_is_pending_journal_and_unchanged() {
     assert!(matches!(res, Err(VaultError::PendingJournal)), "{res:?}");
     assert_eq!(std::fs::read(&db).unwrap(), m);
     assert_eq!(std::fs::read(tmp.path().join("v.db-journal")).unwrap(), j);
+}
+
+/// A torn `meta` page in the main file (garbage) with a valid journal that restores it: the old
+/// key opens, because identification runs on the rolled-back copy.
+#[test]
+fn torn_meta_page_restored_by_the_journal_opens_with_the_old_key() {
+    let tmp = dir();
+    let db = new_vault(&tmp);
+    let journal = tmp.path().join("v.db-journal");
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA cache_size = 1; BEGIN IMMEDIATE;
+             UPDATE meta SET value = randomblob(length(value));
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+             INSERT INTO entries SELECT 'secret:pad' || i, 6, randomblob(3000), 0, 1, 1 FROM n;",
+        )
+        .unwrap();
+    let snap_main = std::fs::read(&db).unwrap();
+    let snap_j = std::fs::read(&journal).unwrap();
+    drop(writer);
+    // Tear the page that holds `meta` (its root page, which the journal has the original of).
+    let root: usize = rusqlite::Connection::open(&db)
+        .map(|c| {
+            c.query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'meta'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let page = 4096;
+    let mut torn = snap_main.clone();
+    torn[(root - 1) * page + 100..root * page].fill(0xA5);
+    std::fs::write(&db, &torn).unwrap();
+    std::fs::write(&journal, &snap_j).unwrap();
+    let v = Vault::open(&db, load_key(&tmp)).unwrap();
+    assert!(
+        v.get(&EntryId::new("secret:one").unwrap())
+            .unwrap()
+            .is_some()
+    );
 }

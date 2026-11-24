@@ -292,9 +292,9 @@ fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
     }
 }
 
-/// Identifies the non-empty file as a vault or not before any read-write open. The probe itself
-/// is entirely read-only (`immutable=1`): no pragma, lock, journal, `-wal` or `-shm` file is
-/// ever written, so a foreign database stays byte-for-byte intact. A vault is:
+/// Identifies the non-empty file as a vault or not before any read-write open. The probe on the
+/// real file is entirely read-only (`immutable=1`): no pragma, lock, journal, `-wal` or `-shm`
+/// file is ever written, so a foreign database stays byte-for-byte intact. A vault is:
 /// - in rollback mode (header bytes 18 and 19 are both 1);
 /// - without a `-wal` sidecar (a vault never uses WAL);
 /// - exactly the vault schema (`meta(key, value)` and `entries`, no other table, index, trigger
@@ -303,19 +303,26 @@ fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
 ///
 /// A zero-length `-journal` is ignored, as SQLite does. A non-empty one means a writer is active
 /// (or crashed), and an immutable read would ignore its contents, so the probe waits up to
-/// [`BUSY_TIMEOUT`] for it to disappear (ADR 0006 section 3: a scan during a write waits). If it
-/// stays: on `open`, a file that passes the full probe (exact schema and keycheck under the
-/// supplied key) is proven to be the owner's vault and may be opened read-write, so SQLite rolls
-/// back its own hot journal; in every other case (and on `create`) the result is
-/// [`VaultError::PendingJournal`], never a "not a vault" verdict, and nothing is modified.
+/// [`BUSY_TIMEOUT`] for it to disappear (ADR 0006 section 3: a scan during a write waits). The
+/// immutable read is also bracketed by a check of the header change counter and of the
+/// `-journal`: if either moved, the read raced a writer and is repeated.
+///
+/// If a `-journal` stays: on `open` the main file and the journal are copied into a private
+/// scratch directory and the copy is opened read-write, so SQLite rolls back the copy. The
+/// identification then runs on the rolled-back copy, which is the state a recovery would leave.
+/// The originals are never modified by the probe; only a copy that proves to be the owner's
+/// vault lets the caller open the real file, and then SQLite rolls back the real journal. On
+/// `create` the result is [`VaultError::PendingJournal`].
 ///
 /// Returns `Ok(false)` for anything that is not a vault. Only "not a database" and schema errors
 /// mean that; every other SQLite error (corruption, I/O and so on) is passed on.
 ///
 /// # Errors
 /// [`VaultError::UnsupportedSchema`], [`VaultError::NotInitialized`] (no keycheck row) and
-/// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks;
-/// [`VaultError::PendingJournal`] as above.
+/// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks
+/// (judged after rolling back a hot journal, on the copy); [`VaultError::PendingJournal`] if the
+/// copy stays corrupt after the rollback (or on `create`); [`VaultError::Io`] and non-corruption
+/// [`VaultError::Sqlite`] errors are passed on.
 fn probe_existing(
     path: &Path,
     file: &PrivateFile,
@@ -325,20 +332,208 @@ fn probe_existing(
         return Ok(false);
     }
     let start = std::time::Instant::now();
-    while journal_present(path)? {
-        if start.elapsed() >= BUSY_TIMEOUT {
-            let Some(key) = key else {
-                return Err(VaultError::PendingJournal);
-            };
-            return match immutable_probe(path, file, Some(key)) {
-                Ok(true) => Ok(true),
-                Err(e @ VaultError::Fs(_)) => Err(e),
-                Ok(false) | Err(_) => Err(VaultError::PendingJournal),
+    loop {
+        let timed_out = start.elapsed() >= BUSY_TIMEOUT;
+        if journal_present(path)? {
+            if timed_out {
+                let Some(key) = key else {
+                    return Err(VaultError::PendingJournal);
+                };
+                match probe_rolled_back_copy(path, file, key)? {
+                    Some(verdict) => return Ok(verdict),
+                    None => continue, // the journal went away: probe the main file again
+                }
+            }
+            std::thread::sleep(JOURNAL_POLL);
+            continue;
+        }
+        let before = change_counter(file)?;
+        let result = immutable_probe(path, file, key);
+        if before == change_counter(file)? && !journal_present(path)? {
+            return result;
+        }
+        // A writer got in between the checks and the read.
+        if timed_out {
+            return match result {
+                Err(e) if is_corruption(&e) => Err(VaultError::PendingJournal),
+                other => other,
             };
         }
         std::thread::sleep(JOURNAL_POLL);
     }
-    immutable_probe(path, file, key)
+}
+
+/// The header change counter (bytes 24..28); 0 for a file too short to have one.
+fn change_counter(file: &PrivateFile) -> Result<u32, VaultError> {
+    use std::os::unix::fs::FileExt;
+    let mut raw = [0u8; 4];
+    match file.file().read_exact_at(&mut raw, 24) {
+        Ok(()) => Ok(u32::from_be_bytes(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+        Err(e) => Err(VaultError::io("reading vault header")(e)),
+    }
+}
+
+/// True for a corruption verdict from SQLite (as opposed to I/O or locking trouble).
+fn is_corruption(e: &VaultError) -> bool {
+    matches!(
+        e,
+        VaultError::Sqlite { source, .. }
+            if matches!(
+                source.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+            )
+    )
+}
+
+/// Most bytes copied into the scratch directory for each of the main file and the journal.
+const MAX_COPY_LEN: u64 = 256 * 1024 * 1024;
+
+/// A private scratch directory beside the vault, removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(parent: &Path) -> Result<Self, VaultError> {
+        use std::os::unix::fs::DirBuilderExt;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = parent.join(format!(
+            ".wardenlens-probe-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(VaultError::io("creating scratch directory"))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Copies `src` (at most [`MAX_COPY_LEN`] bytes) to a new private file `dst`.
+/// `Ok(false)` if the source is longer than the cap.
+fn copy_bounded(src: &std::fs::File, dst: &Path) -> Result<bool, VaultError> {
+    use std::io::Write;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let len = src
+        .metadata()
+        .map_err(VaultError::io("inspecting vault file"))?
+        .len();
+    if len > MAX_COPY_LEN {
+        return Ok(false);
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)
+        .map_err(VaultError::io("creating scratch copy"))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut off = 0u64;
+    while off < len {
+        let want = usize::try_from(len.saturating_sub(off)).map_or(buf.len(), |r| r.min(buf.len()));
+        let Some(window) = buf.get_mut(..want) else {
+            break;
+        };
+        let got = src
+            .read_at(window, off)
+            .map_err(VaultError::io("reading vault file"))?;
+        let Some(done) = buf.get(..got).filter(|d| !d.is_empty()) else {
+            break;
+        };
+        out.write_all(done)
+            .map_err(VaultError::io("writing scratch copy"))?;
+        off = off.saturating_add(u64::try_from(got).unwrap_or(u64::MAX));
+    }
+    out.sync_all()
+        .map_err(VaultError::io("writing scratch copy"))?;
+    Ok(true)
+}
+
+/// Identifies the vault on a privately rolled-back copy of the main file and its `-journal`.
+/// `Ok(None)` if the journal vanished meanwhile (the caller probes the main file again). The
+/// originals are only read.
+fn probe_rolled_back_copy(
+    path: &Path,
+    file: &PrivateFile,
+    key: &KeyFile,
+) -> Result<Option<bool>, VaultError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = parent_of(path)?;
+    let journal = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(sidecar(path, "-journal"))
+    {
+        Ok(j) => j,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(VaultError::io("opening journal")(e)),
+    };
+    if !journal
+        .metadata()
+        .map_err(VaultError::io("inspecting journal"))?
+        .is_file()
+    {
+        return Err(VaultError::PendingJournal);
+    }
+    let scratch = Scratch::new(parent)?;
+    let copy = scratch.0.join("vault.db");
+    let copied = copy_bounded(file.file(), &copy)?
+        && copy_bounded(&journal, Path::new(&sidecar(&copy, "-journal")))?;
+    if !copied {
+        return Err(VaultError::PendingJournal);
+    }
+    file.verify_path_unchanged(path)?;
+    match identify_copy(&copy, key) {
+        Err(e) if is_corruption(&e) => Err(VaultError::PendingJournal),
+        other => other.map(Some),
+    }
+}
+
+/// Opens the scratch copy read-write (SQLite rolls its hot journal back) and identifies it.
+fn identify_copy(copy: &Path, key: &KeyFile) -> Result<bool, VaultError> {
+    let conn = Connection::open_with_flags(
+        copy,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(VaultError::sqlite("open"))?;
+    let rows = match read_identity(&conn) {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return Ok(false),
+        Err(e) if is_not_a_vault(&e) => return Ok(false),
+        Err(e) => return Err(VaultError::sqlite("inspect schema")(e)),
+    };
+    drop(conn);
+    // Recovery may have restored a header that is not rollback mode.
+    let head = std::fs::File::open(copy).map_err(VaultError::io("reading scratch copy"))?;
+    {
+        use std::os::unix::fs::FileExt;
+        let mut mode = [0u8; 2];
+        if head.read_exact_at(&mut mode, 18).is_err() || mode != [1, 1] {
+            return Ok(false);
+        }
+    }
+    judge(rows, key)?;
+    Ok(true)
+}
+
+/// The `open` checks on the identified rows: schema version, then the keycheck under `key`.
+fn judge(rows: MetaRows, key: &KeyFile) -> Result<(), VaultError> {
+    if rows.version.as_deref() != Some(SCHEMA_VERSION.to_string().as_bytes()) {
+        return Err(VaultError::UnsupportedSchema);
+    }
+    let record = rows.keycheck.ok_or(VaultError::NotInitialized)?;
+    check_keycheck(key, &record)
 }
 
 fn immutable_probe(
@@ -377,11 +572,7 @@ fn immutable_probe(
     let Some(key) = key else {
         return Ok(true);
     };
-    if rows.version.as_deref() != Some(SCHEMA_VERSION.to_string().as_bytes()) {
-        return Err(VaultError::UnsupportedSchema);
-    }
-    let record = rows.keycheck.ok_or(VaultError::NotInitialized)?;
-    check_keycheck(key, &record)?;
+    judge(rows, key)?;
     Ok(true)
 }
 
