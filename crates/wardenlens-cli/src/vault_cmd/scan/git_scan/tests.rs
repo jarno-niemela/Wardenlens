@@ -813,6 +813,36 @@ fn tree_entries_are_parsed_with_bounds_checks() {
 }
 
 #[test]
+fn tree_entry_modes_are_classified_the_way_git_does() {
+    use walk::EntryMode::{Blob, Gitlink, Tree};
+    let one = |mode: &[u8]| {
+        let mut raw = mode.to_vec();
+        raw.extend_from_slice(b" n\0");
+        raw.extend_from_slice(&[3u8; 20]);
+        tree_entries(&raw, 20).map(|e| e[0].mode)
+    };
+    assert_eq!(one(b"40755"), Some(Tree));
+    assert_eq!(one(b"040775"), Some(Tree));
+    assert_eq!(one(b"40000"), Some(Tree));
+    assert_eq!(one(b"160000"), Some(Gitlink));
+    assert_eq!(one(b"120000"), Some(Blob));
+    assert_eq!(one(b"100664"), Some(Blob));
+    assert_eq!(one(b"100644"), Some(Blob));
+    assert_eq!(one(b"100755"), Some(Blob));
+    // Unknown type bits, not octal, empty, over-long: malformed, never a file.
+    assert_eq!(one(b"60000"), None);
+    assert_eq!(one(b"20000"), None);
+    assert_eq!(one(b"10000"), None);
+    assert_eq!(one(b"0"), None);
+    assert_eq!(one(b"10064x"), None);
+    assert_eq!(one(b"100689"), None);
+    assert_eq!(one(b"-100644"), None);
+    assert_eq!(one(b""), None);
+    assert_eq!(one(b"01000000"), None);
+    assert_eq!(one(b"100000000000000000000"), None);
+}
+
+#[test]
 fn a_replace_ref_does_not_change_what_is_scanned() {
     let r = Repo::new();
     r.write("a.txt", b"a\n");

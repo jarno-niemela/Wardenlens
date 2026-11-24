@@ -49,6 +49,30 @@ pub(super) struct TreeEntry {
     pub(super) id: Sha,
 }
 
+/// Longest mode text accepted (git writes at most six octal digits; this leaves room for a
+/// leading zero and no more).
+const MAX_MODE_LEN: usize = 7;
+
+/// Classifies a tree entry's mode text the way git does: an octal number whose file-type bits
+/// (`0o170000`) say tree, gitlink, symlink or regular file. Anything else (not octal, empty,
+/// over-long, an unknown type) is `None`: the tree is malformed and the scan fails closed.
+fn classify_mode(text: &[u8]) -> Option<EntryMode> {
+    if text.is_empty() || text.len() > MAX_MODE_LEN {
+        return None;
+    }
+    let mut mode: u32 = 0;
+    for &b in text {
+        let digit = char::from(b).to_digit(8)?;
+        mode = mode.checked_mul(8)?.checked_add(digit)?;
+    }
+    match mode & 0o170_000 {
+        0o040_000 => Some(EntryMode::Tree),
+        0o160_000 => Some(EntryMode::Gitlink),
+        0o120_000 | 0o100_000 => Some(EntryMode::Blob),
+        _ => None,
+    }
+}
+
 /// The entries of a raw tree (`mode SP name NUL id`, `id_len` raw bytes), or `None` when the
 /// tree is not well formed. Bounds are checked with `get`; nothing is sliced by position.
 pub(super) fn tree_entries(raw: &[u8], id_len: usize) -> Option<Vec<TreeEntry>> {
@@ -56,11 +80,7 @@ pub(super) fn tree_entries(raw: &[u8], id_len: usize) -> Option<Vec<TreeEntry>> 
     let mut rest = raw;
     while !rest.is_empty() {
         let sp = rest.iter().position(|&b| b == b' ')?;
-        let mode = match rest.get(..sp)? {
-            b"40000" | b"040000" => EntryMode::Tree,
-            b"160000" => EntryMode::Gitlink,
-            _ => EntryMode::Blob,
-        };
+        let mode = classify_mode(rest.get(..sp)?)?;
         let after_mode = rest.get(sp.checked_add(1)?..)?;
         let nul = after_mode.iter().position(|&b| b == 0)?;
         let name = after_mode.get(..nul)?.to_vec();

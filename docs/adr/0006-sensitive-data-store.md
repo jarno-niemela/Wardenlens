@@ -651,7 +651,7 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   directories, trees only a tag or the range end leads to, and the directory paths themselves. The `diff-tree` path scan was removed: the walk covers
   everything it did (renames and second paths of a blob are paths in a new tree; a merge's tree is a root) and what it
   could not (empty directories, trees only a tag or the range end leads to), and keeping both would report each place
-  twice. A tree git cannot list makes `git rev-list --objects` fail, which stops the scan (exit 2).
+  twice. A tree git cannot list makes `git rev-list --objects` fail, which stops the scan (exit 2). Entry modes are classified as git does (octal, file-type bits: `40755` is a directory, `100664` a file); an unknown or unparsable mode is malformed (exit 2), and `GIT_NO_LAZY_FETCH=1` makes a missing object in a partial clone fail the scan instead of fetching.
 
 ### 10. Access, in-memory handling and the CLI
 

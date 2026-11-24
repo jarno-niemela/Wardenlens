@@ -150,6 +150,9 @@ impl Git {
             .args(["-c", "core.quotePath=false", "-c", "core.fsmonitor=false"])
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
+            // A partial clone must never fetch over the network or write packs during a scan:
+            // a missing object stays missing and fails the scan closed.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env_remove("GIT_EXTERNAL_DIFF")
             // `git push` sends the real objects and ignores replace refs, grafts and a
             // shallow-file override, so the scan must read the same objects (P10: this is the
@@ -534,6 +537,20 @@ mod tests {
         v.extend_from_slice(path);
         v.push(0);
         v
+    }
+
+    #[test]
+    fn git_commands_never_lazy_fetch_and_never_follow_replace_refs() {
+        let git = Git::locate();
+        let c = git.command(&[]);
+        let env = |k: &str| {
+            c.get_envs()
+                .find(|(n, _)| *n == OsStr::new(k))
+                .and_then(|(_, v)| v)
+                .map(OsStr::to_owned)
+        };
+        assert_eq!(env("GIT_NO_LAZY_FETCH"), Some("1".into()));
+        assert_eq!(env("GIT_NO_REPLACE_OBJECTS"), Some("1".into()));
     }
 
     #[test]
