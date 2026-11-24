@@ -61,6 +61,7 @@ fn input(
         now: Timestamp::from_unix_millis(1_000_000),
         policy: Policy {
             hot_max_age: DurationMs::from_millis(u64::MAX),
+            emergency_reserve_bytes: 0,
             ..Policy::default()
         },
         ingested_bytes,
@@ -734,4 +735,141 @@ fn overflow_names_the_quantity() {
         )),
         Err(PlanError::Overflow(OverflowQuantity::ArchiveTotal))
     );
+}
+
+fn reserve_input(
+    free: u64,
+    archive: ArchiveState,
+    segments: &[StoredSegment],
+    reserve: u64,
+    budget: Option<u64>,
+) -> PlanInput<'_> {
+    let mut pin = input(vol(1000, free), archive, segments, 0);
+    pin.policy.emergency_reserve_bytes = reserve;
+    pin.rolling_budget = budget;
+    pin
+}
+
+fn hot_bytes(segments: &[StoredSegment]) -> u64 {
+    segments.iter().map(|s| s.bytes).sum()
+}
+
+fn apply_deletes(segments: &mut Vec<StoredSegment>, free: &mut u64, p: &Plan) {
+    for a in &p.actions {
+        if let Action::Delete(id) = a {
+            if let Some(s) = segments.iter().find(|s| s.id == *id) {
+                *free += s.bytes;
+            }
+            segments.retain(|s| s.id != *id);
+        }
+    }
+}
+
+#[test]
+fn empty_hot_tick_keeps_the_budget_when_the_archive_is_full() {
+    // Hot floor 250 unreachable (free 0, no video); archive room 10 is below its floor 25.
+    let p = plan(&input(
+        vol(1000, 0),
+        ArchiveState::Available(vol(100, 10)),
+        &[],
+        0,
+    ))
+    .unwrap();
+    assert_eq!(p.actions.len(), 0);
+    assert_eq!(p.rolling_budget, Some(0));
+    assert_eq!(p.hot, HotState::Unsatisfiable);
+}
+
+#[test]
+fn emergency_reserve_deletes_oldest_video_even_at_the_budget() {
+    let segments: Vec<StoredSegment> = (0..5).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    // Video 50 is at the budget 50, free 5 is below the reserve 30: delete until free >= 30.
+    let p = plan(&reserve_input(
+        5,
+        ArchiveState::Unavailable,
+        &segments,
+        30,
+        Some(50),
+    ))
+    .unwrap();
+    assert_eq!(
+        ids(&p),
+        vec![
+            Action::Delete(SegmentId::new(0)),
+            Action::Delete(SegmentId::new(1)),
+            Action::Delete(SegmentId::new(2)),
+        ]
+    );
+    assert_eq!(p.hot, HotState::RollingBuffer);
+    assert_eq!(p.rolling_budget, Some(20));
+}
+
+#[test]
+fn unmeetable_reserve_deletes_all_hot_video_and_reports_the_buffer() {
+    let segments: Vec<StoredSegment> = (0..3).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    let p = plan(&reserve_input(
+        0,
+        ArchiveState::Unavailable,
+        &segments,
+        500,
+        Some(30),
+    ))
+    .unwrap();
+    assert_eq!(p.actions.len(), 3);
+    assert_eq!(p.hot, HotState::RollingBuffer);
+    assert_eq!(p.rolling_budget, Some(0));
+}
+
+#[test]
+fn foreign_growth_never_leaves_hot_below_the_reserve_while_video_remains() {
+    const RESERVE: u64 = 30;
+    let mut segments: Vec<StoredSegment> = (0..10).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    let mut free = 100_u64; // floor 250 stays unreachable
+    let mut budget = None;
+    for tick in 0..60_u64 {
+        free = free.saturating_sub(7); // foreign growth
+        if free >= 10 {
+            segments.push(seg(100 + tick, Tier::Hot, 10, 100 + tick));
+            free -= 10;
+        }
+        let p = plan(&reserve_input(
+            free,
+            ArchiveState::Unavailable,
+            &segments,
+            RESERVE,
+            budget,
+        ))
+        .unwrap();
+        budget = p.rolling_budget;
+        apply_deletes(&mut segments, &mut free, &p);
+        assert!(
+            free >= RESERVE || segments.is_empty(),
+            "tick {tick}: free {free} with {} B of video",
+            hot_bytes(&segments)
+        );
+    }
+}
+
+#[test]
+fn rolling_budget_never_rises_across_ticks() {
+    let mut segments: Vec<StoredSegment> = (0..6).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    let mut free = 100_u64;
+    let mut budget: Option<u64> = None;
+    let mut prev = u64::MAX;
+    for tick in 0..80_u64 {
+        // Foreign data shrinks free space on some ticks; video arrives on most.
+        free = free.saturating_sub(tick % 5);
+        if tick % 7 != 0 && free >= 10 {
+            segments.push(seg(100 + tick, Tier::Hot, 10, 100 + tick));
+            free -= 10;
+        }
+        let mut pin = reserve_input(free, ArchiveState::Unavailable, &segments, 20, budget);
+        pin.ingested_bytes = 10;
+        let p = plan(&pin).unwrap();
+        let b = p.rolling_budget.unwrap();
+        assert!(b <= prev, "tick {tick}: budget rose from {prev} to {b}");
+        prev = b;
+        budget = p.rolling_budget;
+        apply_deletes(&mut segments, &mut free, &p);
+    }
 }

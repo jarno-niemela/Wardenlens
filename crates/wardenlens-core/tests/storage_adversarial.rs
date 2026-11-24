@@ -224,6 +224,7 @@ fn u64_max_everything_returns_without_panic() {
             hot_min_free: MinFreePercent::new(pct).unwrap(),
             archive_min_free: MinFreePercent::new(pct).unwrap(),
             hot_max_age: DurationMs::from_millis(0),
+            emergency_reserve_bytes: 0,
         };
         for st in [ArchiveState::Available(archive), ArchiveState::Unavailable] {
             let r = run(hot, st, &segments, policy, 10, u64::MAX);
@@ -339,6 +340,7 @@ proptest! {
         let policy = Policy {
             hot_min_free: MinFreePercent::new(hp).unwrap(),
             archive_min_free: MinFreePercent::new(ap).unwrap(),
+            emergency_reserve_bytes: 0,
             hot_max_age: DurationMs::from_millis(age),
         };
         let st = archive.map_or(ArchiveState::Unavailable, ArchiveState::Available);

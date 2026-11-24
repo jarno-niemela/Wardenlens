@@ -50,6 +50,7 @@ proptest! {
             hot_min_free: MinFreePercent::new(hot_pct).unwrap(),
             archive_min_free: MinFreePercent::new(arch_pct).unwrap(),
             hot_max_age: DurationMs::from_millis(max_age_ms),
+            emergency_reserve_bytes: 0,
         };
         let state = archive.map_or(ArchiveState::Unavailable, ArchiveState::Available);
         let input = PlanInput {
@@ -130,6 +131,7 @@ proptest! {
             hot_min_free: MinFreePercent::new(hot_pct).unwrap(),
             archive_min_free: MinFreePercent::default(),
             hot_max_age: DurationMs::from_millis(u64::MAX / 2),
+            emergency_reserve_bytes: 0,
         };
         let state = archive.map_or(ArchiveState::Unavailable, ArchiveState::Available);
         let input = PlanInput {
@@ -138,14 +140,18 @@ proptest! {
             rolling_budget: fed,
         };
         let p = plan(&input).unwrap();
-        if p.hot != HotState::RollingBuffer {
-            // The budget is only reported while the buffer is in effect.
-            prop_assert!(p.rolling_budget.is_none() || p.hot == HotState::Unsatisfiable);
-        }
+        let hot_total: u64 = segs.iter().filter(|s| s.tier == Tier::Hot).map(|s| s.bytes).sum();
+        let floor_unreachable = u128::from(hot.free_bytes) + u128::from(hot_total)
+            < u128::from(hot.capacity_bytes) * u128::from(hot_pct) / 100;
+        let cannot_help = !matches!(p.archive, ArchiveStatus::Available) || p.archive_below_floor;
+        // The budget exists exactly in the rolling-buffer case.
+        prop_assert_eq!(p.rolling_budget.is_some(), floor_unreachable && cannot_help);
         if p.hot == HotState::RollingBuffer {
-            let budget = p.rolling_budget.unwrap();
+            prop_assert!(p.rolling_budget.is_some());
+        }
+        if let Some(budget) = p.rolling_budget {
+            let limit = fed.unwrap_or(hot_total.saturating_sub(ingested));
             let bytes_of = |id: &SegmentId| segs.iter().find(|s| s.id == *id).map_or(0, |s| s.bytes);
-            let hot_total: u64 = segs.iter().filter(|s| s.tier == Tier::Hot).map(|s| s.bytes).sum();
             let gone: u64 = p.actions.iter()
                 .filter_map(|a| match a {
                     Action::MoveToArchive(id) => Some(bytes_of(id)),
@@ -154,15 +160,16 @@ proptest! {
                 })
                 .sum();
             let remaining = hot_total - gone;
-            prop_assert!(remaining <= budget);
+            // Reserve 0: nothing forces a ratchet, so the level is held.
+            prop_assert_eq!(budget, limit); // reserve 0: no ratchet
+            prop_assert!(remaining <= limit);
             let last = p.actions.iter().rev().find_map(|a| match a {
                 Action::Delete(id) if segs.iter().any(|s| s.id == *id && s.tier == Tier::Hot) => Some(bytes_of(id)),
                 _ => None,
             });
             if let Some(last) = last {
-                prop_assert!(remaining + last > budget);
+                prop_assert!(remaining + last > limit);
             }
-            prop_assert_eq!(budget, fed.unwrap_or(hot_total.saturating_sub(ingested)));
         }
     }
 }

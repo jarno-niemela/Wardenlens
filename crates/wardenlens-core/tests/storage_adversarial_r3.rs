@@ -39,6 +39,7 @@ fn policy(hp: u8, ap: u8, age_ms: u64) -> Policy {
         hot_min_free: MinFreePercent::new(hp).unwrap(),
         archive_min_free: MinFreePercent::new(ap).unwrap(),
         hot_max_age: DurationMs::from_millis(age_ms),
+        emergency_reserve_bytes: 0,
     }
 }
 

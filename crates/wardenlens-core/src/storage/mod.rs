@@ -24,6 +24,6 @@ pub use plan::{
     Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,
 };
 pub use types::{
-    ArchiveState, MinFreePercent, MinFreePercentError, Policy, SegmentId, StoredSegment, Tier,
-    VolumeSpace,
+    ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, MinFreePercent, MinFreePercentError, Policy,
+    SegmentId, StoredSegment, Tier, VolumeSpace,
 };

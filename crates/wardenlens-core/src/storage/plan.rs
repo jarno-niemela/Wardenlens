@@ -47,13 +47,16 @@ pub enum HotState {
     Ok,
     /// The floor cannot be restored even by removing all hot video (something else fills
     /// the volume), and this tick's plan deletes no hot video to stop growth: the archive
-    /// absorbs the ingest, there is nothing ingested, or the moves already cover it.
+    /// absorbs the ingest, there is nothing ingested, the moves already cover it, or the hot
+    /// video is already below the rolling budget and the emergency reserve is free.
     /// State, never an error.
     Unsatisfiable,
     /// As `Unsatisfiable`, and this tick's plan deletes hot video to hold it at the rolling
     /// budget because the archive cannot absorb it. Raise an alert. The adapter must alert on
     /// `RollingBuffer`, and also on `Unsatisfiable` while the plan's `archive` is not
-    /// `Available`: the buffer is then rolling but this tick happened to delete nothing.
+    /// `Available`: the buffer is then rolling but this tick happened to delete nothing. When
+    /// the emergency reserve cannot be met even after deleting all hot video, all of it is
+    /// deleted and this is still the state: the adapter must alert.
     RollingBuffer,
 }
 
@@ -69,8 +72,14 @@ pub struct Plan {
     pub hot: HotState,
     /// Hot-video byte level the rolling buffer holds: `Some` exactly when the hot floor is
     /// unreachable and the archive cannot take the load (the rolling-buffer case), else
-    /// `None`. The adapter must store this value and pass it back as
-    /// [`PlanInput::rolling_budget`] on the next tick, and clear it when it is `None`.
+    /// `None`. It equals the input level, except that when [`Policy::emergency_reserve_bytes`]
+    /// forces deletes below it, it ratchets down to the hot video left. It is never raised
+    /// while the buffer lasts. A budget of 0 keeps no hot video.
+    ///
+    /// The adapter must store this value and pass it back as [`PlanInput::rolling_budget`]
+    /// on the next tick, clear it when it is `None`, clear it when the volume or the
+    /// configuration changes, and never feed back a value larger than the previous plan
+    /// returned.
     pub rolling_budget: Option<u64>,
     /// Foreign or quarantined data keeps the archive below its floor even when everything
     /// it holds is evicted. Kept separate because `ArchiveStatus::Full` takes precedence
@@ -149,11 +158,13 @@ pub struct PlanInput<'a> {
     pub policy: Policy,
     /// Bytes recorded since the previous plan. Used only to set the initial rolling-buffer
     /// budget when entering the buffer with no `rolling_budget`: the budget is then the hot
-    /// video held before this tick's ingest.
+    /// video held before this tick's ingest. A seed of 0 keeps no hot video.
     pub ingested_bytes: u64,
     /// The `rolling_budget` of the previous [`Plan`], fed back by the adapter; `None` when
     /// the previous plan had none (or there was no previous plan). While `Some`, the rolling
-    /// buffer deletes oldest hot segments until remaining hot video is at most this level.
+    /// buffer deletes oldest hot segments until remaining hot video is at most this level
+    /// (and the emergency reserve is free). Never feed back more than the previous plan
+    /// returned; clear it when the volume or configuration changes.
     /// The target is an absolute level, so segment-size overshoot never accumulates.
     pub rolling_budget: Option<u64>,
 }
@@ -211,6 +222,10 @@ struct HotNeed {
     hot_total: u64,
     /// Hot-video level the rolling buffer holds, were it in effect.
     budget: u64,
+    /// Free space of the hot volume before the plan.
+    free: u64,
+    /// Free space the rolling buffer keeps ([`Policy::emergency_reserve_bytes`]).
+    reserve: u64,
 }
 
 /// Archive-side facts.
@@ -226,8 +241,8 @@ struct ArchiveFacts {
 /// Hot video is deleted only when the archive cannot take it, and never to restore a floor that
 /// deleting it cannot reach (ADR 0005 section 6 case 4); then moves are still planned and,
 /// without a usable archive, a rolling buffer deletes the oldest hot video until it is at
-/// most the rolling budget (see [`PlanInput::rolling_budget`]). The same holds for the archive: its video is evicted only when that can restore
-/// its floor.
+/// most the rolling budget (see [`PlanInput::rolling_budget`]) and the emergency reserve is free.
+/// The same holds for the archive: its video is evicted only when that can restore its floor.
 ///
 /// # Errors
 /// [`PlanError`] for an unusable hot volume, duplicate segment ids or byte overflow.
@@ -266,6 +281,8 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         },
         unsatisfiable,
         hot_total,
+        free,
+        reserve: input.policy.emergency_reserve_bytes,
         budget: input
             .rolling_budget
             .unwrap_or_else(|| hot_total.saturating_sub(input.ingested_bytes)),
@@ -284,7 +301,8 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             archive_full: false,
         },
     };
-    let rolling = plan_hot_deletes(&hot, &need, &moves, archive.is_some(), &mut actions);
+    let archive_cannot_help = archive.is_none() || moves.archive_full || below_floor;
+    let rolling = plan_hot_deletes(&hot, &need, &moves, archive_cannot_help, &mut actions);
     let archive_status = match (input.archive, archive) {
         (ArchiveState::Available(_), None) => ArchiveStatus::Unusable,
         (_, None) => ArchiveStatus::Unavailable,
@@ -415,36 +433,49 @@ struct HotDeletes {
 /// Deletion goes to the target only when deleting all hot video can reach it; when only the
 /// floor is reachable it stops there, since deleting further loses recordings for no gain.
 /// When the floor is unreachable (the rolling buffer) it deletes the oldest hot video until
-/// what remains after the moves is at most the budget.
+/// what remains after the moves is at most the budget and the free space after the moves is at
+/// least the emergency reserve, or no hot video is left. When the reserve forced deletes below
+/// the budget, the reported budget is the video that remains (a ratchet down); otherwise it is
+/// the budget unchanged. Ratcheting on every tick would drain the buffer whenever new segments
+/// are smaller than the evicted ones.
 fn plan_hot_deletes(
     hot: &[&StoredSegment],
     need: &HotNeed,
     moves: &Moves,
-    archive_available: bool,
+    archive_cannot_help: bool,
     actions: &mut Vec<Action>,
 ) -> HotDeletes {
     let none = HotDeletes {
         deleted: false,
         budget: None,
     };
-    let archive_cannot_help = !archive_available || moves.archive_full;
     if !archive_cannot_help {
         return none;
     }
     let mut deleted = false;
     if need.unsatisfiable {
         let mut remaining = need.hot_total.saturating_sub(moves.bytes);
+        let mut free = need.free.saturating_add(moves.bytes);
+        let mut reserve_forced = false;
         for seg in hot.iter().skip(moves.count) {
-            if remaining <= need.budget {
+            let over_budget = remaining > need.budget;
+            if !over_budget && free >= need.reserve {
                 break;
             }
+            // Deleting at or below the budget happens only for the emergency reserve.
+            reserve_forced |= !over_budget;
             actions.push(Action::Delete(seg.id));
             deleted = true;
             remaining = remaining.saturating_sub(seg.bytes);
+            free = free.saturating_add(seg.bytes);
         }
         return HotDeletes {
             deleted,
-            budget: Some(need.budget),
+            budget: Some(if reserve_forced {
+                need.budget.min(remaining)
+            } else {
+                need.budget
+            }),
         };
     }
     let mut gone = moves.bytes;

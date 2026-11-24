@@ -94,15 +94,25 @@ pub struct Policy {
     pub archive_min_free: MinFreePercent,
     /// Hot segments that ended earlier than this are moved even without pressure.
     pub hot_max_age: DurationMs,
+    /// Free space, in bytes, the rolling buffer keeps on the hot volume even when the floor is
+    /// unreachable: it deletes the oldest hot video until at least this much is free (or no hot
+    /// video remains). It stops foreign data growth from driving the hot volume to ENOSPC while
+    /// the buffer would otherwise sit at its budget. Only the rolling buffer uses it.
+    pub emergency_reserve_bytes: u64,
 }
 
+/// Default emergency reserve: 2 GiB, about two minutes of headroom for the reference
+/// five-camera site.
+pub const DEFAULT_EMERGENCY_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 impl Default for Policy {
-    /// 25 percent on both volumes and a hot max age of 12 hours.
+    /// 25 percent on both volumes, a hot max age of 12 hours and a 2 GiB emergency reserve.
     fn default() -> Self {
         Self {
             hot_min_free: MinFreePercent::default(),
             archive_min_free: MinFreePercent::default(),
             hot_max_age: DurationMs::from_secs(12 * 3600),
+            emergency_reserve_bytes: DEFAULT_EMERGENCY_RESERVE_BYTES,
         }
     }
 }
