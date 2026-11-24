@@ -1357,7 +1357,9 @@ name = "wardenlens-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

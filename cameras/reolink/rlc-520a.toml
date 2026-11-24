@@ -1,0 +1,59 @@
+vendor = "Reolink"
+model = "RLC-520A"
+support = "partial"
+firmware = ["3.0"]
+# The HTTP API is off by default; the write that turns it on was identified, not executed.
+configurable = ["service_ports"]
+quirks = [
+  "Main stream is variable frame rate: about 17 fps measured against 30 advertised.",
+  "HTTP API is disabled by default; it can be enabled over Baichuan (SET_SERVICE_PORTS), but that write has not been executed.",
+  "The Baichuan service enable flag reads 0 while the port is serving.",
+  "Motion and person push over Baichuan has not been observed live; it is confirmed only by the initial state message and neolink's parser.",
+]
+
+[[streams]]
+role = "main"
+codec = "h264"
+width = 2560
+height = 1920
+fps = 16.7
+gop = 32
+
+[[streams]]
+role = "sub"
+codec = "h264"
+width = 640
+height = 480
+fps = 10.0
+gop = 40
+
+[[protocols]]
+kind = "rtsp"
+port = 554
+paths = ["/h264Preview_01_main", "/h264Preview_01_sub"]
+
+[[protocols]]
+kind = "baichuan"
+port = 9000
+
+[[protocols]]
+kind = "onvif"
+port = 8000
+
+[[events]]
+kind = "motion"
+source = "baichuan"
+status = "advertised"
+
+[[events]]
+kind = "person"
+source = "baichuan"
+status = "advertised"
+
+[[evidence]]
+reference = "docs/adr/0002-camera-integration.md"
+section = "2. Reolink"
+
+[[evidence]]
+reference = "docs/adr/0002-camera-integration.md"
+section = "1. Two-client RTSP tolerance"
