@@ -13,6 +13,8 @@ STUB
 chmod +x "$tmp/bin/gh"
 export PATH="$tmp/bin:$PATH"
 export WARDENLENS_AGENT_STATE="$tmp/state" WARDENLENS_SECRET_FILE="$tmp/secret.json"
+# Hermetic: no vault (so the secret-file fallback is under test) whatever the machine has.
+export HOME="$tmp/home"; mkdir -p "$HOME"; unset WARDENLENS_VAULT WARDENLENS_REQUIRE_VAULT
 fail=0
 ok()  { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
@@ -142,5 +144,54 @@ for t in 'net 10.5/16' 'net 10.5.*' 'net 10.5.X' 'net 192.168/16' 'net 172.16/12
   printf '%s\n' "$t" >"$tmp/c4"; checkf "check refuses: $t" "${cs[@]}" "$tmp/c4"
 done
 printf 'ssh://git@host/x\n' >"$tmp/c4"; check "user-only URL allowed" "${cs[@]}" "$tmp/c4"
+
+# ---- vault mode (ADR 0006 section 9): the fixed installed binary scans the prompt -----------------
+# A fake binary at $HOME/.cargo/bin/wardenlens stands in for the real one; its exit code and arguments are
+# what the script sees. HOME is a throwaway directory, so no real vault or key is ever touched.
+vstate="$tmp/vstate"
+vcs=(env WARDENLENS_AGENT_STATE="$vstate" "$agents" check)
+printf '[]' >"$tmp/secret.json"
+printf 'clean prompt\n' >"$tmp/v1"
+mkdir -p "$HOME/.local/share/wardenlens" "$HOME/.cargo/bin"
+: >"$HOME/.local/share/wardenlens/dev-vault.db"
+checkf "vault present, binary missing: refused (fails closed)" "${vcs[@]}" "$tmp/v1"
+verr=$("${vcs[@]}" "$tmp/v1" 2>&1 || true)
+check "the refusal names the install command" bash -c "grep -q 'cargo install --locked --path crates/wardenlens-cli' <<<\"\$1\"" _ "$verr"
+fake() {  # fake EXIT: a stand-in binary that logs its arguments and exits EXIT
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >"%s/args"\necho "e:x secret somewhere:1"\nexit %s\n' "$tmp" "$1" >"$HOME/.cargo/bin/wardenlens"
+  chmod +x "$HOME/.cargo/bin/wardenlens"
+}
+fake 0
+check "vault present, scan clean (exit 0): accepted" "${vcs[@]}" "$tmp/v1"
+check "the scan is run as: vault scan -- FILE" grep -qx "vault scan -- $tmp/v1" "$tmp/args"
+fake 1
+checkf "vault value found (exit 1): refused" "${vcs[@]}" "$tmp/v1"
+verr=$("${vcs[@]}" "$tmp/v1" 2>&1 || true)
+check "a hit is reported by id and kind" bash -c "grep -q 'e:x secret' <<<\"\$1\"" _ "$verr"
+fake 2
+checkf "scan could not run (exit 2): refused" "${vcs[@]}" "$tmp/v1"
+fake 7
+checkf "any other exit: refused" "${vcs[@]}" "$tmp/v1"
+fake 0
+printf 'host 192.168.1.5\n' >"$tmp/v2"
+checkf "RFC1918 address still refused with a vault" "${vcs[@]}" "$tmp/v2"
+printf 'v6 fd12:3456::1\n' >"$tmp/v2"
+checkf "ULA address still refused with a vault" "${vcs[@]}" "$tmp/v2"
+printf 'url https://bob:pw1@example.org/x\n' >"$tmp/v2"
+checkf "credential URL still refused with a vault" "${vcs[@]}" "$tmp/v2"
+printf '{"password":"s3cretPass!"}' >"$tmp/secret.json"; printf 'pw s3cretPass!\n' >"$tmp/v2"
+check "the secret file is not consulted when a vault exists" "${vcs[@]}" "$tmp/v2"
+check "record uses the same scan" "$agents" record reviewer 5 "$A" "$tmp/v1" vault1
+fake 1
+checkf "record refuses on a vault hit" "$agents" record reviewer 5 "$A" "$tmp/v1" vault2
+check "refused record leaves no prompt file" test ! -e "$tmp/state/vault2.prompt"
+# No vault: the fallback, with lpr and face excluded as keys.
+rm -f "$HOME/.local/share/wardenlens/dev-vault.db"
+printf '{"cams":[{"name":"Frontdoor","lpr":"enabled","face":"nonexistent","password":"s3cretPass!"}]}' >"$tmp/secret.json"
+printf 'features enabled and nonexistent\n' >"$tmp/v3"
+check "lpr and face values are not secrets (no vault)" "${vcs[@]}" "$tmp/v3"
+checkf "other values still are (no vault)" "${vcs[@]}" "$tmp/c3"
+checkf "no vault and WARDENLENS_REQUIRE_VAULT=1: refused" env WARDENLENS_REQUIRE_VAULT=1 "${vcs[@]}" "$tmp/v3"
+check "no vault: the fallback is announced by check" bash -c "\"\$@\" 2>&1 | grep -q 'secret-file fallback'" _ "${vcs[@]}" "$tmp/v3"
 
 exit $fail

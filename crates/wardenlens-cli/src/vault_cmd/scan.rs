@@ -8,15 +8,17 @@
 
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
-use wardenlens_vault::{
-    BINARY_PROBE_LEN, Content, MAX_FILE_LEN, Matcher, classify, is_invisible, scan,
-};
+use wardenlens_vault::{BINARY_PROBE_LEN, Content, MAX_FILE_LEN, Matcher, classify, scan};
 
+mod git;
+mod git_scan;
+mod redact;
+
+use self::redact::Safe;
 use super::session::open_read;
 use super::{say, warn};
 use crate::args::ScanArgs;
@@ -205,67 +207,6 @@ struct Tally {
     truncated: usize,
 }
 
-/// True for a character that may be printed as it is: a graphic, visible one. This is an
-/// allowlist: everything else (controls, `Cf` format characters, separators, invisible
-/// fillers, white space other than the plain space) is escaped.
-fn is_printable(c: char) -> bool {
-    c == ' ' || !(c.is_control() || c.is_whitespace() || is_invisible(c))
-}
-
-/// A path as it may be printed: characters that are not printable are written as `\u{..}`
-/// escapes, so a file name can neither forge a report line nor send terminal escapes.
-fn escaped(path: &Path) -> String {
-    let mut out = String::new();
-    for c in path.to_string_lossy().chars() {
-        if is_printable(c) {
-            out.push(c);
-        } else {
-            out.extend(c.escape_unicode());
-        }
-    }
-    out
-}
-
-/// The text one printed line shows about a path: `{pre}{name}[:{line}]{post}`, where `pre` and
-/// `post` are the fixed message text around it (never the entry id or kind, which are printed
-/// by the caller and are not secret). Redaction (ADR 0006 section 8) considers exactly this
-/// text and the raw path bytes. When either holds a vault value the name becomes
-/// `<redacted-path:N>` (`N` is the position of the file in this scan); if that text still
-/// spells a value (a number equal to the line or the position) the line is dropped, then the
-/// position. A text that cannot be scanned counts as holding a value (fail closed).
-fn location(
-    matcher: &Matcher,
-    path: &Path,
-    ordinal: usize,
-    line: Option<usize>,
-    (pre, post): (&str, &str),
-) -> String {
-    let raw_clean = scan(matcher, path.as_os_str().as_bytes()).is_ok_and(|r| r.hits.is_empty());
-    let show = |name: &str, line: Option<usize>| match line {
-        Some(n) => format!("{name}:{n}"),
-        None => name.to_owned(),
-    };
-    let clean = |shown: &str| {
-        scan(matcher, format!("{pre}{shown}{post}").as_bytes()).is_ok_and(|r| r.hits.is_empty())
-    };
-    let plain = show(&escaped(path), line);
-    if raw_clean && clean(&plain) {
-        return plain;
-    }
-    let numbered = format!("<redacted-path:{ordinal}>");
-    for candidate in [
-        show(&numbered, line),
-        show(&numbered, None),
-        show("<redacted-path>", None),
-    ] {
-        if clean(&candidate) {
-            return candidate;
-        }
-    }
-    // Nothing but the fixed marker is left to print.
-    "<redacted-path>".to_owned()
-}
-
 fn scan_input<T: Terminal>(
     matcher: &Matcher,
     input: &Input,
@@ -275,7 +216,7 @@ fn scan_input<T: Terminal>(
 ) -> Result<(), CliError> {
     // One printed line: `pre`, the location (redacted as a whole by `location`), `post`.
     let at = |line: Option<usize>, pre: &str, post: &str| {
-        let loc = location(matcher, &input.path, ordinal, line, (pre, post));
+        let loc = Safe::path(matcher, &input.path, ordinal, line, (pre, post));
         format!("{pre}{loc}{post}")
     };
     let binary_notice = || at(None, "notice: skipped binary file ", "");
@@ -316,7 +257,7 @@ fn scan_input<T: Terminal>(
         tally.hits = tally.hits.saturating_add(1);
         // The id and kind are printed as they are (not secret, ADR 0006 section 8); only the
         // location is checked.
-        let loc = location(matcher, &input.path, ordinal, Some(h.line), ("", ""));
+        let loc = Safe::path(matcher, &input.path, ordinal, Some(h.line), ("", ""));
         say(term, &format!("{} {} {loc}", h.id, h.kind))?;
     }
     Ok(())
@@ -362,6 +303,7 @@ fn scan_all<T: Terminal>(
     limit: usize,
 ) -> Result<(), CliError> {
     let could_not = |e: CliError| CliError::CouldNotScan(Box::new(e));
+    let git = git::Git::locate();
     let vault = open_read(p).map_err(could_not)?;
     let matcher = Matcher::from_vault(&vault).map_err(|e| could_not(e.into()))?;
     drop(vault);
@@ -373,6 +315,22 @@ fn scan_all<T: Terminal>(
                 u.id, u.kind
             ),
         )?;
+    }
+    if let Some(source) = git_scan::source_of(args, &git)? {
+        let g = git_scan::run(&matcher, &git, &source, git_scan::Sources::ALL, term)?;
+        if g.truncated {
+            warn(term, "notice: more hits than are listed")?;
+        }
+        warn(
+            term,
+            &format!(
+                "scanned {} object(s), {} entries, {} hit(s)",
+                g.objects,
+                matcher.scanned_len(),
+                g.hits
+            ),
+        )?;
+        return verdict(g.unread, g.hits);
     }
     let found = walk(&args.paths, limit)?;
     let mut tally = Tally::default();
@@ -412,10 +370,15 @@ fn scan_all<T: Terminal>(
             tally.hits
         ),
     )?;
-    if tally.unread > 0 {
-        Err(CliError::Incomplete(tally.unread))
-    } else if tally.hits > 0 {
-        Err(CliError::Leak(tally.hits))
+    verdict(tally.unread, tally.hits)
+}
+
+/// Failing to scan outranks a hit; neither is a pass.
+fn verdict(unread: usize, hits: usize) -> Result<(), CliError> {
+    if unread > 0 {
+        Err(CliError::Incomplete(unread))
+    } else if hits > 0 {
+        Err(CliError::Leak(hits))
     } else {
         Ok(())
     }
@@ -463,86 +426,6 @@ mod tests {
             1
         );
         assert!(w.inputs.iter().all(|i| !i.path.ends_with("leaf.txt")));
-    }
-
-    fn matcher_of(kind: wardenlens_core::entry::EntryKind, value: &str) -> Matcher {
-        let m = Matcher::new(&[wardenlens_vault::ScanEntry {
-            id: wardenlens_core::entry::EntryId::new("e:one").unwrap(),
-            kind,
-            value: secrecy::SecretString::from(value.to_owned()),
-            unscannable: false,
-        }])
-        .unwrap();
-        assert!(m.unscannable().is_empty(), "{value:?} is unscannable");
-        m
-    }
-
-    #[test]
-    fn a_number_that_equals_the_line_or_the_position_is_not_printed() {
-        use wardenlens_core::entry::EntryKind::Other;
-        // The value is the line number: `:1234567` would print it.
-        let m = matcher_of(Other, "1234567");
-        let p = Path::new("/w/a-1234567-b.txt");
-        assert_eq!(
-            location(&m, p, 3, Some(1_234_567), ("", "")),
-            "<redacted-path:3>"
-        );
-        // The value is the position: the position goes too.
-        let m = matcher_of(Other, "1234567");
-        let p = Path::new("/w/a-1234567-b.txt");
-        assert_eq!(
-            location(&m, p, 1_234_567, Some(2), ("", "")),
-            "<redacted-path>"
-        );
-        // A clean path with an id-like or unrelated value is printed as it is.
-        let m = matcher_of(Other, "zq-synthetic-mark");
-        assert_eq!(
-            location(&m, Path::new("/w/a.txt"), 0, Some(4), ("", "")),
-            "/w/a.txt:4"
-        );
-    }
-
-    #[test]
-    fn every_unicode_format_character_is_escaped() {
-        let cf: &[(u32, u32)] = &[
-            (0xAD, 0xAD),
-            (0x600, 0x605),
-            (0x61C, 0x61C),
-            (0x6DD, 0x6DD),
-            (0x70F, 0x70F),
-            (0x890, 0x891),
-            (0x8E2, 0x8E2),
-            (0x180E, 0x180E),
-            (0x200B, 0x200F),
-            (0x202A, 0x202E),
-            (0x2060, 0x2064),
-            (0x2066, 0x206F),
-            (0xFEFF, 0xFEFF),
-            (0xFFF9, 0xFFFB),
-            (0x110BD, 0x110BD),
-            (0x110CD, 0x110CD),
-            (0x13430, 0x1343F),
-            (0x1BCA0, 0x1BCA3),
-            (0x1D173, 0x1D17A),
-            (0xE0001, 0xE0001),
-            (0xE0020, 0xE007F),
-        ];
-        for &(lo, hi) in cf {
-            for n in lo..=hi {
-                let c = char::from_u32(n).unwrap();
-                assert!(!is_printable(c), "U+{n:04X}");
-                let shown = escaped(Path::new(&format!("a{c}b")));
-                assert!(!shown.contains(c), "U+{n:04X}");
-            }
-        }
-        for c in [
-            '\u{2028}', '\u{2029}', '\u{85}', '\u{A0}', '\u{7F}', '\n', '\u{3000}',
-        ] {
-            assert!(!is_printable(c), "{c:?}");
-        }
-        for c in ['a', ' ', '/', '\u{e9}', '\u{4e2d}'] {
-            assert!(is_printable(c), "{c:?}");
-        }
     }
 
     #[test]

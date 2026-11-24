@@ -7,6 +7,8 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 hooks=${HOOKS:-$root/.githooks}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# Hermetic: no vault, no installed scanner, whatever this machine has (the hook under test may scan pushes).
+export HOME="$tmp/home"; mkdir -p "$HOME"; unset WARDENLENS_VAULT WARDENLENS_REQUIRE_VAULT
 fail=0; n=0
 unset GIT_DIR GIT_WORK_TREE WARDENLENS_ALLOW_REWRITE GIT_CONFIG_PARAMETERS
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0

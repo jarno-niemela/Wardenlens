@@ -117,6 +117,18 @@ impl Env {
         Ok(())
     }
 
+    /// The same environment without `WARDENLENS_VAULT`, `WARDENLENS_VAULT_KEY_FILE` and the
+    /// `XDG_*` variables, so the paths are the fixed defaults (the git hooks use this).
+    pub(crate) fn without_overrides(&self) -> Self {
+        Self {
+            vault: None,
+            key_file: None,
+            xdg_data_home: None,
+            xdg_config_home: None,
+            ..self.clone()
+        }
+    }
+
     /// True if either path comes from an override variable rather than the fixed default.
     pub(crate) fn has_override(&self) -> bool {
         self.vault.is_some() || self.key_file.is_some()

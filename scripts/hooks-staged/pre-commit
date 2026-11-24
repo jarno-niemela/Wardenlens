@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fast local checks before each commit. Enable with: git config core.hooksPath .githooks
+#
+# Also (ADR 0006 section 9): `wardenlens vault scan --staged` over the staged blobs (read from the index, not the work
+# tree) and their paths. The scanner is the FIXED installed binary $HOME/.cargo/bin/wardenlens (cargo install --locked
+# --path crates/wardenlens-cli); there is no WARDENLENS_BIN override. The vault and key are the fixed default paths:
+# WARDENLENS_VAULT*, XDG_* are ignored (unset for the scanner, which also gets --default-paths). No vault file: SKIPPED
+# (refused with WARDENLENS_REQUIRE_VAULT=1). A vault but no scanner, a hit (exit 1) or a scan that could not run
+# (exit 2): the commit is refused. GITHUB_ACTIONS is not consulted.
+set -euo pipefail
+vault_db=$HOME/.local/share/wardenlens/dev-vault.db
+vault_bin=$HOME/.cargo/bin/wardenlens
+if [[ -e "$vault_db" || -L "$vault_db" ]]; then
+  [[ -x "$vault_bin" ]] || { echo "pre-commit: a vault exists but $vault_bin is missing (install: cargo install --locked --path crates/wardenlens-cli)" >&2; exit 1; }
+  env -u WARDENLENS_VAULT -u WARDENLENS_VAULT_KEY_FILE -u WARDENLENS_VAULT_KEY -u XDG_DATA_HOME -u XDG_CONFIG_HOME \
+    "$vault_bin" vault scan --default-paths --staged </dev/null >&2 \
+    || { echo "pre-commit: vault scan found a vault value, or could not run (see above)" >&2; exit 1; }
+elif [[ "${WARDENLENS_REQUIRE_VAULT:-}" == 1 ]]; then
+  echo "pre-commit: no vault at $vault_db and WARDENLENS_REQUIRE_VAULT=1" >&2
+  exit 1
+else
+  echo "vault scan: SKIPPED (no vault at $vault_db)" >&2
+fi
+# shellcheck source=/dev/null
+[[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
+cargo fmt --all -- --check || { echo "pre-commit: run 'cargo fmt --all'" >&2; exit 1; }
+cargo clippy --workspace --all-targets --locked --quiet -- -D warnings

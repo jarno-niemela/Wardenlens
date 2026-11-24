@@ -9,6 +9,8 @@ mkdir -p "$tmp/bin"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$tmp/bin/gh"; chmod +x "$tmp/bin/gh"
 export PATH="$tmp/bin:$PATH"
 export WARDENLENS_AGENT_STATE="$tmp/state" WARDENLENS_SECRET_FILE="$tmp/secret.json"
+# Hermetic: no vault (so the secret-file fallback is under test) whatever the machine has.
+export HOME="$tmp/home"; mkdir -p "$HOME"; unset WARDENLENS_VAULT WARDENLENS_REQUIRE_VAULT
 fail=0
 ok()  { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }

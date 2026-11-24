@@ -1627,6 +1627,7 @@ impl Terminal for Broken {
 fn scan_args(path: &Path) -> crate::args::ScanArgs {
     crate::args::ScanArgs {
         paths: vec![path.to_owned()],
+        ..crate::args::ScanArgs::default()
     }
 }
 

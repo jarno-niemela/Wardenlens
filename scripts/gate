@@ -9,16 +9,22 @@ if [[ "${GITHUB_ACTIONS:-}" != true && "$(git config core.hooksPath || true)" !=
   exit 1
 fi
 step() { printf '\n== %s\n' "$*"; }
+# shellcheck source=scripts/lib/vault.sh
+. scripts/lib/vault.sh
 
 step "fmt";    cargo fmt --all -- --check
 step "clippy"; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 step "test";   cargo test --workspace --all-features --locked
+# ADR 0006 section 9: the tree's own build scans the tracked tree. Skipped (said so) only with no vault; a
+# vault that exists is always scanned, in CI too.
+step "vault scan"
+vault_scan_tree cargo run -q -p wardenlens-cli --locked -- || exit 1
 step "tooling tests"
 for t in scripts/tests/*.test.sh scripts/tests/adversarial/*.sh; do "$t" >/dev/null || { echo "FAILED: $t" >&2; "$t" | grep -v '^ok' >&2 || true; exit 1; }; done
 if command -v shellcheck >/dev/null; then
   step "shellcheck"
-  shellcheck scripts/agents scripts/ticket scripts/ticket-audit scripts/verify scripts/gate scripts/labels.sh \
-    scripts/tests/*.sh scripts/tests/adversarial/*.sh .claude/hooks/*.sh .githooks/*
+  shellcheck -x scripts/agents scripts/ticket scripts/ticket-audit scripts/verify scripts/gate scripts/labels.sh \
+    scripts/lib/vault.sh scripts/hooks-staged/pre-* scripts/tests/*.sh scripts/tests/adversarial/*.sh .claude/hooks/*.sh .githooks/*
 fi
 if [[ $quick -eq 0 ]]; then
   step "doc";  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
