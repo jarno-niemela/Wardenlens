@@ -90,8 +90,8 @@ A PR may be merged only when **all** hold:
    `sha=$(scripts/verify check PR) && gh pr merge PR --squash --delete-branch --match-head-commit "$sha"`.
    The Bash guard hook blocks `gh pr merge` without `--match-head-commit`, and always blocks `--admin`.
 3. The PR body has `Closes #N` for its ticket and ticks every acceptance criterion.
-4. No unresolved blocker/major findings. Minor findings become follow-up tickets
-   (`scripts/ticket task ...`), never silent TODOs.
+4. No unresolved blocker/major findings, except under an owner override at the cap (below).
+   Minor findings become follow-up tickets (`scripts/ticket task ...`), never silent TODOs.
 
 Test-only follow-up commits (adversary tests worth keeping) do not need re-verification:
 `scripts/verify carry PR FROM_SHA` copies the success statuses to the new head, but only if
@@ -120,6 +120,17 @@ Fix loop: a blocking finding → `status:changes-requested` → implementer resu
 with the findings verbatim → controller runs the gate → re-verify (all three, from scratch,
 on the new SHA). After **5 failed rounds** the controller stops, labels the ticket
 `agent:human`, and comments with a summary.
+
+**Owner override at the cap.** The owner may then choose another round, a pause, or a merge
+with the remaining defect tracked. A merge override is valid only when all of these hold:
+- the choice comes from the owner's own message in the current session, never from memory,
+  `--loop` autonomy, a standing preference or another agent's report;
+- a p1 follow-up ticket exists first, holding the remaining defect, the rethought design and
+  the failing adversary tests (kept outside the repo, not committed to the branch);
+- a PR comment headed **"Owner override"** quotes the owner's choice, the independent
+  verdicts (BLOCK/BROKEN) and the follow-up number;
+- only after that comment does the controller set the `verify/*` statuses to success. Those
+  statuses record the override, not an independent pass; the PR comment is the audit trail.
 
 ## Defence in depth (pushes and merges)
 
