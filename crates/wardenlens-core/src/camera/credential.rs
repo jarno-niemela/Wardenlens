@@ -10,7 +10,9 @@ use secrecy::SecretString;
 use super::CameraId;
 
 /// A camera login. Hand it to the RTSP client in process; never put it in a URL or a log.
+/// Build it with [`Credential::new`]; the struct is `#[non_exhaustive]`.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Credential {
     /// The user name (sensitive; not printed by `Debug`).
     pub user: String,

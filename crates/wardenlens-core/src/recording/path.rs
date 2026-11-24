@@ -3,6 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::camera::{CameraError, CameraId};
 use crate::time::UnixMs;
 
 /// Errors from the recording module's validated types and the segmenter config.
@@ -32,39 +33,11 @@ impl fmt::Display for RecordingError {
 
 impl std::error::Error for RecordingError {}
 
-/// A validated camera slug, `[a-z][a-z0-9-]{0,31}`; also a path component.
-///
-/// Minimal local definition: the camera model (#43) owns the shared type and
-/// this is unified with it when both land.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CameraId(String);
-
-impl CameraId {
-    /// The id as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for CameraId {
-    type Err = RecordingError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut bytes = s.bytes();
-        let first_ok = bytes.next().is_some_and(|b| b.is_ascii_lowercase());
-        let rest_ok = bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        if first_ok && rest_ok && s.len() <= 32 {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(RecordingError::InvalidCameraId)
-        }
-    }
-}
-
-impl fmt::Display for CameraId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+/// A camera id failure is [`RecordingError::InvalidCameraId`]: `recording` uses the one
+/// [`CameraId`] of the camera module, so only its id errors can occur here.
+impl From<CameraError> for RecordingError {
+    fn from(_: CameraError) -> Self {
+        Self::InvalidCameraId
     }
 }
 
@@ -279,6 +252,15 @@ mod tests {
         }
         assert!("a".repeat(32).parse::<CameraId>().is_ok());
         assert!("a-1".parse::<CameraId>().is_ok());
+    }
+
+    #[test]
+    fn camera_id_is_the_camera_modules_type() {
+        let id: CameraId = "cam-1".parse().unwrap();
+        let same: crate::camera::CameraId = id.clone();
+        assert_eq!(same.as_str(), "cam-1");
+        let e: RecordingError = "Bad".parse::<CameraId>().unwrap_err().into();
+        assert_eq!(e, RecordingError::InvalidCameraId);
     }
 
     #[test]

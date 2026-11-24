@@ -59,16 +59,20 @@ impl CameraId {
     }
 
     /// The vault entry id for this camera's `kind` (`cam:<id>:host`, `cam:<id>:credential`,
-    /// `cam:<id>:name`); `None` for kinds a camera does not own.
-    #[must_use]
-    pub fn entry_id(&self, kind: EntryKind) -> Option<EntryId> {
+    /// `cam:<id>:name`).
+    ///
+    /// # Errors
+    /// [`CameraError::EntryKindNotOwned`] for a kind a camera does not own;
+    /// [`CameraError::EntryId`] if the vault refuses the built id (it cannot today: at most
+    /// `cam:` + 32 + `:credential` = 47 bytes of `[a-z0-9:-]`, and a test pins that).
+    pub fn entry_id(&self, kind: EntryKind) -> Result<EntryId, CameraError> {
         let suffix = match kind {
             EntryKind::Credential => "credential",
             EntryKind::Host => "host",
             EntryKind::DisplayName => "name",
-            _ => return None,
+            _ => return Err(CameraError::EntryKindNotOwned),
         };
-        EntryId::new(&format!("cam:{}:{suffix}", self.0)).ok()
+        EntryId::new(&format!("cam:{}:{suffix}", self.0)).map_err(|_| CameraError::EntryId)
     }
 }
 
@@ -169,7 +173,7 @@ mod tests {
     #[test]
     fn entry_ids_follow_the_adr_naming() {
         let id = CameraId::new("reolink-1").unwrap();
-        let name = |k| id.entry_id(k).map(|e| e.as_str().to_owned());
+        let name = |k| id.entry_id(k).map(|e| e.as_str().to_owned()).ok();
         assert_eq!(name(EntryKind::Host).as_deref(), Some("cam:reolink-1:host"));
         assert_eq!(
             name(EntryKind::Credential).as_deref(),
@@ -180,6 +184,22 @@ mod tests {
             Some("cam:reolink-1:name")
         );
         assert_eq!(name(EntryKind::Mac), None);
+        assert_eq!(
+            id.entry_id(EntryKind::Mac),
+            Err(CameraError::EntryKindNotOwned)
+        );
+    }
+
+    #[test]
+    fn entry_id_never_fails_for_an_owned_kind_at_the_longest_id() {
+        let id = CameraId::new(&format!("a{}", "9".repeat(31))).unwrap();
+        for k in [
+            EntryKind::Credential,
+            EntryKind::Host,
+            EntryKind::DisplayName,
+        ] {
+            assert!(id.entry_id(k).is_ok(), "{k:?}");
+        }
     }
 
     proptest::proptest! {

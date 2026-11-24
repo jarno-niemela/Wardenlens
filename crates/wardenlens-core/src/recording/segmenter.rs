@@ -1,7 +1,8 @@
 //! `Segmenter`: decides where segments start and end (ADR 0005 section 2).
 
 use super::clock::{MediaClock, TICKS_PER_SECOND};
-use super::path::{CameraId, RecordingError};
+use super::path::RecordingError;
+use crate::camera::CameraId;
 use crate::time::{DurationMs, Timestamp, UnixMs};
 
 /// Largest accepted frame, 8 MiB (ADR 0005 section 2). A larger frame is a

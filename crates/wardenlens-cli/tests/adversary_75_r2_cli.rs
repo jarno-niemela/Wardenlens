@@ -222,11 +222,12 @@ fn invisible_and_bidi_formatting_characters_in_a_path_are_escaped() {
     assert!(raw.is_empty(), "printed raw: {raw:?}");
 }
 
-/// A display name holding a narrow no-break space (valid: not a control character), present
-/// verbatim in a file, is found end to end.
+/// A value holding a narrow no-break space (valid: not a control character), present verbatim in
+/// a file, is found end to end. Since #43 a display name is core's `DisplayName`, which refuses a
+/// stored U+202F, so this uses the `other` kind, which keeps the same scan rule.
 #[test]
-fn a_display_name_with_a_narrow_no_break_space_is_found_end_to_end() {
-    let s = Setup::new(&[("cam:a:name", "display-name", "Back\u{202F}Door North")]);
+fn a_value_with_a_narrow_no_break_space_is_found_end_to_end() {
+    let s = Setup::new(&[("cam:a:name", "other", "Back\u{202F}Door North")]);
     for (name, text) in [
         ("v.txt", "x\nBack\u{202F}Door North\n"),
         ("s.txt", "x\nback door   north\n"),
@@ -235,10 +236,7 @@ fn a_display_name_with_a_narrow_no_break_space_is_found_end_to_end() {
         let f = s.file(name, text.as_bytes());
         let o = s.scan(&[&f]);
         assert_eq!(o.status.code(), Some(1), "{text:?} {}", err(&o));
-        assert_eq!(
-            out(&o),
-            format!("cam:a:name display-name {}:2\n", f.display())
-        );
+        assert_eq!(out(&o), format!("cam:a:name other {}:2\n", f.display()));
     }
 }
 

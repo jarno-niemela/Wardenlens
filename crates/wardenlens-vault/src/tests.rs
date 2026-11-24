@@ -413,12 +413,7 @@ fn value_shape_must_match_the_kind() {
 #[test]
 fn value_limit_is_4096_bytes_for_every_kind() {
     let (_d, mut v) = fresh();
-    for kind in [
-        EntryKind::Secret,
-        EntryKind::Serial,
-        EntryKind::DisplayName,
-        EntryKind::Other,
-    ] {
+    for kind in [EntryKind::Secret, EntryKind::Serial, EntryKind::Other] {
         v.set(&id("x"), kind, &text(&"v".repeat(4096)), Scan::Normal)
             .unwrap();
         let e = v
@@ -426,6 +421,35 @@ fn value_limit_is_4096_bytes_for_every_kind() {
             .unwrap_err();
         assert!(matches!(e, VaultError::ValueTooLarge { .. }), "{kind}: {e}");
     }
+    // A display name is capped at 128 bytes by core's `DisplayName` (the one validator), but the
+    // 4096-byte size check still comes first.
+    v.set(
+        &id("x"),
+        EntryKind::DisplayName,
+        &text(&"v".repeat(128)),
+        Scan::Normal,
+    )
+    .unwrap();
+    for len in [129, 4096] {
+        let e = v
+            .set(
+                &id("x"),
+                EntryKind::DisplayName,
+                &text(&"v".repeat(len)),
+                Scan::Normal,
+            )
+            .unwrap_err();
+        assert!(matches!(e, VaultError::InvalidValue { .. }), "{len}: {e}");
+    }
+    let e = v
+        .set(
+            &id("x"),
+            EntryKind::DisplayName,
+            &text(&"v".repeat(4097)),
+            Scan::Normal,
+        )
+        .unwrap_err();
+    assert!(matches!(e, VaultError::ValueTooLarge { .. }), "{e}");
     let big =
         |u: usize, p: usize| Value::Credential(Credentials::new("u".repeat(u), "p".repeat(p)));
     v.set(

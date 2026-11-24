@@ -1,9 +1,9 @@
-//! [`Camera`], [`StreamRole`] and [`RtspUrl`].
+//! [`Camera`], [`StreamSet`] and [`RtspUrl`].
 
 use std::fmt;
 use std::num::NonZeroU16;
 
-use super::{CameraError, CameraId, DisplayName, Host, RtspPath};
+use super::{CameraError, CameraId, DisplayName, Host, ModelRef, RtspPath, StreamRole};
 
 /// The standard RTSP port.
 pub const DEFAULT_RTSP_PORT: NonZeroU16 = match NonZeroU16::new(554) {
@@ -11,14 +11,31 @@ pub const DEFAULT_RTSP_PORT: NonZeroU16 = match NonZeroU16::new(554) {
     None => NonZeroU16::MIN,
 };
 
-/// Which of a camera's streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[non_exhaustive]
-pub enum StreamRole {
+/// The streams of one camera: a main stream and an optional sub stream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamSet {
     /// The full-resolution stream (always present).
-    Main,
-    /// The low-resolution stream (optional).
-    Sub,
+    pub main: RtspPath,
+    /// The low-resolution stream, if the camera has one.
+    pub sub: Option<RtspPath>,
+}
+
+impl StreamSet {
+    /// A stream set from its paths.
+    #[must_use]
+    pub fn new(main: RtspPath, sub: Option<RtspPath>) -> Self {
+        Self { main, sub }
+    }
+
+    /// The path of `role`, if there is one. The match is exhaustive on purpose: a new role must
+    /// decide where its path lives.
+    #[must_use]
+    pub fn get(&self, role: StreamRole) -> Option<&RtspPath> {
+        match role {
+            StreamRole::Main => Some(&self.main),
+            StreamRole::Sub => self.sub.as_ref(),
+        }
+    }
 }
 
 /// An RTSP URL without credentials. `Debug` and `Display` print `rtsp://<redacted>` because the
@@ -46,15 +63,16 @@ impl fmt::Display for RtspUrl {
     }
 }
 
-/// One camera. `Debug` shows the id, port and paths; the host and name are redacted by their types.
+/// One camera. `Debug` shows the id, model and port; the host, name and paths are redacted by
+/// their types. It holds no credential (ADR 0006: a `CredentialSource` supplies it by id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Camera {
     id: CameraId,
     name: DisplayName,
+    model: ModelRef,
     host: Host,
     port: NonZeroU16,
-    main_path: RtspPath,
-    sub_path: Option<RtspPath>,
+    streams: StreamSet,
 }
 
 impl Camera {
@@ -63,18 +81,18 @@ impl Camera {
     pub fn new(
         id: CameraId,
         name: DisplayName,
+        model: ModelRef,
         host: Host,
         port: NonZeroU16,
-        main_path: RtspPath,
-        sub_path: Option<RtspPath>,
+        streams: StreamSet,
     ) -> Self {
         Self {
             id,
             name,
+            model,
             host,
             port,
-            main_path,
-            sub_path,
+            streams,
         }
     }
 
@@ -88,6 +106,18 @@ impl Camera {
     #[must_use]
     pub fn name(&self) -> &DisplayName {
         &self.name
+    }
+
+    /// The catalogue model this camera is.
+    #[must_use]
+    pub fn model(&self) -> &ModelRef {
+        &self.model
+    }
+
+    /// The streams (redacting `Debug`/`Display`).
+    #[must_use]
+    pub fn streams(&self) -> &StreamSet {
+        &self.streams
     }
 
     /// The host (redacting `Debug`/`Display`).
@@ -105,10 +135,7 @@ impl Camera {
     /// The path of `role`, if the camera has that stream.
     #[must_use]
     pub fn path(&self, role: StreamRole) -> Option<&RtspPath> {
-        match role {
-            StreamRole::Main => Some(&self.main_path),
-            StreamRole::Sub => self.sub_path.as_ref(),
-        }
+        self.streams.get(role)
     }
 
     /// The credential-free RTSP URL for `role`: `rtsp://<host>:<port><path>`.
@@ -135,10 +162,13 @@ mod tests {
         Camera::new(
             CameraId::new("reolink-1").unwrap(),
             DisplayName::new("Back Door North").unwrap(),
+            ModelRef::new("reolink", "rlc-520a").unwrap(),
             Host::new(host).unwrap(),
             NonZeroU16::new(port).unwrap(),
-            RtspPath::new(main).unwrap(),
-            sub.map(|s| RtspPath::new(s).unwrap()),
+            StreamSet::new(
+                RtspPath::new(main).unwrap(),
+                sub.map(|s| RtspPath::new(s).unwrap()),
+            ),
         )
     }
 
@@ -176,6 +206,44 @@ mod tests {
         assert_eq!(c.rtsp_url(StreamRole::Sub), Err(CameraError::NoSuchStream));
         assert!(c.path(StreamRole::Sub).is_none());
         assert_eq!(c.path(StreamRole::Main).unwrap().as_str(), "/main");
+    }
+
+    #[test]
+    fn camera_exposes_model_and_streams() {
+        let c = cam("192.0.2.10", 554, "/main", Some("/sub"));
+        assert_eq!(c.model().to_string(), "reolink/rlc-520a");
+        assert_eq!(c.streams().main.as_str(), "/main");
+        assert_eq!(c.streams().sub.as_ref().map(RtspPath::as_str), Some("/sub"));
+        assert_eq!(c.streams().get(StreamRole::Sub), c.path(StreamRole::Sub));
+    }
+
+    #[test]
+    fn stream_role_is_the_catalogue_enum() {
+        let r: crate::catalogue::StreamRole = StreamRole::Main;
+        let mut set = std::collections::HashSet::new();
+        set.insert(r);
+        assert!(set.contains(&StreamRole::Main) && !set.contains(&StreamRole::Sub));
+    }
+
+    #[test]
+    fn debug_never_prints_a_path_even_with_an_unlisted_credential_name() {
+        let c = cam(
+            "192.0.2.10",
+            554,
+            "/cam?pin=Tr0ub4dor-x9",
+            Some("/sub?who=svc-reader"),
+        );
+        for shown in [
+            format!("{c:?}"),
+            format!("{c:#?}"),
+            format!("{:?}", c.streams()),
+        ] {
+            assert!(
+                !shown.contains("Tr0ub4dor") && !shown.contains("svc-reader"),
+                "{shown}"
+            );
+            assert!(!shown.contains("pin="), "{shown}");
+        }
     }
 
     #[test]
@@ -236,10 +304,10 @@ mod tests {
             let c = Camera::new(
                 CameraId::new("cam1").unwrap(),
                 DisplayName::new("n").unwrap(),
+                ModelRef::new("acme", "c1").unwrap(),
                 h.clone(),
                 NonZeroU16::new(port).unwrap(),
-                p.clone(),
-                None,
+                StreamSet::new(p.clone(), None),
             );
             let url = c.rtsp_url(StreamRole::Main).unwrap();
             proptest::prop_assert!(!url.as_str().contains('@'));

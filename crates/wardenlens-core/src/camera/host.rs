@@ -6,22 +6,25 @@
 //! | input | result |
 //! |---|---|
 //! | `192.0.2.10` (std strict `Ipv4Addr`) | IPv4 |
-//! | `2001:db8::1`, `::1`, `::ffff:192.0.2.1` (std `Ipv6Addr`) | IPv6, stored canonical (lower case, compressed) |
+//! | `2001:db8::1`, `::1`, `64:ff9b::192.0.2.1` (std `Ipv6Addr`) | IPv6, stored canonical (lower case, compressed) |
+//! | IPv4-mapped IPv6 (`::ffff:192.0.2.1`, `::ffff:c000:201`, any spelling) | `HostSyntax`: the address has one spelling, the IPv4 one |
 //! | `[2001:db8::1]` (brackets) | IPv6, same value as unbracketed |
 //! | `nvr-1.example.invalid`, `localhost`, `xn--` labels, upper case | DNS name, lower-cased |
+//! | `_sip._tcp.example.invalid`, `a_b.invalid` (`_` anywhere in a label: service and DNS-SD names, ADR 0006 section 1) | DNS name |
 //! | empty | `HostEmpty` |
 //! | more than 253 bytes | `HostTooLong` |
 //! | empty label (`a..b`, leading dot, **trailing dot**), label over 63 bytes | `HostLabel` |
-//! | `user@h`, `h:554`, `h/p`, `h?q`, `h#f`, `rtsp://h`, `%41`, `\`, `*`, `_` | `HostSyntax` |
+//! | `user@h`, `h:554`, `h/p`, `h?q`, `h#f`, `rtsp://h`, `%41`, `\`, `*` | `HostSyntax` |
 //! | any whitespace or control char, anywhere | `HostSyntax` |
 //! | any non-ASCII char (no IDNA in core: callers give the `xn--` form) | `HostSyntax` |
-//! | label starting or ending with `-` | `HostSyntax` |
+//! | label starting or ending with `-` | `HostSyntax` (a label may start or end with `_`) |
 //! | IPv4 spellings std refuses (`192.000.2.1`, `0300.0.0.1`, `0x7f.0.0.1`, `192.0.2`, `3221225985`) | `HostSyntax`: a name whose last label is all digits, or `0x` plus hex digits, is not a DNS name here |
 //! | zone ids (`fe80::1%eth0`), `[fe80::1%25eth0]` | `HostSyntax` |
 //! | `[192.0.2.1]`, `[::1`, `::1]`, `[[::1]]`, `[]`, `[ ::1]`, `[::1]:554` | `HostSyntax` |
 //!
-//! A trailing dot is refused so that every host has exactly one spelling. A DNS name with `_` is
-//! refused (LDH only); a vault host value that uses one cannot become a camera host.
+//! A trailing dot is refused so that every host has exactly one spelling (the vault strips one
+//! before it calls [`Host::new`]). This is the one host validator: the vault calls it for its
+//! `host` entries, so a stored host always builds a camera (ADR 0006 section 1).
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -65,16 +68,10 @@ impl Host {
         }
         if let Some(rest) = text.strip_prefix('[') {
             let inner = rest.strip_suffix(']').ok_or(CameraError::HostSyntax)?;
-            return inner
-                .parse::<Ipv6Addr>()
-                .map(|a| Self(Repr::V6(a)))
-                .map_err(|_| CameraError::HostSyntax);
+            return ipv6(inner);
         }
         if text.contains(':') {
-            return text
-                .parse::<Ipv6Addr>()
-                .map(|a| Self(Repr::V6(a)))
-                .map_err(|_| CameraError::HostSyntax);
+            return ipv6(text);
         }
         if let Ok(v4) = text.parse::<Ipv4Addr>() {
             return Ok(Self(Repr::V4(v4)));
@@ -102,10 +99,20 @@ impl Host {
     }
 }
 
+fn ipv6(text: &str) -> Result<Host, CameraError> {
+    let addr = text
+        .parse::<Ipv6Addr>()
+        .map_err(|_| CameraError::HostSyntax)?;
+    if addr.to_ipv4_mapped().is_some() {
+        return Err(CameraError::HostSyntax);
+    }
+    Ok(Host(Repr::V6(addr)))
+}
+
 fn dns_name(text: &str) -> Result<String, CameraError> {
     if !text
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
         return Err(CameraError::HostSyntax);
     }
@@ -176,7 +183,7 @@ mod tests {
             assert_eq!(h.url_host(), "[2001:db8::1]");
         }
         assert_eq!(ok("::1").url_host(), "[::1]");
-        assert_eq!(ok("::ffff:192.0.2.1").expose(), "::ffff:192.0.2.1");
+        assert_eq!(ok("64:ff9b::192.0.2.1").expose(), "64:ff9b::c000:201");
     }
 
     #[test]
@@ -192,6 +199,10 @@ mod tests {
             ),
             ("1a.example.invalid", "1a.example.invalid"),
             ("example.0xg", "example.0xg"),
+            ("_sip._tcp.example.invalid", "_sip._tcp.example.invalid"),
+            ("A_B.invalid", "a_b.invalid"),
+            ("_", "_"),
+            ("_1.example.invalid", "_1.example.invalid"),
         ] {
             assert_eq!(ok(text).expose(), want, "{text}");
         }
@@ -242,7 +253,6 @@ mod tests {
             "h%2e",
             "h\\x",
             "*.invalid",
-            "a_b.invalid",
             "a b",
             " a",
             "a ",
@@ -274,6 +284,24 @@ mod tests {
         for host in bad {
             assert_eq!(Host::new(host), Err(CameraError::HostSyntax), "{host:?}");
         }
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_in_every_spelling() {
+        for bad in [
+            "::ffff:192.0.2.1",
+            "::FFFF:192.0.2.1",
+            "::ffff:c000:201",
+            "[::ffff:192.0.2.1]",
+            "0:0:0:0:0:ffff:192.0.2.1",
+            "0000:0000:0000:0000:0000:ffff:c000:0201",
+            "::ffff:0:0",
+        ] {
+            assert_eq!(Host::new(bad), Err(CameraError::HostSyntax), "{bad:?}");
+        }
+        // Not mapped: IPv4-compatible and NAT64 forms keep their own spelling.
+        assert!(Host::new("::192.0.2.1").is_ok());
+        assert!(Host::new("::ffff:0:192.0.2.1").is_ok());
     }
 
     #[test]

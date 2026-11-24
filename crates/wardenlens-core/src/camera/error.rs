@@ -37,8 +37,8 @@ pub enum CameraError {
     /// The path has a `.` or `..` segment.
     #[error("RTSP path has a dot segment")]
     PathDotSegment,
-    /// The query string has a parameter that can carry a credential.
-    #[error("RTSP path has a credential-bearing query parameter")]
+    /// A `name=value` pair anywhere in the path or query has a name that can carry a credential.
+    #[error("RTSP path has a credential-bearing parameter")]
     PathCredentialParam,
     /// The display name is empty or longer than 128 bytes.
     #[error("display name must be 1 to 128 bytes")]
@@ -46,6 +46,15 @@ pub enum CameraError {
     /// The display name has a control, invisible or non-space whitespace character, or edge spaces.
     #[error("display name has a disallowed character")]
     NameCharset,
+    /// A catalogue vendor or model is not a canonical slug (`[a-z0-9]+(-[a-z0-9]+)*`, 1 to 64 bytes).
+    #[error("catalogue vendor or model is not a canonical slug of 1 to 64 bytes")]
+    ModelSlug,
+    /// The entry kind is not one a camera owns (host, display name, credential).
+    #[error("camera does not own an entry of that kind")]
+    EntryKindNotOwned,
+    /// The vault entry id built from a camera id was refused.
+    #[error("vault entry id for the camera was refused")]
+    EntryId,
     /// The camera has no stream for the requested role.
     #[error("camera has no stream for that role")]
     NoSuchStream,

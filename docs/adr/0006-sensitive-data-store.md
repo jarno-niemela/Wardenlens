@@ -63,11 +63,23 @@ is deliberately weaker (case-insensitive, whitespace-collapsed) because PII pros
 stable on disk and are bound into the ciphertext (section 3); a new kind takes a new code, never a reused one.
 
 **Limits (SEC-2).** A value is at most 4096 bytes of UTF-8, an id at most 128 bytes, a store at most 10,000 entries; all
-are checked on `set` and on `open`. Values are validated per kind on `set` (an IPv4 host must parse with std's strict
-`Ipv4Addr`, a MAC must reduce to 12 hex digits; a hostname is validated **per label**: 1 to 63 bytes of `a-z`, `0-9`,
-`-` and `_` (the underscore is allowed because service and DNS-SD names use it), no label starting or ending with a
-hyphen, the whole name at most 253 bytes, lower-cased at `set`, trailing dot removed; IDN hostnames are entered in
-their `xn--` form).
+are checked on `set` and on `open`. Values are validated per kind on `set`; a MAC must reduce to 12 hex digits.
+
+**One validator for hosts and display names (amended by #43).** The `host` and `display-name` rules are those of the
+pure core types `camera::Host` and `camera::DisplayName`; the vault calls `Host::new` and `DisplayName::new` and stores
+the canonical text they return, so a value the vault stores always builds a camera and the rules cannot drift. The
+vault adds only the normalisation in front of them (lower-case, one trailing dot removed, display-name edge whitespace
+trimmed, bracketed IPv6 refused so a stored address has one spelling).
+
+- *Host:* 1 to 253 bytes of ASCII. An IPv4 address must parse with std's strict `Ipv4Addr`; an IPv6 address with std's
+  `Ipv6Addr`, stored canonical, with no zone id and not IPv4-mapped (`::ffff:a.b.c.d`) so each address has one
+  spelling. Otherwise a DNS name validated **per label**: 1 to 63 bytes of `a-z`, `0-9`, `-` and `_` (the underscore is
+  allowed because service and DNS-SD names use it), no label starting or ending with a hyphen, lower-cased. The last
+  label must not be all digits or `0x` plus hex digits (that would be a spelling of an IPv4 address). Userinfo, port,
+  path, whitespace, controls and non-ASCII are refused; IDN hostnames are entered in their `xn--` form.
+- *Display name:* 1 to 128 bytes; no control character, no whitespace other than U+0020, no leading or trailing space,
+  and no invisible character: every Unicode `Cf` character plus the invisible fillers and variation selectors, as
+  decided by the one predicate `wardenlens_core::text::is_invisible` (re-exported by the vault scanner).
 
 **What stays out of the store.** Anything that is not about the site: vendor, model, firmware family, stream codec,
 resolution, ONVIF profile numbers, RTSP path templates, default ports, inventory ids (`reolink-1`). These are public

@@ -2,23 +2,34 @@
 //!
 //! Input forms:
 //!
+//! Allowed characters are RFC 3986 `pchar` (unreserved, sub-delims, `:`) plus `/` and `?`, minus
+//! `@` and `%`, so a URL parser never re-encodes the text and there is one spelling.
+//!
 //! | input | result |
 //! |---|---|
 //! | `/`, `/stream1`, `/h264Preview_01_main`, `/11` | accepted |
-//! | `/cam/realmonitor?channel=1&subtype=0` (Dahua), any `?query` of printable ASCII | accepted |
+//! | `/cam/realmonitor?channel=1&subtype=0` (Dahua), any `?query` of allowed characters | accepted |
 //! | `/a?b?c`, `/?`, `/a?x=1;y=2` | accepted (a later `?` is plain query text) |
-//! | `/a:b`, `/a=b`, `/a,b`, `/a~b`, `/a//b` (inner `//`) | accepted |
+//! | `/a:b`, `/a=b`, `/a,b`, `/a~b`, `/a(b)`, `/a!$'*+`, `/a//b` (inner `//`) | accepted |
 //! | empty, no leading `/`, `?q` alone, `rtsp://h/p`, `h/p` | `PathStart` |
 //! | `//x`, `//` (would parse as an authority) | `PathStart` |
 //! | more than 512 bytes | `PathTooLong` |
 //! | space, tab, newline, NUL, any control char incl. DEL, any non-ASCII | `PathCharset` |
-//! | `@` anywhere (userinfo), `\`, `#` (fragment), `%` (no percent-encoding: one spelling) | `PathCharset` |
+//! | `@` (userinfo), `\`, `#` (fragment), `%` (no percent-encoding), `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `}`, the pipe | `PathCharset` |
 //! | a `.` or `..` segment in the path part (`/..`, `/a/./b`, `/a/..`) | `PathDotSegment` |
-//! | a query parameter named (case-insensitive) `pass`, `password`, `pwd`, `user`, `usr`, `username`, `token`, `auth`, `key`, `secret`, `login`, `passwd` | `PathCredentialParam` |
+//! | a `name=value` pair whose name is on the credential list, **anywhere** (path or query) | `PathCredentialParam` |
+//! | a bare query parameter without `=` whose name is on the list (`/a?pass`) | `PathCredentialParam` |
 //!
-//! Query parameters are split on `&` and `;`; the name is the text before the first `=`.
-//! A name is checked after trimming nothing: spaces and `%` are already refused, so there is
-//! no way to spell a denied name differently.
+//! Credential check: the whole text is split on every one of `/ ? & ; ,`; each piece is a
+//! parameter, its name is the text before the first `=` (the whole piece when it has no `=` and
+//! lies in the query). A name is compared case-insensitively with this list: `pass`, `passw`,
+//! `passwd`, `password`, `passcode`, `pw`, `pwd`, `p`, `user`, `usr`, `u`, `username`,
+//! `user_name`, `user-name`, `userid`, `user_id`, `login`, `loginuse`, `loginpas`, `token`,
+//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`. This covers the
+//! Xiongmai/XMEye form `/user=admin&password=x&channel=1&stream=0.sdp`, `;` path parameters and
+//! a second `?`. The list can never be complete, so the second layer is that `Debug` and
+//! `Display` of [`RtspPath`] print `<redacted-path>`: a credential name the list misses is still
+//! never logged. Only [`RtspPath::as_str`] returns the text, for the RTSP client.
 
 use std::fmt;
 use std::str::FromStr;
@@ -28,14 +39,71 @@ use super::CameraError;
 /// Longest path (with query) in bytes.
 pub const MAX_PATH_LEN: usize = 512;
 
-const DENIED_PARAMS: [&str; 12] = [
-    "pass", "password", "passwd", "pwd", "user", "usr", "username", "login", "token", "auth",
-    "key", "secret",
+const DENIED_PARAMS: [&str; 27] = [
+    "pass",
+    "passw",
+    "passwd",
+    "password",
+    "passcode",
+    "pw",
+    "pwd",
+    "p",
+    "user",
+    "usr",
+    "u",
+    "username",
+    "user_name",
+    "user-name",
+    "userid",
+    "user_id",
+    "login",
+    "loginuse",
+    "loginpas",
+    "token",
+    "access_token",
+    "auth",
+    "key",
+    "apikey",
+    "api_key",
+    "api-key",
+    "secret",
 ];
 
-/// A validated RTSP path. Not site-identifying (vendor stream templates), so `Debug` and `Display`
-/// print it as is.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// What `Debug` and `Display` print.
+const REDACTED_PATH: &str = "<redacted-path>";
+
+fn is_denied(name: &str) -> bool {
+    DENIED_PARAMS.iter().any(|d| name.eq_ignore_ascii_case(d))
+}
+
+/// RFC 3986 `pchar` plus `/` and `?`, without `@` and `%`.
+fn allowed(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'/'
+                | b'?'
+        )
+}
+
+/// A validated RTSP path. `Debug` and `Display` print `<redacted-path>` (a path can carry a
+/// credential in a spelling the list misses); use [`RtspPath::as_str`] for the RTSP client.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RtspPath(String);
 
 impl RtspPath {
@@ -50,10 +118,7 @@ impl RtspPath {
         if text.len() > MAX_PATH_LEN {
             return Err(CameraError::PathTooLong);
         }
-        if !text
-            .bytes()
-            .all(|b| (0x21..=0x7e).contains(&b) && !matches!(b, b'@' | b'\\' | b'#' | b'%'))
-        {
+        if !text.bytes().all(allowed) {
             return Err(CameraError::PathCharset);
         }
         let (path, query) = match text.split_once('?') {
@@ -63,14 +128,19 @@ impl RtspPath {
         if path.split('/').any(|seg| seg == "." || seg == "..") {
             return Err(CameraError::PathDotSegment);
         }
-        if let Some(q) = query {
-            let denied = q.split(['&', ';']).any(|param| {
-                let name = param.split_once('=').map_or(param, |(n, _)| n);
-                DENIED_PARAMS.iter().any(|d| name.eq_ignore_ascii_case(d))
-            });
-            if denied {
+        let query_start = text.len().saturating_sub(query.map_or(0, str::len));
+        let mut offset = 0_usize;
+        for piece in text.split(['/', '?', '&', ';', ',']) {
+            let name = match piece.split_once('=') {
+                Some((n, _)) => Some(n),
+                // A bare name counts only in the query: `/user` is just a path segment.
+                None if offset >= query_start => Some(piece),
+                None => None,
+            };
+            if name.is_some_and(is_denied) {
                 return Err(CameraError::PathCredentialParam);
             }
+            offset = offset.saturating_add(piece.len()).saturating_add(1);
         }
         Ok(Self(text.to_owned()))
     }
@@ -82,9 +152,15 @@ impl RtspPath {
     }
 }
 
+impl fmt::Debug for RtspPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REDACTED_PATH)
+    }
+}
+
 impl fmt::Display for RtspPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(REDACTED_PATH)
     }
 }
 
@@ -122,6 +198,13 @@ mod tests {
             "/a?passage=2",
             "/a?users=3",
             "/a?tokens=1",
+            "/a(b)!$'*+",
+            "/live/user",
+            "/p/u",
+            "/stream=0.sdp",
+            "/a?x=1&stream=0",
+            "/user_x=1",
+            "/a?puser=1",
         ] {
             assert_eq!(RtspPath::new(p).unwrap().as_str(), p);
         }
@@ -184,6 +267,13 @@ mod tests {
             "/a?x=%41",
             "/a?x=1 &y=2",
             "/a\u{85}",
+            "/a\"b",
+            "/a<b>",
+            "/a[0]",
+            "/a^b",
+            "/a`b",
+            "/a{b}",
+            "/a|b",
         ] {
             assert_eq!(RtspPath::new(p), Err(CameraError::PathCharset), "{p:?}");
         }
@@ -235,6 +325,80 @@ mod tests {
     }
 
     #[test]
+    fn rejects_credential_parameters_anywhere_in_the_text() {
+        for p in [
+            // Xiongmai/XMEye: the login rides in the path itself.
+            "/user=admin&password=Tr0ub4dor-x9&channel=1&stream=0.sdp",
+            "/user=admin_password=Tr0ub4dor-x9_channel=1_stream=0.sdp",
+            "/live;user=admin;password=Tr0ub4dor-x9",
+            "/live,user=admin,password=x",
+            "/password=x",
+            "/a/pass=x/b",
+            "/a/PWD=x",
+            // path parameters and a second `?`
+            "/a;pw=x",
+            "/a?x=1?password=y",
+            "/a?x=1?y=2&token=z",
+            "/a?x=1/user=y",
+            // vendor names and the short ones
+            "/videostream.cgi?loginuse=admin&loginpas=x",
+            "/a?passw=x",
+            "/a?passcode=x",
+            "/a?user_name=x",
+            "/a?user-name=x",
+            "/a?userid=x",
+            "/a?user_id=x",
+            "/a?access_token=x",
+            "/a?apikey=x",
+            "/a?api_key=x",
+            "/a?api-key=x",
+            "/a?u=admin&p=x",
+            "/a?P=x",
+            "/u=admin&p=x",
+            "/a?x=1;p=2",
+        ] {
+            assert_eq!(
+                RtspPath::new(p),
+                Err(CameraError::PathCredentialParam),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_names_count_only_in_the_query() {
+        assert!(RtspPath::new("/pass").is_ok());
+        assert!(RtspPath::new("/user/token").is_ok());
+        assert!(RtspPath::new("/a?pass").is_err());
+        assert!(RtspPath::new("/a?x=1&token").is_err());
+        assert!(RtspPath::new("/a/user?x=1").is_ok());
+    }
+
+    #[test]
+    fn debug_and_display_are_redacted_everywhere() {
+        // A name the list misses must still never be printed.
+        let p = RtspPath::new("/cam?pin=Tr0ub4dor-x9&who=svc-reader").unwrap();
+        for shown in [
+            format!("{p}"),
+            format!("{p:?}"),
+            format!("{p:#?}"),
+            format!("{p:>40}"),
+            format!("{:?}", Some(&p)),
+            format!("{:#?}", vec![p.clone()]),
+            p.to_string(),
+        ] {
+            assert!(
+                !shown.contains("Tr0ub4dor")
+                    && !shown.contains("svc-reader")
+                    && !shown.contains("pin"),
+                "{shown}"
+            );
+            assert!(shown.contains("redacted"), "{shown}");
+        }
+        assert_eq!(p.as_str(), "/cam?pin=Tr0ub4dor-x9&who=svc-reader");
+    }
+
+    #[test]
     fn errors_never_echo_input() {
         for p in ["/secret@x", "/a?password=hunter2", "/secret path", "secret"] {
             let msg = RtspPath::new(p).unwrap_err().to_string();
@@ -257,7 +421,7 @@ mod tests {
         #[test]
         fn plain_paths_round_trip(s in "/[a-zA-Z0-9_/=&?;:,~-][a-zA-Z0-9_/=&?;:,~-]{0,100}") {
             match RtspPath::new(&s) {
-                Ok(p) => proptest::prop_assert_eq!(p.to_string().parse::<RtspPath>().unwrap(), p),
+                Ok(p) => proptest::prop_assert_eq!(p.as_str().parse::<RtspPath>().unwrap(), p),
                 Err(e) if s.starts_with("//") => proptest::prop_assert_eq!(e, CameraError::PathStart),
                 Err(e) => proptest::prop_assert_eq!(e, CameraError::PathCredentialParam),
             }
