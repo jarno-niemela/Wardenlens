@@ -172,6 +172,7 @@ fn parent_of(path: &Path) -> Result<&Path, VaultError> {
 /// and before SQLite opens the path (the window a swap attack needs); tests use it.
 fn connect(
     path: &Path,
+    key: &KeyFile,
     must_exist: bool,
     between: impl FnOnce(),
 ) -> Result<(Connection, PrivateFile), VaultError> {
@@ -203,7 +204,7 @@ fn connect(
     between();
     if len > 0 {
         // Read-only probe before ANY pragma: a foreign database must stay byte-for-byte intact.
-        let is_vault = probe_existing(path, &file)?;
+        let is_vault = probe_existing(path, &file, must_exist.then_some(key))?;
         if !must_exist {
             return Err(if is_vault {
                 VaultError::AlreadyInitialized
@@ -248,13 +249,42 @@ fn file_len(file: &PrivateFile) -> Result<u64, VaultError> {
         .len())
 }
 
-/// True if the non-empty file is a vault (has the `meta` table), false for any other database.
-/// Opened `immutable=1` and read-only: no pragma, lock, journal, `-wal` or `-shm` file is ever
-/// written, so the foreign bytes stay exactly as they were. (A vault is always in rollback mode,
-/// so its main file is complete.)
-fn probe_existing(path: &Path, file: &PrivateFile) -> Result<bool, VaultError> {
+/// Identifies the non-empty file as a vault or not, entirely read-only (`immutable=1`), before
+/// any read-write open: no pragma, lock, journal, `-wal` or `-shm` file is ever written, so a
+/// foreign database stays byte-for-byte intact. A vault is:
+/// - in rollback mode (header bytes 18 and 19 are both 1);
+/// - without a `-wal` or `-journal` sidecar (a vault never leaves one, and an immutable read
+///   would ignore its contents);
+/// - exactly the vault schema (`meta(key, value)` and `entries`, nothing else);
+/// - on `open` (`key` is `Some`): `schema_version = 1` and a keycheck row that decrypts under `key`.
+///
+/// Returns `Ok(false)` for anything that is not a vault. Only "not a database" and schema errors
+/// mean that; every other SQLite error (I/O and so on) is passed on.
+///
+/// # Errors
+/// [`VaultError::UnsupportedSchema`], [`VaultError::NotInitialized`] (no keycheck row) and
+/// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks.
+fn probe_existing(
+    path: &Path,
+    file: &PrivateFile,
+    key: Option<&KeyFile>,
+) -> Result<bool, VaultError> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::FileExt;
+    let mut mode = [0u8; 2];
+    if file.file().read_exact_at(&mut mode, 18).is_err() || mode != [1, 1] {
+        return Ok(false);
+    }
+    for suffix in ["-wal", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match Path::new(&sidecar).symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(VaultError::io("inspecting sidecar")(e)),
+            Ok(_) => return Ok(false),
+        }
+    }
     let abs = std::path::absolute(path).map_err(VaultError::io("resolving vault path"))?;
     // `file://` + empty authority + the encoded absolute path, so a leading `//` stays path.
     let mut uri = b"file://".to_vec();
@@ -275,12 +305,83 @@ fn probe_existing(path: &Path, file: &PrivateFile) -> Result<bool, VaultError> {
     )
     .map_err(VaultError::sqlite("open"))?;
     file.verify_path_unchanged(path)?;
-    // A header with no readable schema is not a vault either.
-    Ok(has_meta(&conn).unwrap_or(false))
+    let rows = match read_identity(&conn) {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return Ok(false),
+        Err(e) if is_not_a_vault(&e) => return Ok(false),
+        Err(e) => return Err(VaultError::sqlite("inspect schema")(e)),
+    };
+    let Some(key) = key else {
+        return Ok(true);
+    };
+    if rows.version.as_deref() != Some(SCHEMA_VERSION.to_string().as_bytes()) {
+        return Err(VaultError::UnsupportedSchema);
+    }
+    let record = rows.keycheck.ok_or(VaultError::NotInitialized)?;
+    check_keycheck(key, &record)?;
+    Ok(true)
 }
 
-/// True if the file starts with the SQLite header; only such a file is handed to SQLite by
-/// `create`, which then tells a vault (`AlreadyInitialized`) from another database (`NotEmpty`).
+/// The `meta` rows the probe reads.
+struct MetaRows {
+    version: Option<Vec<u8>>,
+    keycheck: Option<Vec<u8>>,
+}
+
+/// `None` unless the schema is exactly the vault's two tables.
+fn read_identity(conn: &Connection) -> rusqlite::Result<Option<MetaRows>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?;
+    let tables = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if tables != ["entries", "meta"] {
+        return Ok(None);
+    }
+    let columns = |table: &str| -> rusqlite::Result<Vec<(String, String, bool, i64)>> {
+        conn.prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(5)?)))?
+            .collect()
+    };
+    let col = |n: &str, t: &str, nn: bool, pk: i64| (n.to_owned(), t.to_owned(), nn, pk);
+    if columns("meta")? != [col("key", "TEXT", false, 1), col("value", "BLOB", true, 0)]
+        || columns("entries")?
+            != [
+                col("id", "TEXT", false, 1),
+                col("kind", "INTEGER", true, 0),
+                col("record", "BLOB", true, 0),
+                col("unscannable", "INTEGER", true, 0),
+                col("created_at", "INTEGER", true, 0),
+                col("updated_at", "INTEGER", true, 0),
+            ]
+    {
+        return Ok(None);
+    }
+    let get = |k: &str| -> rusqlite::Result<Option<Vec<u8>>> {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get(0))
+            .optional()
+    };
+    Ok(Some(MetaRows {
+        version: get("schema_version")?,
+        keycheck: get("keycheck")?,
+    }))
+}
+
+/// SQLite errors that mean "this file is not a vault" rather than "reading it failed".
+fn is_not_a_vault(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(
+            rusqlite::ErrorCode::NotADatabase
+                | rusqlite::ErrorCode::DatabaseCorrupt
+                | rusqlite::ErrorCode::SchemaChanged
+        )
+    )
+}
+
+/// True if the file starts with the SQLite header. Only such a non-empty file is handed to SQLite
+/// (the read-only probe, never a read-write open, until [`probe_existing`] identifies a vault);
+/// `create` then tells a vault (`AlreadyInitialized`) from another database (`NotEmpty`).
 fn has_sqlite_header(file: &std::fs::File) -> bool {
     use std::os::unix::fs::FileExt;
     let mut head = [0u8; 16];
@@ -312,7 +413,7 @@ impl Vault {
         key: KeyFile,
         between: impl FnOnce(),
     ) -> Result<Self, VaultError> {
-        let (mut conn, file) = connect(path, false, between)?;
+        let (mut conn, file) = connect(path, &key, false, between)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(VaultError::sqlite("begin"))?;
@@ -369,7 +470,7 @@ impl Vault {
         key: KeyFile,
         between: impl FnOnce(),
     ) -> Result<Self, VaultError> {
-        let (conn, file) = connect(path, true, between)?;
+        let (conn, file) = connect(path, &key, true, between)?;
         if !has_meta(&conn)? {
             return Err(VaultError::NotInitialized);
         }

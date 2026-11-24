@@ -42,7 +42,7 @@ licence allow list in `deny.toml`), ADR 0004's crate map (section 8), a Docker d
 that may appear in committed files, prompts and logs. Ids match `[a-z0-9][a-z0-9:_.-]{0,127}`, are plaintext in the
 database and in `vault list`, and must never be derived from a value. The prefix `meta:` is **reserved** for the store's
 own entries (`meta:keycheck`); `set` and `import-legacy` refuse it. Imported ids come from the inventory ids (ADR 0002,
-`cam:reolink-1:host`) or from an ordinal (`cam:import-3:host`), never from a value. **One rule refuses a bad id:** before
+`cam:reolink-1:host`) or from an ordinal (`cam:import-json-3:host` or `cam:import-toml-3:host`), never from a value. **One rule refuses a bad id:** before
 storing, the section 7 matcher for the new value (built for its kind) is run over the id string, and a hit refuses the
 entry (this catches `cam:192-0-2-10:host` for the value `192.0.2.10`). Everything else about ids is review (residual
 risk 6).
