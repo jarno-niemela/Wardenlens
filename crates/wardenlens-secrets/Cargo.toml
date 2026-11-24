@@ -12,7 +12,7 @@ base64 = { version = "0.23", default-features = false, features = ["std"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 getrandom = "0.4"
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
-secrecy = "0.10"
+secrecy.workspace = true
 thiserror = "2"
 zeroize = "1"
 

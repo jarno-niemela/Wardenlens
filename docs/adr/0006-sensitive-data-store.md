@@ -67,9 +67,15 @@ are checked on `set` and on `open`. Values are validated per kind on `set`; a MA
 
 **One validator for hosts and display names (amended by #43).** The `host` and `display-name` rules are those of the
 pure core types `camera::Host` and `camera::DisplayName`; the vault calls `Host::new` and `DisplayName::new` and stores
-the canonical text they return, so a value the vault stores always builds a camera and the rules cannot drift. The
-vault adds only the normalisation in front of them (lower-case, one trailing dot removed, display-name edge whitespace
-trimmed, bracketed IPv6 refused so a stored address has one spelling).
+the canonical text they return, so a value set by this version always builds a camera and the rules cannot drift. A
+value stored by an older version may not: the future camera loader must report such a value by its id when it builds a
+camera (it is not built here). The vault adds only the normalisation in front of them (lower-case, one trailing dot
+removed, bracketed IPv6 refused so a stored address has one spelling). For a display name the normalisation is: every
+`char::is_whitespace` character becomes U+0020, a run is one space, invisible characters (`text::is_invisible`) are
+dropped and the ends are trimmed, so a hand-written name with an NBSP or narrow NBSP stays usable and is stored in the
+one plain-space form; legacy import maps names in that stored form too. Core then refuses a name over 128 bytes, a
+control character, or a name that renders blank (no alphanumeric, a leading combining mark, private use,
+noncharacters, U+2800, U+FFFC); the import report names a refused `.name` key.
 
 - *Host:* 1 to 253 bytes of ASCII. An IPv4 address must parse with std's strict `Ipv4Addr`; an IPv6 address with std's
   `Ipv6Addr`, stored canonical, with no zone id and not IPv4-mapped (`::ffff:a.b.c.d`) so each address has one
@@ -346,11 +352,11 @@ entry and line):
 
 **Which view is built from which.** The squeezed view is built from the raw text; the decoded, the JSON-unescaped and the
 joined view (below) are each built from the **squeezed** text, independently of each other (the decoded view is not
-JSON-unescaped and the other way round). The decoding steps do not squeeze again, so a character of the squeeze table that
-appears only after decoding is not mapped by the squeeze; the decoded and JSON-unescaped views are therefore also matched
-against the unsqueezed needles (next paragraph), which finds the encoded forms of a character *inside a stored value*.
-What stays a gap (section 8) is an invisible character **inserted** as an escape into text (`%E2%80%8B`, `\u200b`) in the
-middle of a value that does not contain it.
+JSON-unescaped and the other way round). Each decoded view is **squeezed again** and also **whitespace-joined** like the
+raw text (one code path, amended by #43), so a plain-space display name is found in `Porte%E2%80%AFNord%20Est` or
+`Porte\u202fNord Est`, and an invisible character inserted as an escape (`%E2%80%8B`, `\u200b`) is deleted like a raw one.
+The decoded and JSON-unescaped views are still also matched against the unsqueezed needles (next paragraph). What stays a
+gap (section 8) is chained encoding (percent-encoding of a JSON escape and the other way round).
 
 **Needles are squeezed with the same table.** Every literal needle (the raw value, its slugs, its joined-view form, its
 compact serial form, its XML and percent forms) is built from the stored value and then passed through the **same squeeze
@@ -528,8 +534,7 @@ is not a listed rendering of a vault value is outside the guarantee):
    inside the blob), regrouped phone numbers (`555 0100` against `5550100`), **spaced hex dumps** (`63 6f 72 ...`), a display name encoded
    with `+` for spaces (`Back+Door+North`), **defanged hostnames** (`nvr-1[.]example[.]invalid`), and **IDN (Unicode) forms of `xn--` hostnames**, **an IPv6 address with a trailing word glued on** (`2001:db8::1:<hex word>`), **a hex word or a dotted prefix glued on in
    front** (`cafe2001:db8::1`, `1.2001:db8::1`), **IPv4-compatible, NAT64 and translated forms** of an address, the
-   **unbracketed port form** `2001:db8::1:554`, **invisible characters inserted as escapes** into the middle of a value (`%E2%80%8B`, `\u200b`: the decoding steps run after the
-   squeeze step and do not squeeze again), **Rust renderings** of a value such as `Ipv4Addr::new(192, 0, 2, 10)` and `[192, 0, 2, 10]`, and **byte-array MACs**
+   **unbracketed port form** `2001:db8::1:554`, **Rust renderings** of a value such as `Ipv4Addr::new(192, 0, 2, 10)` and `[192, 0, 2, 10]`, and **byte-array MACs**
    (`[0x02, 0x00, 0x5e, 0x00, 0x53, 0xaf]`).
 4. Lookalike characters: Cyrillic or other homoglyphs, NFD vs NFC forms, transliteration (`ä` to `a`) of display names
    and `other` text.

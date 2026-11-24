@@ -8,9 +8,12 @@
 //! | control chars (NUL, tab, newline, DEL, C1) | `NameCharset` |
 //! | whitespace other than U+0020 (NBSP, U+2003, U+3000, U+2028) | `NameCharset` |
 //! | any Unicode `Cf` char, bidi control (incl. U+061C), soft hyphen, variation selector or invisible filler (`crate::text::is_invisible`, the vault scanner's predicate) | `NameCharset` |
+//! | no alphanumeric character, a leading combining mark, a private-use or noncharacter code point, U+2800 or U+FFFC (renders blank or as a box) | `NameCharset` |
 //!
-//! This is the one display-name validator: the vault calls [`DisplayName::new`] for its
-//! `display_name` entries, so a stored name always builds a camera (ADR 0006 section 1).
+//! This is the one display-name validator: the vault normalises whitespace and invisible
+//! characters and then calls [`DisplayName::new`] for its `display_name` entries, so a name set
+//! by this version always builds a camera (ADR 0006 section 1). A value stored by an older
+//! version may not; the future camera loader must report such a value by its id, not build it.
 use std::fmt;
 use std::str::FromStr;
 
@@ -28,6 +31,34 @@ pub(crate) const REDACTED_NAME: &str = "<redacted-name>";
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DisplayName(String);
 
+/// Code points that render as nothing or as a placeholder box: private use, noncharacters,
+/// U+2800 (braille blank) and U+FFFC (object replacement).
+fn is_blank_glyph(c: char) -> bool {
+    let n = u32::from(c);
+    matches!(n, 0x2800 | 0xFFFC | 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x0010_0000..=0x0010_FFFD | 0xFDD0..=0xFDEF)
+        || (n & 0xFFFE) == 0xFFFE
+}
+
+/// Combining marks (`Mn`, `Mc`, `Me`), by the main blocks: a name may not start with one.
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0591..=0x05BD
+            | 0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0900..=0x0903
+            | 0x093A..=0x094F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0x302A..=0x302F
+            | 0x3099..=0x309A
+            | 0xFE20..=0xFE2F
+    )
+}
+
 impl DisplayName {
     /// Validates `text` as a display name.
     ///
@@ -37,10 +68,19 @@ impl DisplayName {
         if text.is_empty() || text.len() > MAX_NAME_LEN {
             return Err(CameraError::NameLength);
         }
-        let bad = text
-            .chars()
-            .any(|c| c.is_control() || is_invisible(c) || (c.is_whitespace() && c != ' '));
-        if bad || text.starts_with(' ') || text.ends_with(' ') {
+        let bad = text.chars().any(|c| {
+            c.is_control()
+                || is_invisible(c)
+                || (c.is_whitespace() && c != ' ')
+                || is_blank_glyph(c)
+        });
+        let leading_mark = text.chars().next().is_some_and(is_combining_mark);
+        if bad
+            || leading_mark
+            || !text.chars().any(char::is_alphanumeric)
+            || text.starts_with(' ')
+            || text.ends_with(' ')
+        {
             return Err(CameraError::NameCharset);
         }
         Ok(Self(text.to_owned()))
@@ -87,6 +127,30 @@ mod tests {
             &"a".repeat(128),
         ] {
             assert_eq!(DisplayName::new(n).unwrap().expose(), n);
+        }
+    }
+
+    #[test]
+    fn rejects_names_that_render_blank() {
+        for n in [
+            "\u{2800}",
+            "\u{2800}\u{2800}",
+            "\u{301}",
+            "\u{301}abc",
+            "\u{FFFC}",
+            "\u{E000}",
+            "a\u{E000}b",
+            "\u{FFFF}",
+            "\u{1FFFE}",
+            "\u{FDD0}",
+            "---",
+            "(?)",
+            "\u{F0000}x",
+        ] {
+            assert_eq!(DisplayName::new(n), Err(CameraError::NameCharset), "{n:?}");
+        }
+        for n in ["a\u{301}", "1", "\u{4e2d}", "Cam #1", "\u{e9}-"] {
+            assert!(DisplayName::new(n).is_ok(), "{n:?}");
         }
     }
 

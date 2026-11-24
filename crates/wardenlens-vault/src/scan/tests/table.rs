@@ -292,20 +292,20 @@ fn dash_rows() -> Vec<Row> {
     ] {
         rows.push(row(s, Secret, JSON_PW, t, Found));
     }
-    let s = "PR 77 confirmation pass, documented gaps (squeeze-table character in the wrong place)";
+    let s = "PR 77 confirmation pass, squeeze-table character in an escaped spelling (closed by #43: decoded views are squeezed)";
     rows.push(row(
         s,
         DisplayName,
         HYPHEN_NAME,
         concat!("Garage ", esc!("2013"), " Side"),
-        Missing,
+        Found,
     ));
     rows.push(row(
         s,
         DisplayName,
         HYPHEN_NAME,
         "Garage%20%E2%80%93%20Side",
-        Missing,
+        Found,
     ));
     rows.push(row(
         s,
@@ -321,6 +321,17 @@ fn dash_rows() -> Vec<Row> {
         "Garage \u{2013} Side",
         Found,
     ));
+    let s = "#43 plain-space display name against no-break spaces, raw and escaped";
+    for t in [
+        "Porte\u{202F}Nord Est",
+        "Porte\u{A0}Nord Est",
+        concat!("Porte", esc!("202f"), "Nord Est"),
+        concat!("Porte", esc!("00a0"), "Nord Est"),
+        "Porte%E2%80%AFNord%20Est",
+        "Porte%C2%A0Nord%20Est",
+    ] {
+        rows.push(row(s, DisplayName, "Porte Nord Est", t, Found));
+    }
     rows
 }
 
@@ -368,8 +379,6 @@ fn secret_rows() -> Vec<Row> {
         ("Passw0rdX", "passw0rdx"),
         ("abcdefgh", "hgfedcba"),
         ("abcdefgh", "abcdefg"),
-        ("abcdefgh", "abcd%E2%80%8Befgh"),
-        ("abcdefgh", concat!("abcd", esc!("200b"), "efgh")),
         ("abcdefgh", "abcd%0Aefgh"),
         (
             "correct-horse-9",
@@ -378,12 +387,21 @@ fn secret_rows() -> Vec<Row> {
         ("ab$cdefg", "ab\\$cdefg"),
         ("abcd\nefgh", "abcd\\nefgh"),
         ("abcd\nefgh", concat!("abcd", esc!("000a"), "efgh")),
+    ] {
+        rows.push(row(s, Secret, stored, t, Missing));
+    }
+    // Closed by #43: decoded and JSON-unescaped views are squeezed, so an escaped invisible
+    // character inside a secret is deleted like a raw one.
+    let s = "#43 squeezed decoded views, escaped invisible characters in a secret";
+    for (stored, t) in [
+        ("abcdefgh", "abcd%E2%80%8Befgh"),
+        ("abcdefgh", concat!("abcd", esc!("200b"), "efgh")),
         (
             JSON_PW,
             concat!("pa\"ss", esc!("2013"), "w", esc!("200b"), "ord"),
         ),
     ] {
-        rows.push(row(s, Secret, stored, t, Missing));
+        rows.push(row(s, Secret, stored, t, Found));
     }
     rows.push(row(
         "ADR 7 lookalike and normalisation gaps",

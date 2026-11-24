@@ -25,7 +25,9 @@
 //! lies in the query). A name is compared case-insensitively with this list: `pass`, `passw`,
 //! `passwd`, `password`, `passcode`, `pw`, `pwd`, `p`, `user`, `usr`, `u`, `username`,
 //! `user_name`, `user-name`, `userid`, `user_id`, `login`, `loginuse`, `loginpas`, `token`,
-//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`. This covers the
+//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`, `pword`, `account`. Also, for every `=`, the maximal run of ASCII
+//! alphanumerics right before it is compared with the list, so `_password=`, `0_user=`,
+//! `+password=`, `(password=` and `:password=` are refused. This covers the
 //! Xiongmai/XMEye form `/user=admin&password=x&channel=1&stream=0.sdp`, `;` path parameters and
 //! a second `?`. The list can never be complete, so the second layer is that `Debug` and
 //! `Display` of [`RtspPath`] print `<redacted-path>`: a credential name the list misses is still
@@ -39,7 +41,7 @@ use super::CameraError;
 /// Longest path (with query) in bytes.
 pub const MAX_PATH_LEN: usize = 512;
 
-const DENIED_PARAMS: [&str; 27] = [
+const DENIED_PARAMS: [&str; 29] = [
     "pass",
     "passw",
     "passwd",
@@ -67,6 +69,8 @@ const DENIED_PARAMS: [&str; 27] = [
     "api_key",
     "api-key",
     "secret",
+    "pword",
+    "account",
 ];
 
 /// What `Debug` and `Display` print.
@@ -74,6 +78,17 @@ const REDACTED_PATH: &str = "<redacted-path>";
 
 fn is_denied(name: &str) -> bool {
     DENIED_PARAMS.iter().any(|d| name.eq_ignore_ascii_case(d))
+}
+
+/// True when the maximal run of ASCII alphanumerics at the end of `before_eq` (the text in front
+/// of one `=`) is on the list, so `_password=`, `0_user=`, `+password=` and `(password=` are
+/// all caught whatever separator precedes the name.
+fn tail_denied(before_eq: &str) -> bool {
+    let start = before_eq
+        .bytes()
+        .rposition(|b| !b.is_ascii_alphanumeric())
+        .map_or(0, |i| i.saturating_add(1));
+    before_eq.get(start..).is_some_and(is_denied)
 }
 
 /// RFC 3986 `pchar` plus `/` and `?`, without `@` and `%`.
@@ -137,7 +152,7 @@ impl RtspPath {
                 None if offset >= query_start => Some(piece),
                 None => None,
             };
-            if name.is_some_and(is_denied) {
+            if name.is_some_and(is_denied) || piece.split('=').rev().skip(1).any(tail_denied) {
                 return Err(CameraError::PathCredentialParam);
             }
             offset = offset.saturating_add(piece.len()).saturating_add(1);
@@ -174,6 +189,36 @@ impl FromStr for RtspPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_names_behind_any_separator_are_refused() {
+        for p in [
+            "/a?x=1&_password=2",
+            "/a?0_user=1",
+            "/a?+password=1",
+            "/a?(password=1",
+            "/a?:password=1",
+            "/a?$password=1",
+            "/a?pword=1",
+            "/a?account=1",
+            "/a?Account=1",
+            "/x_pword=1",
+        ] {
+            assert_eq!(
+                RtspPath::new(p),
+                Err(CameraError::PathCredentialParam),
+                "{p}"
+            );
+        }
+        for p in [
+            "/cam/realmonitor?channel=1&subtype=0",
+            "/a?accounting=1",
+            "/a?monkey=1",
+            "/a?apikeys=1",
+        ] {
+            assert!(RtspPath::new(p).is_ok(), "{p}");
+        }
+    }
 
     #[test]
     fn accepts_vendor_paths() {

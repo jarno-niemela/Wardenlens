@@ -22,7 +22,7 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_secrets::Credentials;
 
 use crate::store::Value;
-use crate::validate::{check_credential, normalize_text};
+use crate::validate::{check_credential, display_name_text, normalize_text};
 
 /// Most cameras accepted from one legacy file (SEC-2).
 pub const MAX_LEGACY_CAMERAS: usize = 256;
@@ -231,6 +231,16 @@ fn text(s: &str) -> Value {
 
 /// Maps the `AgentDVR` secret file (a JSON array of camera objects).
 ///
+/// The inventory names in their stored form (whitespace normalised), to inventory ids.
+fn by_stored_name(names_to_ids: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (n, id) in names_to_ids {
+        map.entry((*display_name_text(n)).clone())
+            .or_insert_with(|| id.clone());
+    }
+    map
+}
+
 /// Mapped: `name` (display name), `login` or `username`, and `password` (a credential entry).
 /// `names_to_ids` maps a camera name to its inventory id; a camera not in it gets the ordinal id
 /// `import-json-<n>`. A `password` without a login, and a `username` that differs from `login`,
@@ -247,6 +257,7 @@ pub fn map_secret_json(
     if cameras.len() > MAX_LEGACY_CAMERAS {
         return Err(LegacyError::TooMany);
     }
+    let by_stored_name = by_stored_name(names_to_ids);
     let mut out = LegacyImport::default();
     let mut seen = BTreeSet::new();
     let mut taken = BTreeSet::new();
@@ -261,12 +272,16 @@ pub fn map_secret_json(
             }
             ok
         });
+        // Names are compared in their stored form (whitespace normalised), so an NBSP in either
+        // file still finds the inventory camera.
+        let norm = name.map(display_name_text);
+        let name = norm.as_deref().map(String::as_str);
         if let Some(n) = name
             && !seen.insert(n.to_owned())
         {
             return Err(LegacyError::DuplicateName);
         }
-        let mapped = name.and_then(|n| names_to_ids.get(n)).map(String::as_str);
+        let mapped = name.and_then(|n| by_stored_name.get(n)).map(String::as_str);
         let (inv, renamed) = inventory_id(mapped, "json", ordinal);
         if renamed && let Some(m) = mapped {
             out.report(Some("cameras"), m);
@@ -659,6 +674,35 @@ mod tests {
         let i = map_secret_json(&v, &m).unwrap();
         assert_eq!(i.unknown_keys, ["cameras.Front\\tGate"]);
         assert_eq!(entry_ids(&i)[0], "cam:import-json-1:name");
+    }
+
+    /// A hand-written name with a no-break or narrow no-break space still maps to its inventory
+    /// camera, and the stored name is the plain-space form (#43 round 3).
+    #[test]
+    fn names_with_no_break_spaces_map_to_their_inventory_ids() {
+        let names = BTreeMap::from([
+            ("Porte\u{a0}Nord".to_owned(), "porte-a".to_owned()),
+            ("Porte Sud".to_owned(), "porte-b".to_owned()),
+        ]);
+        let doc = json(
+            r#"[{"name":"Porte Nord","login":"u1","password":"Tr0ub4dor-1"},
+                {"name":"Porte\u202fSud","login":"u2","password":"Tr0ub4dor-2"},
+                {"name":"Cour\u00a0Est","login":"u3","password":"Tr0ub4dor-3"}]"#,
+        );
+        let imp = map_secret_json(&doc, &names).unwrap();
+        assert_eq!(
+            entry_ids(&imp),
+            [
+                "cam:porte-a:credential",
+                "cam:porte-b:credential",
+                "cam:import-json-3:name",
+                "cam:import-json-3:credential"
+            ]
+        );
+        let Value::Text(t) = &find(&imp, "cam:import-json-3:name").value else {
+            panic!("shape")
+        };
+        assert_eq!(t.expose_secret(), "Cour Est");
     }
 
     #[test]

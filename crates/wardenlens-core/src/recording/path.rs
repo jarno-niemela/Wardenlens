@@ -3,7 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::camera::{CameraError, CameraId};
+use crate::camera::CameraId;
 use crate::time::UnixMs;
 
 /// Errors from the recording module's validated types and the segmenter config.
@@ -32,14 +32,6 @@ impl fmt::Display for RecordingError {
 }
 
 impl std::error::Error for RecordingError {}
-
-/// A camera id failure is [`RecordingError::InvalidCameraId`]: `recording` uses the one
-/// [`CameraId`] of the camera module, so only its id errors can occur here.
-impl From<CameraError> for RecordingError {
-    fn from(_: CameraError) -> Self {
-        Self::InvalidCameraId
-    }
-}
 
 const MS_PER_DAY: i64 = 86_400_000;
 
@@ -259,8 +251,7 @@ mod tests {
         let id: CameraId = "cam-1".parse().unwrap();
         let same: crate::camera::CameraId = id.clone();
         assert_eq!(same.as_str(), "cam-1");
-        let e: RecordingError = "Bad".parse::<CameraId>().unwrap_err().into();
-        assert_eq!(e, RecordingError::InvalidCameraId);
+        assert!("Bad".parse::<CameraId>().is_err());
     }
 
     #[test]

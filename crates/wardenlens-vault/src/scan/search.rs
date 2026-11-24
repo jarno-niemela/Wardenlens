@@ -1,7 +1,8 @@
 //! Matching one input in every view (ADR 0006 section 7).
 //!
 //! Views: raw (unsqueezed needles), squeezed (squeezed needles), decoded and JSON-unescaped
-//! (both), joined (squeezed needles; display names and `other` only). Needles of folded kinds
+//! (both, each squeezed again), joined (squeezed needles; display names and `other` only; built
+//! from the squeezed, the decoded and the JSON-unescaped text alike). Needles of folded kinds
 //! are matched in lowercased copies of the views. A view that would equal the squeezed view
 //! (no `%`, no backslash) is not built: it cannot match anything the squeezed view does not.
 
@@ -10,7 +11,7 @@ use std::collections::HashSet;
 
 use super::matcher::{Automaton, Matcher};
 use super::needles::{Boundary, view};
-use super::squeeze::{fold, lossy, squeeze_lossy};
+use super::squeeze::{fold, lossy, squeeze, squeeze_lossy};
 use super::views::{View, joined_folded, json_unescaped, percent_decoded};
 use super::{Hit, MAX_HITS, MAX_INPUT_LEN, ScanError, ScanReport, net};
 
@@ -112,6 +113,22 @@ impl Matcher {
         Ok(())
     }
 
+    /// The joined view of an already squeezed text (display names and `other` only).
+    fn joined(&self, squeezed: &str, found: &mut Found) -> Result<(), ScanError> {
+        if self.needs_joined && self.folded.ac.is_some() {
+            literals(&self.folded, &joined_folded(squeezed), view::JOINED, found)?;
+        }
+        Ok(())
+    }
+
+    /// A decoded text: squeezed again (decoding can produce characters the table maps), then
+    /// matched as a text view and as a joined view.
+    fn decoded(&self, text: &str, bit: u8, found: &mut Found) -> Result<(), ScanError> {
+        let squeezed = squeeze(text);
+        self.text_view(squeezed.as_bytes(), bit, found)?;
+        self.joined(&squeezed, found)
+    }
+
     pub(super) fn scan(&self, input: &[u8]) -> Result<ScanReport, ScanError> {
         if input.len() > MAX_INPUT_LEN {
             return Err(ScanError::InputTooLarge);
@@ -120,17 +137,14 @@ impl Matcher {
         self.text_view(input, view::RAW, &mut found)?;
         let squeezed = squeeze_lossy(input);
         self.text_view(squeezed.as_bytes(), view::SQUEEZED, &mut found)?;
+        self.joined(&squeezed, &mut found)?;
+        // Decoded views go through the same squeeze and join as the raw text (one place), so a
+        // name written with an escaped no-break space still matches its plain-space needle.
         if squeezed.contains('%') {
-            let decoded = percent_decoded(&squeezed);
-            self.text_view(decoded.as_bytes(), view::DECODED, &mut found)?;
+            self.decoded(&percent_decoded(&squeezed), view::DECODED, &mut found)?;
         }
         if squeezed.contains('\\') {
-            let json = json_unescaped(&squeezed);
-            self.text_view(json.as_bytes(), view::JSON, &mut found)?;
-        }
-        if self.needs_joined && self.folded.ac.is_some() {
-            let joined = joined_folded(&squeezed);
-            literals(&self.folded, &joined, view::JOINED, &mut found)?;
+            self.decoded(&json_unescaped(&squeezed), view::JSON, &mut found)?;
         }
         Ok(self.report(found))
     }

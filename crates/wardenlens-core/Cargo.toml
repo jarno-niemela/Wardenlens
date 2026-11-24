@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-secrecy = "0.10"
+secrecy.workspace = true
 serde.workspace = true
 toml.workspace = true
 

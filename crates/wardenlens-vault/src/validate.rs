@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use secrecy::zeroize::Zeroizing;
 use wardenlens_core::camera::{CameraError, DisplayName, Host};
 use wardenlens_core::entry::EntryKind;
+use wardenlens_core::text::is_invisible;
 
 use crate::error::VaultError;
 use crate::store::MAX_VALUE_LEN;
@@ -99,12 +100,34 @@ fn host_rule(e: CameraError) -> &'static str {
     }
 }
 
-/// The display-name rule: surrounding whitespace is trimmed, the rest is core's
-/// [`DisplayName::new`] (1 to 128 bytes, no control, invisible or non-space whitespace
-/// characters).
+/// The display name as the vault stores it: every `char::is_whitespace` character becomes
+/// U+0020, a run of them is one space, invisible characters (`is_invisible`) are dropped and the
+/// ends are trimmed. A hand-written name with an NBSP or a narrow NBSP therefore stays usable
+/// and is stored in the one plain-space form the scanner looks for.
+pub(crate) fn display_name_text(raw: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(raw.len()));
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+        } else if !is_invisible(c) {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The display-name rule: whitespace and invisible characters are normalised
+/// ([`display_name_text`]), the rest is core's [`DisplayName::new`] (1 to 128 bytes, no control
+/// character, at least one alphanumeric one).
 fn normalize_display_name(raw: &str) -> Result<Zeroizing<String>, VaultError> {
     let kind = EntryKind::DisplayName;
-    let t = non_empty(kind, raw.trim())?;
+    let t = display_name_text(raw);
+    let t = non_empty(kind, &t)?;
     let name = DisplayName::new(t).map_err(|e| {
         invalid(
             kind,
@@ -303,9 +326,8 @@ mod tests {
     }
 
     /// Every stored display name builds a camera name; names core refuses are refused here.
-    /// Changes against the pre-#43 vault rule, all intentional: more than 128 bytes, an inner
-    /// NBSP or other non-space whitespace, and any invisible or bidi format character are now
-    /// refused.
+    /// Whitespace of any kind becomes one plain space and invisible characters are dropped before
+    /// core sees the name; more than 128 bytes and the remaining controls are refused.
     #[test]
     fn stored_display_names_go_through_core_display_name() {
         for raw in [
@@ -317,19 +339,29 @@ mod tests {
             let stored = n(EntryKind::DisplayName, raw).unwrap();
             assert_eq!(DisplayName::new(&stored).unwrap().expose(), stored);
         }
+        for (raw, want) in [
+            ("a\u{a0}b", "a b"),
+            ("Porte\u{202f}Nord Est", "Porte Nord Est"),
+            ("a\u{2003}\u{a0} b", "a b"),
+            ("a\tb", "a b"),
+            ("a\nb", "a b"),
+            ("a\u{200b}b", "ab"),
+            ("a\u{202e}b", "ab"),
+            ("a\u{61c}b", "ab"),
+            ("a\u{feff}b", "ab"),
+            ("\u{a0}\u{3000}Porte Nord\u{2003}", "Porte Nord"),
+        ] {
+            assert_eq!(n(EntryKind::DisplayName, raw).unwrap(), want, "{raw:?}");
+        }
         for bad in [
-            "a\u{a0}b",
-            "a\u{2003}b",
-            "a\u{200b}b",
-            "a\u{202e}b",
-            "a\u{61c}b",
-            "a\u{feff}b",
-            "a\tb",
-            "a\nb",
             &"a".repeat(129),
+            "a\x7fb",
+            "a\u{85}\u{1}b",
+            "\u{2800}",
+            "\u{200b}",
+            "   ",
         ] {
             assert!(n(EntryKind::DisplayName, bad).is_err(), "{bad:?}");
-            assert!(DisplayName::new(bad).is_err(), "{bad:?}");
         }
     }
 
@@ -380,7 +412,7 @@ mod tests {
     #[test]
     fn serial_and_display_name_refuse_control_characters() {
         assert!(n(EntryKind::Serial, "SN\n1").is_err());
-        assert!(n(EntryKind::DisplayName, "a\tb").is_err());
+        assert!(n(EntryKind::DisplayName, "a\x01b").is_err());
         assert!(n(EntryKind::Other, "a\nb").is_ok());
     }
 
