@@ -29,7 +29,8 @@ The binding source is `docs/CODING_GUIDELINES.md` — read the relevant section 
 - A destructive action must restore a reachable goal; hold levels as absolute values; test minimality over many ticks (P2).
 - Prove identity read-only before any write-capable open, for every entry point and sidecar (P3).
 - No `str` slicing after a byte-length check; use `.get()` (P4). Use a monotonic clock for timeouts (P5).
-- No `unwrap_or(false)` on I/O; one test per error variant (P6). Assertions must not be tautological (P7).
+- No `unwrap_or(false)` on I/O; one test per error variant (P6). Every test can fail (TEST-8, P7).
+- Open foreign paths with `O_NOFOLLOW | O_NONBLOCK` (P3). Enforce a policy at its one choke point, as an allowlist, and test it over every entry point (P10).
 
 **Workflow**
 - `scripts/gate` before every push. Conventional commits with `Refs #N`. Suppress lints only with `#[expect(lint, reason = "...")]`; bare `#[allow]` is forbidden (ERR-1, DOC-6).
