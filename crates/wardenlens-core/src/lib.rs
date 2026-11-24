@@ -8,6 +8,7 @@ pub mod connection;
 pub mod entry;
 pub mod mp4box;
 pub mod recording;
+pub mod storage;
 pub mod time;
 
 /// Crate version, taken from `Cargo.toml` at compile time.
