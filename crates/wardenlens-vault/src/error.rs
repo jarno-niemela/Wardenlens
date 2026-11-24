@@ -24,9 +24,29 @@ pub enum VaultError {
     /// The vault file does not exist.
     #[error("vault file does not exist")]
     NotFound,
-    /// The file exists but holds no vault (no `meta` table).
+    /// The file exists but holds no vault: no `meta` table, not exactly the vault schema, or no
+    /// keycheck record. A corrupt database or an unfinished transaction is never reported as
+    /// this (see [`VaultError::PendingJournal`]).
     #[error("file is not an initialised vault")]
     NotInitialized,
+    /// The vault has a non-empty `-journal` that did not go away within the busy timeout and the
+    /// state could not be judged: `create` met it, a copy of the vault with its journal rolled
+    /// back in a private scratch directory is still corrupt, the copy was over the 256 MiB cap, or
+    /// the journal is not a regular file. Nothing was modified. The owner can wait for a running
+    /// writer to finish and retry; if no writer is running, restore the vault from a backup. Do
+    /// not delete the `-journal` file: it holds the data needed to roll the vault back. A wrong
+    /// key, a foreign database or an unknown schema in that state is reported as
+    /// [`VaultError::WrongKey`], [`VaultError::NotInitialized`] or
+    /// [`VaultError::UnsupportedSchema`] instead.
+    ///
+    /// A process killed in the middle of `create` leaves a non-empty file with a hot journal and
+    /// no vault: `create` then reports [`VaultError::NotEmpty`] and `open` reports
+    /// [`VaultError::NotInitialized`]. The library cannot recover this state (the file holds
+    /// nothing of value); the owner removes both files and runs `create` again.
+    #[error(
+        "vault has an unfinished transaction (another process is writing, or a previous write was interrupted); do not delete the -journal file"
+    )]
+    PendingJournal,
     /// `create` found a file that is not empty and holds no vault.
     #[error("file exists and is not empty")]
     NotEmpty,
