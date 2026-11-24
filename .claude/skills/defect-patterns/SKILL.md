@@ -179,6 +179,7 @@ Keep it current with `/retro` (the `retro` skill).
   - The guard cannot resolve git after `cd $VAR` or a relative `cd`. Use `cd /abs/path &&` or `git -C /abs/path`, one worktree per Bash call.
   - Any command text containing the literal merge command without `--match-head-commit`, even inside a heredoc, is blocked. Write such text to a file with the Write tool.
   - Only dangerous `git -c` keys (hooks, push, alias, editor) are blocked; `user.name` and `user.email` pass.
+- **Gate then push:** chain them with `&&`, never `;`. With `;` a failed gate still pushes (it happened on #75's branch; there was no PR, so nothing merged).
 - **Escapes in tool input:** `\uXXXX` text in a tool call can be decoded into the real character. In issue bodies and briefs, describe such escapes in words ("the JSON escape for U+2028").
 - **Kept adversary tests:** `scripts/verify carry` accepts only `crates/*/tests/**` and `scripts/tests/**`. Tests in a `src/` test module need re-verification, so they go to the follow-up ticket instead (PR #115). Before committing kept tests, read them for sleeps or racing threads; a timing-dependent test goes to a follow-up, not to main (#116).
 - **Merge conflicts:** almost every branch adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`. Before verifying two PRs in parallel, trial-merge them; resolve conflicts by taking the union of both module lists (PR #97, #101, #102). Resolving a conflict changes the head, so all three verifiers must run again.
