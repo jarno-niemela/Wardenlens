@@ -45,7 +45,7 @@ fn fresh() -> (TempDir, PathBuf, Vault) {
 // ---- every legacy key is imported or reported by name ---------------------------------------
 
 /// A login that the vault would refuse (NUL) drops the credential. The `password` key is then
-/// neither imported nor reported.
+/// reported by name in `unknown_keys`, not silently lost.
 #[test]
 fn json_password_dropped_with_an_unusable_login_is_reported() {
     let v = json(r#"[{"login":"svc\u0000reader","password":"Tr0ub4dor-x9"}]"#);
@@ -58,7 +58,8 @@ fn json_password_dropped_with_an_unusable_login_is_reported() {
     );
 }
 
-/// A password the vault would refuse (NUL) is reported as `login`, not `password`.
+/// A password the vault would refuse (NUL) is not imported and is reported under its own
+/// `password` key.
 #[test]
 fn json_unusable_password_is_reported_under_its_own_key() {
     let v = json(r#"[{"login":"svc-reader","password":"Tr0ub\u0000dor"}]"#);
@@ -304,8 +305,8 @@ fn create_on_a_foreign_rollback_db_is_not_empty_and_leaves_it_unchanged() {
     assert_eq!(std::fs::read(&p).unwrap(), before);
 }
 
-/// A WAL-mode database: `connect` runs `PRAGMA journal_mode = DELETE` before `create` checks
-/// for foreign data, which rewrites the header of someone else's database.
+/// A WAL-mode database: `create` refuses it with `NotEmpty` and leaves its bytes and the
+/// directory listing unchanged (no pragma runs before the read-only probe).
 #[test]
 fn create_on_a_foreign_wal_db_is_not_empty_and_leaves_it_unchanged() {
     let d = dir();
@@ -368,4 +369,29 @@ fn create_on_a_short_non_sqlite_file_is_not_empty() {
     let key = KeyFile::generate(&d.path().join("k")).unwrap();
     assert!(matches!(Vault::create(&p, key), Err(VaultError::NotEmpty)));
     assert_eq!(std::fs::read(&p).unwrap(), b"SQLite");
+}
+
+/// `open` on a foreign database (either journal mode) is refused as `NotInitialized` and the
+/// file is left byte-for-byte unchanged: no pragma runs before the read-only probe.
+fn open_foreign_leaves_it_unchanged(wal: bool) {
+    let d = dir();
+    let p = d.path().join("v.db");
+    foreign_db(&p, wal);
+    let before = std::fs::read(&p).unwrap();
+    let key = KeyFile::generate(&d.path().join("k")).unwrap();
+    assert!(matches!(
+        Vault::open(&p, key),
+        Err(VaultError::NotInitialized)
+    ));
+    assert_eq!(std::fs::read(&p).unwrap(), before);
+}
+
+#[test]
+fn open_on_a_foreign_wal_db_is_refused_and_leaves_it_unchanged() {
+    open_foreign_leaves_it_unchanged(true);
+}
+
+#[test]
+fn open_on_a_foreign_rollback_db_is_refused_and_leaves_it_unchanged() {
+    open_foreign_leaves_it_unchanged(false);
 }

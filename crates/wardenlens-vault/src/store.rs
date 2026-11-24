@@ -191,16 +191,35 @@ fn connect(
         let _ = std::fs::remove_file(path);
         return Err(VaultError::NotFound);
     }
-    if !must_exist {
-        // A non-empty file is a vault or somebody's data: never initialise over it, and
-        // refuse before SQLite touches it.
-        if file_len(&file)? > 0 && !has_sqlite_header(file.file()) {
-            return Err(VaultError::NotEmpty);
-        }
+    let len = file_len(&file)?;
+    if len > 0 && !has_sqlite_header(file.file()) {
+        // Somebody's data: never initialise over it, and refuse before SQLite touches it.
+        return Err(if must_exist {
+            VaultError::NotInitialized
+        } else {
+            VaultError::NotEmpty
+        });
     }
     between();
+    if len > 0 {
+        // Read-only probe before ANY pragma: a foreign database must stay byte-for-byte intact.
+        let is_vault = probe_existing(path, &file)?;
+        if !must_exist {
+            return Err(if is_vault {
+                VaultError::AlreadyInitialized
+            } else {
+                VaultError::NotEmpty
+            });
+        }
+        if !is_vault {
+            return Err(VaultError::NotInitialized);
+        }
+    } else if must_exist {
+        return Err(VaultError::NotInitialized);
+    }
     if !must_exist && file_len(&file)? > 0 {
-        probe_existing(path, &file)?;
+        // The file grew since the probe found it empty.
+        return Err(VaultError::NotEmpty);
     }
     let conn = Connection::open_with_flags(
         path,
@@ -212,6 +231,8 @@ fn connect(
     file.verify_path_unchanged(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(VaultError::sqlite("busy timeout"))?;
+    // Invariant: a pragma that writes (journal_mode) only runs on a file that is empty (`create`)
+    // or that the read-only probe above showed to be a vault (`open`).
     conn.execute_batch(
         "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON;",
     )
@@ -227,15 +248,17 @@ fn file_len(file: &PrivateFile) -> Result<u64, VaultError> {
         .len())
 }
 
-/// Tells a vault from another database in a non-empty file for `create`, which refuses both.
+/// True if the non-empty file is a vault (has the `meta` table), false for any other database.
 /// Opened `immutable=1` and read-only: no pragma, lock, journal, `-wal` or `-shm` file is ever
 /// written, so the foreign bytes stay exactly as they were. (A vault is always in rollback mode,
 /// so its main file is complete.)
-fn probe_existing(path: &Path, file: &PrivateFile) -> Result<(), VaultError> {
+fn probe_existing(path: &Path, file: &PrivateFile) -> Result<bool, VaultError> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let mut uri = b"file:".to_vec();
-    for &b in path.as_os_str().as_bytes() {
+    let abs = std::path::absolute(path).map_err(VaultError::io("resolving vault path"))?;
+    // `file://` + empty authority + the encoded absolute path, so a leading `//` stays path.
+    let mut uri = b"file://".to_vec();
+    for &b in abs.as_os_str().as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
             uri.push(b);
         } else {
@@ -253,10 +276,7 @@ fn probe_existing(path: &Path, file: &PrivateFile) -> Result<(), VaultError> {
     .map_err(VaultError::sqlite("open"))?;
     file.verify_path_unchanged(path)?;
     // A header with no readable schema is not a vault either.
-    match has_meta(&conn) {
-        Ok(true) => Err(VaultError::AlreadyInitialized),
-        _ => Err(VaultError::NotEmpty),
-    }
+    Ok(has_meta(&conn).unwrap_or(false))
 }
 
 /// True if the file starts with the SQLite header; only such a file is handed to SQLite by

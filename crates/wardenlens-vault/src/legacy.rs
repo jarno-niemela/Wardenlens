@@ -234,7 +234,8 @@ fn text(s: &str) -> Value {
 /// Mapped: `name` (display name), `login` or `username`, and `password` (a credential entry).
 /// `names_to_ids` maps a camera name to its inventory id; a camera not in it gets the ordinal id
 /// `import-json-<n>`. A `password` without a login, and a `username` that differs from `login`,
-/// are reported in `unknown_keys`, as is every other key.
+/// are reported in `unknown_keys`, as is every other key. A camera found in `names_to_ids` has its
+/// `name` reported there, not emitted.
 ///
 /// # Errors
 /// [`LegacyError`] for a wrongly shaped file, duplicate camera names or a duplicate entry id.

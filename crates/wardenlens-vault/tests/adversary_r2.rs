@@ -159,7 +159,7 @@ fn json_and_toml_results_never_share_an_entry_id() {
 /// A real inventory id on both sides: the inventory owns the display name, so the import
 /// succeeds and the JSON name is reported by key.
 #[test]
-fn json_name_and_toml_name_for_one_camera_are_refused_by_map_legacy() {
+fn json_name_of_a_mapped_camera_yields_to_the_inventory_name() {
     let toml: toml::Table = toml::from_str("[cameras.tapo]\nname = \"Garage Side\"\n").unwrap();
     let json: serde_json::Value =
         serde_json::from_str(r#"[{"name":"Garage","login":"u","password":"p"}]"#).unwrap();
