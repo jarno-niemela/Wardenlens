@@ -440,8 +440,20 @@ support = "community"
     }
 
     #[test]
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn rejects_site_data_in_comments_before_parsing() {
         let text = format!("# camera at 192.168.1.20, admin:hunter2\n{MINIMAL}");
+        assert!(matches!(
+            CatalogueEntry::from_toml_str(&text),
+            Err(CatalogueError::SiteData { .. })
+        ));
+    }
+
+    #[test]
+    fn encoding_in_comments_is_rejected_before_parsing_but_shapes_are_not() {
+        let text = format!("# camera at 192.168.1.20, admin:hunter2\n{MINIMAL}");
+        assert!(CatalogueEntry::from_toml_str(&text).is_ok());
+        let text = format!("# 1\u{200B}0\n{MINIMAL}");
         assert!(matches!(
             CatalogueEntry::from_toml_str(&text),
             Err(CatalogueError::SiteData { .. })

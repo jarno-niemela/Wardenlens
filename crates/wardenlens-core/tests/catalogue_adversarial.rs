@@ -29,6 +29,7 @@ fn is_site(r: &Result<(), CatalogueError>) -> bool {
 // ---- Expected-to-fail attacks (defects) ----
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn comment_in_entry_file_with_private_ip_is_rejected() {
     // Comments are part of the public file but never reach `validate`.
     let toml = format!(
@@ -43,6 +44,7 @@ fn comment_in_entry_file_with_private_ip_is_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn password_in_query_string_path_is_rejected() {
     let mut bad: Vec<String> = Vec::new();
     for p in [
@@ -58,6 +60,7 @@ fn password_in_query_string_path_is_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn partial_private_ipv4_is_rejected() {
     let mut bad: Vec<String> = Vec::new();
     for q in ["camera on 192.168.1.x", "subnet 10.0.0.* only"] {
@@ -69,6 +72,7 @@ fn partial_private_ipv4_is_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn ipv4_with_invisible_or_fullwidth_characters_is_rejected() {
     let mut bad: Vec<String> = Vec::new();
     for q in [
@@ -85,6 +89,7 @@ fn ipv4_with_invisible_or_fullwidth_characters_is_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn mac_with_space_or_underscore_separators_is_rejected() {
     let mut bad: Vec<String> = Vec::new();
     for q in ["mac a4 5e 60 00 11 22", "mac a4_5e_60_00_11_22"] {
@@ -96,6 +101,7 @@ fn mac_with_space_or_underscore_separators_is_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn lowercase_or_grouped_serial_is_rejected() {
     let mut bad: Vec<String> = Vec::new();
     for q in ["sn xk3j9q2m7z8w4p", "sn 2J0A-1B2C-3D4E-5F6G"] {
@@ -123,6 +129,7 @@ fn matrix_is_independent_of_input_order_for_equal_slugs() {
 // ---- Expected-to-pass coverage ----
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn toml_unicode_escapes_are_decoded_before_the_guard() {
     let toml = entry_text("quirks=[\"host \\u0031\\u0039\\u0032.168.1.20\"]");
     let r = validate(&CatalogueEntry::from_toml_str(&toml).unwrap());
@@ -139,6 +146,7 @@ fn toml_unicode_escapes_are_decoded_before_the_guard() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn credentials_in_evidence_reference_url_are_rejected() {
     let toml = "vendor=\"A\"\nmodel=\"B\"\nsupport=\"verified\"\n[[evidence]]\nreference=\"https://user:ghp_token@github.com/x\"\n";
     let r = CatalogueEntry::from_toml_str(toml).and_then(|e| validate(&e));
@@ -155,6 +163,7 @@ fn credentials_in_evidence_reference_url_are_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn site_data_in_rtsp_path_with_port_and_brackets_is_rejected() {
     for p in ["/x?host=10.1.2.3:554", "/[fe80::1]/x", "/a4:5e:60:00:11:22"] {
         assert!(is_site(&path(p)), "{p}");

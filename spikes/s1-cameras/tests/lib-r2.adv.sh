@@ -148,9 +148,13 @@ pull() { # <cam> <addr> -> 0 if the address was followed
   [[ -s $fx/pp.log ]]
 }
 check "onvif_pull: same origin is followed" 'pull HDIPC http://10.0.0.5:8000/onvif/pp'
-for a in 'http://10.0.0.5:8000@evil.example/x' 'http://10.0.0.5:8001/x' 'http://10.0.0.5.:8000/x' 'http://10.0.0.50:8000/x' \
-  'http://10.0.0.5:8000.evil.example/x' 'http://evil@10.0.0.5:8000/x' 'http://10.0.0.5/x' 'http://10.0.0.5:80/x' \
-  'http://10.0.0.5:8000\@evil.example/x' 'http://10.0.0.5:8000#@evil.example/' 'http://[::ffff:10.0.0.5]:8000/x' \
+# Host-only comparison (Tapo serves the pull point on another port); fragment/query text is not authority.
+for a in http://10.0.0.5:8001/x http://10.0.0.5/x http://10.0.0.5:80/x 'http://10.0.0.5:8000#@evil.example/'; do
+  check "onvif_pull: same host, other port or fragment is followed: $a" 'pull HDIPC "$a"'
+done
+for a in 'http://10.0.0.5:8000@evil.example/x' 'http://10.0.0.5.:8000/x' 'http://10.0.0.50:8000/x' \
+  'http://10.0.0.5:8000.evil.example/x' 'http://evil@10.0.0.5:8000/x' \
+  'http://10.0.0.5:8000\@evil.example/x' 'http://[::ffff:10.0.0.5]:8000/x' \
   'http://10.0.0.5:8000/x>http://evil.example/y'; do
   check "onvif_pull: refuses $a" '! pull HDIPC "$a"'
 done

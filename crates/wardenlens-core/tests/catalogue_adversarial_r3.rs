@@ -37,6 +37,7 @@ fn rejected(inputs: &[&str], f: impl Fn(&str) -> Result<(), CatalogueError>) -> 
 /// ONVIF WS-Security `UsernameToken` and Hikvision ISAPI bodies are XML. The element form carries
 /// the secret between tags rather than after `=` or `:`.
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn xml_element_credentials_are_rejected() {
     let inputs = [
         "<Password>hunter2</Password>",
@@ -172,6 +173,7 @@ fn secret_words_in_descriptive_prose_are_accepted() {
 /// The realistic hand-pasted forms that carry a plaintext password in XML: ONVIF `CreateUsers`
 /// and WS-Security `PasswordText`.
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn onvif_plaintext_password_bodies_are_rejected() {
     let inputs = [
         "CreateUsers body <tt:User><tt:Username>admin</tt:Username><tt:Password>hunter2</tt:Password><tt:UserLevel>Administrator</tt:UserLevel></tt:User>",

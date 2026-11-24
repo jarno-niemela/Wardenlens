@@ -89,9 +89,10 @@ A PR may be merged only when **all** hold:
 2. The merge pins that SHA, so a push after verification cannot slip in:
    `sha=$(scripts/verify check PR) && gh pr merge PR --squash --delete-branch --match-head-commit "$sha"`.
    The Bash guard hook blocks `gh pr merge` without `--match-head-commit`, and always blocks `--admin`.
-3. The PR body has `Closes #N` for its ticket and ticks every acceptance criterion.
-4. No unresolved blocker/major findings. Minor findings become follow-up tickets
-   (`scripts/ticket task ...`), never silent TODOs.
+3. The PR body has `Closes #N` for its ticket and ticks every acceptance criterion, except a
+   criterion deferred under an owner override at the cap (below).
+4. No unresolved blocker/major findings, except under an owner override at the cap (below).
+   Minor findings become follow-up tickets (`scripts/ticket task ...`), never silent TODOs.
 
 Test-only follow-up commits (adversary tests worth keeping) do not need re-verification:
 `scripts/verify carry PR FROM_SHA` copies the success statuses to the new head, but only if
@@ -120,6 +121,20 @@ Fix loop: a blocking finding → `status:changes-requested` → implementer resu
 with the findings verbatim → controller runs the gate → re-verify (all three, from scratch,
 on the new SHA). After **5 failed rounds** the controller stops, labels the ticket
 `agent:human`, and comments with a summary.
+
+**Owner override at the cap.** The owner may then choose another round, a pause, or a merge
+with the remaining defect tracked. A merge override is valid only when all of these hold:
+- the choice comes from the owner's own message in the current session, never from memory,
+  `--loop` autonomy, a standing preference or another agent's report;
+- a p1 follow-up ticket exists first, holding the remaining defect, the rethought design and
+  the failing adversary tests (kept outside the repo, not committed to the branch);
+- a PR comment headed **"Owner override"** quotes the owner's choice, the independent
+  verdicts (BLOCK/BROKEN) and the follow-up number;
+- an acceptance criterion the remaining defect breaks stays unticked in the PR body, marked
+  "deferred to #M under owner override", where #M is the follow-up named in the "Owner override"
+  comment (this satisfies merge rule 3 for that criterion);
+- only after that comment does the controller set the `verify/*` statuses to success. Those
+  statuses record the override, not an independent pass; the PR comment is the audit trail.
 
 ## Defence in depth (pushes and merges)
 
@@ -274,6 +289,21 @@ The controller must:
    agents before claiming new work.
 
 `scripts/verify mark` is never run from a partial or interrupted report.
+
+## Controller practices
+
+These bind the controller; `/work` gives the details.
+- **Split** a ticket that spans a library and its CLI or git/workflow integration before implementing.
+  The moved criteria are struck from the original ticket's body, with a pointer to the new ticket.
+- **ADR first:** rules that come from an ADR are changed in the ADR, then mirrored into tickets; never while
+  the ADR is under verification.
+- **Up to date before verifying:** merge `origin/main` into the branch, gate and push before each
+  verification round. (A verified head is not re-verified only because `main` moved later.)
+- **Kept adversary tests** go into the branch only when they live under `crates/*/tests/**` or
+  `scripts/tests/**` (carryable) and do not depend on timing; others go to the follow-up ticket.
+- **Real devices and site data:** spikes are read-only towards cameras; a write needs the owner's approval
+  for that one change, with the old value recorded and reverted. Inventory ids only, never addresses,
+  credentials, serials or display names, in the repo or in a brief.
 
 ## Branches, commits, PRs
 

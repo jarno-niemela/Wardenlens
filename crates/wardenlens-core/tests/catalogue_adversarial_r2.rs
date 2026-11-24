@@ -91,6 +91,7 @@ fn control_characters_in_vendor_do_not_reach_the_readme() {
 // ---- Credentials ----
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn json_style_secret_pairs_are_rejected() {
     let inputs = [
         r#"login body {"password":"hunter2"}"#,
@@ -102,6 +103,7 @@ fn json_style_secret_pairs_are_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn other_common_secret_keys_are_rejected() {
     let inputs = [
         "passphrase=hunter2",
@@ -118,6 +120,7 @@ fn other_common_secret_keys_are_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn url_encoded_secret_pair_is_rejected() {
     let inputs = ["/x?q=password%3Dhunter2", "password&#61;hunter2"];
     let bad = accepted(&inputs, check_source);
@@ -235,6 +238,7 @@ fn backslash_before_pipe_cannot_break_a_matrix_cell() {
 // ---- Must hold (coverage) ----
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn toml_escapes_hiding_ipv4_in_every_string_field_are_caught() {
     let hidden = "192\\u002e168\\u002e1\\u002e20";
     for extra in [
@@ -257,12 +261,14 @@ fn toml_escapes_hiding_ipv4_in_every_string_field_are_caught() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn multiline_string_line_continuation_cannot_hide_ipv4() {
     let toml = entry_text("quirks=[\"\"\"host 192.168.\\\n   1.20\"\"\"]");
     assert!(matches!(full(&toml), Err(CatalogueError::SiteData { .. })));
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn crlf_entry_files_parse_and_are_scanned() {
     let toml = entry_text("# 10.0.0.1").replace('\n', "\r\n");
     assert!(matches!(
@@ -290,6 +296,7 @@ fn duplicate_keys_and_wrong_types_are_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn vendor_json_login_bodies_with_credentials_are_rejected() {
     // Reolink HTTP API and Tapo local API login bodies are JSON; a quirk quoting one leaks the
     // password. Same key: value form as round-1 finding 2, with the key quoted.

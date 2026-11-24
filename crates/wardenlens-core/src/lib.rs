@@ -5,6 +5,13 @@
 //! depend on this one, never the other way round.
 
 pub mod catalogue;
+pub mod connection;
+pub mod entry;
+pub mod mp4box;
+pub mod recording;
+pub mod storage;
+pub mod time;
+pub mod token_store;
 
 /// Crate version, taken from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

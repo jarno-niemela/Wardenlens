@@ -1,0 +1,33 @@
+[package]
+name = "wardenlens-api"
+description = "HTTP API for Wardenlens: axum router, bearer-token authentication and the OpenAPI document."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# Versions and features follow ADR 0004 section 10.
+[dependencies]
+wardenlens-core = { workspace = true }
+thiserror = { workspace = true }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tower = { version = "0.5.3", default-features = false, features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.7.1", default-features = false, features = ["trace", "sensitive-headers", "limit", "timeout"] }
+tracing = "0.1.44"
+utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
+utoipa-axum = "0.3.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = { version = "0.11.1", default-features = false }
+subtle = "2.6.1"
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "time", "test-util"] }
+http-body-util = "0.1.5"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+
+[lints]
+workspace = true

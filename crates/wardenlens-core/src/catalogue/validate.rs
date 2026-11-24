@@ -3,16 +3,17 @@
 //! live in [`guard`](super::guard).
 
 use super::entry::{CatalogueEntry, Event, Evidence, Protocol, Stream};
-use super::error::CatalogueError;
-use super::guard::{Mode, site_data};
+use super::error::{CatalogueError, SiteDataKind};
+use super::guard::{LintWarning, Mode, has_odd_encoding, site_data};
 
-/// Checks an entry for completeness and for site-specific data in any string field.
+/// Checks an entry for completeness and structure, and every string field for disallowed
+/// characters. Shape heuristics are the soft [`lint`], not enforced.
 ///
 /// # Errors
 /// [`CatalogueError::Missing`] for an empty vendor, model, evidence list or blank evidence
 /// reference, [`CatalogueError::OutOfRange`] for implausible stream numbers,
 /// [`CatalogueError::Malformed`] for a protocol path that is not a plain `/path`, and
-/// [`CatalogueError::SiteData`] naming the field (never the value) for site data.
+/// [`CatalogueError::SiteData`] (kind `Encoding`) naming the field (never the value).
 pub fn validate(entry: &CatalogueEntry) -> Result<(), CatalogueError> {
     if entry.vendor.trim().is_empty() {
         return Err(CatalogueError::Missing("vendor"));
@@ -51,12 +52,28 @@ pub fn validate(entry: &CatalogueEntry) -> Result<(), CatalogueError> {
             return Err(CatalogueError::OutOfRange("stream gop"));
         }
     }
-    for (field, value, mode) in strings(entry) {
-        if let Some(kind) = site_data(value, mode) {
-            return Err(CatalogueError::SiteData { field, kind });
+    for (field, value, _) in strings(entry) {
+        if has_odd_encoding(value) {
+            return Err(CatalogueError::SiteData {
+                field,
+                kind: SiteDataKind::Encoding,
+            });
         }
     }
     Ok(())
+}
+
+/// Optional soft lint over every string of a parsed entry (which also covers TOML `\u` escapes):
+/// the shape heuristics of the guard module. Returns warnings, never an error; the authoritative
+/// check is the exact-match vault scan (ADR 0006, #75).
+#[must_use]
+pub fn lint(entry: &CatalogueEntry) -> Vec<LintWarning> {
+    strings(entry)
+        .into_iter()
+        .filter_map(|(field, value, mode)| {
+            site_data(value, mode).map(|kind| LintWarning { field, kind })
+        })
+        .collect()
 }
 
 /// Every string in the entry with a field label and the rule that applies to it. Exhaustive destructuring (of the entry and of
@@ -179,6 +196,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn checks_every_string_field() {
         let bad = "10.1.2.3".to_owned();
         let mut cases = Vec::new();
@@ -227,12 +245,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn error_names_the_field_but_not_the_value() {
         let mut e = base();
         e.quirks = vec!["gateway 192.168.7.7".to_owned()];
         let msg = validate(&e).unwrap_err().to_string();
         assert!(msg.contains("quirks[0]"), "{msg}");
         assert!(!msg.contains("192.168"), "{msg}");
+    }
+
+    #[test]
+    fn lint_warns_per_field_without_the_value_and_validate_still_passes() {
+        let mut e = base();
+        e.quirks = vec!["gateway 192.168.7.7".to_owned()];
+        e.vendor = "10.1.2.3".to_owned();
+        let w = lint(&e);
+        let fields: Vec<&str> = w.iter().map(|x| x.field.as_str()).collect();
+        assert_eq!(fields, ["vendor", "quirks[0]"]);
+        assert!(w.iter().all(|x| !x.to_string().contains("192.168")));
+        assert_eq!(validate(&e), Ok(()));
+        assert_eq!(lint(&base()), vec![]);
+    }
+
+    #[test]
+    fn validate_enforces_the_encoding_allow_list_in_every_string_field() {
+        let mut e = base();
+        e.quirks = vec!["1\u{200B}0".to_owned()];
+        assert_eq!(
+            validate(&e),
+            Err(CatalogueError::SiteData {
+                field: "quirks[0]".to_owned(),
+                kind: SiteDataKind::Encoding
+            })
+        );
     }
 
     #[test]

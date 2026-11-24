@@ -9,17 +9,28 @@ WARDENLENS_BLESS=1 cargo test -p wardenlens-core --test catalogue
 ```
 
 The parser and the checks live in `wardenlens_core::catalogue` (`crates/wardenlens-core/src/catalogue/`),
-and `cargo test` (so `scripts/gate`) loads every file, so unknown fields and site data fail the build.
+and `cargo test` (so `scripts/gate`) loads every file, so unknown fields, bad structure and disallowed
+characters fail the build.
 
 ## Public repository: what must never appear
 
-Vendor, model and firmware `major.minor` are fine. Never write IP addresses (any dotted quad), IPv6
-addresses, MAC addresses, serial numbers, credentials (including URLs that embed them and
-`key=value` pairs for passwords or tokens), email addresses, private hostnames, or
-display names of cameras that identify a site. The guard rejects these in every string field **and in comments** (every raw line is scanned
-before parsing), and also rejects invisible and fullwidth characters that could disguise them;
-its exact rules are in the `guard` module docs. `cameras/` may hold only `README.md`,
-`FORMAT.md` and the vendor directories.
+Vendor, model and firmware `major.minor` are fine. Never write IP addresses, MAC addresses, serial
+numbers, credentials, email addresses, private hostnames, or display names of cameras that identify
+a site. Those live only in the encrypted vault (ADR 0006). Three layers apply:
+
+1. **Exact-match scan (authoritative).** `wardenlens vault scan cameras/` matches every file against
+   the real values of the vault, including their normalised and encoded forms, so the result does
+   not depend on how a value is written. `crates/wardenlens-cli/tests/catalogue_scan.rs` runs it
+   against a synthetic vault (with a planted-value control) and, when a vault exists at the default
+   path, against the real one; the git hooks and `scripts/agents check` run it too.
+2. **Structure (enforced).** Unknown fields, `://` or non-`/` protocol paths, files over 64 KiB, and
+   characters outside the allow-list (ASCII without controls, plus alphabetic letters; no invisible
+   or fullwidth characters) are rejected on every raw line, comments included.
+3. **Soft lint (optional, never fails anything).** `catalogue::lint` and `catalogue::lint_source`
+   return warnings for text that merely looks like an address, MAC, serial, credential or private
+   hostname. It is advice for authors; its rules are in the `guard` module docs.
+
+`cameras/` may hold only `README.md`, `FORMAT.md` and the vendor directories.
 
 ## Fields
 

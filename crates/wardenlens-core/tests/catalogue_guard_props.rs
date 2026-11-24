@@ -13,6 +13,7 @@ fn prose() -> impl Strategy<Value = String> {
 
 proptest! {
     #[test]
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn any_ipv4_in_text_is_rejected(octets in any::<[u8; 4]>(), pre in prose(), post in prose()) {
         let ip = Ipv4Addr::from(octets);
         let text = format!("{pre} {ip} {post}");
@@ -20,6 +21,8 @@ proptest! {
     }
 
     #[test]
+
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn any_mac_in_text_is_rejected(
         bytes in any::<[u8; 6]>(),
         sep in prop::sample::select(vec![':', '-']),

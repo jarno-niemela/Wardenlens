@@ -1,5 +1,8 @@
-//! The site-data guard. The repository is public, so no text in a catalogue entry (values or
-//! comments) may look like data that identifies a particular installation.
+//! The site-data checks. The repository is public, so no text in a catalogue entry may identify
+//! a particular installation. The authoritative check is the exact-match vault scan (ADR 0006,
+//! #75). Here, only the character allow-list below is enforced; everything else is an optional
+//! **soft lint** ([`lint_source`](lint_source), [`lint`](super::lint)) that returns warnings and
+//! never fails validation.
 //!
 //! Heuristics, deliberately conservative (a false positive is fixed by rewording the text):
 //!
@@ -80,14 +83,53 @@ const PRIVATE_SUFFIXES: [&str; 8] = [
 ];
 const MAC_SEPARATORS: &[u8; 4] = b":- _";
 
-/// Runs the site-data checks on every raw line of a catalogue file, comments included.
+/// A soft-lint finding: where, and what the text looked like. Never the text itself (SEC-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintWarning {
+    /// `line N` for source text, or a field label such as `quirks[2]` for a parsed entry.
+    pub field: String,
+    /// What it looked like.
+    pub kind: SiteDataKind,
+}
+
+impl std::fmt::Display for LintWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "looks like site data ({:?}) in {}",
+            self.kind, self.field
+        )
+    }
+}
+
+/// Enforcing structural check on every raw line of a catalogue file, comments included: the
+/// character allow-list ([`SiteDataKind::Encoding`]). Shape heuristics are not enforced here;
+/// see [`lint_source`] and the exact-match `wardenlens vault scan cameras/` (ADR 0006).
 ///
 /// [`CatalogueEntry::from_toml_str`](super::CatalogueEntry::from_toml_str) calls this before
-/// parsing; call it directly for other files that are published next to the entries.
+/// parsing.
 ///
 /// # Errors
 /// [`CatalogueError::SiteData`] naming `line N` (never the text) for the first offending line.
 pub fn check_source(text: &str) -> Result<(), CatalogueError> {
+    for (index, line) in text.lines().enumerate() {
+        if has_odd_encoding(line) {
+            let field = format!("line {}", index.saturating_add(1));
+            return Err(CatalogueError::SiteData {
+                field,
+                kind: SiteDataKind::Encoding,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Optional soft lint: runs the shape heuristics on every raw line (comments included) and
+/// returns one warning per offending line. It never fails validation or the gate; the
+/// authoritative leak check is the exact-match vault scan (ADR 0006, #75).
+#[must_use]
+pub fn lint_source(text: &str) -> Vec<LintWarning> {
+    let mut out = Vec::new();
     for (index, line) in text.lines().enumerate() {
         // Model names are structured like serials (`IPC-HDBW2431EP-S-0280B`), so the lines that
         // carry them get the model rule; everything else is free text, including a trailing
@@ -105,10 +147,10 @@ pub fn check_source(text: &str) -> Result<(), CatalogueError> {
         };
         if let Some(kind) = found {
             let field = format!("line {}", index.saturating_add(1));
-            return Err(CatalogueError::SiteData { field, kind });
+            out.push(LintWarning { field, kind });
         }
     }
-    Ok(())
+    out
 }
 
 /// Splits a TOML line at the first `#` outside a string.
@@ -210,7 +252,7 @@ fn decode_escapes(text: &str) -> String {
 /// refuses every non-ASCII digit, space, punctuation, format and invisible character, which are
 /// the means of disguising addresses. A few letters render as nothing (Hangul fillers) and the
 /// fullwidth block imitates ASCII, so those are refused as well.
-fn has_odd_encoding(text: &str) -> bool {
+pub(super) fn has_odd_encoding(text: &str) -> bool {
     text.chars().any(|c| {
         if c.is_ascii() {
             c.is_ascii_control() && c != '\t'
@@ -907,6 +949,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn comments_on_model_lines_get_the_strict_text_rule() {
         let ok = "model = \"IPC-HDBW2431EP-S-0280B\"\n";
         assert_eq!(check_source(ok), Ok(()));
@@ -1006,6 +1049,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
     fn source_check_reports_the_line_and_scans_comments() {
         let err = check_source("a = 1\n# camera at 192.168.1.20\n").unwrap_err();
         let msg = err.to_string();
@@ -1013,6 +1057,51 @@ mod tests {
         assert!(!msg.contains("192"), "{msg}");
         assert_eq!(check_source("# fine\nb = 2\n"), Ok(()));
         assert_eq!(check_source(""), Ok(()));
+    }
+
+    #[test]
+    fn lint_source_warns_on_the_line_and_scans_comments_without_the_value() {
+        let w = lint_source("a = 1\n# camera at 192.168.1.20\n");
+        assert_eq!(
+            w,
+            vec![LintWarning {
+                field: "line 2".to_owned(),
+                kind: SiteDataKind::Ipv4
+            }]
+        );
+        let msg = w.first().unwrap().to_string();
+        assert!(!msg.contains("192"), "{msg}");
+        assert_eq!(lint_source("# fine\nb = 2\n"), vec![]);
+        assert_eq!(lint_source(""), vec![]);
+    }
+
+    #[test]
+    fn lint_source_gives_comments_on_model_lines_the_strict_text_rule() {
+        assert_eq!(lint_source("model = \"IPC-HDBW2431EP-S-0280B\"\n"), vec![]);
+        assert_eq!(lint_source("model = \"A#B\" # fine\n"), vec![]);
+        for bad in [
+            "model = \"IPC-HDBW2431EP-S-0280B\" # sn ABCD-EFGHIJKLMN1\n",
+            "aliases = [\"X\"] # camera at 10.0.0.1\n",
+            "model = \"X\" # DS-2CD2T87G2P-LSU\n",
+        ] {
+            assert_eq!(lint_source(bad).len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn check_source_enforces_only_the_encoding_allow_list() {
+        assert_eq!(
+            check_source("# camera at 192.168.1.20 admin:hunter2\n"),
+            Ok(())
+        );
+        let err = check_source("a = 1\nb = \"1\u{200B}0\"\n").unwrap_err();
+        assert_eq!(
+            err,
+            CatalogueError::SiteData {
+                field: "line 2".to_owned(),
+                kind: SiteDataKind::Encoding
+            }
+        );
     }
 
     #[test]

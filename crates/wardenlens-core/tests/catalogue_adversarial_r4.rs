@@ -39,6 +39,7 @@ fn rejected(inputs: &[&str], f: impl Fn(&str) -> Result<(), CatalogueError>) -> 
 /// the element form only matches a key exactly. Hikvision ISAPI user bodies carry
 /// `<loginPassword>`, and vendor XML commonly uses prefixed element names.
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn camel_case_and_prefixed_xml_secret_elements_are_rejected() {
     let inputs = [
         "<loginPassword>hunter2</loginPassword>",
@@ -58,6 +59,7 @@ fn camel_case_and_prefixed_xml_secret_elements_are_rejected() {
 
 /// Text hidden behind markup inside a secret element: the guard reads only up to the next `<`.
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn xml_secret_behind_cdata_or_comment_is_rejected() {
     let inputs = [
         "<Password><![CDATA[hunter2]]></Password>",
@@ -76,6 +78,7 @@ fn xml_secret_with_entity_escaped_brackets_is_rejected() {
 }
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn xml_secret_elements_with_unusual_whitespace_and_case_are_rejected() {
     let inputs = [
         "<PASSWORD>hunter2</PASSWORD>",
@@ -101,6 +104,7 @@ fn xml_secret_split_across_lines_of_a_multiline_string_is_rejected() {
 // ---- camelCase boundary ----
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn camel_case_short_keys_after_digits_or_capitals_are_rejected() {
     let inputs = [
         "adminPin=4711",
@@ -167,6 +171,7 @@ fn angle_bracket_placeholders_in_prose_are_accepted() {
 // ---- model-line comments ----
 
 #[test]
+#[ignore = "shape heuristics superseded by the vault exact-match scan (ADR 0006, #75); see PR #71"]
 fn comments_on_model_and_alias_lines_are_scanned_strictly() {
     let inputs = [
         "vendor=\"A\"\nmodel = \"B\" # sn ABCDEF1234XYZ\nsupport=\"verified\"\n",
