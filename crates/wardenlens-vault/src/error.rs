@@ -24,9 +24,19 @@ pub enum VaultError {
     /// The vault file does not exist.
     #[error("vault file does not exist")]
     NotFound,
-    /// The file exists but holds no vault (no `meta` table).
+    /// The file exists but holds no vault: no `meta` table, not exactly the vault schema, or no
+    /// keycheck record. A corrupt database or an unfinished transaction is never reported as
+    /// this (see [`VaultError::PendingJournal`]).
     #[error("file is not an initialised vault")]
     NotInitialized,
+    /// The vault has a non-empty `-journal` that did not go away within the busy timeout (another
+    /// process is writing, or a previous write was interrupted) and the file could not be proven
+    /// to be the caller's vault. Do not delete the `-journal` file: it holds the data needed to
+    /// roll the vault back.
+    #[error(
+        "vault has an unfinished transaction (another process is writing, or a previous write was interrupted); do not delete the -journal file"
+    )]
+    PendingJournal,
     /// `create` found a file that is not empty and holds no vault.
     #[error("file exists and is not empty")]
     NotEmpty,

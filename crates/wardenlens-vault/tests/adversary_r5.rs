@@ -138,6 +138,11 @@ fn open_on_a_foreign_db_with_meta_and_a_hot_journal_leaves_it_unchanged() {
         snap_main,
         "main file changed ({res:?})"
     );
+    assert_eq!(
+        std::fs::read(&journal).unwrap(),
+        snap_j,
+        "journal changed ({res:?})"
+    );
 }
 
 /// A truncated vault (only the 16-byte header) is refused by open, not accepted.

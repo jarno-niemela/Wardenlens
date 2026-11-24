@@ -193,7 +193,7 @@ fn connect(
         return Err(VaultError::NotFound);
     }
     let len = file_len(&file)?;
-    if len > 0 && !has_sqlite_header(file.file()) {
+    if len > 0 && !has_sqlite_header(file.file())? {
         // Somebody's data: never initialise over it, and refuse before SQLite touches it.
         return Err(if must_exist {
             VaultError::NotInitialized
@@ -217,6 +217,9 @@ fn connect(
         }
     } else if must_exist {
         return Err(VaultError::NotInitialized);
+    } else if wal_present(path)? || journal_present(path)? {
+        // SQLite deletes a sidecar next to a zero-page database on first open: never let it.
+        return Err(VaultError::NotEmpty);
     }
     if !must_exist && file_len(&file)? > 0 {
         // The file grew since the probe found it empty.
@@ -249,42 +252,102 @@ fn file_len(file: &PrivateFile) -> Result<u64, VaultError> {
         .len())
 }
 
-/// Identifies the non-empty file as a vault or not, entirely read-only (`immutable=1`), before
-/// any read-write open: no pragma, lock, journal, `-wal` or `-shm` file is ever written, so a
-/// foreign database stays byte-for-byte intact. A vault is:
+/// How often a pending `-journal` is re-checked while waiting for it to go away.
+const JOURNAL_POLL: Duration = Duration::from_millis(50);
+
+fn sidecar(path: &Path, suffix: &str) -> std::ffi::OsString {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    name
+}
+
+/// True if a `-wal` sidecar of any kind exists (a vault never uses WAL).
+fn wal_present(path: &Path) -> Result<bool, VaultError> {
+    match Path::new(&sidecar(path, "-wal")).symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(VaultError::io("inspecting sidecar")(e)),
+        Ok(_) => Ok(true),
+    }
+}
+
+/// True if a `-journal` exists that SQLite would not ignore. A zero-length regular file is
+/// ignored, as SQLite does; anything else (including a non-regular file) counts.
+fn journal_present(path: &Path) -> Result<bool, VaultError> {
+    match Path::new(&sidecar(path, "-journal")).symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(VaultError::io("inspecting sidecar")(e)),
+        Ok(m) => Ok(!(m.is_file() && m.len() == 0)),
+    }
+}
+
+/// True if the header says rollback mode (bytes 18 and 19 are both 1). Only a short file means
+/// "no"; any other read failure is passed on.
+fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
+    use std::os::unix::fs::FileExt;
+    let mut mode = [0u8; 2];
+    match file.file().read_exact_at(&mut mode, 18) {
+        Ok(()) => Ok(mode == [1, 1]),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(VaultError::io("reading vault header")(e)),
+    }
+}
+
+/// Identifies the non-empty file as a vault or not before any read-write open. The probe itself
+/// is entirely read-only (`immutable=1`): no pragma, lock, journal, `-wal` or `-shm` file is
+/// ever written, so a foreign database stays byte-for-byte intact. A vault is:
 /// - in rollback mode (header bytes 18 and 19 are both 1);
-/// - without a `-wal` or `-journal` sidecar (a vault never leaves one, and an immutable read
-///   would ignore its contents);
-/// - exactly the vault schema (`meta(key, value)` and `entries`, nothing else);
+/// - without a `-wal` sidecar (a vault never uses WAL);
+/// - exactly the vault schema (`meta(key, value)` and `entries`, no other table, index, trigger
+///   or view);
 /// - on `open` (`key` is `Some`): `schema_version = 1` and a keycheck row that decrypts under `key`.
 ///
+/// A zero-length `-journal` is ignored, as SQLite does. A non-empty one means a writer is active
+/// (or crashed), and an immutable read would ignore its contents, so the probe waits up to
+/// [`BUSY_TIMEOUT`] for it to disappear (ADR 0006 section 3: a scan during a write waits). If it
+/// stays: on `open`, a file that passes the full probe (exact schema and keycheck under the
+/// supplied key) is proven to be the owner's vault and may be opened read-write, so SQLite rolls
+/// back its own hot journal; in every other case (and on `create`) the result is
+/// [`VaultError::PendingJournal`], never a "not a vault" verdict, and nothing is modified.
+///
 /// Returns `Ok(false)` for anything that is not a vault. Only "not a database" and schema errors
-/// mean that; every other SQLite error (I/O and so on) is passed on.
+/// mean that; every other SQLite error (corruption, I/O and so on) is passed on.
 ///
 /// # Errors
 /// [`VaultError::UnsupportedSchema`], [`VaultError::NotInitialized`] (no keycheck row) and
-/// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks.
+/// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks;
+/// [`VaultError::PendingJournal`] as above.
 fn probe_existing(
+    path: &Path,
+    file: &PrivateFile,
+    key: Option<&KeyFile>,
+) -> Result<bool, VaultError> {
+    if !rollback_header(file)? || wal_present(path)? {
+        return Ok(false);
+    }
+    let start = std::time::Instant::now();
+    while journal_present(path)? {
+        if start.elapsed() >= BUSY_TIMEOUT {
+            let Some(key) = key else {
+                return Err(VaultError::PendingJournal);
+            };
+            return match immutable_probe(path, file, Some(key)) {
+                Ok(true) => Ok(true),
+                Err(e @ VaultError::Fs(_)) => Err(e),
+                Ok(false) | Err(_) => Err(VaultError::PendingJournal),
+            };
+        }
+        std::thread::sleep(JOURNAL_POLL);
+    }
+    immutable_probe(path, file, key)
+}
+
+fn immutable_probe(
     path: &Path,
     file: &PrivateFile,
     key: Option<&KeyFile>,
 ) -> Result<bool, VaultError> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::FileExt;
-    let mut mode = [0u8; 2];
-    if file.file().read_exact_at(&mut mode, 18).is_err() || mode != [1, 1] {
-        return Ok(false);
-    }
-    for suffix in ["-wal", "-journal"] {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        match Path::new(&sidecar).symlink_metadata() {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(VaultError::io("inspecting sidecar")(e)),
-            Ok(_) => return Ok(false),
-        }
-    }
     let abs = std::path::absolute(path).map_err(VaultError::io("resolving vault path"))?;
     // `file://` + empty authority + the encoded absolute path, so a leading `//` stays path.
     let mut uri = b"file://".to_vec();
@@ -328,14 +391,32 @@ struct MetaRows {
     keycheck: Option<Vec<u8>>,
 }
 
-/// `None` unless the schema is exactly the vault's two tables.
+/// A `meta` value as bytes. A missing row or a value that is not a blob is `None`: it counts as
+/// a mismatch or a missing record, never as a conversion error.
+fn meta_blob(conn: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+    use rusqlite::types::ValueRef;
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+        Ok(match r.get_ref(0)? {
+            ValueRef::Blob(b) => Some(b.to_vec()),
+            _ => None,
+        })
+    })
+    .optional()
+    .map(Option::flatten)
+}
+
+/// `None` unless the schema is exactly the vault's two tables (and nothing else: no index,
+/// trigger or view; the automatic indexes of the primary keys are not listed).
 fn read_identity(conn: &Connection) -> rusqlite::Result<Option<MetaRows>> {
-    let mut stmt =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?;
-    let tables = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+    let mut stmt = conn.prepare(
+        "SELECT type, name FROM sqlite_master
+         WHERE substr(name, 1, 17) != 'sqlite_autoindex_' ORDER BY type, name",
+    )?;
+    let objects = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if tables != ["entries", "meta"] {
+    let table = |n: &str| ("table".to_owned(), n.to_owned());
+    if objects != [table("entries"), table("meta")] {
         return Ok(None);
     }
     let columns = |table: &str| -> rusqlite::Result<Vec<(String, String, bool, i64)>> {
@@ -357,35 +438,32 @@ fn read_identity(conn: &Connection) -> rusqlite::Result<Option<MetaRows>> {
     {
         return Ok(None);
     }
-    let get = |k: &str| -> rusqlite::Result<Option<Vec<u8>>> {
-        conn.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get(0))
-            .optional()
-    };
     Ok(Some(MetaRows {
-        version: get("schema_version")?,
-        keycheck: get("keycheck")?,
+        version: meta_blob(conn, "schema_version")?,
+        keycheck: meta_blob(conn, "keycheck")?,
     }))
 }
 
-/// SQLite errors that mean "this file is not a vault" rather than "reading it failed".
+/// SQLite errors that mean "this file is not a vault" rather than "reading it failed". A
+/// corrupt database is not among them: it is passed on as an error.
 fn is_not_a_vault(e: &rusqlite::Error) -> bool {
     matches!(
         e.sqlite_error_code(),
-        Some(
-            rusqlite::ErrorCode::NotADatabase
-                | rusqlite::ErrorCode::DatabaseCorrupt
-                | rusqlite::ErrorCode::SchemaChanged
-        )
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::SchemaChanged)
     )
 }
 
 /// True if the file starts with the SQLite header. Only such a non-empty file is handed to SQLite
 /// (the read-only probe, never a read-write open, until [`probe_existing`] identifies a vault);
 /// `create` then tells a vault (`AlreadyInitialized`) from another database (`NotEmpty`).
-fn has_sqlite_header(file: &std::fs::File) -> bool {
+fn has_sqlite_header(file: &std::fs::File) -> Result<bool, VaultError> {
     use std::os::unix::fs::FileExt;
     let mut head = [0u8; 16];
-    file.read_exact_at(&mut head, 0).is_ok() && &head == b"SQLite format 3\0"
+    match file.read_exact_at(&mut head, 0) {
+        Ok(()) => Ok(&head == b"SQLite format 3\0"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(VaultError::io("reading vault header")(e)),
+    }
 }
 
 fn seal_keycheck(key: &KeyFile) -> Result<Vec<u8>, VaultError> {
@@ -402,7 +480,8 @@ impl Vault {
     ///
     /// # Errors
     /// [`VaultError::AlreadyInitialized`] if the file already holds a vault, [`VaultError::NotEmpty`] if it
-    /// holds anything else; the open-sequence
+    /// holds anything else (including an empty file with a `-wal` or non-empty `-journal` next to
+    /// it), [`VaultError::PendingJournal`] if the vault has an unfinished transaction; the open-sequence
     /// refusals (symlink, wrong owner or mode, identity mismatch, unsafe parent, work tree).
     pub fn create(path: &Path, key: KeyFile) -> Result<Self, VaultError> {
         Self::create_with(path, key, || {})
@@ -460,7 +539,8 @@ impl Vault {
     ///
     /// # Errors
     /// [`VaultError::NotFound`], [`VaultError::NotInitialized`], [`VaultError::WrongKey`],
-    /// [`VaultError::TooManyEntries`], and the open-sequence refusals.
+    /// [`VaultError::TooManyEntries`], [`VaultError::PendingJournal`], and the open-sequence
+    /// refusals.
     pub fn open(path: &Path, key: KeyFile) -> Result<Self, VaultError> {
         Self::open_with(path, key, || {})
     }
@@ -474,22 +554,12 @@ impl Vault {
         if !has_meta(&conn)? {
             return Err(VaultError::NotInitialized);
         }
-        let version: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
+        let version = meta_blob(&conn, "schema_version")
             .map_err(VaultError::sqlite("read schema version"))?;
         if version.as_deref() != Some(SCHEMA_VERSION.to_string().as_bytes()) {
             return Err(VaultError::UnsupportedSchema);
         }
-        let record: Vec<u8> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'keycheck'", [], |r| {
-                r.get(0)
-            })
-            .optional()
+        let record = meta_blob(&conn, "keycheck")
             .map_err(VaultError::sqlite("read keycheck"))?
             .ok_or(VaultError::NotInitialized)?;
         check_keycheck(&key, &record)?;

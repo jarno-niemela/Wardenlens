@@ -160,6 +160,11 @@ Rules:
 - The vault uses `journal_mode = DELETE` and `synchronous = FULL`: it is tiny and rarely written, and no `-wal`
   or `-shm` sidecar files are created. (Sidecars would only hold ciphertext anyway.) Every connection sets a busy
   timeout of 5 seconds, so a scan during a write waits instead of failing.
+  The read-only identity probe (which runs before any read-write open) honours this too: a non-empty `-journal` is
+  polled for up to the same 5 seconds. If it is still there, `open` proceeds only when the file passes the full
+  probe (exact vault schema and a keycheck that authenticates under the supplied key), so SQLite rolls back its own
+  hot journal; otherwise, and always for `create`, the result is a typed `PendingJournal` error. The journal is never
+  deleted and a `-wal` sidecar is always refused.
 - Schema (version 1): `meta(key TEXT PRIMARY KEY, value BLOB)` holding `schema_version` and `keycheck` (a sealed
   constant under id `meta:keycheck`, so a wrong key is detected before any entry is touched), and
   `entries(id TEXT PRIMARY KEY, kind INTEGER NOT NULL, record BLOB NOT NULL, created_at INTEGER NOT NULL, updated_at
