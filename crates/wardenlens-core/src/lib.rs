@@ -4,6 +4,7 @@
 //! threads. Adapters (CLI, network, storage) live in their own crates and
 //! depend on this one, never the other way round.
 
+pub mod camera;
 pub mod catalogue;
 pub mod connection;
 pub mod entry;
