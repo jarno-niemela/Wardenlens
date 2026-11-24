@@ -5,11 +5,11 @@ description: Catalogue of the defect classes the Opus verifiers (reviewer, secur
 
 # Defect patterns (learned from verification rounds)
 
-Every entry cost at least one extra review round. Before reporting `DONE`, walk the
+Most entries cost at least one extra review round; the rest were recurring minors. Before reporting `DONE`, walk the
 **checklist** at the end against your diff, and write the listed self-test for every
 pattern your change touches. Patterns are ordered by how often they recur.
 `docs/CODING_GUIDELINES.md` is still the binding rule set; this file is the field guide.
-Keep it current with `/retro` (the `improve-skills` skill).
+Keep it current with `/retro` (the `retro` skill).
 
 ## P1. Silent loss or overwrite ("nothing is dropped silently")
 - **Rule.** When several inputs feed one key space, check uniqueness over the **union**
@@ -35,7 +35,11 @@ Keep it current with `/retro` (the `improve-skills` skill).
 ## P2. Destructive actions that do not achieve their goal
 - **Rule.** Only delete, evict or overwrite when doing so **restores a goal that is
   reachable**:
-  - target if reachable, else floor, else **nothing**, and report the state;
+  - target if reachable, else floor;
+  - if even the floor is unreachable, delete only what an **explicit absolute
+    safety level** demands. In #44 that is the rolling-buffer budget and the emergency
+    reserve that keep the "never ENOSPC" invariant. Otherwise delete nothing, and report
+    the state;
   - apply the rule symmetrically to every tier or side.
 - **Rule.** Hold steady state with an **absolute** level (a budget), not a per-tick
   relative amount. A relative amount drifts by one granule each tick and drains everything.
@@ -70,11 +74,17 @@ Keep it current with `/retro` (the `improve-skills` skill).
 - **Self-test.** For each entry point:
   - a foreign WAL database, a database with a `meta` table, a leftover `-wal` and a hot `-journal`, each asserting the main file, the sidecar and the directory listing are **byte-identical**;
   - an own vault opened during a concurrent write, and after a crash mid-write and mid-rekey.
+    For mid-rekey, the crash must leave the **new keycheck page in the main file** with the
+    old pages in the journal, as found in #104 r2. A crash that touches only `entries` does
+    not test it.
+  - **Timing (TEST-5):** coordinate the concurrent writer with a channel or barrier, not a
+    `sleep`. The only real-time element allowed is the code's own bounded `BUSY_TIMEOUT`.
 
 ## P4. Panics and blow-ups on untrusted bytes
 - **Rule.** A byte-length check followed by `str` slicing (`split_at`, `[a..b]`) panics
-  on multibyte input. Check ASCII or digits first, or use `.get(a..b)`. Consider
-  `clippy::string_slice`.
+  on multibyte input. Check ASCII or digits first, or use `.get(a..b)`.
+  `clippy::string_slice` catches `&s[a..b]` but **not** `split_at`, so also grep the diff
+  for `split_at`.
 - **Rule.** Do not collect every match before processing. In #54, a `Vec` of start-code
   offsets reached about 22 MB on an 8 MiB input. Stream instead.
 - **Rule.** Keep one source of truth for enumerations shared by a parser and a writer.
@@ -87,19 +97,22 @@ Keep it current with `/retro` (the `improve-skills` skill).
 
 ## P5. Time, clocks and hostile timestamps
 - **Rule.** Measure timeouts, deadlines and backoff on a **monotonic** clock. Heuristics
-  that guess at wall-clock steps create new stalls (#46 r2 to r3).
+  that guess at wall-clock steps create new stalls.
 - **Rule.** Never store a *clamped* value as "the last good" value. Keep the last
-  unclamped step separately (#45 `last_good_step`).
+  unclamped step separately (`last_good_step`).
 - **Rule.** A hostile source can freeze or slowly reverse its clock. Bound the result
   in a second dimension (wall clock, bytes) and file an ADR amendment if the spec lacks
   one (#103).
+- **Example.**
+  - #46 (PR #95) r2: wall-clock step heuristics stalled a hung camera at 7.5-15 s tick cadences. Fixed in r3 by moving to `MonoMs`.
+  - #45 (PR #102) r1: a re-base reused a 1-tick clamped step. A frozen RTP clock keeps a segment open for hours (#103).
 - **Self-test.** A proptest over every tick cadence and failure latency, from 1 ms to
   60 s, that asserts liveness: the camera degrades, and retries keep coming.
 
 ## P6. Error typing that lies
 - **Rule.** `fallible().unwrap_or(false)` or `.is_err()` turns an I/O error into a
-  semantic answer. Map only the specific kinds, such as `UnexpectedEof` or
-  `NotADatabase`, and pass everything else on as a typed error.
+  semantic answer. Map only specific `io::ErrorKind`s such as `UnexpectedEof`, or
+  SQLite codes such as `SQLITE_NOTADB`, and pass everything else on as a typed error.
 - **Rule.** A variant name must describe the cause. `AlreadyInitialized` for a foreign
   non-empty file is wrong; it should be `NotEmpty`.
 - **Rule.** A pair of booleans or fields that can represent an impossible state should
@@ -107,6 +120,11 @@ Keep it current with `/retro` (the `improve-skills` skill).
   - `unsatisfiable` with `rolling_buffer`;
   - `Decision::Append` with `Some(error)`;
   - `set(.., bool) -> bool`.
+- **Example.**
+  - #74 (PR #97) r3-r4: a foreign non-empty file reported as `AlreadyInitialized`; `has_meta(..).unwrap_or(false)`.
+  - #74 (PR #97) r1: `set(.., force_unscannable: bool) -> bool` (TYPE-1).
+  - #44 (PR #101) r1: the `unsatisfiable` / `rolling_buffer` bools.
+  - #45 (PR #102) r2: `Decision` with `Option<PushError>` (#105).
 - **Self-test.** One test per error variant that the new code can return. `grep` each
   variant in the tests; an untested variant is a finding.
 
@@ -122,22 +140,32 @@ Keep it current with `/retro` (the `improve-skills` skill).
   notes were flagged.
 - **Rule.** Boundaries mean exact, minus one and plus one, for every cap:
   8 MiB / 8 MiB + 1, 16 MiB, 600 000 ms, u32::MAX.
+- **Example.**
+  - #45 (PR #102) r1 reviewer: the "sum of durations" proptest asserted `ended == started + duration`, which is true by construction. In r2: random-u32 RTP never reached the hard maximum.
+  - #74 (PR #97) r1: `json_without_login_imports_no_credential` locked in the dropped password.
+  - #46 (PR #95) r3 and #44 (PR #101) r5: stale adversary-test doc comments.
+- **Self-test.**
+  - For each assertion, ask: "would this fail if the function returned a constant or its own input?"
+  - For each proptest, count with a temporary counter how often the target branch is hit, and require more than 0.
 
 ## P8. Missing acceptance criteria and spec drift
 - **Rule.** Read the **whole** ticket. "Amended by ADR …" sections override the text
   above them, and items assigned to this ticket in an amendment are in scope. For
-  example, the fragment caps belonged to #45 (r1 major).
+  example, the fragment caps belonged to #45 (PR #102 r1 blocker).
 - **Rule.** Public rustdoc must list **every** category or state the code can produce,
   such as every reason a key lands in `unknown_keys`.
 - **Rule.** A deviation from the ADR or the brief goes in the report under
   NOTES FOR VERIFIERS with the reason. Verifiers accept a justified deviation; they
   block a silent one.
+- **Example.** #74 (PR #97) r3: the `unknown_keys` rustdoc missed two categories. #110 r1: a ticket criterion (cap escalation) was left out.
+- **Self-test.** List each acceptance criterion with its test name or file evidence (the
+  implementer report's CRITERIA block). A criterion with no evidence is unmet.
 
-## P9. Workflow traps (controller and implementer)
+## P9. Workflow traps (controller and implementer; no code self-test, the gate and CI catch these)
 - **Copied adversary tests:** run `cargo fmt --all` before committing them; the pre-commit hook rejects otherwise.
 - **`Policy` literals:** a new field breaks every external struct literal in the test files. Add the field with a neutral value, not a semantics change.
-- **CodeQL:** it flags synthetic keys and passwords in tests (`hard-coded-cryptographic-value`, `cleartext-logging`). Dismiss them with a reason; never weaken the test.
-- **Merge conflicts:** almost every branch adds a `pub mod` line to `core/src/lib.rs`. Before verifying two PRs in parallel, trial-merge them; resolve conflicts by taking the union of both module lists.
+- **CodeQL:** it flags synthetic keys and passwords in tests (`hard-coded-cryptographic-value`, `cleartext-logging`). The controller dismisses **test-path** alerts with a reason (PR #90, #97). An alert in non-test code is a security finding for the auditor or the owner. Never weaken the test.
+- **Merge conflicts:** almost every branch adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`. Before verifying two PRs in parallel, trial-merge them; resolve conflicts by taking the union of both module lists (PR #97, #101, #102). Resolving a conflict changes the head, so all three verifiers must run again.
 
 ## Checklist (run before reporting DONE)
 1. **P8:** the ticket has been reread, including amendments, and every criterion maps to a named test.
@@ -149,4 +177,5 @@ Keep it current with `/retro` (the `improve-skills` skill).
 7. **P6:** is every new error variant tested? Is there no `unwrap_or`/`is_err` collapsing an I/O error?
 8. **P7:** is each assertion independent of the code under test? Do the generators reach the interesting branches? Are boundaries covered at -1, exact and +1?
 9. Are deviations, assumptions and anything left undone listed in NOTES FOR VERIFIERS?
-Last retro: 2026-11-24, covering PRs #93 #95 #97 #98 #101 #102 #106.
+
+Last retro: 2026-11-24, covering PRs #93, #95, #97, #98, #101 and #102, plus #106 rounds 1-2 (still open).

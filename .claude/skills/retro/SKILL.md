@@ -1,5 +1,5 @@
 ---
-name: improve-skills
+name: retro
 description: Retrospective loop that turns verifier findings into better development skills, so later tickets pass verification in fewer rounds. Use after a PR merges, always when a ticket needed 3 or more verification rounds or hit the round cap, when the same finding appears in two PRs, or when the user asks for /retro or to improve the dev skills.
 ---
 
@@ -10,14 +10,17 @@ Input: a PR number, a ticket, or `recent` (every PR merged since the last retro;
 
 ## 1. Collect
 For each PR:
-- **Rounds:** count them from the `verify/*` status history (`gh api repos/{owner}/{repo}/commits/<sha>/statuses`) or the PR comments.
-- **Findings:** gather every **blocker and major** from the verifier reports in the PR comments, the controller's fix briefs (`~/.local/state/wardenlens/agents/<ticket>-implementer-rN.md`) and the follow-up tickets.
+- **Rounds:** the highest `rN` among the briefs in `~/.local/state/wardenlens/agents/<ticket>-*-rN.md`. The `scripts/agents` ledger records one verifier set per round. A commit's `verify/*` statuses only cover that one SHA.
+- **Findings:** gather every **blocker and major** from:
+  - the controller's fix briefs (`<ticket>-implementer-rN.md`), which quote the findings;
+  - the per-round consolidated PR comments that `/work` step 5 requires;
+  - the follow-up tickets.
 - **Minors:** collect those that showed up in two or more PRs.
 - **Controller mistakes:** note any brief or design ruling that caused a round. Example: #44 r2 "delete toward the target".
 
 ## 2. Classify
 For each finding, ask four questions:
-1. **Which pattern?** Does an existing `defect-patterns` entry (P1-P9) already describe it?
+1. **Which pattern?** Does an existing `defect-patterns` entry already describe it?
    - If yes, add the example (ticket, PR and round, one line).
    - If not, write a new pattern with these parts: the rule, the example, and the self-test that would have caught it.
 2. **Why wasn't it caught earlier?** Was the checklist item missing, too vague, or ignored? Did the brief lack it? Is the guideline missing?
@@ -27,7 +30,7 @@ For each finding, ask four questions:
    - an implementer procedure step (`.claude/agents/implementer.md`);
    - a brief template line in the `work` skill;
    - a ticket template or acceptance-criteria prompt (`plan-epic` / `new-ticket`);
-   - a lint or tooling check. This is the strongest option when the defect is mechanical. Example: `clippy::string_slice` for P4.
+   - a lint or tooling check. This is the strongest option when the defect is mechanical. Check that the lint really catches the case: `clippy::string_slice` catches `&s[a..b]` but not `split_at`.
 4. **Is it a spec problem?** If the ADR or ticket was wrong or silent, file an ADR amendment or follow-up ticket instead of a skill change.
 
 ## 3. Edit, keeping it lean
