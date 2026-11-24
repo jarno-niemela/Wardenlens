@@ -55,6 +55,7 @@ fn run(
         now: Timestamp::from_unix_millis(now),
         policy,
         ingested_bytes: ingested,
+        rolling_budget: None,
     })
 }
 
@@ -338,8 +339,10 @@ fn check(
         let before_last = moved + hdel - u128::from(last.bytes);
         let goal = if unsat {
             u128::from(ingested)
+        } else if hfree + hot_total >= htarget {
+            htarget - hfree
         } else {
-            htarget.saturating_sub(hfree)
+            hfloor - hfree
         };
         prop_assert!(
             before_last < goal,

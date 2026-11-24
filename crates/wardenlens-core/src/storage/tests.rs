@@ -64,6 +64,7 @@ fn input(
             ..Policy::default()
         },
         ingested_bytes,
+        rolling_budget: None,
     }
 }
 
@@ -392,6 +393,7 @@ fn unreachable_floor_without_archive_keeps_hot_video_flat_and_alerts() {
     let capacity = 1000;
     let mut segments: Vec<StoredSegment> = (0..3).map(|i| seg(i, Tier::Hot, SEG, i)).collect();
     let mut hot_free = 100_u64;
+    let mut budget = None;
     let initial_video: u64 = segments.iter().map(|s| s.bytes).sum();
     for tick in 0..50_u64 {
         // New video arrives and consumes space.
@@ -401,8 +403,12 @@ fn unreachable_floor_without_archive_keeps_hot_video_flat_and_alerts() {
             capacity_bytes: capacity,
             free_bytes: hot_free,
         };
-        let p = plan(&input(space, ArchiveState::Unavailable, &segments, SEG)).unwrap();
+        let mut pin = input(space, ArchiveState::Unavailable, &segments, SEG);
+        pin.rolling_budget = budget;
+        let p = plan(&pin).unwrap();
         assert_eq!(p.hot, HotState::RollingBuffer, "tick {tick}");
+        assert_eq!(p.rolling_budget, Some(initial_video), "tick {tick}");
+        budget = p.rolling_budget;
         let (free, _, left) = simulate(hot_free, None, &segments, &p);
         hot_free = free;
         segments = left;
@@ -410,6 +416,68 @@ fn unreachable_floor_without_archive_keeps_hot_video_flat_and_alerts() {
         assert_eq!(video, initial_video, "tick {tick}");
         assert_eq!(hot_free, 100, "tick {tick}");
     }
+}
+
+/// Floor 250 unreachable (free 200, hot video 30) but the archive is usable and has room only
+/// for the floor-reaching moves: moves still aim for the target and hot stays `Ok`.
+#[test]
+fn usable_archive_with_only_the_floor_reachable_moves_to_the_target() {
+    // Hot: floor 250, target 260, free 200, video 55: reachable 255 (floor yes, target no).
+    // Archive: ample room.
+    let segments = [
+        seg(1, Tier::Hot, 20, 1),
+        seg(2, Tier::Hot, 25, 2),
+        seg(3, Tier::Hot, 10, 3),
+    ];
+    let p = plan(&input(
+        vol(1000, 200),
+        ArchiveState::Available(vol(1000, 900)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    // Target shortfall is 60 B: all three (55 B) move, since the target is unreachable.
+    assert_eq!(
+        ids(&p),
+        vec![
+            Action::MoveToArchive(SegmentId::new(1)),
+            Action::MoveToArchive(SegmentId::new(2)),
+            Action::MoveToArchive(SegmentId::new(3)),
+        ]
+    );
+    assert_eq!(p.hot, HotState::Ok);
+    assert_eq!(p.archive, ArchiveStatus::Available);
+    assert_eq!(p.rolling_budget, None);
+}
+
+#[test]
+fn rolling_budget_is_seeded_from_hot_video_before_the_ingest_then_honoured() {
+    let hot = vol(1000, 0);
+    let segments = [
+        seg(1, Tier::Hot, 20, 1),
+        seg(2, Tier::Hot, 20, 2),
+        seg(3, Tier::Hot, 20, 3),
+    ];
+    // Seed: 60 - 25 = 35; remaining must be <= 35, so two segments go.
+    let p = plan(&input(hot, ArchiveState::Unavailable, &segments, 25)).unwrap();
+    assert_eq!(p.rolling_budget, Some(35));
+    assert_eq!(
+        ids(&p),
+        vec![
+            Action::Delete(SegmentId::new(1)),
+            Action::Delete(SegmentId::new(2))
+        ]
+    );
+    // A fed-back budget wins over the ingest.
+    let mut pin = input(hot, ArchiveState::Unavailable, &segments, 25);
+    pin.rolling_budget = Some(40);
+    let p = plan(&pin).unwrap();
+    assert_eq!(p.rolling_budget, Some(40));
+    assert_eq!(ids(&p), vec![Action::Delete(SegmentId::new(1))]);
+    // Outside the rolling-buffer case the budget is cleared.
+    let mut pin = input(vol(1000, 900), ArchiveState::Unavailable, &segments, 25);
+    pin.rolling_budget = Some(40);
+    assert_eq!(plan(&pin).unwrap().rolling_budget, None);
 }
 
 #[test]

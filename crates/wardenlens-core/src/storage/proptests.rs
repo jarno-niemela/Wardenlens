@@ -55,6 +55,7 @@ proptest! {
         let input = PlanInput {
             hot, archive: state, segments: &segs,
             now: Timestamp::from_unix_millis(2_000_000), policy, ingested_bytes: ingested,
+            rolling_budget: None,
         };
         let p = plan(&input).unwrap();
 
@@ -117,11 +118,12 @@ proptest! {
     }
 
     #[test]
-    fn rolling_buffer_deletes_no_more_than_ingest_beyond_moves_plus_one_segment(
+    fn rolling_buffer_holds_hot_video_at_the_budget_minimally(
         hot in volume(),
         segs in segments(),
         hot_pct in 0_u8..=90,
         ingested in 0_u64..100_000,
+        fed in prop::option::of(0_u64..200_000),
         archive in prop::option::of(volume()),
     ) {
         let policy = Policy {
@@ -133,21 +135,34 @@ proptest! {
         let input = PlanInput {
             hot, archive: state, segments: &segs,
             now: Timestamp::from_unix_millis(2_000_000), policy, ingested_bytes: ingested,
+            rolling_budget: fed,
         };
         let p = plan(&input).unwrap();
+        if p.hot != HotState::RollingBuffer {
+            // The budget is only reported while the buffer is in effect.
+            prop_assert!(p.rolling_budget.is_none() || p.hot == HotState::Unsatisfiable);
+        }
         if p.hot == HotState::RollingBuffer {
+            let budget = p.rolling_budget.unwrap();
             let bytes_of = |id: &SegmentId| segs.iter().find(|s| s.id == *id).map_or(0, |s| s.bytes);
-            let moved: u64 = p.actions.iter()
-                .filter_map(|a| if let Action::MoveToArchive(id) = a { Some(bytes_of(id)) } else { None })
-                .sum();
-            let deleted: u64 = p.actions.iter()
+            let hot_total: u64 = segs.iter().filter(|s| s.tier == Tier::Hot).map(|s| s.bytes).sum();
+            let gone: u64 = p.actions.iter()
                 .filter_map(|a| match a {
+                    Action::MoveToArchive(id) => Some(bytes_of(id)),
                     Action::Delete(id) if segs.iter().any(|s| s.id == *id && s.tier == Tier::Hot) => Some(bytes_of(id)),
                     _ => None,
                 })
                 .sum();
-            let biggest = segs.iter().map(|s| s.bytes).max().unwrap_or(0);
-            prop_assert!(deleted <= ingested.saturating_sub(moved) + biggest);
+            let remaining = hot_total - gone;
+            prop_assert!(remaining <= budget);
+            let last = p.actions.iter().rev().find_map(|a| match a {
+                Action::Delete(id) if segs.iter().any(|s| s.id == *id && s.tier == Tier::Hot) => Some(bytes_of(id)),
+                _ => None,
+            });
+            if let Some(last) = last {
+                prop_assert!(remaining + last > budget);
+            }
+            prop_assert_eq!(budget, fed.unwrap_or(hot_total.saturating_sub(ingested)));
         }
     }
 }

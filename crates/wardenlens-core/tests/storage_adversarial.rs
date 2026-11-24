@@ -55,6 +55,7 @@ fn run(
         now: Timestamp::from_unix_millis(now),
         policy,
         ingested_bytes: ingested,
+        rolling_budget: None,
     })
 }
 

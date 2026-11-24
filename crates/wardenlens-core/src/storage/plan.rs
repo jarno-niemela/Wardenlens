@@ -50,8 +50,10 @@ pub enum HotState {
     /// absorbs the ingest, there is nothing ingested, or the moves already cover it.
     /// State, never an error.
     Unsatisfiable,
-    /// As `Unsatisfiable`, and this tick's plan deletes hot video as fast as it arrives
-    /// because the archive cannot absorb it. Raise an alert.
+    /// As `Unsatisfiable`, and this tick's plan deletes hot video to hold it at the rolling
+    /// budget because the archive cannot absorb it. Raise an alert. The adapter must alert on
+    /// `RollingBuffer`, and also on `Unsatisfiable` while the plan's `archive` is not
+    /// `Available`: the buffer is then rolling but this tick happened to delete nothing.
     RollingBuffer,
 }
 
@@ -65,6 +67,11 @@ pub struct Plan {
     pub archive: ArchiveStatus,
     /// State of the hot volume.
     pub hot: HotState,
+    /// Hot-video byte level the rolling buffer holds: `Some` exactly when the hot floor is
+    /// unreachable and the archive cannot take the load (the rolling-buffer case), else
+    /// `None`. The adapter must store this value and pass it back as
+    /// [`PlanInput::rolling_budget`] on the next tick, and clear it when it is `None`.
+    pub rolling_budget: Option<u64>,
     /// Foreign or quarantined data keeps the archive below its floor even when everything
     /// it holds is evicted. Kept separate because `ArchiveStatus::Full` takes precedence
     /// over `BelowFloor` in `archive`.
@@ -140,8 +147,15 @@ pub struct PlanInput<'a> {
     pub now: Timestamp,
     /// Policy.
     pub policy: Policy,
-    /// Bytes recorded since the previous plan; sizes the rolling buffer.
+    /// Bytes recorded since the previous plan. Used only to set the initial rolling-buffer
+    /// budget when entering the buffer with no `rolling_budget`: the budget is then the hot
+    /// video held before this tick's ingest.
     pub ingested_bytes: u64,
+    /// The `rolling_budget` of the previous [`Plan`], fed back by the adapter; `None` when
+    /// the previous plan had none (or there was no previous plan). While `Some`, the rolling
+    /// buffer deletes oldest hot segments until remaining hot video is at most this level.
+    /// The target is an absolute level, so segment-size overshoot never accumulates.
+    pub rolling_budget: Option<u64>,
 }
 
 /// Percent of `capacity` rounded down.
@@ -187,11 +201,16 @@ struct Moves {
 struct HotNeed {
     /// Bytes that must leave the hot volume to reach the target (0 when not below the floor).
     needed: u64,
-    /// Bytes hot deletes must free: 0 when not below the floor; the target shortfall when the
+    /// Bytes hot deletes must free: 0 when not below the floor or when the floor is unreachable
+    /// (the rolling buffer sizes its deletes by the budget instead); the target shortfall when the
     /// target is reachable by deleting all hot video, else the floor shortfall.
     delete_goal: u64,
     /// The floor cannot be restored even by deleting all hot video.
     unsatisfiable: bool,
+    /// Total size of the hot segments.
+    hot_total: u64,
+    /// Hot-video level the rolling buffer holds, were it in effect.
+    budget: u64,
 }
 
 /// Archive-side facts.
@@ -206,8 +225,8 @@ struct ArchiveFacts {
 /// Order of actions: archive deletions, then `MoveToArchive` oldest first, then hot deletions.
 /// Hot video is deleted only when the archive cannot take it, and never to restore a floor that
 /// deleting it cannot reach (ADR 0005 section 6 case 4); then moves are still planned and,
-/// without a usable archive, a rolling buffer deletes hot video as fast as `ingested_bytes`
-/// arrives. The same holds for the archive: its video is evicted only when that can restore
+/// without a usable archive, a rolling buffer deletes the oldest hot video until it is at
+/// most the rolling budget (see [`PlanInput::rolling_budget`]). The same holds for the archive: its video is evicted only when that can restore
 /// its floor.
 ///
 /// # Errors
@@ -241,12 +260,15 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             0
         },
         delete_goal: match (below, unsatisfiable, reachable >= hot_target) {
-            (false, _, _) => 0,
-            (true, true, _) => input.ingested_bytes,
+            (false, _, _) | (true, true, _) => 0,
             (true, false, true) => hot_target.saturating_sub(free),
             (true, false, false) => hot_floor.saturating_sub(free),
         },
         unsatisfiable,
+        hot_total,
+        budget: input
+            .rolling_budget
+            .unwrap_or_else(|| hot_total.saturating_sub(input.ingested_bytes)),
     };
     let mut actions = Vec::new();
     let mut below_floor = false;
@@ -262,7 +284,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             archive_full: false,
         },
     };
-    let rolling_buffer = plan_hot_deletes(&hot, &need, &moves, archive.is_some(), &mut actions);
+    let rolling = plan_hot_deletes(&hot, &need, &moves, archive.is_some(), &mut actions);
     let archive_status = match (input.archive, archive) {
         (ArchiveState::Available(_), None) => ArchiveStatus::Unusable,
         (_, None) => ArchiveStatus::Unavailable,
@@ -274,11 +296,12 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         actions,
         archive: archive_status,
         archive_below_floor: below_floor,
-        hot: match (need.unsatisfiable, rolling_buffer) {
+        hot: match (need.unsatisfiable, rolling.deleted) {
             (false, _) => HotState::Ok,
             (true, false) => HotState::Unsatisfiable,
             (true, true) => HotState::RollingBuffer,
         },
+        rolling_budget: rolling.budget,
     })
 }
 
@@ -379,31 +402,58 @@ fn choose_moves(
     Ok(moves)
 }
 
-/// Pushes hot deletions when the archive cannot take the load; returns whether any hot
-/// segment was deleted to stop an unreachable floor from growing (the rolling buffer).
+/// Outcome of the hot-delete step.
+struct HotDeletes {
+    /// Hot video was deleted to hold an unreachable floor (the rolling buffer).
+    deleted: bool,
+    /// The rolling budget, set exactly in the rolling-buffer case.
+    budget: Option<u64>,
+}
+
+/// Pushes hot deletions when the archive cannot take the load.
 ///
 /// Deletion goes to the target only when deleting all hot video can reach it; when only the
 /// floor is reachable it stops there, since deleting further loses recordings for no gain.
+/// When the floor is unreachable (the rolling buffer) it deletes the oldest hot video until
+/// what remains after the moves is at most the budget.
 fn plan_hot_deletes(
     hot: &[&StoredSegment],
     need: &HotNeed,
     moves: &Moves,
     archive_available: bool,
     actions: &mut Vec<Action>,
-) -> bool {
+) -> HotDeletes {
+    let none = HotDeletes {
+        deleted: false,
+        budget: None,
+    };
     let archive_cannot_help = !archive_available || moves.archive_full;
     if !archive_cannot_help {
-        return false;
+        return none;
+    }
+    let mut deleted = false;
+    if need.unsatisfiable {
+        let mut remaining = need.hot_total.saturating_sub(moves.bytes);
+        for seg in hot.iter().skip(moves.count) {
+            if remaining <= need.budget {
+                break;
+            }
+            actions.push(Action::Delete(seg.id));
+            deleted = true;
+            remaining = remaining.saturating_sub(seg.bytes);
+        }
+        return HotDeletes {
+            deleted,
+            budget: Some(need.budget),
+        };
     }
     let mut gone = moves.bytes;
-    let mut deleted = false;
     for seg in hot.iter().skip(moves.count) {
         if gone >= need.delete_goal {
             break;
         }
         actions.push(Action::Delete(seg.id));
-        deleted = true;
         gone = gone.saturating_add(seg.bytes);
     }
-    deleted && need.unsatisfiable
+    none
 }
