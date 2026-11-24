@@ -1433,3 +1433,156 @@ fn adv_key_import_accepts_surrounding_whitespace_and_rejects_31_bytes() {
     assert!(cmd(&h2.env(), &["key", "import"], &mut t).is_err());
     assert!(!h2.paths().key.exists());
 }
+
+// ---- adversary round 2 ------------------------------------------------------------------------
+
+#[test]
+fn adv2_a_one_line_piped_credential_with_its_line_ending_is_refused() {
+    // `echo svc-reader | wardenlens vault set ... --kind credential` is one line, as is
+    // "svc-reader" without the newline (refused by `a_one_line_credential_is_refused`). The
+    // contract in `set --help` is "exactly two lines": neither form may store an empty password.
+    for input in ["svc-reader\n", "svc-reader\r\n"] {
+        let h = Home::new();
+        h.init();
+        let mut t = Fake::pipe().with_stdin(input);
+        let r = cmd(
+            &h.env(),
+            &["set", "cam:a:credential", "--kind", "credential"],
+            &mut t,
+        );
+        assert!(r.is_err(), "{input:?} was stored as a credential");
+    }
+}
+
+#[test]
+fn adv2_an_explicitly_empty_piped_password_is_two_lines_and_accepted() {
+    let h = Home::new();
+    h.init();
+    ok(
+        &h,
+        &["set", "cam:a:credential", "--kind", "credential"],
+        Fake::pipe().with_stdin("svc-reader\n\n"),
+    );
+    let pass = ok(
+        &h,
+        &["get", "cam:a:credential", "--field", "password"],
+        Fake::pipe(),
+    );
+    assert_eq!(pass, "");
+}
+
+#[test]
+fn adv2_credential_separators_and_trailing_forms() {
+    // (input, Some(password)) accepted, None refused.
+    let cases: [(&str, Option<&str>); 8] = [
+        ("u\np\n\r\n", Some("p")),
+        ("u\np\r\n\n", Some("p")),
+        ("u\n\npw-synthetic\n", None),
+        ("u\npw-synthetic\n \n", None),
+        ("u\npw-synthetic\nx", None),
+        ("u\r\npw syn thetic", Some("pw syn thetic")),
+        ("\npw-synthetic\n", None),
+        ("u\np\r\n\r\n\r\n", None),
+    ];
+    for (input, want) in cases {
+        let h = Home::new();
+        h.init();
+        let mut t = Fake::pipe().with_stdin(input);
+        let r = cmd(
+            &h.env(),
+            &["set", "cam:a:credential", "--kind", "credential"],
+            &mut t,
+        );
+        if let Some(w) = want {
+            {
+                r.unwrap();
+                let got = ok(
+                    &h,
+                    &["get", "cam:a:credential", "--field", "password"],
+                    Fake::pipe(),
+                );
+                assert_eq!(got, w, "{input:?}");
+            }
+        } else {
+            {
+                let err = r.unwrap_err();
+                assert!(!format!("{err} {err:?}").contains("pw-synthetic"), "{err}");
+                assert!(!t.err().contains("pw-synthetic") && !t.out().contains("pw-synthetic"));
+            }
+        }
+    }
+}
+
+#[test]
+fn adv2_every_subcommand_refuses_the_key_variable_before_touching_anything() {
+    // Even on an empty HOME (no vault): the key-variable refusal comes first, and nothing is created.
+    let h = Home::new();
+    let mut env = h.env();
+    env.key_var_set = true;
+    for args in [&["init"][..], &["key", "import"]] {
+        let mut t = Fake::tty().with_prompts(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]);
+        let err = cmd(&env, args, &mut t).unwrap_err();
+        assert!(err.to_string().contains("WARDENLENS_VAULT_KEY"), "{err}");
+        assert_eq!(err.exit_code(), 1);
+    }
+    assert_eq!(std::fs::read_dir(h.dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn adv2_unsafe_next_rule_text_is_identical_for_read_and_write() {
+    let h = Home::new();
+    h.init();
+    set_text(&h, "cam:a:host", "host", "192.0.2.77");
+    crash_after_commit(&h);
+    let next = h.paths().next_key();
+    // A symlink as next: fails the key rules.
+    let real = h.dir.path().join("elsewhere.key");
+    std::fs::rename(&next, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &next).unwrap();
+    let r = cmd(&h.env(), &["list"], &mut Fake::pipe()).unwrap_err();
+    let w = cmd(&h.env(), &["rm", "cam:a:host"], &mut Fake::pipe()).unwrap_err();
+    assert_eq!(r.to_string(), w.to_string());
+    assert_eq!((r.exit_code(), w.exit_code()), (2, 2));
+    assert!(
+        std::fs::symlink_metadata(&next)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn adv2_a_partial_legacy_import_then_a_rerun_completes_it() {
+    let home = Home::new();
+    home.init();
+    let p = home.paths();
+    let mut vault = Vault::open(&p.db, KeyFile::load(&p.key).unwrap()).unwrap();
+    let mut fill = Vec::new();
+    for n in 0..wardenlens_vault::MAX_ENTRIES - 1 {
+        let id = wardenlens_core::entry::EntryId::new(&format!("fill:{n}")).unwrap();
+        let v = wardenlens_vault::Value::Text(secrecy::SecretString::from("192.0.2.1".to_owned()));
+        vault
+            .set(
+                &id,
+                wardenlens_core::entry::EntryKind::Host,
+                &v,
+                wardenlens_vault::Scan::Normal,
+            )
+            .unwrap();
+        fill.push(id);
+    }
+    drop(vault);
+    let json = r#"[{"name":"A","login":"svc","password":"pw-synthetic-1"}]"#;
+    let files = legacy_files(&home, json, "[cameras.cam-a]\nname = \"A\"\n");
+    let (j, i) = (files.json.to_str().unwrap(), files.toml.to_str().unwrap());
+    let args = ["import-legacy", "--secret-json", j, "--inventory", i];
+    let err = cmd(&home.env(), &args, &mut Fake::pipe()).unwrap_err();
+    assert_eq!(err.exit_code(), 1, "{err}");
+    // Make room and re-run: everything is imported, nothing duplicated.
+    for id in fill.iter().take(10) {
+        ok(&home, &["rm", id.as_str()], Fake::pipe());
+    }
+    let out = ok(&home, &args, Fake::pipe());
+    assert!(out.contains("imported"), "{out}");
+    assert!(!out.contains("pw-synthetic"), "{out}");
+}

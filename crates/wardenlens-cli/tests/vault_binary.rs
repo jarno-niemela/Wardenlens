@@ -28,12 +28,8 @@ fn run_with_stdin(mut c: Command, stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // The child may exit before reading (a refusal); a broken pipe is then expected.
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -172,4 +168,59 @@ fn help_and_version_still_print() {
             .unwrap()
             .contains("exactly two lines")
     );
+}
+
+fn assert_no_marker(out: &Output, marker: &str) {
+    assert_eq!(out.status.code(), Some(2));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains(marker), "{all}");
+}
+
+#[test]
+fn clap_errors_never_echo_argv() {
+    let h = home();
+    let m = "zqmarker9x";
+    for args in [
+        vec![m],
+        vec!["vault", m],
+        vec!["vault", "key", m],
+        vec!["vault", "get", "cam:a:host", "--field", m],
+        vec!["vault", "set", "cam:a:host", "--kind", m],
+        vec!["vault", "list", m],
+        vec!["vault", "--zqmarker9x"],
+    ] {
+        let mut c = wardenlens(&h);
+        c.args(&args);
+        assert_no_marker(&run_with_stdin(c, ""), m);
+    }
+}
+
+#[test]
+fn one_line_credential_is_refused() {
+    let h = home();
+    vault(&h, &["init"], "");
+    for input in ["svc-reader\n", "svc-reader\r\n", "svc-reader"] {
+        let out = vault(&h, &["set", "cam:a:cred", "--kind", "credential"], input);
+        assert_eq!(out.status.code(), Some(1), "{input:?}");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("svc-reader"));
+    }
+}
+
+#[test]
+fn error_causes_are_not_doubled() {
+    let h = home();
+    vault(&h, &["init"], "");
+    let out = vault(&h, &["set", "BAD_ID", "--kind", "host"], "x\n");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(err.lines().count(), 1, "{err}");
+    let line = err.trim_end();
+    let tail = line.strip_prefix("error: ").unwrap();
+    // The cause text must not appear twice.
+    for part in tail.split(": ") {
+        assert_eq!(tail.matches(part).count(), 1, "{line}");
+    }
 }

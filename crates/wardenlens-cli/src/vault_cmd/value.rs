@@ -65,7 +65,14 @@ pub(super) fn read(kind: EntryKind, term: &mut impl Terminal) -> Result<Value, C
                     "a credential is two lines on stdin: username, then password",
                 ))?;
             let (u, rest) = raw.split_at(at);
-            let p = strip_trailing(rest.get(1..).unwrap_or_default());
+            let rest = rest.get(1..).unwrap_or_default();
+            // "user\n" alone is one line, not a credential with an empty password.
+            if rest.is_empty() {
+                return Err(CliError::Refused(
+                    "a credential is two lines on stdin: username, then password",
+                ));
+            }
+            let p = strip_trailing(rest);
             // Exactly two lines: anything left that spans another line is refused, unnamed.
             if p.contains(&b'\n') {
                 return Err(CliError::Refused(

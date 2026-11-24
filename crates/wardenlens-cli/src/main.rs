@@ -48,15 +48,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Clap echoes the offending text for these kinds, and a value put on argv by mistake must not
-/// reach a terminal log, so a fixed message replaces it. Help, version and the rest print as is.
+/// Clap echoes the offending text in most error kinds, and a value put on argv by mistake must not
+/// reach a terminal log. Only kinds known to echo nothing pass through; every other kind (and any
+/// kind added later) gets a fixed message.
 fn usage_error(e: &clap::Error) -> ExitCode {
     match e.kind() {
-        ErrorKind::UnknownArgument | ErrorKind::InvalidValue => fail(
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayVersion
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::MissingRequiredArgument
+        | ErrorKind::MissingSubcommand => e.exit(),
+        _ => fail(
             "error: invalid arguments; values are never arguments (run `wardenlens vault --help`)",
             2,
         ),
-        _ => e.exit(),
     }
 }
 
@@ -80,8 +85,12 @@ fn report(e: &error::CliError, term: &mut impl Terminal) {
     let mut line = format!("error: {e}");
     let mut source = e.source();
     while let Some(s) = source {
-        line.push_str(": ");
-        line.push_str(&s.to_string());
+        let text = s.to_string();
+        // Some variants embed their source in their own message; do not print it twice.
+        if !line.ends_with(&text) {
+            line.push_str(": ");
+            line.push_str(&text);
+        }
         source = s.source();
     }
     // As in `fail`: nothing more can be done if stderr is closed.

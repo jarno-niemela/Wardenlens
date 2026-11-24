@@ -33,8 +33,9 @@ pub(crate) enum VaultCommand {
     ///
     /// On a terminal each field is a no-echo prompt. On a pipe the value is the whole of stdin
     /// minus its end: one trailing line ending (LF or CRLF) and, if that was present, one
-    /// further blank line. A credential is exactly two lines, username then password; a
-    /// third line is refused. Other line breaks inside a value are kept.
+    /// further blank line. A credential is exactly two lines, username then password (a
+    /// username line alone is refused; an empty second line is an empty password); a third
+    /// line is refused. Other line breaks inside a value are kept.
     Set(SetArgs),
     /// Write one value to stdout with no trailing text (pipe or terminal only).
     Get(GetArgs),
