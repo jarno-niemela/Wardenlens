@@ -58,6 +58,21 @@ pub(crate) enum VaultCommand {
     Key(KeyCommand),
     /// Import the legacy `AgentDVR` secret file and camera inventory.
     ImportLegacy(LegacyArgs),
+    /// Scan files and directories for any vault value. Exits 1 on a hit, 2 if the scan could not run.
+    ///
+    /// A hit is printed as `entry-id kind path:line`; the value, the matching text and the line
+    /// are never printed, and a path that contains a hit is replaced by `<redacted-path:N>`.
+    /// Binary files are skipped with a notice; a file over 8 MiB, an unreadable file and a
+    /// vault or key that cannot be used all make the scan fail (exit 2).
+    Scan(ScanArgs),
+}
+
+/// Arguments of `scan`.
+#[derive(Debug, Args)]
+pub(crate) struct ScanArgs {
+    /// Files and directories to scan; a directory is walked, symlinks inside it are skipped.
+    #[arg(required = true, value_name = "PATH")]
+    pub(crate) paths: Vec<PathBuf>,
 }
 
 /// `wardenlens vault key ...`

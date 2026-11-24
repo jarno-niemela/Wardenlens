@@ -30,9 +30,10 @@ pub enum Scan {
 
 /// Whether the leak scan can use a stored value.
 ///
-/// The flag does not yet apply the ADR 0006 section 7 squeeze table (zero-width characters,
-/// soft hyphens): a value made only of those is flagged `Scannable` here. #75 recomputes the
-/// flag for all kinds when it builds the matcher.
+/// The flag does not apply the ADR 0006 section 7 squeeze table (zero-width characters, soft
+/// hyphens): a value made only of those is flagged `Scannable` here. `Matcher` recomputes the
+/// rule from the squeezed needles when it is built and lists such an entry through
+/// `Matcher::unscannable`, so the scan never trusts this flag alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Scannability {

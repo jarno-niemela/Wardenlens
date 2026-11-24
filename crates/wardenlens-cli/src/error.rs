@@ -1,8 +1,8 @@
 //! The CLI error type. Messages carry ids, kinds and rule names only, never values (SEC-6).
 
 use wardenlens_secrets::SecretsError;
-use wardenlens_vault::VaultError;
 use wardenlens_vault::legacy::LegacyError;
+use wardenlens_vault::{ScanError, VaultError};
 
 /// Why a command failed.
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +25,19 @@ pub(crate) enum CliError {
     /// A legacy file could not be mapped.
     #[error("legacy import")]
     Legacy(#[from] LegacyError),
+    /// The leak scan itself failed (exit 2).
+    #[error(transparent)]
+    Scan(#[from] ScanError),
+    /// The scan could not run: the vault, the key or the paths were unusable (exit 2). The
+    /// cause is the source.
+    #[error("the scan could not run")]
+    CouldNotScan(#[source] Box<CliError>),
+    /// At least one vault value was found (exit 1). Only a count.
+    #[error("found {0} occurrence(s) of vault values")]
+    Leak(usize),
+    /// Some inputs could not be scanned (exit 2). Only a count.
+    #[error("{0} input(s) could not be scanned")]
+    Incomplete(usize),
     /// An I/O failure; `op` names the step, never a value.
     #[error("i/o failed during {op}")]
     Io {
@@ -44,7 +57,10 @@ impl CliError {
         match self {
             // Refusals the owner can act on directly, not an unusable vault or key.
             Self::Key(SecretsError::KeyFileExists | SecretsError::InvalidKeyEncoding) => 1,
-            Self::Key(_)
+            Self::Scan(_)
+            | Self::CouldNotScan(_)
+            | Self::Incomplete(_)
+            | Self::Key(_)
             | Self::KeyMismatch(_)
             | Self::Vault(
                 VaultError::WrongKey
