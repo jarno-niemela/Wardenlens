@@ -170,12 +170,15 @@ fn parent_of(path: &Path) -> Result<&Path, VaultError> {
 }
 
 /// The open sequence of ADR 0006 section 4. `between` runs after our own descriptor is checked
-/// and before SQLite opens the path (the window a swap attack needs); tests use it.
+/// and before SQLite opens the path (the window a swap attack needs); tests use it. `after_copy`
+/// runs after the probe has copied a journal into its scratch directory and before it re-checks
+/// that nothing moved (the window a racing writer needs); tests use it to drive that race.
 fn connect(
     path: &Path,
     key: &KeyFile,
     must_exist: bool,
     between: impl FnOnce(),
+    after_copy: &mut dyn FnMut(),
 ) -> Result<(Connection, PrivateFile), VaultError> {
     let parent = parent_of(path)?;
     refuse_work_tree(parent)?;
@@ -205,7 +208,7 @@ fn connect(
     between();
     if len > 0 {
         // Read-only probe before ANY pragma: a foreign database must stay byte-for-byte intact.
-        let is_vault = probe_existing(path, &file, must_exist.then_some(key))?;
+        let is_vault = probe_existing(path, &file, must_exist.then_some(key), after_copy)?;
         if !must_exist {
             return Err(if is_vault {
                 VaultError::AlreadyInitialized
@@ -257,7 +260,7 @@ fn file_len(file: &PrivateFile) -> Result<u64, VaultError> {
 const JOURNAL_POLL: Duration = Duration::from_millis(50);
 
 /// Loop iterations allowed after the busy timeout before a still-moving journal is refused.
-const MAX_RETRIES_AFTER_TIMEOUT: u32 = 20;
+pub(crate) const MAX_RETRIES_AFTER_TIMEOUT: u32 = 20;
 
 fn sidecar(path: &Path, suffix: &str) -> std::ffi::OsString {
     let mut name = path.as_os_str().to_owned();
@@ -316,7 +319,10 @@ fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
 /// identification then runs on the rolled-back copy, which is the state a recovery would leave.
 /// The originals are never modified by the probe; only a copy that proves to be the owner's
 /// vault lets the caller open the real file, and then SQLite rolls back the real journal. On
-/// `create` the result is [`VaultError::PendingJournal`].
+/// `create` (`key` is `None`) the same copy is made and only the identity is judged: a copy that
+/// is not a vault (a crashed `create`) is `Ok(false)` ([`VaultError::NotEmpty`] for the caller),
+/// a copy that is a vault is [`VaultError::PendingJournal`]. A journal that ends in a
+/// super-journal pointer is never copied.
 ///
 /// Returns `Ok(false)` for anything that is not a vault. Only "not a database" and schema errors
 /// mean that; every other SQLite error (corruption, I/O and so on) is passed on.
@@ -325,12 +331,14 @@ fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
 /// [`VaultError::UnsupportedSchema`], [`VaultError::NotInitialized`] (no keycheck row) and
 /// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks
 /// (judged after rolling back a hot journal, on the copy); [`VaultError::PendingJournal`] if the
-/// copy stays corrupt after the rollback (or on `create`); [`VaultError::Io`] and non-corruption
+/// copy stays corrupt after the rollback, the retry cap is exhausted, a timed-out raced read
+/// finds the file corrupt, or `create` meets a vault; [`VaultError::Io`] and non-corruption
 /// [`VaultError::Sqlite`] errors are passed on.
 fn probe_existing(
     path: &Path,
     file: &PrivateFile,
     key: Option<&KeyFile>,
+    after_copy: &mut dyn FnMut(),
 ) -> Result<bool, VaultError> {
     if !rollback_header(file)? || wal_present(path)? {
         return Ok(false);
@@ -347,11 +355,12 @@ fn probe_existing(
         }
         if journal_present(path)? {
             if timed_out {
-                let Some(key) = key else {
-                    return Err(VaultError::PendingJournal);
-                };
-                if let Some(verdict) = probe_rolled_back_copy(path, file, key)? {
-                    return Ok(verdict && !wal_present(path)?);
+                if let Some(verdict) = probe_rolled_back_copy(path, file, key, after_copy)? {
+                    if verdict && key.is_none() {
+                        // `create` met a vault with an unfinished transaction.
+                        return Err(VaultError::PendingJournal);
+                    }
+                    return confirm_no_wal(path, Ok(verdict));
                 }
                 // The journal went away or a writer raced the copy: look again.
                 std::thread::sleep(JOURNAL_POLL);
@@ -363,19 +372,28 @@ fn probe_existing(
         let before = change_counter(file)?;
         let result = immutable_probe(path, file, key);
         if before == change_counter(file)? && !journal_present(path)? {
-            if matches!(result, Ok(true)) && wal_present(path)? {
-                return Ok(false);
-            }
-            return result;
+            return confirm_no_wal(path, result);
         }
         // A writer got in between the checks and the read.
         if timed_out {
             return match result {
                 Err(e) if is_corruption(&e) => Err(VaultError::PendingJournal),
-                other => other,
+                other => confirm_no_wal(path, other),
             };
         }
         std::thread::sleep(JOURNAL_POLL);
+    }
+}
+
+/// A positive verdict is withdrawn if a `-wal` appeared while it was being reached (a vault
+/// never uses WAL). Every way out of the probe that reports "this is a vault" passes through here.
+pub(crate) fn confirm_no_wal(
+    path: &Path,
+    verdict: Result<bool, VaultError>,
+) -> Result<bool, VaultError> {
+    match verdict {
+        Ok(true) if wal_present(path)? => Ok(false),
+        other => other,
     }
 }
 
@@ -480,7 +498,8 @@ fn copy_bounded(src: &std::fs::File, dst: &Path) -> Result<bool, VaultError> {
 fn probe_rolled_back_copy(
     path: &Path,
     file: &PrivateFile,
-    key: &KeyFile,
+    key: Option<&KeyFile>,
+    after_copy: &mut dyn FnMut(),
 ) -> Result<Option<bool>, VaultError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = parent_of(path)?;
@@ -505,12 +524,18 @@ fn probe_rolled_back_copy(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(VaultError::io("opening journal")(e)),
     };
-    let stamp = |j: &std::fs::File| -> Result<(bool, u64, u64, u64), VaultError> {
-        let m = j.metadata().map_err(VaultError::io("inspecting journal"))?;
-        Ok((m.is_file(), m.dev(), m.ino(), m.len()))
-    };
-    let journal_before = stamp(&journal)?;
+    let stamp = |m: &std::fs::Metadata| (m.is_file(), m.dev(), m.ino(), m.len());
+    let journal_before = stamp(
+        &journal
+            .metadata()
+            .map_err(VaultError::io("inspecting journal"))?,
+    );
     if !journal_before.0 {
+        return Err(VaultError::PendingJournal);
+    }
+    // A vault never writes a super-journal pointer, and SQLite would follow it (and open a FIFO
+    // under a valid `-mj` name, blocking) while rolling the copy back: refuse before copying.
+    if ends_with_super_pointer(&journal, journal_before.3)? {
         return Err(VaultError::PendingJournal);
     }
     let counter_before = change_counter(file)?;
@@ -521,7 +546,15 @@ fn probe_rolled_back_copy(
     if !copied {
         return Err(VaultError::PendingJournal);
     }
-    if change_counter(file)? != counter_before || stamp(&journal)? != journal_before {
+    after_copy();
+    // The journal is re-stamped through its path, not the descriptor: a journal renamed over the
+    // path (a different file now) must be noticed too.
+    let journal_after = match Path::new(&journal_path).symlink_metadata() {
+        Ok(m) => Some(stamp(&m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(VaultError::io("inspecting journal")(e)),
+    };
+    if change_counter(file)? != counter_before || journal_after != Some(journal_before) {
         // A writer was active during the copy: the copy may be torn. Probe again.
         return Ok(None);
     }
@@ -532,8 +565,26 @@ fn probe_rolled_back_copy(
     }
 }
 
-/// Opens the scratch copy read-write (SQLite rolls its hot journal back) and identifies it.
-fn identify_copy(copy: &Path, key: &KeyFile) -> Result<bool, VaultError> {
+/// True if the last 8 bytes of the journal (`len` long) are the magic that ends a super-journal
+/// pointer (the layout SQLite's `readSuperJournal` reads).
+fn ends_with_super_pointer(journal: &std::fs::File, len: u64) -> Result<bool, VaultError> {
+    use std::os::unix::fs::FileExt;
+    const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    let Some(at) = len.checked_sub(8) else {
+        return Ok(false);
+    };
+    let mut tail = [0u8; 8];
+    match journal.read_exact_at(&mut tail, at) {
+        Ok(()) => Ok(tail == MAGIC),
+        // The journal shrank under us: the stamp check will notice.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(VaultError::io("reading journal")(e)),
+    }
+}
+
+/// Opens the scratch copy read-write (SQLite rolls its hot journal back) and identifies it. With
+/// `key` the `open` checks run on the rows; without it (`create`) only the identity is judged.
+fn identify_copy(copy: &Path, key: Option<&KeyFile>) -> Result<bool, VaultError> {
     let conn = Connection::open_with_flags(
         copy,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -560,7 +611,9 @@ fn identify_copy(copy: &Path, key: &KeyFile) -> Result<bool, VaultError> {
             Err(e) => return Err(VaultError::io("reading scratch copy")(e)),
         }
     }
-    judge(rows, key)?;
+    if let Some(key) = key {
+        judge(rows, key)?;
+    }
     Ok(true)
 }
 
@@ -720,7 +773,7 @@ impl Vault {
         key: KeyFile,
         between: impl FnOnce(),
     ) -> Result<Self, VaultError> {
-        let (mut conn, file) = connect(path, &key, false, between)?;
+        let (mut conn, file) = connect(path, &key, false, between, &mut || {})?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(VaultError::sqlite("begin"))?;
@@ -778,7 +831,16 @@ impl Vault {
         key: KeyFile,
         between: impl FnOnce(),
     ) -> Result<Self, VaultError> {
-        let (conn, file) = connect(path, &key, true, between)?;
+        Self::open_with_hooks(path, key, between, &mut || {})
+    }
+
+    pub(crate) fn open_with_hooks(
+        path: &Path,
+        key: KeyFile,
+        between: impl FnOnce(),
+        after_copy: &mut dyn FnMut(),
+    ) -> Result<Self, VaultError> {
+        let (conn, file) = connect(path, &key, true, between, after_copy)?;
         if !has_meta(&conn)? {
             return Err(VaultError::NotInitialized);
         }
