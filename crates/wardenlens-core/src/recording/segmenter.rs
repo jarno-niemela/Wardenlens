@@ -1,7 +1,8 @@
 //! `Segmenter`: decides where segments start and end (ADR 0005 section 2).
 
 use super::clock::{MediaClock, TICKS_PER_SECOND};
-use super::path::{CameraId, RecordingError, UnixMs};
+use super::path::{CameraId, RecordingError};
+use crate::time::{DurationMs, Timestamp, UnixMs};
 
 /// Metadata of one encoded frame, as the recorder sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +60,9 @@ pub struct SegmentRecord {
 impl SegmentRecord {
     /// `started_at_ms + duration_ms`; saturates instead of overflowing.
     #[must_use]
-    pub fn ended_at_ms(&self) -> u64 {
-        self.started_at_ms.get().saturating_add(self.duration_ms)
+    pub fn ended_at_ms(&self) -> Timestamp {
+        Timestamp::from(self.started_at_ms)
+            .saturating_add(DurationMs::from_millis(self.duration_ms))
     }
 }
 
@@ -252,7 +254,7 @@ mod tests {
 
     use super::*;
 
-    const T0: u64 = 1_700_000_000_000;
+    const T0: i64 = 1_700_000_000_000;
 
     fn seg(target: u32) -> Segmenter {
         Segmenter::new(
@@ -261,7 +263,7 @@ mod tests {
         )
     }
 
-    fn frame(key: bool, rtp: u32, at: u64, bytes: u64) -> FrameMeta {
+    fn frame(key: bool, rtp: u32, at: i64, bytes: u64) -> FrameMeta {
         FrameMeta {
             is_keyframe: key,
             media_ts_90k: rtp,
@@ -277,7 +279,7 @@ mod tests {
                 s.push(frame(
                     i % gop == 0,
                     i * 90_000,
-                    T0 + u64::from(i) * 1000,
+                    T0 + i64::from(i) * 1000,
                     100,
                 ))
             })
@@ -317,7 +319,7 @@ mod tests {
         let mut s = seg(10);
         // keyframes at 0, 4, 8, 12, 16 s; target 10 s -> cut at 12 s
         let out: Vec<Pushed> = (0..14u32)
-            .map(|i| s.push(frame(i % 4 == 0, i * 90_000, T0 + u64::from(i) * 1000, 10)))
+            .map(|i| s.push(frame(i % 4 == 0, i * 90_000, T0 + i64::from(i) * 1000, 10)))
             .collect();
         let starts: Vec<usize> = out
             .iter()
@@ -329,9 +331,9 @@ mod tests {
         let r = out[12].closed.as_ref().unwrap();
         assert_eq!(r.frame_count, 12);
         assert_eq!(r.bytes, 120);
-        assert_eq!(r.started_at_ms.get(), T0);
+        assert_eq!(r.started_at_ms.as_i64(), T0);
         assert_eq!(r.duration_ms, 12_000);
-        assert_eq!(r.ended_at_ms(), T0 + 12_000);
+        assert_eq!(r.ended_at_ms(), Timestamp::from_unix_millis(T0 + 12_000));
         assert_eq!(out[12].dts, Some(0));
         assert_eq!(out[13].dts, Some(90_000));
     }
@@ -426,7 +428,7 @@ mod tests {
                 s.push(frame(
                     i == 0,
                     base.wrapping_add(i * 90_000),
-                    T0 + u64::from(i) * 1000,
+                    T0 + i64::from(i) * 1000,
                     1,
                 ))
             })
@@ -461,7 +463,7 @@ mod tests {
             .enumerate()
             .map(|(i, &ms)| {
                 let rtp = u32::try_from(ms * 90).unwrap();
-                s.push(frame(i == 0, rtp, T0 + ms, 1))
+                s.push(frame(i == 0, rtp, T0 + i64::try_from(ms).unwrap(), 1))
             })
             .collect()
     }
@@ -530,7 +532,10 @@ mod tests {
                 proptest::prop_assert!(r.duration_ms >= 1);
                 proptest::prop_assert!(r.duration_ms <= 600_000);
                 proptest::prop_assert!(r.frame_count >= 1);
-                proptest::prop_assert_eq!(r.ended_at_ms(), r.started_at_ms.get() + r.duration_ms);
+                proptest::prop_assert_eq!(
+                    r.ended_at_ms().as_unix_millis(),
+                    r.started_at_ms.as_i64() + i64::try_from(r.duration_ms).unwrap()
+                );
                 summed_frames += r.frame_count;
             }
             proptest::prop_assert_eq!(summed_frames, appended);

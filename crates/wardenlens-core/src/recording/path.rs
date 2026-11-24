@@ -1,7 +1,9 @@
-//! Validated camera ids, bounded wall-clock times and the derived segment path.
+//! Validated camera ids and the derived segment path.
 
 use std::fmt;
 use std::str::FromStr;
+
+use crate::time::UnixMs;
 
 /// Errors from the recording module's validated types and the segmenter config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,8 +11,6 @@ use std::str::FromStr;
 pub enum RecordingError {
     /// The camera id is not `[a-z][a-z0-9-]{0,31}`.
     InvalidCameraId,
-    /// The wall-clock time is outside the years 2000-2099.
-    TimeOutOfRange,
     /// The path is not the canonical `<camera>/<YYYY-MM-DD>/<HHMMSS>-<mmm>.mp4`.
     InvalidRelPath,
     /// The target segment duration is outside 10-290 s.
@@ -23,7 +23,6 @@ impl fmt::Display for RecordingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidCameraId => "camera id must match [a-z][a-z0-9-]{0,31}",
-            Self::TimeOutOfRange => "time is outside the years 2000-2099",
             Self::InvalidRelPath => "not a canonical segment path",
             Self::TargetOutOfRange => "target segment duration must be 10-290 seconds",
             Self::ZeroByteCap => "segment byte cap must be positive",
@@ -66,38 +65,6 @@ impl FromStr for CameraId {
 impl fmt::Display for CameraId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-/// UTC Unix milliseconds bounded to 2000-01-01 ..= 2099-12-31 (the index `CHECK`).
-///
-/// Minimal local definition: the connection module (#46) owns the shared
-/// timestamp type and this is unified with it when both land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UnixMs(u64);
-
-impl UnixMs {
-    /// First valid instant, 2000-01-01T00:00:00.000Z.
-    pub const MIN: u64 = 946_684_800_000;
-    /// Last valid instant, 2099-12-31T23:59:59.999Z.
-    pub const MAX: u64 = 4_102_444_799_999;
-
-    /// Validates a millisecond value.
-    ///
-    /// # Errors
-    /// [`RecordingError::TimeOutOfRange`] outside the years 2000-2099.
-    pub fn new(ms: u64) -> Result<Self, RecordingError> {
-        if (Self::MIN..=Self::MAX).contains(&ms) {
-            Ok(Self(ms))
-        } else {
-            Err(RecordingError::TimeOutOfRange)
-        }
-    }
-
-    /// The raw millisecond value.
-    #[must_use]
-    pub fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -171,8 +138,7 @@ impl RelPath {
 
 impl fmt::Display for RelPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // UnixMs is at most 4.1e12, which always fits i64.
-        let ms = i64::try_from(self.started_at.get()).map_err(|_| fmt::Error)?;
+        let ms = self.started_at.as_i64();
         let (year, month, day) = civil_from_days(ms.div_euclid(MS_PER_DAY));
         let in_day = ms.rem_euclid(MS_PER_DAY);
         let (hour, minute, second, milli) = (
@@ -245,9 +211,7 @@ impl FromStr for RelPath {
             + mi * 60_000
             + sec * 1000
             + milli;
-        let started_at = u64::try_from(ms)
-            .map_err(|_| RecordingError::InvalidRelPath)
-            .and_then(|v| UnixMs::new(v).map_err(|_| RecordingError::InvalidRelPath))?;
+        let started_at = UnixMs::new(ms).map_err(|_| RecordingError::InvalidRelPath)?;
         let path = Self::new(&camera, started_at);
         // Canonical form only: rejects hour 24+, minute 60+, 31 February and the like.
         if path.to_string() == s {
@@ -262,6 +226,9 @@ impl FromStr for RelPath {
 mod tests {
     use super::*;
 
+    const MIN_MS: i64 = 946_684_800_000;
+    const MAX_MS: i64 = 4_102_444_799_999;
+
     fn cam(s: &str) -> CameraId {
         s.parse().unwrap()
     }
@@ -275,18 +242,19 @@ mod tests {
 
     #[test]
     fn formats_the_range_boundaries() {
-        let first = RelPath::new(&cam("a"), UnixMs::new(UnixMs::MIN).unwrap());
+        let first = RelPath::new(&cam("a"), UnixMs::new(MIN_MS).unwrap());
         assert_eq!(first.to_string(), "a/2000-01-01/000000-000.mp4");
-        let last = RelPath::new(&cam("a"), UnixMs::new(UnixMs::MAX).unwrap());
+        let last = RelPath::new(&cam("a"), UnixMs::new(MAX_MS).unwrap());
         assert_eq!(last.to_string(), "a/2099-12-31/235959-999.mp4");
     }
 
     #[test]
     fn rejects_times_outside_2000_2099() {
-        assert!(UnixMs::new(UnixMs::MIN - 1).is_err());
-        assert!(UnixMs::new(UnixMs::MAX + 1).is_err());
+        assert!(UnixMs::new(MIN_MS - 1).is_err());
+        assert!(UnixMs::new(MAX_MS + 1).is_err());
         assert!(UnixMs::new(0).is_err());
-        assert!(UnixMs::new(u64::MAX).is_err());
+        assert!(UnixMs::new(i64::MAX).is_err());
+        assert!(UnixMs::new(-1).is_err());
     }
 
     #[test]
@@ -336,13 +304,13 @@ mod tests {
     #[test]
     fn parses_a_canonical_path() {
         let p: RelPath = "hdipc/2024-02-29/134507-042.mp4".parse().unwrap();
-        assert_eq!(p.started_at().get(), 1_709_214_307_042);
+        assert_eq!(p.started_at().as_i64(), 1_709_214_307_042);
         assert_eq!(p.camera().as_str(), "hdipc");
     }
 
     proptest::proptest! {
         #[test]
-        fn path_round_trips(ms in UnixMs::MIN..=UnixMs::MAX, id in "[a-z][a-z0-9-]{0,31}") {
+        fn path_round_trips(ms in MIN_MS..=MAX_MS, id in "[a-z][a-z0-9-]{0,31}") {
             let p = RelPath::new(&id.parse().unwrap(), UnixMs::new(ms).unwrap());
             let back: RelPath = p.to_string().parse().unwrap();
             proptest::prop_assert_eq!(back, p);

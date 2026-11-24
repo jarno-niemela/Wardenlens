@@ -1,0 +1,20 @@
+[package]
+name = "wardenlens-mp4"
+description = "Fragmented MP4 (fMP4) writer for H.264 passthrough. No I/O beyond std::io::Write."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Golden tests walk the writer's output with the bounded core parser (ADR 0005 section 1).
+wardenlens-core = { workspace = true }
+proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

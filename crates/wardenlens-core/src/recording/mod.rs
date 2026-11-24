@@ -9,7 +9,7 @@ mod path;
 mod segmenter;
 
 pub use clock::{MAX_STEP_TICKS, MediaClock, TICKS_PER_SECOND};
-pub use path::{CameraId, RecordingError, RelPath, UnixMs};
+pub use path::{CameraId, RecordingError, RelPath};
 pub use segmenter::{
     Decision, FrameMeta, Pushed, SegmentConfig, SegmentRecord, Segmenter, ticks_to_ms_ceil,
 };
