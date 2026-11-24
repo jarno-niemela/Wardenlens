@@ -4,10 +4,12 @@ use std::collections::HashSet;
 
 use proptest::prelude::*;
 
+use crate::time::{DurationMs, Timestamp};
+
 use super::tests::simulate;
 use super::{
     Action, ArchiveState, MinFreePercent, PlanInput, Policy, SegmentId, StoredSegment, Tier,
-    TimestampMs, VolumeSpace, plan,
+    VolumeSpace, plan,
 };
 
 fn volume() -> impl Strategy<Value = VolumeSpace> {
@@ -27,7 +29,7 @@ fn segments() -> impl Strategy<Value = Vec<StoredSegment>> {
                 id: SegmentId::new(u64::try_from(i).unwrap_or(0)),
                 tier: if hot { Tier::Hot } else { Tier::Archive },
                 bytes,
-                ended_at: TimestampMs::new(ended),
+                ended_at: Timestamp::from_unix_millis(i64::try_from(ended).unwrap()),
             })
             .collect()
     })
@@ -47,12 +49,12 @@ proptest! {
         let policy = Policy {
             hot_min_free: MinFreePercent::new(hot_pct).unwrap(),
             archive_min_free: MinFreePercent::new(arch_pct).unwrap(),
-            hot_max_age: std::time::Duration::from_millis(max_age_ms),
+            hot_max_age: DurationMs::from_millis(max_age_ms),
         };
         let state = archive.map_or(ArchiveState::Unavailable, ArchiveState::Available);
         let input = PlanInput {
             hot, archive: state, segments: &segs,
-            now: TimestampMs::new(2_000_000), policy, ingested_bytes: ingested,
+            now: Timestamp::from_unix_millis(2_000_000), policy, ingested_bytes: ingested,
         };
         let p = plan(&input).unwrap();
 

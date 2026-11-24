@@ -1,7 +1,8 @@
 //! Value types of the storage planner.
 
 use std::fmt;
-use std::time::Duration;
+
+use crate::time::{DurationMs, Timestamp};
 
 /// A storage tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,27 +28,6 @@ impl SegmentId {
     /// The raw id.
     #[must_use]
     pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-/// UTC Unix time in milliseconds.
-///
-/// A minimal local type; to be unified with the connection module's
-/// `Timestamp` when both are on `main`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TimestampMs(u64);
-
-impl TimestampMs {
-    /// Wraps a millisecond count.
-    #[must_use]
-    pub const fn new(millis: u64) -> Self {
-        Self(millis)
-    }
-
-    /// The millisecond count.
-    #[must_use]
-    pub const fn as_millis(self) -> u64 {
         self.0
     }
 }
@@ -113,7 +93,7 @@ pub struct Policy {
     /// Floor of the archive volume.
     pub archive_min_free: MinFreePercent,
     /// Hot segments that ended earlier than this are moved even without pressure.
-    pub hot_max_age: Duration,
+    pub hot_max_age: DurationMs,
 }
 
 impl Default for Policy {
@@ -122,7 +102,7 @@ impl Default for Policy {
         Self {
             hot_min_free: MinFreePercent::default(),
             archive_min_free: MinFreePercent::default(),
-            hot_max_age: Duration::from_hours(12),
+            hot_max_age: DurationMs::from_secs(12 * 3600),
         }
     }
 }
@@ -164,5 +144,5 @@ pub struct StoredSegment {
     /// Size in bytes.
     pub bytes: u64,
     /// When the segment ended.
-    pub ended_at: TimestampMs,
+    pub ended_at: Timestamp,
 }

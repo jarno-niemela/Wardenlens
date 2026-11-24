@@ -23,5 +23,5 @@ mod tests;
 pub use plan::{Action, ArchiveStatus, Plan, PlanError, PlanInput, plan};
 pub use types::{
     ArchiveState, MinFreePercent, MinFreePercentError, Policy, SegmentId, StoredSegment, Tier,
-    TimestampMs, VolumeSpace,
+    VolumeSpace,
 };

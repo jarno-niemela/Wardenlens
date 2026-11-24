@@ -3,9 +3,9 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use super::types::{
-    ArchiveState, Policy, SegmentId, StoredSegment, Tier, TimestampMs, VolumeSpace,
-};
+use crate::time::Timestamp;
+
+use super::types::{ArchiveState, Policy, SegmentId, StoredSegment, Tier, VolumeSpace};
 
 /// One step of a plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +79,7 @@ pub struct PlanInput<'a> {
     /// All segments of both tiers.
     pub segments: &'a [StoredSegment],
     /// The current time.
-    pub now: TimestampMs,
+    pub now: Timestamp,
     /// Policy.
     pub policy: Policy,
     /// Bytes recorded since the previous plan; sizes the rolling buffer.
@@ -236,10 +236,6 @@ fn choose_moves(
     archive_total: u64,
     archive_floor: u64,
 ) -> Result<Moves, PlanError> {
-    let cutoff = input
-        .now
-        .as_millis()
-        .saturating_sub(u64::try_from(input.policy.hot_max_age.as_millis()).unwrap_or(u64::MAX));
     // Most the archive can offer once everything it holds is evicted.
     let room = space.free_bytes.saturating_add(archive_total);
     let mut moves = Moves {
@@ -248,7 +244,7 @@ fn choose_moves(
         archive_full: false,
     };
     for seg in hot {
-        let aged = seg.ended_at.as_millis() < cutoff;
+        let aged = input.now.saturating_duration_since(seg.ended_at) > input.policy.hot_max_age;
         let pressure = need.unsatisfiable || moves.bytes < need.needed;
         if !aged && !pressure {
             break;

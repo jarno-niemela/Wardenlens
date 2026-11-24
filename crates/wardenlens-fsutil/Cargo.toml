@@ -1,0 +1,18 @@
+[package]
+name = "wardenlens-fsutil"
+description = "Filesystem trust-boundary helpers: secure SQLite-file open, RootDir (openat2) and quarantine rename."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustix = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

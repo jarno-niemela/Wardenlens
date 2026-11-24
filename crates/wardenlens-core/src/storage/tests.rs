@@ -1,10 +1,10 @@
 //! Unit tests: ADR 0005 worked example, the case 4 override and the edges.
 
-use std::time::Duration;
+use crate::time::{DurationMs, Timestamp};
 
 use super::{
     Action, ArchiveState, ArchiveStatus, MinFreePercent, Plan, PlanError, PlanInput, Policy,
-    SegmentId, StoredSegment, Tier, TimestampMs, VolumeSpace, plan,
+    SegmentId, StoredSegment, Tier, VolumeSpace, plan,
 };
 
 /// Applies a plan to a simulated state: `(hot free, archive free, segments)`.
@@ -44,7 +44,7 @@ fn seg(id: u64, tier: Tier, bytes: u64, ended_ms: u64) -> StoredSegment {
         id: SegmentId::new(id),
         tier,
         bytes,
-        ended_at: TimestampMs::new(ended_ms),
+        ended_at: Timestamp::from_unix_millis(i64::try_from(ended_ms).unwrap()),
     }
 }
 
@@ -58,9 +58,9 @@ fn input(
         hot,
         archive,
         segments,
-        now: TimestampMs::new(1_000_000),
+        now: Timestamp::from_unix_millis(1_000_000),
         policy: Policy {
-            hot_max_age: Duration::from_secs(u64::MAX / 2000),
+            hot_max_age: DurationMs::from_millis(u64::MAX),
             ..Policy::default()
         },
         ingested_bytes,
@@ -207,8 +207,8 @@ fn moves_segments_older_than_hot_max_age_without_pressure() {
         seg(3, Tier::Hot, 10, 900_000),
     ];
     i.segments = &segments;
-    i.now = TimestampMs::new(100_000);
-    i.policy.hot_max_age = Duration::from_millis(60_000);
+    i.now = Timestamp::from_unix_millis(100_000);
+    i.policy.hot_max_age = DurationMs::from_millis(60_000);
     // cutoff 40,000: only segment 1 ended before it.
     let p = plan(&i).unwrap();
     assert_eq!(ids(&p), vec![Action::MoveToArchive(SegmentId::new(1))]);
@@ -226,8 +226,8 @@ fn max_age_larger_than_now_moves_nothing() {
     };
     let segments = [seg(1, Tier::Hot, 10, 0)];
     let mut i = input(hot, ArchiveState::Available(arch), &segments, 0);
-    i.now = TimestampMs::new(5);
-    i.policy.hot_max_age = Duration::from_secs(3600);
+    i.now = Timestamp::from_unix_millis(5);
+    i.policy.hot_max_age = DurationMs::from_secs(3600);
     assert_eq!(ids(&plan(&i).unwrap()), Vec::<Action>::new());
 }
 
@@ -316,8 +316,8 @@ fn archive_unavailable_and_hot_above_floor_plans_nothing_even_for_aged_segments(
     };
     let segments = [seg(1, Tier::Hot, 15, 0)];
     let mut i = input(hot, ArchiveState::Unavailable, &segments, 0);
-    i.now = TimestampMs::new(10_000_000_000);
-    i.policy.hot_max_age = Duration::from_secs(1);
+    i.now = Timestamp::from_unix_millis(10_000_000_000);
+    i.policy.hot_max_age = DurationMs::from_secs(1);
     assert_eq!(ids(&plan(&i).unwrap()), Vec::<Action>::new());
 }
 
