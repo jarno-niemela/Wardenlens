@@ -526,4 +526,3 @@ async fn undocumented_path_is_never_served() {
 }
 
 mod adversary;
-mod adversary_r2;
