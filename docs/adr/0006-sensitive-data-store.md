@@ -42,7 +42,7 @@ licence allow list in `deny.toml`), ADR 0004's crate map (section 8), a Docker d
 that may appear in committed files, prompts and logs. Ids match `[a-z0-9][a-z0-9:_.-]{0,127}`, are plaintext in the
 database and in `vault list`, and must never be derived from a value. The prefix `meta:` is **reserved** for the store's
 own entries (`meta:keycheck`); `set` and `import-legacy` refuse it. Imported ids come from the inventory ids (ADR 0002,
-`cam:reolink-1:host`) or from an ordinal (`cam:import-3:host`), never from a value. **One rule refuses a bad id:** before
+`cam:reolink-1:host`) or from an ordinal (`cam:import-json-3:host` or `cam:import-toml-3:host`), never from a value. **One rule refuses a bad id:** before
 storing, the section 7 matcher for the new value (built for its kind) is run over the id string, and a hit refuses the
 entry (this catches `cam:192-0-2-10:host` for the value `192.0.2.10`). Everything else about ids is review (residual
 risk 6).
@@ -160,6 +160,19 @@ Rules:
 - The vault uses `journal_mode = DELETE` and `synchronous = FULL`: it is tiny and rarely written, and no `-wal`
   or `-shm` sidecar files are created. (Sidecars would only hold ciphertext anyway.) Every connection sets a busy
   timeout of 5 seconds, so a scan during a write waits instead of failing.
+  The read-only identity probe (which runs before any read-write open) honours this too: a non-empty `-journal` is
+  polled for up to the same 5 seconds. If it is still there, `open` does not judge the torn main file: it writes a
+  private copy of the vault file and the journal into a `.wardenlens-probe-*` directory (mode 0700, files 0600)
+  beside the vault and lets SQLite roll the copy back; the verdict is taken on the rolled-back copy. A wrong key
+  gives `WrongKey`, a foreign database `NotInitialized`, an unknown schema `UnsupportedSchema`. `PendingJournal`
+  is returned only for `create`, for a copy that is still corrupt after the rollback, for a copy over the cap
+  (256 MiB per file) or for a journal that is not a regular file (checked with `O_NOFOLLOW | O_NONBLOCK`, so a
+  FIFO or symlink cannot hang or redirect the open). The directory is removed on every return path but is left
+  behind if the process is killed during the probe. Only a copy that proves to be the owner's vault lets `open`
+  proceed on the real file, so SQLite rolls back its own hot journal. The originals are never modified, the journal
+  is never deleted and a `-wal` sidecar is always refused. The safety against a journal that names a super-journal
+  (which SQLite would otherwise delete) relies on bundled SQLite (`rusqlite` with `features = ["bundled"]`,
+  3.54 or later) and must stay.
 - Schema (version 1): `meta(key TEXT PRIMARY KEY, value BLOB)` holding `schema_version` and `keycheck` (a sealed
   constant under id `meta:keycheck`, so a wrong key is detected before any entry is touched), and
   `entries(id TEXT PRIMARY KEY, kind INTEGER NOT NULL, record BLOB NOT NULL, created_at INTEGER NOT NULL, updated_at
