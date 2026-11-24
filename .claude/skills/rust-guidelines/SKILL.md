@@ -24,6 +24,13 @@ The binding source is `docs/CODING_GUIDELINES.md` — read the relevant section 
 **Tests**
 - Failing test first; one behaviour per test, named for it; cover empty/max/unicode/invalid; proptest for invariants; deterministic.
 
+**Most-missed in review** (details and self-tests: `.claude/skills/defect-patterns/SKILL.md`)
+- Every input key is imported or reported, and uniqueness is checked over the union of sources (P1).
+- A destructive action must restore a reachable goal; hold levels as absolute values; test minimality over many ticks (P2).
+- Prove identity read-only before any write-capable open, for every entry point and sidecar (P3).
+- No `str` slicing after a byte-length check; use `.get()` (P4). Use a monotonic clock for timeouts (P5).
+- No `unwrap_or(false)` on I/O; one test per error variant (P6). Assertions must not be tautological (P7).
+
 **Workflow**
 - `scripts/gate` before every push. Conventional commits with `Refs #N`. Suppress lints only with `#[expect(lint, reason = "...")]`; bare `#[allow]` is forbidden (ERR-1, DOC-6).
 
