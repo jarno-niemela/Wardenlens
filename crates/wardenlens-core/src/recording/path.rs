@@ -190,11 +190,15 @@ impl FromStr for RelPath {
             .strip_suffix(".mp4")
             .ok_or(RecordingError::InvalidRelPath)?;
         let (clock, milli) = stem.split_once('-').ok_or(RecordingError::InvalidRelPath)?;
-        if clock.len() != 6 {
+        // `get` returns None on a multibyte boundary, so no slice can panic.
+        let (Some(h), Some(mi), Some(sec), 6) = (
+            clock.get(0..2),
+            clock.get(2..4),
+            clock.get(4..6),
+            clock.len(),
+        ) else {
             return Err(bad);
-        }
-        let (h, rest) = clock.split_at(2);
-        let (mi, sec) = rest.split_at(2);
+        };
         let (year, month, dom) = (digits(y, 4)?, digits(mo, 2)?, digits(da, 2)?);
         let (h, mi, sec, milli) = (
             digits(h, 2)?,
@@ -314,6 +318,15 @@ mod tests {
             let p = RelPath::new(&id.parse().unwrap(), UnixMs::new(ms).unwrap());
             let back: RelPath = p.to_string().parse().unwrap();
             proptest::prop_assert_eq!(back, p);
+        }
+
+        #[test]
+        fn well_formed_shape_with_arbitrary_characters_never_panics(
+            cam in ".{0,6}", y in ".{0,5}", mo in ".{0,3}", da in ".{0,3}",
+            h in ".{0,3}", mi in ".{0,3}", sec in ".{0,3}", ms in ".{0,4}",
+        ) {
+            let s = format!("{cam}/{y}-{mo}-{da}/{h}{mi}{sec}-{ms}.mp4");
+            let _ = s.parse::<RelPath>();
         }
 
         #[test]

@@ -4,8 +4,17 @@ use super::clock::{MediaClock, TICKS_PER_SECOND};
 use super::path::{CameraId, RecordingError};
 use crate::time::{DurationMs, Timestamp, UnixMs};
 
+/// Largest accepted frame, 8 MiB (ADR 0005 section 2). A larger frame is a
+/// stream error ([`PushError::FrameTooLarge`]).
+pub const MAX_FRAME_BYTES: u64 = 8 << 20;
+
+/// Largest fragment (one GOP of the fMP4 muxer), 16 MiB: when appending a frame
+/// would take the open fragment past this, [`Pushed::flush_fragment`] is set.
+pub const MAX_FRAGMENT_BYTES: u64 = 16 << 20;
+
 /// Metadata of one encoded frame, as the recorder sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameMeta {
     /// Whether the frame is a keyframe (IDR).
     pub is_keyframe: bool,
@@ -15,6 +24,33 @@ pub struct FrameMeta {
     pub arrival: UnixMs,
     /// Encoded size of the frame in bytes.
     pub bytes: u64,
+}
+
+impl FrameMeta {
+    /// Describes one frame.
+    #[must_use]
+    pub fn new(is_keyframe: bool, media_ts_90k: u32, arrival: UnixMs, bytes: u64) -> Self {
+        Self {
+            is_keyframe,
+            media_ts_90k,
+            arrival,
+            bytes,
+        }
+    }
+}
+
+/// A frame the segmenter refuses: a stream error.
+///
+/// The open segment is closed (its record is in [`Pushed::closed`]) and frames
+/// are dropped until the next keyframe. The recorder (#57) treats this as a
+/// discontinuity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PushError {
+    /// The frame is larger than [`MAX_FRAME_BYTES`].
+    FrameTooLarge,
+    /// The frame has no bytes.
+    EmptyFrame,
 }
 
 /// What to do with a frame.
@@ -40,10 +76,29 @@ pub struct Pushed {
     /// The segment this frame closed, if any. Present on `StartNew` (the
     /// previous segment) and on a `Drop` that hit the hard maximum or byte cap.
     pub closed: Option<SegmentRecord>,
+    /// Flush the open fragment before this frame: set at each keyframe (a
+    /// fragment is one GOP) and when appending the frame would take the open
+    /// fragment past [`MAX_FRAGMENT_BYTES`]. Never set on a dropped frame.
+    pub flush_fragment: bool,
+    /// Set when the frame was refused; the decision is then `Drop`.
+    pub error: Option<PushError>,
+}
+
+impl Pushed {
+    fn dropped(closed: Option<SegmentRecord>, error: Option<PushError>) -> Self {
+        Self {
+            decision: Decision::Drop,
+            dts: None,
+            closed,
+            flush_fragment: false,
+            error,
+        }
+    }
 }
 
 /// An index row for a finished segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SegmentRecord {
     /// The camera that produced the segment.
     pub camera: CameraId,
@@ -68,7 +123,7 @@ impl SegmentRecord {
 
 /// Converts 90 kHz ticks to milliseconds, rounding up, minimum 1.
 #[must_use]
-pub fn ticks_to_ms_ceil(ticks: u64) -> u64 {
+pub(crate) fn ticks_to_ms_ceil(ticks: u64) -> u64 {
     let ms = ticks
         .saturating_mul(1000)
         .saturating_add(TICKS_PER_SECOND.saturating_sub(1))
@@ -133,6 +188,8 @@ struct Open {
     /// Step before the latest frame; the last sample reuses it (at least 1).
     last_step: u64,
     bytes: u64,
+    /// Bytes in the open fragment.
+    fragment_bytes: u64,
     frames: u64,
 }
 
@@ -141,7 +198,9 @@ struct Open {
 /// Rules: frames before the first keyframe are dropped; a segment is cut at
 /// the first keyframe at or after the target; at the hard maximum (2x target)
 /// or the byte cap the segment closes at that frame unless it is a keyframe,
-/// and frames are dropped until the next keyframe.
+/// and frames are dropped until the next keyframe. A frame of 0 bytes or more
+/// than 8 MiB is a stream error: the open segment closes and frames are dropped
+/// until the next keyframe.
 #[derive(Debug, Clone)]
 pub struct Segmenter {
     camera: CameraId,
@@ -183,12 +242,15 @@ impl Segmenter {
             last_dts: dts,
             last_step: 1,
             bytes: f.bytes,
+            fragment_bytes: f.bytes,
             frames: 1,
         });
         Pushed {
             decision: Decision::StartNew,
             dts: Some(0),
             closed: None,
+            flush_fragment: true,
+            error: None,
         }
     }
 
@@ -196,15 +258,22 @@ impl Segmenter {
     pub fn push(&mut self, f: FrameMeta) -> Pushed {
         // The clock sees every frame so its RTP line stays continuous while dropping.
         let dts = self.clock.push(f.media_ts_90k);
+        let invalid = if f.bytes == 0 {
+            Some(PushError::EmptyFrame)
+        } else if f.bytes > MAX_FRAME_BYTES {
+            Some(PushError::FrameTooLarge)
+        } else {
+            None
+        };
+        if invalid.is_some() {
+            let closed = self.open.take().map(|o| self.record(&o));
+            return Pushed::dropped(closed, invalid);
+        }
         let Some(mut o) = self.open else {
             return if f.is_keyframe {
                 self.start(&f, dts)
             } else {
-                Pushed {
-                    decision: Decision::Drop,
-                    dts: None,
-                    closed: None,
-                }
+                Pushed::dropped(None, None)
             };
         };
         let elapsed = dts.saturating_sub(o.start_dts);
@@ -218,21 +287,27 @@ impl Segmenter {
         }
         if forced {
             self.open = None;
-            return Pushed {
-                decision: Decision::Drop,
-                dts: None,
-                closed: Some(self.record(&o)),
-            };
+            return Pushed::dropped(Some(self.record(&o)), None);
         }
         o.last_step = dts.saturating_sub(o.last_dts).max(1);
         o.last_dts = dts;
         o.bytes = o.bytes.saturating_add(f.bytes);
         o.frames = o.frames.saturating_add(1);
+        let flush_fragment =
+            if f.is_keyframe || o.fragment_bytes.saturating_add(f.bytes) > MAX_FRAGMENT_BYTES {
+                o.fragment_bytes = f.bytes;
+                true
+            } else {
+                o.fragment_bytes = o.fragment_bytes.saturating_add(f.bytes);
+                false
+            };
         self.open = Some(o);
         Pushed {
             decision: Decision::Append,
             dts: Some(elapsed),
             closed: None,
+            flush_fragment,
+            error: None,
         }
     }
 
@@ -264,12 +339,7 @@ mod tests {
     }
 
     fn frame(key: bool, rtp: u32, at: i64, bytes: u64) -> FrameMeta {
-        FrameMeta {
-            is_keyframe: key,
-            media_ts_90k: rtp,
-            arrival: UnixMs::new(at).unwrap(),
-            bytes,
-        }
+        FrameMeta::new(key, rtp, UnixMs::new(at).unwrap(), bytes)
     }
 
     /// 1 fps frames, keyframe every `gop` frames.
@@ -490,6 +560,94 @@ mod tests {
         assert!(r.duration_ms <= 600_000);
     }
 
+    const MIB: u64 = 1 << 20;
+
+    /// A keyframe of `first` bytes, then P-frames of the given sizes; returns the flush flags.
+    fn flushes(first: u64, rest: &[u64]) -> Vec<bool> {
+        let mut s = seg(290);
+        let mut out = vec![s.push(frame(true, 0, T0, first)).flush_fragment];
+        for (i, &b) in rest.iter().enumerate() {
+            let rtp = u32::try_from(i + 1).unwrap() * 3600;
+            let p = s.push(frame(false, rtp, T0, b));
+            assert_eq!(p.decision, Decision::Append);
+            out.push(p.flush_fragment);
+        }
+        out
+    }
+
+    #[test]
+    fn fragment_flush_at_keyframes() {
+        let mut s = seg(290);
+        let k = s.push(frame(true, 0, T0, 10));
+        assert!(k.flush_fragment);
+        assert!(!s.push(frame(false, 3600, T0, 10)).flush_fragment);
+        let k2 = s.push(frame(true, 7200, T0, 10));
+        assert_eq!(k2.decision, Decision::Append);
+        assert!(k2.flush_fragment);
+        assert!(!s.push(frame(false, 10_800, T0, 10)).flush_fragment);
+    }
+
+    #[test]
+    fn fragment_cap_boundaries() {
+        // 8 MiB keyframe + 8 MiB - 1 = 16 MiB - 1: no flush.
+        assert_eq!(flushes(8 * MIB, &[8 * MIB - 1]), [true, false]);
+        // exactly 16 MiB: no flush.
+        assert_eq!(flushes(8 * MIB, &[8 * MIB]), [true, false]);
+        // 16 MiB + 1: flush before the frame.
+        assert_eq!(flushes(8 * MIB, &[8 * MIB - 1, 2]), [true, false, true]);
+        // the new fragment starts with the flushed frame.
+        assert_eq!(
+            flushes(8 * MIB, &[8 * MIB, 1, 8 * MIB, 8 * MIB]),
+            [true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn frame_of_8_mib_is_accepted_and_one_more_byte_is_an_error() {
+        let mut s = seg(10);
+        let ok = s.push(frame(true, 0, T0, 8 * MIB));
+        assert_eq!((ok.decision, ok.error), (Decision::StartNew, None));
+        let bad = s.push(frame(false, 3600, T0, 8 * MIB + 1));
+        assert_eq!(bad.decision, Decision::Drop);
+        assert_eq!(bad.error, Some(PushError::FrameTooLarge));
+        let r = bad.closed.unwrap();
+        assert_eq!((r.frame_count, r.bytes), (1, 8 * MIB));
+        // dropped until the next keyframe
+        let d = s.push(frame(false, 7200, T0, 1));
+        assert_eq!(
+            (d.decision, d.error, d.closed),
+            (Decision::Drop, None, None)
+        );
+        let k = s.push(frame(true, 10_800, T0, 1));
+        assert_eq!((k.decision, k.dts), (Decision::StartNew, Some(0)));
+    }
+
+    #[test]
+    fn oversized_keyframe_never_opens_a_segment() {
+        let mut s = seg(10);
+        let p = s.push(frame(true, 0, T0, u64::MAX));
+        assert_eq!(
+            (p.decision, p.error, p.closed),
+            (Decision::Drop, Some(PushError::FrameTooLarge), None)
+        );
+        assert_eq!(s.finish(), None);
+    }
+
+    #[test]
+    fn zero_byte_frame_is_a_stream_error_and_no_record_has_zero_bytes() {
+        let mut s = seg(10);
+        assert_eq!(
+            s.push(frame(true, 0, T0, 0)).error,
+            Some(PushError::EmptyFrame)
+        );
+        s.push(frame(true, 3600, T0, 5));
+        let p = s.push(frame(false, 7200, T0, 0));
+        assert_eq!(p.error, Some(PushError::EmptyFrame));
+        let r = p.closed.unwrap();
+        assert_eq!((r.bytes, r.frame_count), (5, 1));
+        assert_eq!(s.finish(), None);
+    }
+
     #[test]
     fn config_bounds() {
         assert!(SegmentConfig::new(9, 1).is_err());
@@ -516,18 +674,42 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn records_are_positive_bounded_and_cover_the_media_time(
-            frames in proptest::collection::vec((proptest::bool::ANY, proptest::num::u32::ANY, 0u64..5000), 1..300),
+            frames in proptest::collection::vec((proptest::bool::ANY, proptest::num::u32::ANY, 1u64..5000), 1..300),
         ) {
             let mut s = seg(10);
             let mut records = Vec::new();
             let mut summed_frames = 0u64;
             let mut appended = 0u64;
+            // Pushed.dts of the frames of the open segment.
+            let mut cur: Vec<u64> = Vec::new();
+            let mut closed_dts: Vec<Vec<u64>> = Vec::new();
             for (key, rtp, bytes) in frames {
                 let p = s.push(frame(key, rtp, T0, bytes));
-                if let Some(r) = p.closed { records.push(r); }
+                if let Some(r) = p.closed {
+                    records.push(r);
+                    closed_dts.push(std::mem::take(&mut cur));
+                }
+                match p.decision {
+                    Decision::StartNew => cur = vec![0],
+                    Decision::Append => cur.extend(p.dts),
+                    _ => {}
+                }
                 if p.decision != Decision::Drop { appended += 1; }
             }
-            records.extend(s.finish());
+            if let Some(r) = s.finish() {
+                records.push(r);
+                closed_dts.push(cur);
+            }
+            for (r, dts) in records.iter().zip(&closed_dts) {
+                // Media span = last dts + the last step (the last sample reuses it).
+                let last = dts.last().copied().unwrap();
+                let step = match dts.len() {
+                    1 => 1,
+                    n => last - dts[n - 2],
+                };
+                proptest::prop_assert_eq!(ticks_to_ms_ceil(last + step), r.duration_ms);
+                proptest::prop_assert_eq!(u64::try_from(dts.len()).unwrap(), r.frame_count);
+            }
             for r in &records {
                 proptest::prop_assert!(r.duration_ms >= 1);
                 proptest::prop_assert!(r.duration_ms <= 600_000);

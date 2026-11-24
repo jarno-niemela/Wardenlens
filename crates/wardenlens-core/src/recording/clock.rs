@@ -1,13 +1,16 @@
 //! `MediaClock`: strictly increasing 90 kHz media time from RTP timestamps.
 
 /// Ticks per second of the media timescale (RTP video clock).
-pub const TICKS_PER_SECOND: u64 = 90_000;
+pub(crate) const TICKS_PER_SECOND: u64 = 90_000;
 
 /// Largest step between two samples, 10 s; also the forward re-base threshold.
-pub const MAX_STEP_TICKS: u64 = 10 * TICKS_PER_SECOND;
+pub(crate) const MAX_STEP_TICKS: u64 = 10 * TICKS_PER_SECOND;
 
 /// A backward step of more than this (about 1 s) is a re-base, less is jitter.
 const BACKWARD_REBASE_TICKS: i64 = 90_000;
+
+/// Re-base step used before any unclamped step has been seen (25 fps).
+const DEFAULT_STEP_TICKS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy)]
 struct State {
@@ -19,8 +22,9 @@ struct State {
     base: i64,
     /// Media time of the previous frame.
     dts: u64,
-    /// Last good step, reused when a re-base keeps the media time continuous.
-    last_step: u64,
+    /// Last unclamped step, reused when a re-base keeps the media time continuous.
+    /// Starts at one frame of 25 fps (3600 ticks) until a real step is seen.
+    last_good_step: u64,
 }
 
 /// Turns RTP timestamps into strictly increasing media time (ADR 0005 section 2).
@@ -50,7 +54,7 @@ impl MediaClock {
     ///
     /// The first frame after creation or [`reset`](Self::reset) is time 0.
     /// The result is strictly greater than the previous one, and the step is
-    /// between 1 and [`MAX_STEP_TICKS`]. All arithmetic saturates; it cannot panic.
+    /// between 1 tick and 10 s. All arithmetic saturates; it cannot panic.
     pub fn push(&mut self, rtp: u32) -> u64 {
         let Some(prev) = self.state else {
             self.state = Some(State {
@@ -58,7 +62,7 @@ impl MediaClock {
                 last_ext: i64::from(rtp),
                 base: i64::from(rtp),
                 dts: 0,
-                last_step: 1,
+                last_good_step: DEFAULT_STEP_TICKS,
             });
             return 0;
         };
@@ -66,26 +70,41 @@ impl MediaClock {
             rtp.wrapping_sub(prev.last_rtp).to_ne_bytes(),
         ));
         let ext = prev.last_ext.saturating_add(delta);
+        let line_signed = ext.saturating_sub(prev.base);
+        // The RTP line has fallen far behind media time: a run of small backward
+        // steps, each too short to re-base on its own, would otherwise freeze it.
+        let drift = i64::try_from(prev.dts)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(line_signed)
+            > BACKWARD_REBASE_TICKS;
         let rebase = delta < -BACKWARD_REBASE_TICKS
+            || drift
             || u64::try_from(delta).is_ok_and(|d| d > MAX_STEP_TICKS);
-        let (dts, base, step) = if rebase {
-            let dts = prev.dts.saturating_add(prev.last_step);
+        let (dts, base, good) = if rebase {
+            let dts = prev.dts.saturating_add(prev.last_good_step);
             (
                 dts,
                 ext.saturating_sub(i64::try_from(dts).unwrap_or(i64::MAX)),
-                prev.last_step,
+                prev.last_good_step,
             )
         } else {
-            let line = u64::try_from(ext.saturating_sub(prev.base)).unwrap_or(0);
-            let dts = line.max(prev.dts.saturating_add(1));
-            (dts, prev.base, dts.saturating_sub(prev.dts))
+            let line = u64::try_from(line_signed).unwrap_or(0);
+            let floor = prev.dts.saturating_add(1);
+            let dts = line.max(floor);
+            // Only a step that followed the RTP line (not clamped) is "good".
+            let good = if line >= floor {
+                dts.saturating_sub(prev.dts)
+            } else {
+                prev.last_good_step
+            };
+            (dts, prev.base, good)
         };
         self.state = Some(State {
             last_rtp: rtp,
             last_ext: ext,
             base,
             dts,
-            last_step: step,
+            last_good_step: good,
         });
         dts
     }
@@ -175,6 +194,33 @@ mod tests {
     #[test]
     fn backward_step_of_exactly_a_second_is_jitter() {
         assert_eq!(run(&[200_000, 203_600, 113_600]), [0, 3600, 3601]);
+    }
+
+    #[test]
+    fn rebase_after_jitter_uses_the_last_good_step() {
+        let d = run(&[0, 3600, 7200, 3600, 7200 + 2_000_000]);
+        assert_eq!(d, [0, 3600, 7200, 7201, 7201 + 3600]);
+    }
+
+    #[test]
+    fn run_of_sub_second_backward_steps_does_not_freeze_media_time() {
+        // Each step back is 80 000 ticks (jitter alone); the line drifts away and re-bases.
+        let d = run(&[200_000, 203_600, 123_600, 43_600, 47_200]);
+        assert_eq!(d, [0, 3600, 3601, 7201, 10_801]);
+    }
+
+    #[test]
+    fn reolink_variable_frame_rate_follows_the_rtp_line_exactly() {
+        let steps = [3000u32, 3600, 4500, 2700, 3000, 4500, 3600, 2700];
+        let mut rtp = 1_000u32;
+        let mut want = 0u64;
+        let mut c = MediaClock::default();
+        assert_eq!(c.push(rtp), 0);
+        for s in steps {
+            rtp = rtp.wrapping_add(s);
+            want += u64::from(s);
+            assert_eq!(c.push(rtp), want);
+        }
     }
 
     #[test]
