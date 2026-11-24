@@ -26,6 +26,9 @@ For every subagent: write its exact prompt to a file in the scratchpad, run `scr
 ## 1. Select and claim
 - Ticket = the argument, else `scripts/ticket next`. If none: report "queue empty", show `scripts/ticket list`, stop.
 - `gh issue view N` — read it fully. If acceptance criteria are missing or vague, refine the ticket body first (or label `agent:human` and ask) — never implement a vague ticket.
+- **Split before implementing** when the ticket spans a library and its CLI or git/workflow integration, or carries several rounds of amendments. Keep the pure library in N, file the rest as a new ticket blocked by N, and record the split as an amendment comment on N. The unsplit #74 vault and #32 catalogue hit the 5-round cap; the split #94 CLI took 3 rounds.
+- **Amending a ticket:** if the rule comes from an ADR, change the ADR first and mirror it into the ticket. Never add new rules to a ticket while its ADR is still under verification. In PR #77, ticket bullets drifted from the ADR, which wins, and that cost a major.
+- **Real devices and site data:** spike tickets are read-only towards cameras. A write needs the owner's approval for that one change: read and record the old value first, change nothing else, and revert when done. Code, docs and briefs name cameras by inventory id only; LAN addresses, credentials, serials and display names never enter the repo or a brief.
 - `scripts/ticket claim N`
 - Branch `<type>/<N>-<slug>` (type from conventional title: feat/fix/refactor/chore/docs/test).
 ```bash
@@ -46,6 +49,10 @@ git -C .claude/worktrees/N push -u origin <branch>
 gh pr create --head <branch> --title "<conventional title> (#N)" --body-file <filled .github/pull_request_template.md with Closes #N>
 gh pr edit <pr> --add-label agent:sonnet
 ```
+**Bring the branch up to date before every verification round.** If `origin/main` moved, run `git merge origin/main` in the worktree. Resolve a `Cargo.lock` conflict with `git checkout --theirs Cargo.lock` and a cargo re-resolve, and resolve `lib.rs` module lists by union. Then run the gate and push. A branch verified while behind would need re-verification after the merge.
+
+**Pipeline:** while one PR verifies, start the next ticket's implementer in its own worktree. Never verify two branches that conflict (5b).
+
 `ticket-sync.yml` moves the issue to `status:in-review`. Record the commit under verification: `SHA=$(gh pr view <pr> --json headRefOid -q .headRefOid)`. Wait for CI on that SHA to start; the `verify-labels-reset` workflow only clears display labels on new pushes.
 
 ## 4. Verify (Opus, in parallel, fresh context)
