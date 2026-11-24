@@ -10,7 +10,7 @@
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use wardenlens_vault::MAX_FILE_LEN;
 
@@ -283,6 +283,24 @@ impl Git {
         parse_shas(&self.capture(&a, b"", MAX_OUTPUT)?)
     }
 
+    /// Starts a `cat-file --batch` process that answers one request at a time.
+    pub(super) fn object_reader(&self) -> Result<ObjectReader, GitError> {
+        let mut child = self
+            .command(&args(&["cat-file", "--batch"]))
+            .spawn()
+            .map_err(|_| GitError::Spawn)?;
+        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+            kill(&mut child);
+            let _ = child.wait();
+            return Err(GitError::Spawn);
+        };
+        Ok(ObjectReader {
+            child,
+            input,
+            output: BufReader::new(output),
+        })
+    }
+
     /// Reads objects with `cat-file --batch`, in order. `each` gets the kind, the size and a
     /// reader limited to the object; what it leaves unread is skipped.
     pub(super) fn objects<F>(&self, shas: &[Sha], mut each: F) -> Result<(), GitError>
@@ -348,30 +366,69 @@ where
     F: FnMut(&Sha, Kind, u64, &mut Body<'_>) -> Result<(), GitError>,
 {
     for sha in shas {
-        let mut header = Vec::new();
-        reader
-            .by_ref()
-            .take(MAX_HEADER)
-            .read_until(b'\n', &mut header)
-            .map_err(|_| GitError::Io)?;
-        let line = header.strip_suffix(b"\n").ok_or(GitError::Malformed)?;
-        let (kind, size) = parse_header(line, sha)?;
-        let mut body = reader.by_ref().take(size);
-        let outcome = each(sha, kind, size, &mut body);
-        // Skip what the callback did not read, then the newline git writes after the body.
-        let left = body.limit();
-        let skipped = io::copy(&mut body, &mut io::sink()).map_err(|_| GitError::Io)?;
-        outcome?;
-        if skipped != left {
-            return Err(GitError::Malformed);
-        }
-        let mut nl = [0u8; 1];
-        reader.read_exact(&mut nl).map_err(|_| GitError::Io)?;
-        if nl != *b"\n" {
-            return Err(GitError::Malformed);
-        }
+        read_one(reader, sha, each)?;
     }
     Ok(())
+}
+
+/// Reads the answer for one requested object from a `cat-file --batch` stream.
+fn read_one<F>(reader: &mut BufReader<ChildStdout>, sha: &Sha, each: &mut F) -> Result<(), GitError>
+where
+    F: FnMut(&Sha, Kind, u64, &mut Body<'_>) -> Result<(), GitError>,
+{
+    let mut header = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_HEADER)
+        .read_until(b'\n', &mut header)
+        .map_err(|_| GitError::Io)?;
+    let line = header.strip_suffix(b"\n").ok_or(GitError::Malformed)?;
+    let (kind, size) = parse_header(line, sha)?;
+    let mut body = reader.by_ref().take(size);
+    let outcome = each(sha, kind, size, &mut body);
+    // Skip what the callback did not read, then the newline git writes after the body.
+    let left = body.limit();
+    let skipped = io::copy(&mut body, &mut io::sink()).map_err(|_| GitError::Io)?;
+    outcome?;
+    if skipped != left {
+        return Err(GitError::Malformed);
+    }
+    let mut nl = [0u8; 1];
+    reader.read_exact(&mut nl).map_err(|_| GitError::Io)?;
+    if nl != *b"\n" {
+        return Err(GitError::Malformed);
+    }
+    Ok(())
+}
+
+/// A `cat-file --batch` process asked for one object at a time (old trees, on demand). One
+/// request line is written and its whole answer read before the next, so neither pipe can fill
+/// and block the other. The child is killed when the reader is dropped.
+pub(super) struct ObjectReader {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+impl ObjectReader {
+    /// Asks for `sha`; `each` is called as for [`Git::objects`].
+    pub(super) fn read<F>(&mut self, sha: &Sha, mut each: F) -> Result<(), GitError>
+    where
+        F: FnMut(&Sha, Kind, u64, &mut Body<'_>) -> Result<(), GitError>,
+    {
+        let mut line = sha.as_str().as_bytes().to_vec();
+        line.push(b'\n');
+        self.input.write_all(&line).map_err(|_| GitError::Io)?;
+        self.input.flush().map_err(|_| GitError::Io)?;
+        read_one(&mut self.output, sha, &mut each)
+    }
+}
+
+impl Drop for ObjectReader {
+    fn drop(&mut self) {
+        kill(&mut self.child);
+        let _ = self.child.wait();
+    }
 }
 
 /// `<sha> <type> <size>`; the id must be the one asked for (a desynchronised stream is never

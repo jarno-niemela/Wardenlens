@@ -633,13 +633,22 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
 - `--default-paths` makes the scanner use the fixed default vault and key paths and ignore `WARDENLENS_VAULT*`.
 - **Paths are scanned as full paths, by a walk of the new trees.** A path can spell a value and a value can hold a `/`,
   so the unit scanned is the full path of an entry (`parent/child`), never a name alone. The walk starts at the roots (the
-  root tree of every new commit, and every new tree a tag or the end of the range points at directly) and descends only
-  into trees that are new: every ancestor of a new tree is itself new, so every changed path is visited and a published
-  subtree is never walked again. It uses an explicit stack over one path buffer (no recursion) and fails closed (exit 2)
-  on a path longer than 4096 bytes, on more than 500 000 distinct (path, entry) places, or on more than 32 MiB of raw
-  trees. A place is visited once (key: full path and entry id), so a tree shared by many commits is not rescanned. A value
+  root tree of every new commit, and every new tree a tag or the end of the range points at directly) and descends into
+  **every** entry below them, subtrees that are not new included, loading old trees on demand with the same bounded
+  `cat-file --batch` reader. The invariant: **every full path that appears in any tree reachable from a new root is
+  scanned, whatever the age of the subtrees it passes through.** (An earlier version walked only new trees on the claim
+  that every ancestor of a new tree is new; that is wrong, because a new path can sit on an old tree: `git mv holder
+  zqsplit-part` or a copy of a published directory under a new name keeps the old subtree id, so
+  `zqsplit-part/mark-7781/f.txt` is published but no tree on it is new.) A visited set of (full path, entry id) keeps it
+  cheap: the same subtree reached again at the same full path has had its full paths scanned and is skipped, while the same
+  subtree at a different path is walked again. A path already published that holds a value is therefore reported on
+  later pushes too; that is accepted, because it fails closed. It uses an explicit stack over one path buffer (no
+  recursion) and fails closed (exit 2) on a path longer than 4096 bytes, on more than 500 000 places, or on more than
+  32 MiB of raw trees (old ones count). A tree shared by many commits at one path is read once and not rescanned. A value
   in a directory's path is reported at the files and directories below it (where it is published); only when nothing below
-  reports it is it reported at the directory itself (an empty one). The `diff-tree` path scan was removed: the walk covers
+  reports it is it reported at the directory itself (an empty one). The walk replaces `git diff-tree -r --name-only
+  --root -m` (named in the #117 criterion) and covers a superset of it: every path `diff-tree` lists, plus empty
+  directories, trees only a tag or the range end leads to, and the directory paths themselves. The `diff-tree` path scan was removed: the walk covers
   everything it did (renames and second paths of a blob are paths in a new tree; a merge's tree is a root) and what it
   could not (empty directories, trees only a tag or the range end leads to), and keeping both would report each place
   twice. A tree git cannot list makes `git rev-list --objects` fail, which stops the scan (exit 2).

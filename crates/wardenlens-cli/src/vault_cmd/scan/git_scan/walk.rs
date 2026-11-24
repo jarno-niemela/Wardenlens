@@ -1,16 +1,22 @@
 //! The full-path walk of the new trees (ADR 0006 section 9).
 //!
 //! A path can spell a vault value, and a value can hold a `/`, so the unit scanned is the FULL
-//! path of an entry (`parent/child`), never a name alone. The walk starts at the roots (the root
-//! tree of every new commit, and every new tree a tag or the end of the range points at) and
-//! descends only into trees that are new: every ancestor of a new tree is itself new, so every
-//! changed path is visited, and an already published subtree is never walked again.
+//! path of an entry (`parent/child`), never a name alone.
+//!
+//! THE INVARIANT: every full path that appears in any tree reachable from a new root (the root
+//! tree of every new commit, and every new tree a tag or the end of the range points at) is
+//! scanned, whatever the age of the subtrees it passes through. A new path can sit on an old
+//! tree (`git mv dir new` keeps the subtree id), so the walk descends into EVERY entry, old
+//! subtrees included, loading those on demand. To stay cheap it keeps a visited set of
+//! (full path, entry id): the same subtree reached again at the same full path has had all its
+//! full paths scanned, so it is skipped; the same subtree at a different path is walked again.
 //!
 //! It is an explicit stack over one shared path buffer (no recursion, so no overflow), and it is
-//! bounded: a path longer than [`MAX_PATH_LEN`] and more than [`MAX_PLACES`] distinct
-//! (path, entry) places fail the scan closed instead of running away on a hostile tree.
+//! bounded: a path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places and more than
+//! [`MAX_TREE_BYTES`] of raw trees (old ones included) fail the scan closed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_vault::{Matcher, scan};
@@ -75,10 +81,18 @@ pub(super) fn tree_entries(raw: &[u8], id_len: usize) -> Option<Vec<TreeEntry>> 
     Some(entries)
 }
 
+/// The parsed entries of a tree, shared between the cache and the frames walking it.
+pub(super) type Entries = Rc<[TreeEntry]>;
+
+/// Loads an old tree by id: its entries, or `None` when it could not be read or parsed (the
+/// loader records the problem). An error fails the scan.
+pub(super) type Loader<'l> =
+    dyn FnMut(&Sha, &mut Collected) -> Result<Option<Entries>, GitError> + 'l;
+
 /// One directory being walked.
-struct Frame<'a> {
-    tree: &'a Sha,
-    entries: &'a [TreeEntry],
+struct Frame {
+    tree: Sha,
+    entries: Entries,
     next: usize,
     /// Length of this directory's path in the shared buffer (0 for a root).
     dir_len: usize,
@@ -96,7 +110,7 @@ struct Frame<'a> {
 
 /// Closes a directory: its own hits that nothing below reported are reported at it, and what it
 /// held is reported at or below it for the directory above.
-fn finish(found: &mut Collected, frame: Frame<'_>, parent: Option<&mut Frame<'_>>) {
+fn finish(found: &mut Collected, frame: Frame, parent: Option<&mut Frame>) {
     for (id, kind) in &frame.hits {
         if let (Some(at), false) = (&frame.at, frame.covered.contains(id)) {
             found.add(id, *kind, at.clone());
@@ -108,25 +122,56 @@ fn finish(found: &mut Collected, frame: Frame<'_>, parent: Option<&mut Frame<'_>
     }
 }
 
-/// Walks `roots` over `trees` (the new trees, by id), scanning the full path of every entry.
+/// Test entry point: the trees are all given, nothing is loaded, the visited-set skip is on.
 ///
 /// # Errors
-/// A path longer than [`MAX_PATH_LEN`], or more than [`MAX_PLACES`] places.
+/// As [`walk_with`].
+#[cfg(test)]
 pub(super) fn walk<'a>(
     matcher: &Matcher,
     found: &mut Collected,
-    trees: &'a HashMap<Sha, Vec<TreeEntry>>,
+    trees: &HashMap<Sha, Vec<TreeEntry>>,
     roots: impl IntoIterator<Item = &'a Sha>,
 ) -> Result<(), GitError> {
+    let mut cache: HashMap<Sha, Entries> = trees
+        .iter()
+        .map(|(k, v)| (k.clone(), Entries::from(v.clone())))
+        .collect();
+    walk_with(
+        matcher,
+        found,
+        &mut cache,
+        roots,
+        &mut |_, _| Ok(None),
+        true,
+    )
+}
+
+/// Walks `roots`, scanning the full path of every entry reachable from them. `cache` holds the
+/// trees already read (the new ones); any other tree is fetched with `load` and cached. With
+/// `skip_seen` false the visited-set skip is off (a test of the skip: same hits, more work).
+///
+/// # Errors
+/// A path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places, or a loader error.
+pub(super) fn walk_with<'a>(
+    matcher: &Matcher,
+    found: &mut Collected,
+    cache: &mut HashMap<Sha, Entries>,
+    roots: impl IntoIterator<Item = &'a Sha>,
+    load: &mut Loader<'_>,
+    skip_seen: bool,
+) -> Result<(), GitError> {
     let mut seen: HashSet<(Vec<u8>, Sha)> = HashSet::new();
+    let mut failed: HashSet<Sha> = HashSet::new();
+    let mut places: usize = 0;
     let mut path: Vec<u8> = Vec::new();
     let mut blob_paths: BTreeMap<Sha, Vec<Vec<u8>>> = BTreeMap::new();
     for root in roots {
-        let Some(entries) = trees.get(root) else {
+        let Some(entries) = cache.get(root).cloned() else {
             continue;
         };
         let mut stack = vec![Frame {
-            tree: root,
+            tree: root.clone(),
             entries,
             next: 0,
             dir_len: 0,
@@ -136,7 +181,8 @@ pub(super) fn walk<'a>(
             covered: Vec::new(),
         }];
         while let Some(top) = stack.last_mut() {
-            let Some(entry) = top.entries.get(top.next) else {
+            let entries = Rc::clone(&top.entries);
+            let Some(entry) = entries.get(top.next) else {
                 if let Some(done) = stack.pop() {
                     finish(found, done, stack.last_mut());
                 }
@@ -151,13 +197,14 @@ pub(super) fn walk<'a>(
             if path.len() > MAX_PATH_LEN {
                 return Err(GitError::PathTooLong);
             }
-            if !seen.insert((path.clone(), entry.id.clone())) {
+            if !seen.insert((path.clone(), entry.id.clone())) && skip_seen {
                 continue;
             }
-            if seen.len() > MAX_PLACES {
+            places = places.saturating_add(1);
+            if places > MAX_PLACES {
                 return Err(GitError::TooMany);
             }
-            let at = place(entry, &path, top.tree);
+            let at = place(entry, &path, &top.tree);
             if entry.mode == EntryMode::Blob {
                 blob_paths
                     .entry(entry.id.clone())
@@ -165,12 +212,14 @@ pub(super) fn walk<'a>(
                     .push(path.clone());
             }
             let mut hits = scan_path(matcher, found, &path, &at);
-            let sub = (entry.mode == EntryMode::Tree)
-                .then(|| trees.get(&entry.id))
-                .flatten();
+            let sub = if entry.mode == EntryMode::Tree {
+                subtree(cache, &mut failed, load, found, &entry.id)?
+            } else {
+                None
+            };
             if let Some(sub) = sub {
                 stack.push(Frame {
-                    tree: &entry.id,
+                    tree: entry.id.clone(),
                     entries: sub,
                     next: 0,
                     dir_len: path.len(),
@@ -180,7 +229,7 @@ pub(super) fn walk<'a>(
                     covered: Vec::new(),
                 });
             } else {
-                // A file, a submodule, or a directory nothing of which is new: a place itself.
+                // A file, a submodule, or a directory that could not be read: a place itself.
                 for (id, kind) in &hits {
                     found.add(id, *kind, at.clone());
                 }
@@ -192,6 +241,30 @@ pub(super) fn walk<'a>(
         found.paths.entry(sha).or_default().append(&mut paths);
     }
     Ok(())
+}
+
+/// The entries of the tree `id`: cached, or loaded now. `None` for one that cannot be read
+/// (remembered in `failed`, so its problem is recorded once).
+fn subtree(
+    cache: &mut HashMap<Sha, Entries>,
+    failed: &mut HashSet<Sha>,
+    load: &mut Loader<'_>,
+    found: &mut Collected,
+    id: &Sha,
+) -> Result<Option<Entries>, GitError> {
+    if let Some(e) = cache.get(id) {
+        return Ok(Some(Rc::clone(e)));
+    }
+    if failed.contains(id) {
+        return Ok(None);
+    }
+    let loaded = load(id, found)?;
+    if let Some(e) = &loaded {
+        cache.insert(id.clone(), Rc::clone(e));
+    } else {
+        failed.insert(id.clone());
+    }
+    Ok(loaded)
 }
 
 /// Where an entry at `path` in the tree `containing` is, as it is reported.

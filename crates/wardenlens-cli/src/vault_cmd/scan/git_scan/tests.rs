@@ -15,6 +15,7 @@ use tempfile::TempDir;
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_vault::{Matcher, ScanEntry};
 
+use super::walk::TreeEntry;
 use super::*;
 
 const V_BLOB: &str = "zq-blobval-1001";
@@ -925,14 +926,15 @@ fn a_malformed_tree_is_a_malformed_problem_not_a_size_problem() {
     // The real object, read the way the scan reads it: one problem, `Malformed`, at the tree
     // itself (reported as `tree <sha>`, no stray space) and nothing in the walk's input.
     let mut found = Collected::default();
-    let mut trees = HashMap::new();
+    let mut got = Some(Entries::from(Vec::new()));
     Git::at(r.path())
         .objects(std::slice::from_ref(&tree), |sha, kind, size, body| {
             assert_eq!(kind, Kind::Tree);
-            take_tree(&mut found, &mut trees, sha, size, body)
+            got = take_tree(&mut found, kind, sha, size, body)?;
+            Ok(())
         })
         .unwrap();
-    assert!(trees.is_empty());
+    assert!(got.is_none());
     assert_eq!(found.problems.len(), 1);
     let (at, why) = &found.problems[0];
     assert_eq!(*why, Unread::Malformed);
@@ -1112,6 +1114,140 @@ fn a_value_spelled_across_a_slash_is_found_in_a_full_path_only() {
     let found = r.range(Some(&base), &c, Sources::ALL, &m);
     expect(&ids(&found), &["e:split"]);
     assert_eq!(found.findings.len(), 1);
+}
+
+// ---- the invariant: every full path below a new root is scanned, old subtrees included ------
+
+fn mkdirs_write(r: &Repo, name: &str, bytes: &[u8]) {
+    let p = r.path().join(name);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, bytes).unwrap();
+}
+
+#[test]
+fn a_renamed_directory_is_scanned_by_the_full_paths_below_it() {
+    // The value spans the new directory name and a file two levels down in the old subtree.
+    let r = Repo::new();
+    mkdirs_write(&r, "holder/sub/deep/f.txt", b"clean\n");
+    let base = r.commit(&[], "base");
+    r.git(&[], &["mv", "holder", "zqnew"]);
+    r.commit(&[], "rename");
+    let m = matcher(&[("e:span", "zqnew/sub/deep/f.txt")]);
+    let c = r.range(Some(&base), "HEAD", Sources::ALL, &m);
+    expect(&ids(&c), &["e:span"]);
+    // TEST-8: the path source alone can have found it (the subtree and the blob are old).
+    let c = r.range(
+        Some(&base),
+        "HEAD",
+        Sources::ALL.without(Sources::PATHS),
+        &m,
+    );
+    expect(&ids(&c), &[]);
+}
+
+#[test]
+fn a_copy_of_an_old_subtree_is_scanned_under_the_path_of_the_copy() {
+    let r = Repo::new();
+    mkdirs_write(&r, "orig/inner/f.txt", b"clean\n");
+    let base = r.commit(&[], "base");
+    mkdirs_write(&r, "zqcopy/inner/f.txt", b"clean\n");
+    r.commit(&[], "copy");
+    let m = matcher(&[("e:copy", "zqcopy/inner/f.txt")]);
+    let c = r.range(Some(&base), "HEAD", Sources::ALL, &m);
+    expect(&ids(&c), &["e:copy"]);
+}
+
+#[test]
+fn a_value_wholly_inside_an_old_subtree_below_a_renamed_entry_is_found() {
+    // A grandchild path: renamed/a/<value>.txt. Its old path was published before; the new
+    // full path is published now, so it is reported again (fails closed, ADR 0006 section 9).
+    let r = Repo::new();
+    mkdirs_write(&r, &format!("top/a/g-{V_RENAME}.txt"), b"clean\n");
+    let base = r.commit(&[], "base");
+    r.git(&[], &["mv", "top", "renamed"]);
+    r.commit(&[], "rename");
+    let m = matcher(&[("e:rename", V_RENAME)]);
+    let c = r.range(Some(&base), "HEAD", Sources::ALL, &m);
+    expect(&ids(&c), &["e:rename"]);
+    assert!(c.findings.iter().any(|f| matches!(
+        &f.at,
+        Where::BlobPath { path, .. } if path.starts_with(b"renamed/a/")
+    )));
+}
+
+#[test]
+fn an_unchanged_subtree_is_read_once_and_skipped_at_the_same_path() {
+    let m = matcher(&[("e:path", V_PATH)]);
+    let blob = fake_sha(9);
+    let shared = fake_sha(3);
+    let file = |n: &str| TreeEntry {
+        name: n.as_bytes().to_vec(),
+        mode: walk::EntryMode::Blob,
+        id: blob.clone(),
+    };
+    let old: HashMap<Sha, Vec<TreeEntry>> = HashMap::from([(
+        shared.clone(),
+        vec![file(&format!("f-{V_PATH}")), file("clean")],
+    )]);
+    // Ten new commits, each with the same old subtree at `d`, and one more at `copy`.
+    let roots: Vec<Sha> = (10..20).map(fake_sha).collect();
+    let run = |skip: bool| {
+        let mut cache: HashMap<Sha, walk::Entries> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut v = vec![dir_entry("d", &shared)];
+                if i == 0 {
+                    v.push(dir_entry("copy", &shared));
+                }
+                (r.clone(), walk::Entries::from(v))
+            })
+            .collect();
+        let mut reads = 0usize;
+        let mut found = Collected::default();
+        walk::walk_with(
+            &m,
+            &mut found,
+            &mut cache,
+            roots.iter(),
+            &mut |id, _| {
+                reads += 1;
+                Ok(old.get(id).map(|v| walk::Entries::from(v.clone())))
+            },
+            skip,
+        )
+        .unwrap();
+        (reads, found)
+    };
+    let (reads, on) = run(true);
+    // Read once though it is reached by ten commits and at two paths; both paths are scanned.
+    assert_eq!(reads, 1);
+    assert_eq!(on.findings.len(), 2);
+    // TEST-8: without the skip the same ids are found, only more often (more work).
+    let (reads_off, off) = run(false);
+    assert_eq!(reads_off, 1);
+    assert_eq!(ids(&on), ids(&off));
+    assert!(off.findings.len() > on.findings.len());
+}
+
+#[test]
+fn old_trees_count_toward_the_tree_byte_bound() {
+    // A loader that reports more bytes than allowed fails the walk closed.
+    let m = matcher(&[("e:path", V_PATH)]);
+    let old = fake_sha(3);
+    let mut cache: HashMap<Sha, walk::Entries> =
+        HashMap::from([(fake_sha(1), walk::Entries::from(vec![dir_entry("d", &old)]))]);
+    let mut found = Collected::default();
+    let root = fake_sha(1);
+    let r = walk::walk_with(
+        &m,
+        &mut found,
+        &mut cache,
+        [&root],
+        &mut |_, _| Err(GitError::TooLarge),
+        true,
+    );
+    assert_eq!(r, Err(GitError::TooLarge));
 }
 
 #[test]

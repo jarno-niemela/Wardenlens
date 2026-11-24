@@ -19,9 +19,9 @@ use std::io::Read;
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_vault::{Content, Matcher, classify, scan};
 
-use self::walk::{TreeEntry, tree_entries};
+use self::walk::{Entries, tree_entries};
 use super::Unread;
-use super::git::{Body, Git, GitError, Kind, MAX_OBJECT_LEN, RawEntry, Sha};
+use super::git::{Body, Git, GitError, Kind, MAX_OBJECT_LEN, ObjectReader, RawEntry, Sha};
 use super::redact::{Loc, Part, render, render_in};
 use crate::args::ScanArgs;
 use crate::error::CliError;
@@ -426,7 +426,7 @@ fn collect_range(
     let mut found = Collected::default();
     // The new trees (parsed), and where a walk of them starts: the root tree of every new
     // commit and every tree a tag or the end of the range points at directly.
-    let mut trees: HashMap<Sha, Vec<TreeEntry>> = HashMap::new();
+    let mut trees: HashMap<Sha, Entries> = HashMap::new();
     let mut roots: BTreeSet<Sha> = BTreeSet::new();
     git.objects(&objects, |sha, kind, size, body| {
         found.objects = found.objects.saturating_add(1);
@@ -484,7 +484,13 @@ fn collect_range(
                 if sha == to {
                     roots.insert(sha.clone());
                 }
-                take_tree(&mut found, &mut trees, sha, size, body)?;
+                // An unreadable new tree is a problem already; it stays in the map as an empty
+                // directory so the walk does not read it (and report it) a second time.
+                let entries = take_tree(&mut found, Kind::Tree, sha, size, body)?;
+                trees.insert(
+                    sha.clone(),
+                    entries.unwrap_or_else(|| Entries::from(Vec::new())),
+                );
             }
             _ => {}
         }
@@ -494,7 +500,7 @@ fn collect_range(
         // `diff-tree -r` lists files only and never runs for a tree a tag or the end of the
         // range leads to, and a name alone cannot spell a value with a `/`: the full path of
         // every entry of every new tree is scanned instead (see `walk`).
-        walk::walk(matcher, &mut found, &trees, roots.iter())?;
+        walk_new_trees(matcher, git, &mut found, &mut trees, &roots)?;
     }
     if sources.has(Sources::REFS) {
         for (i, name) in refs.iter().enumerate() {
@@ -504,19 +510,51 @@ fn collect_range(
     Ok(found)
 }
 
-/// Parses a new tree into `trees`. A tree that cannot be read or parsed is a problem (reported
-/// once, at the tree), not an error; too many tree bytes held for one scan is an error.
+/// Walks from `roots`. Old subtrees below a new root are fetched on demand (a new path can sit
+/// on an old tree), with the same bounds, through one `cat-file` process started on first use.
+fn walk_new_trees(
+    matcher: &Matcher,
+    git: &Git,
+    found: &mut Collected,
+    trees: &mut HashMap<Sha, Entries>,
+    roots: &BTreeSet<Sha>,
+) -> Result<(), GitError> {
+    let mut reader: Option<ObjectReader> = None;
+    let mut load = |sha: &Sha, found: &mut Collected| -> Result<Option<Entries>, GitError> {
+        if reader.is_none() {
+            reader = Some(git.object_reader()?);
+        }
+        let Some(r) = reader.as_mut() else {
+            return Err(GitError::Spawn);
+        };
+        let mut loaded = None;
+        r.read(sha, |sha, kind, size, body| {
+            loaded = take_tree(found, kind, sha, size, body)?;
+            Ok(())
+        })?;
+        Ok(loaded)
+    };
+    walk::walk_with(matcher, found, trees, roots.iter(), &mut load, true)
+}
+
+/// Parses a tree read from git. A tree that cannot be read or parsed is a problem (reported
+/// once, at the tree) and gives `None`, not an error; too many tree bytes held for one scan
+/// (old trees included) is an error.
 fn take_tree(
     found: &mut Collected,
-    trees: &mut HashMap<Sha, Vec<TreeEntry>>,
+    kind: Kind,
     sha: &Sha,
     size: u64,
     body: &mut Body<'_>,
-) -> Result<(), GitError> {
+) -> Result<Option<Entries>, GitError> {
     let at = Where::TreePath {
         path: Vec::new(),
         sha: sha.clone(),
     };
+    if kind != Kind::Tree {
+        found.problems.push((at, Unread::Malformed));
+        return Ok(None);
+    }
     match read_object(size, body) {
         Err(why) => found.problems.push((at, why)),
         Ok(raw) => {
@@ -525,14 +563,12 @@ fn take_tree(
                 return Err(GitError::TooLarge);
             }
             match tree_entries(&raw, sha.as_str().len() / 2) {
-                Some(entries) => {
-                    trees.insert(sha.clone(), entries);
-                }
+                Some(entries) => return Ok(Some(Entries::from(entries))),
                 None => found.problems.push((at, Unread::Malformed)),
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Reads a whole object, or says why it was not read.
