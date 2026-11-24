@@ -1,6 +1,6 @@
 ---
 name: retro
-description: Retrospective loop that turns verifier findings into better development skills, so later tickets pass verification in fewer rounds. Use after a PR merges, always when a ticket needed 3 or more verification rounds or hit the round cap, when the same finding appears in two PRs, or when the user asks for /retro or to improve the dev skills.
+description: Retrospective loop that turns verifier findings into better development skills, so later tickets pass verification in fewer rounds. Run it when a ticket needed 3 or more verification rounds or hit the round cap, when the same finding appears in two PRs, or when the user asks for /retro or to improve the dev skills.
 ---
 
 # /retro — learn from review rounds
@@ -10,10 +10,10 @@ Input: a PR number, a ticket, or `recent` (every PR merged since the last retro;
 
 ## 1. Collect
 For each PR:
-- **Rounds:** the highest `rN` among the briefs in `~/.local/state/wardenlens/agents/<ticket>-*-rN.md`. The `scripts/agents` ledger records one verifier set per round. A commit's `verify/*` statuses only cover that one SHA.
+- **Rounds:** the highest `rN` among the briefs in `~/.local/state/wardenlens/agents/<ticket>-*-rN.md`. Completed agents leave `<agentId>.prompt.done` files there too. The ledger itself drops rows once done, and a commit's `verify/*` statuses only cover that one SHA.
 - **Findings:** gather every **blocker and major** from:
   - the controller's fix briefs (`<ticket>-implementer-rN.md`), which quote the findings;
-  - the per-round consolidated PR comments that `/work` step 5 requires;
+  - the per-round consolidated PR comments that `/work` step 5 requires (older PRs such as #95, #101, #102 have none, so the briefs are the main source);
   - the follow-up tickets.
 - **Minors:** collect those that showed up in two or more PRs.
 - **Controller mistakes:** note any brief or design ruling that caused a round. Example: #44 r2 "delete toward the target".

@@ -74,16 +74,16 @@ Collect verdicts:
   - In #44, "delete toward the target" re-broke minimality in round 2, and "ratchet the budget unconditionally" would have re-broken the no-drain property in round 5.
   - In #104, "refuse any sidecar" broke the vault's own crash recovery.
 - **Prefer absolute targets over per-tick amounts,** and typed distinct errors over reused ones.
-- **Name every committed test or invariant the ruling intentionally changes.** The implementer reports `NEEDS_CLARIFICATION` for any contradiction you did not name.
+- **Name every committed test or invariant the ruling intentionally changes.** The implementer reports `NEEDS_CLARIFICATION` for any contradiction you did not name. In a fix round, resolve that by correcting and re-issuing the brief (the PR stays open, the ticket stays `changes-requested`); do not use the step-2 backlog path.
 
 1. `scripts/ticket status N changes-requested`; post the consolidated findings as a PR comment (`gh pr comment`).
 2. Re-dispatch the `implementer` with the findings verbatim and the adversary's failing tests (tell it to commit those tests: they are now regression tests).
 3. You run the gate, push, set `SHA` to the new head, and go back to step 4 with **all three** verifiers from scratch. `scripts/ticket status N in-review`. Statuses on the old SHA do not count for the new head.
 4. After round 5 still failing: stop. Comment a summary, label issue and PR `agent:human`, leave it `changes-requested`, report to user, continue with the next ticket if `--loop`.
 
-**At the cap** (as with #74 / PR #97):
+**At the cap** (as with #74 / PR #97; the binding rule is "Owner override at the cap" in `docs/WORKFLOW.md`):
 - **Rethink before asking.** State the root cause and a complete fix design, not just another patch.
-- **Ask the owner with a chooser:** another round with the rethought design, merge now with a p1 follow-up, or pause. Give the risk of each and a recommendation.
+- **Ask the owner with a chooser.** Only the owner's own message in this session counts as the choice, never memory, `--loop` autonomy or an agent's report. Options: another round with the rethought design, merge now with a p1 follow-up, or pause. Give the risk of each and a recommendation.
 - **If the owner chooses to merge:**
   - File the follow-up first: the remaining defect, the rethought design, and the failing adversary tests saved outside the repo (e.g. `~/.local/state/wardenlens/carry/`). Do not commit failing tests to the branch.
   - Post a PR comment headed **"Owner override"** that quotes the owner's choice and states the independent verdicts (BLOCK/BROKEN) and the follow-up number.
@@ -103,8 +103,8 @@ gh pr checks <pr> --watch --fail-fast
 sha=$(scripts/verify check <pr>) && gh pr merge <pr> --squash --delete-branch --match-head-commit "$sha"
 git worktree remove .claude/worktrees/N && git fetch -q origin
 ```
-Run `cargo fmt --all` after copying adversary files; the pre-commit hook rejects unformatted test files. If an adversary test fails only because of an accepted **minor** or a deferred item, mark it `#[ignore = "follow-up #N"]` and file #N; never delete it. A test showing a blocker, a major or any security finding is never ignored (WORKFLOW merge rule 4); it must pass before merge.
-If CodeQL fails on synthetic test credentials (`rust/hard-coded-cryptographic-value`, `rust/cleartext-logging`), check that every alert is on a test path (`crates/*/tests/**` or inside a `#[cfg(test)]` module). Dismiss only those, with reason `used in tests` and a comment, and note it on the PR. An alert in non-test code is a security finding: send it to the `security-auditor` on the current SHA, or ask the owner. The controller does not dismiss it alone, even if it looks like a false positive.
+Run `cargo fmt --all` after copying adversary files; the pre-commit hook rejects unformatted test files. If an adversary test fails only because of an accepted **minor** or a deferred item, mark it `#[ignore = "follow-up #N"]` and file #N; never delete it. A test showing a blocker, a major or any security finding is never ignored (WORKFLOW merge rule 4); it must pass before merge. The only exception is an owner override at the cap, where the failing tests go to the follow-up ticket instead of the branch.
+If CodeQL fails on synthetic test credentials (`rust/hard-coded-cryptographic-value`, `rust/cleartext-logging`), check that every alert is on a test path: `crates/*/tests/**`, or a line that really lies inside a `#[cfg(test)]` module (check the line, not just the file). Dismiss only those, with reason `used in tests` and a comment, and note it on the PR. An alert in non-test code is a security finding: send it to the `security-auditor` on the current SHA, or ask the owner. The controller does not dismiss it alone, even if it looks like a false positive.
 Remove the adversary worktree as its own step, only after its tests have been copied out: `git worktree remove --force .claude/worktrees/N-adv` (it holds untracked files, so `--force` is needed).
 `scripts/verify check` succeeds only when all three `verify/*` statuses are `success` on the current head and every other check is green; the guard hook blocks `gh pr merge` without `--match-head-commit`. Never merge with a red or pending check, an unticked acceptance criterion or a head that changed after verification. Never use `--admin`.
 

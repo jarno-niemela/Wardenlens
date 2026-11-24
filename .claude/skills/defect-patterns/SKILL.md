@@ -59,7 +59,9 @@ Keep it current with `/retro` (the `retro` skill).
 ## P3. Touching what is not yours (foreign files, sidecars, recovery)
 - **Rule.** Before any write-capable operation, prove identity **read-only**:
   - write-capable means a read-write open, a pragma, `CREATE`, or SQLite's hot-journal or WAL recovery;
-  - identity means exact schema, version and a keycheck under the supplied key, checked by an immutable probe.
+  - identity means exact schema, version and a keycheck under the supplied key, checked by an immutable probe;
+  - with a hot `-journal`, the main file may be torn (for example a crash mid-rekey leaves the new
+    keycheck page), so identify a **private rolled-back copy** of main file + journal instead (#104 r3).
   - Enumerate **every entry point** (`open`, `create`, `rekey`, the empty-file path) and every sidecar (`-wal`, `-journal`).
 - **Rule.** Separate "foreign" from "mine, mid-write or crashed":
   - wait for a live writer up to the busy timeout;
@@ -164,7 +166,7 @@ Keep it current with `/retro` (the `retro` skill).
 ## P9. Workflow traps (controller and implementer; no code self-test, the gate and CI catch these)
 - **Copied adversary tests:** run `cargo fmt --all` before committing them; the pre-commit hook rejects otherwise.
 - **`Policy` literals:** a new field breaks every external struct literal in the test files. Add the field with a neutral value, not a semantics change.
-- **CodeQL:** it flags synthetic keys and passwords in tests (`hard-coded-cryptographic-value`, `cleartext-logging`). The controller dismisses **test-path** alerts with a reason (PR #90, #97). An alert in non-test code is a security finding for the auditor or the owner. Never weaken the test.
+- **CodeQL:** it flags synthetic keys and passwords in tests (`hard-coded-cryptographic-value`, `cleartext-logging`). The controller dismisses **test-path** alerts with a reason (PR #90). An alert in non-test code is a security finding for the auditor or the owner. Never weaken the test.
 - **Merge conflicts:** almost every branch adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`. Before verifying two PRs in parallel, trial-merge them; resolve conflicts by taking the union of both module lists (PR #97, #101, #102). Resolving a conflict changes the head, so all three verifiers must run again.
 
 ## Checklist (run before reporting DONE)
