@@ -21,6 +21,8 @@ cat >"$tmp/stub" <<'STUB'
 [[ "$1 $2 $3" == "vault scan --" ]] || { echo "stub: unexpected arguments" >&2; exit 99; }
 shift 3
 printf '%s\n' "$@" >>"$STUB_LOG"
+# A copied symlink target is read now: the scratch directory is gone when the step returns.
+for f in "$@"; do case $f in */symlink-*) printf 'target-of-symlink: %s\n' "$(cat "$f")" >>"$STUB_LOG.links" ;; esac; done
 exit "${STUB_EXIT:-0}"
 STUB
 chmod +x "$tmp/stub"
@@ -60,11 +62,14 @@ for ci in "" true; do
   check "vault present (GITHUB_ACTIONS='$ci'): scanner ran" test -s "$STUB_LOG"
 done
 run >/dev/null 2>&1
-seen=$(LC_ALL=C sort "$STUB_LOG" | tr '\n' ' ')
+rm -f "$STUB_LOG.links"
+run >/dev/null 2>&1
+seen=$(grep -v '/symlink-' "$STUB_LOG" | LC_ALL=C sort | tr '\n' ' ')
 check "tracked and untracked files are scanned" test "$seen" = ".gitignore a.txt b.txt untracked.txt "
-check "ignored, symlinked and deleted files are not" bash -c "! grep -qE 'x.log|link|gone' '$STUB_LOG'"
+check "ignored and deleted files are not" bash -c "! grep -qE 'x.log|gone' '$STUB_LOG'"
+check "a tracked symlink is scanned through its target text" grep -qxF "target-of-symlink: a.txt" "$STUB_LOG.links"
 out=$(run 2>&1)
-check "symlink and missing file are counted, not named" bash -c "grep -q '1 symlink(s) and 1 missing' <<<\"\$1\" && ! grep -q 'gone.txt' <<<\"\$1\"" _ "$out"
+check "a missing file is counted, not named" bash -c "grep -q '0 untracked symlink(s) and 1 missing' <<<\"\$1\" && ! grep -q 'gone.txt' <<<\"\$1\"" _ "$out"
 # Scanner failure fails the step.
 checkf "a scanner failure (exit 1) fails" env STUB_EXIT=1 bash -c ". '$root/scripts/lib/vault.sh'; vault_scan_tree '$tmp/stub'"
 checkf "a scanner failure (exit 2) fails" env STUB_EXIT=2 bash -c ". '$root/scripts/lib/vault.sh'; vault_scan_tree '$tmp/stub'"

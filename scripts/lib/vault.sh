@@ -26,29 +26,52 @@ vault_check() {
 # (`git ls-files --cached`) and the untracked, not-ignored files. Run it at the repository top.
 #   - a tracked file over the size limit is passed on, and the scanner fails on it (exit 2);
 #   - an untracked file over the limit only warns (it is not scanned);
-#   - symlinks and files deleted from the work tree are not scanned (counted, never named);
-#   - binary files get the scanner's own notice.
+#   - a tracked symlink is scanned through its target text (the index's blob, copied to a
+#     temporary file); an untracked symlink is counted, not scanned;
+#   - files deleted from the work tree are not scanned (counted, never named);
+#   - binary files get the scanner's own notice;
+#   - a file listing that git cannot produce fails the step (never "nothing to scan").
 # Returns 0 when the scan passed or was skipped, 1 otherwise. Names are never printed: a name can
 # hold a value.
 vault_scan_tree() {
-  local rc=0 limit=8388608 f size skipped=0 big=0 links=0
+  local rc=0
   vault_check || rc=$?
   case $rc in 0) ;; 10) return 0 ;; *) return 1 ;; esac
+  local work
+  work=$(mktemp -d) || { echo "vault scan: FAILED (no temporary directory)" >&2; return 1; }
+  _vault_scan_tree_in "$work" "$@" || rc=$?
+  rm -rf -- "$work"
+  return "$rc"
+}
+
+# _vault_scan_tree_in WORKDIR SCANNER...: the body of vault_scan_tree; WORKDIR is a scratch directory.
+_vault_scan_tree_in() {
+  local work=$1 limit=8388608 f size skipped=0 big=0 links=0 target=0
+  shift
   local files=()
+  # The listings go to files, not process substitutions: the exit status of a failed `git ls-files`
+  # inside `< <(...)` is lost, and a failed listing must never read as an empty tree.
+  git ls-files -z --cached >"$work/tracked" || { echo "vault scan: FAILED (cannot list the tracked files)" >&2; return 1; }
+  git ls-files -z --others --exclude-standard >"$work/untracked" || { echo "vault scan: FAILED (cannot list the untracked files)" >&2; return 1; }
   while IFS= read -r -d '' f; do
-    if [[ -L "$f" ]]; then links=$((links + 1)); continue; fi
+    if [[ -L "$f" ]]; then
+      target=$((target + 1))
+      git cat-file blob ":0:$f" >"$work/symlink-$target" || { echo "vault scan: FAILED (cannot read a tracked symlink)" >&2; return 1; }
+      files+=("$work/symlink-$target")
+      continue
+    fi
     if [[ -d "$f" ]]; then skipped=$((skipped + 1)); continue; fi
     if [[ ! -e "$f" ]]; then skipped=$((skipped + 1)); continue; fi
     files+=("$f")
-  done < <(git ls-files -z --cached)
+  done <"$work/tracked"
   while IFS= read -r -d '' f; do
     if [[ -L "$f" ]]; then links=$((links + 1)); continue; fi
     size=$(stat -c %s -- "$f") || { skipped=$((skipped + 1)); continue; }
     if [[ "$size" -gt "$limit" ]]; then big=$((big + 1)); continue; fi
     files+=("$f")
-  done < <(git ls-files -z --others --exclude-standard)
+  done <"$work/untracked"
   [[ $big -eq 0 ]] || echo "vault scan: warning: $big untracked file(s) over the 8 MiB limit were not scanned" >&2
-  [[ $((links + skipped)) -eq 0 ]] || echo "vault scan: notice: $links symlink(s) and $skipped missing or directory entries not scanned" >&2
+  [[ $((links + skipped)) -eq 0 ]] || echo "vault scan: notice: $links untracked symlink(s) and $skipped missing or directory entries not scanned" >&2
   if [[ ${#files[@]} -eq 0 ]]; then echo "vault scan: nothing to scan"; return 0; fi
   if printf '%s\0' "${files[@]}" | xargs -0 -r "$@" vault scan --; then
     echo "vault scan: PASS (${#files[@]} files)"

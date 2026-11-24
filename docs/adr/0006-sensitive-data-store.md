@@ -525,7 +525,14 @@ is not a listed rendering of a vault value is outside the guarantee):
    image can identify a site and no text scan sees it.
 6. Derived or contextual information: relationships between values, counts, layout, positions of cameras, timestamps
    of events, a hostname's label alone (`nvr-1`), geo-location.
-7. Anything the scan is not run on (section 9): text posted through the GitHub API (see residual risk 9), tool output
+7. Commit and tag objects in a character set the scan does not decode: a commit with a non-UTF-8 `encoding` header holds
+   its message in that encoding (the scan matches the raw bytes, so a value in UTF-16 or a legacy code page is missed),
+   and UTF-16 binary content without a byte-order mark is matched on raw bytes only.
+8. **Trust in the local remote-tracking refs.** "New to the remote" is computed against `refs/remotes/<remote>/*`, which are
+   local files: `git update-ref refs/remotes/origin/x <commit>` marks a commit as already published and it is then not
+   scanned. A fetch keeps them honest; a process that writes them can hide a commit from the scan. The ref-name and
+   replace-ref cases are covered: the scan reads the real objects (`GIT_NO_REPLACE_OBJECTS`, no graft file), as `git push` does.
+9. Anything the scan is not run on (section 9): text posted through the GitHub API (see residual risk 9), tool output
    seen only by an agent, tag and commit messages on a machine without the hooks.
 
 ### 9. Where the scan runs
@@ -607,6 +614,22 @@ a Claude Code `UserPromptSubmit` hook (blocks the owner pasting a vault value in
 agent already knows from reaching a file, a `gh` body or a log), a `scripts/ticket` and `scripts/verify` step that
 scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.claude/projects` transcripts with
 `vault scan PATH...` (this finds a leak after the fact; a transcript cannot be unsent).
+
+**Flags of the git sources (as implemented in #117).**
+
+- `--staged` scans the index against `HEAD` (the empty tree before the first commit), read with the plumbing
+  `git diff-index --cached --raw -z`; `--range A..B` scans what a push of `B` over `A` publishes (an empty or all-zero `A`
+  is a new branch). Every git call ignores replace refs, graft and shallow overrides, reads no configuration that
+  changes output and writes nothing.
+- `--remote NAME` excludes `refs/remotes/NAME/*`. The hook passes it only for a name that matches
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, a stricter pattern than git accepts for a remote name: a URL or an odd name
+  excludes nothing and so scans more (it cannot hide a commit).
+- `--ref NAME` (repeatable) adds a ref name to the scan. A name with a hit is reported as `ref:<index>`, the 0-based
+  position among the `--ref` arguments. The pre-push hook passes every ref of the push, in input order, to each scan, and
+  its own refusal also says `ref:<index>`, never the name.
+- `--default-paths` makes the scanner use the fixed default vault and key paths and ignore `WARDENLENS_VAULT*`.
+- The entry names of a tree object that no new commit leads to (an annotated tag, or a range, ending at a tree) are scanned
+  too; the paths of a tree a commit leads to come from `diff-tree`.
 
 ### 10. Access, in-memory handling and the CLI
 

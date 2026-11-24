@@ -9,10 +9,11 @@ owner copies them in.
 - `pre-commit` runs `wardenlens vault scan --default-paths --staged`: the staged blobs (read from the index, not the working
   tree, binary blobs included) and their paths.
 - `pre-push` runs, for every ref update it receives,
-  `wardenlens vault scan --default-paths --range=<remote_sha>..<local_sha> --remote=<remote name> --ref=<remote ref>`
+  `wardenlens vault scan --default-paths --range=<remote_sha>..<local_sha> --remote=<remote name> --ref=<ref> ...`
   (an all-zero remote sha is a new branch). That covers the blobs that are new to the remote, every path of every new
   commit (`git diff-tree -r --root -m`, so a renamed unchanged file and a second path of one blob are found), the raw
-  commit and tag objects (every header, `mergetag` included, and the message) and the remote ref name. "New to the
+  commit and tag objects (every header, `mergetag` included, and the message) and the remote ref names (every ref of the push goes to each scan, in input order; a name with a hit is reported as
+  `ref:<index>` and the hook's refusal never prints a ref name). "New to the
   remote" is computed against `--remotes=<destination>` only.
 - The scanner is the **fixed installed binary** `$HOME/.cargo/bin/wardenlens`. There is no `WARDENLENS_BIN` override and
   a binary built from the working tree is never used (a hook that runs the code it checks can be edited out of the way

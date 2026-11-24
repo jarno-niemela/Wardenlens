@@ -50,11 +50,16 @@ fn matcher(values: &[(&str, &str)]) -> Matcher {
 }
 
 fn matcher_of_kind(values: &[(&str, &str)], kind: EntryKind) -> Matcher {
+    let typed: Vec<(&str, &str, EntryKind)> = values.iter().map(|(i, v)| (*i, *v, kind)).collect();
+    matcher_typed(&typed)
+}
+
+fn matcher_typed(values: &[(&str, &str, EntryKind)]) -> Matcher {
     let entries: Vec<ScanEntry> = values
         .iter()
-        .map(|(id, v)| ScanEntry {
+        .map(|(id, v, kind)| ScanEntry {
             id: EntryId::new(id).unwrap(),
-            kind,
+            kind: *kind,
             value: SecretString::from((*v).to_owned()),
             unscannable: false,
         })
@@ -698,4 +703,141 @@ fn a_missing_repository_or_revision_is_an_error() {
     let g = Git::at(r.path());
     assert!(g.resolve("no-such-revision").is_err());
     assert!(g.resolve("--help").is_err());
+}
+
+/// A binary blob that holds the addresses between NUL and 0xff bytes: the address tokenisers
+/// must find them in the raw bytes (no line number, a binary blob has none).
+fn binary_blob_with_addresses() -> Vec<u8> {
+    let mut bin = vec![0u8, 0xff, 0];
+    for a in ["192.0.2.77", "2001:db8::77", "02:00:5e:00:53:af"] {
+        bin.extend_from_slice(a.as_bytes());
+        bin.extend_from_slice(&[0, 0xff, 0xfe, 0]);
+    }
+    bin
+}
+
+fn address_matcher() -> Matcher {
+    matcher_typed(&[
+        ("h:v4", "192.0.2.77", EntryKind::Host),
+        ("h:v6", "2001:db8::77", EntryKind::Host),
+        ("m:mac", "02:00:5e:00:53:af", EntryKind::Mac),
+    ])
+}
+
+#[test]
+fn addresses_stored_in_a_binary_blob_are_found_in_a_range() {
+    let r = Repo::new();
+    r.write("blob.bin", &binary_blob_with_addresses());
+    r.commit(&[], "bin");
+    let m = address_matcher();
+    let c = r.range(None, "HEAD", Sources::ALL, &m);
+    expect(&ids(&c), &["h:v4", "h:v6", "m:mac"]);
+    assert!(
+        c.findings
+            .iter()
+            .all(|f| matches!(f.at, Where::Blob { line: None, .. })),
+        "{:?}",
+        c.findings
+    );
+    expect(
+        &ids(&r.range(None, "HEAD", Sources::ALL.without(Sources::BLOBS), &m)),
+        &[],
+    );
+}
+
+#[test]
+fn addresses_stored_in_a_staged_binary_blob_are_found() {
+    let r = Repo::new();
+    r.write("blob.bin", &binary_blob_with_addresses());
+    r.git(&[], &["add", "-A"]);
+    let m = address_matcher();
+    let c = r.staged(Sources::ALL, &m);
+    expect(&ids(&c), &["h:v4", "h:v6", "m:mac"]);
+    assert!(
+        c.findings
+            .iter()
+            .all(|f| matches!(f.at, Where::Index { line: None, .. })),
+        "{:?}",
+        c.findings
+    );
+    expect(
+        &ids(&r.staged(Sources::ALL.without(Sources::BLOBS), &m)),
+        &[],
+    );
+}
+
+#[test]
+fn tree_entry_names_are_parsed_with_bounds_checks() {
+    let mut raw = Vec::new();
+    let mut bounds = vec![0usize];
+    for name in [&b"a b"[..], b"x\xff", b"dir"] {
+        raw.extend_from_slice(b"100644 ");
+        raw.extend_from_slice(name);
+        raw.push(0);
+        raw.extend_from_slice(&[7u8; 20]);
+        bounds.push(raw.len());
+    }
+    let names = tree_names(&raw, 20).unwrap();
+    assert_eq!(names, [&b"a b"[..], b"x\xff", b"dir"]);
+    assert_eq!(tree_names(b"", 20), Some(Vec::new()));
+    // Cut anywhere: no panic, and an error unless the cut falls on an entry boundary.
+    for n in 1..raw.len() {
+        let cut = raw.get(..n).unwrap();
+        let ok = bounds.contains(&n);
+        assert_eq!(tree_names(cut, 20).is_some(), ok, "{n}");
+    }
+    // A 32-byte id (SHA-256) and a missing NUL.
+    let mut wide = b"40000 d\0".to_vec();
+    wide.extend_from_slice(&[1u8; 32]);
+    assert_eq!(tree_names(&wide, 32).unwrap(), [&b"d"[..]]);
+    assert!(tree_names(b"100644 nonul", 20).is_none());
+}
+
+#[test]
+fn a_replace_ref_does_not_change_what_is_scanned() {
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    r.write("s.txt", format!("{V_BLOB}\n").as_bytes());
+    let bad = r.commit(&[], "add s");
+    let blob = r.git(&[], &["rev-parse", &format!("{bad}:s.txt")]);
+    let clean = r.git_in(&["hash-object", "-w", "--stdin"], b"nothing\n");
+    r.git(&[], &["replace", &blob, &clean]);
+    let m = matcher(&[("e:blob", V_BLOB)]);
+    expect(
+        &ids(&r.range(Some(&base), &bad, Sources::ALL, &m)),
+        &["e:blob"],
+    );
+}
+
+#[test]
+fn a_problem_line_is_checked_with_the_text_around_the_location() {
+    // The value spans the fixed text and the location: neither part alone holds it.
+    let m = matcher(&[("e:span", "error: ref:3")]);
+    assert_eq!(render(&m, &Loc::Ref(3)).to_string(), "ref:3");
+    assert_eq!(
+        render_in(&m, &Loc::Ref(3), ("error: ", " is too large")).to_string(),
+        "<redacted-location>"
+    );
+}
+
+#[test]
+fn the_names_of_a_tree_no_commit_leads_to_are_scanned_and_reported_without_the_name() {
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    r.commit(&[], "base");
+    let blob = r.git_in(&["hash-object", "-w", "--stdin"], b"clean\n");
+    let tree = r.git_in(
+        &["mktree"],
+        format!("100644 blob {blob}\tname-{V_PATH}.txt\n").as_bytes(),
+    );
+    let m = matcher(&[("e:path", V_PATH)]);
+    let c = r.range(None, &tree, Sources::ALL, &m);
+    expect(&ids(&c), &["e:path"]);
+    let shown = render(&m, &loc(&c.findings[0].at, &c.paths)).to_string();
+    assert_eq!(shown, format!("<redacted-path> tree {tree}"));
+    expect(
+        &ids(&r.range(None, &tree, Sources::ALL.without(Sources::PATHS), &m)),
+        &[],
+    );
 }

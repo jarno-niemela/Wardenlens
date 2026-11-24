@@ -13,7 +13,7 @@
 //!
 //! Nothing is printed except through [`render`], so a location never holds a value.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 
 use wardenlens_core::entry::{EntryId, EntryKind};
@@ -21,7 +21,7 @@ use wardenlens_vault::{Content, Matcher, classify, scan};
 
 use super::Unread;
 use super::git::{Body, Git, GitError, Kind, MAX_OBJECT_LEN, RawEntry, Sha};
-use super::redact::{Loc, Part, render};
+use super::redact::{Loc, Part, render, render_in};
 use crate::args::ScanArgs;
 use crate::error::CliError;
 use crate::terminal::Terminal;
@@ -47,27 +47,45 @@ pub(super) enum Source {
     },
 }
 
+/// One part of a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceKind {
+    Blobs,
+    Paths,
+    Commits,
+    Tags,
+    Refs,
+}
+
 /// Which parts of a source are scanned. Production scans all of them; a test drops one to
 /// prove that the fixture that finds a value in it really depends on that part.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Sources(u8);
+pub(super) struct Sources {
+    dropped: Option<SourceKind>,
+}
 
 impl Sources {
-    pub(super) const BLOBS: u8 = 1;
-    pub(super) const PATHS: u8 = 2;
-    pub(super) const COMMITS: u8 = 4;
-    pub(super) const TAGS: u8 = 8;
-    pub(super) const REFS: u8 = 16;
-    pub(super) const ALL: Self = Self(31);
+    pub(super) const BLOBS: SourceKind = SourceKind::Blobs;
+    pub(super) const PATHS: SourceKind = SourceKind::Paths;
+    pub(super) const COMMITS: SourceKind = SourceKind::Commits;
+    pub(super) const TAGS: SourceKind = SourceKind::Tags;
+    pub(super) const REFS: SourceKind = SourceKind::Refs;
+    pub(super) const ALL: Self = Self { dropped: None };
 
-    fn has(self, part: u8) -> bool {
-        self.0 & part != 0
+    fn has(self, part: SourceKind) -> bool {
+        self.dropped != Some(part)
     }
 
     /// Every part but `part`.
     #[cfg(test)]
-    pub(super) fn without(self, part: u8) -> Self {
-        Self(self.0 & !part)
+    #[expect(
+        clippy::unused_self,
+        reason = "read as `Sources::ALL.without(x)` at the call sites; only one part is dropped"
+    )]
+    pub(super) fn without(self, part: SourceKind) -> Self {
+        Self {
+            dropped: Some(part),
+        }
     }
 }
 
@@ -84,6 +102,10 @@ enum Where {
         line: Option<usize>,
     },
     BlobPath {
+        path: Vec<u8>,
+        sha: Sha,
+    },
+    TreePath {
         path: Vec<u8>,
         sha: Sha,
     },
@@ -260,6 +282,10 @@ fn loc<'a>(at: &'a Where, paths: &'a BTreeMap<Sha, Vec<Vec<u8>>>) -> Loc<'a> {
             sha: sha.as_str(),
             line: None,
         },
+        Where::TreePath { path, sha } => Loc::Tree {
+            path,
+            sha: sha.as_str(),
+        },
         Where::Commit(sha, part) => Loc::Commit {
             sha: sha.as_str(),
             part: *part,
@@ -282,8 +308,9 @@ fn print<T: Terminal>(
         say(term, &format!("{} {} {at}", f.id, f.kind))?;
     }
     for (at, why) in &found.problems {
-        let at = render(matcher, &loc(at, &found.paths));
-        warn(term, &format!("error: {at} {why}"))?;
+        let post = format!(" {why}");
+        let at = render_in(matcher, &loc(at, &found.paths), ("error: ", &post));
+        warn(term, &format!("error: {at}{post}"))?;
     }
     Ok(GitTally {
         objects: found.objects,
@@ -393,6 +420,7 @@ fn collect_range(
     let objects = git.new_objects(from, to, remote)?;
     let mut found = Collected::default();
     let mut commits = Vec::new();
+    let mut trees = Vec::new();
     git.objects(&objects, |sha, kind, size, body| {
         found.objects = found.objects.saturating_add(1);
         match kind {
@@ -427,11 +455,26 @@ fn collect_range(
                     why,
                 )),
             },
+            Kind::Tree if sources.has(Sources::PATHS) => trees.push(sha.clone()),
             _ => {}
         }
         Ok(())
     })?;
     if sources.has(Sources::PATHS) {
+        // A tag can point at a tree and a range can end at one: no new commit leads to it, so
+        // `diff-tree` lists none of its paths. The entry names of such trees are scanned here
+        // (a tree a commit leads to is covered by the full paths of `diff-tree`).
+        let reached: BTreeSet<Sha> = git
+            .new_objects_of(&commits, from, remote)?
+            .into_iter()
+            .collect();
+        trees.retain(|t| !reached.contains(t));
+        git.objects(&trees, |sha, kind, size, body| {
+            if kind == Kind::Tree {
+                scan_tree_names(matcher, &mut found, sha, size, body);
+            }
+            Ok(())
+        })?;
         for e in git.commit_paths(&commits)? {
             let Some(sha) = e.any_sha() else { continue };
             let at = |_| Where::BlobPath {
@@ -448,6 +491,50 @@ fn collect_range(
         }
     }
     Ok(found)
+}
+
+/// Scans the entry names of a tree object. A tag can point at a tree and a range can end at
+/// one, so no commit leads to it and `diff-tree` lists none of its paths.
+fn scan_tree_names(
+    matcher: &Matcher,
+    found: &mut Collected,
+    sha: &Sha,
+    size: u64,
+    body: &mut Body<'_>,
+) {
+    let at = |path: &[u8]| Where::TreePath {
+        path: path.to_vec(),
+        sha: sha.clone(),
+    };
+    let mut raw = Vec::new();
+    let too_large = usize::try_from(size).map_or(true, |n| n > MAX_OBJECT_LEN);
+    if too_large || body.read_to_end(&mut raw).is_err() {
+        found.problems.push((at(b""), Unread::TooLarge));
+        return;
+    }
+    let Some(names) = tree_names(&raw, sha.as_str().len() / 2) else {
+        found.problems.push((at(b""), Unread::TooLarge));
+        return;
+    };
+    for name in names {
+        found.scan_with(matcher, name, &|_| at(name), false);
+    }
+}
+
+/// The entry names of a raw tree (`mode SP name NUL id`, `id_len` raw bytes), or `None` when the
+/// tree is not well formed. Bounds are checked with `get`; nothing is sliced by position.
+pub(super) fn tree_names(raw: &[u8], id_len: usize) -> Option<Vec<&[u8]>> {
+    let mut names = Vec::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let sp = rest.iter().position(|&b| b == b' ')?;
+        let after_mode = rest.get(sp.checked_add(1)?..)?;
+        let nul = after_mode.iter().position(|&b| b == 0)?;
+        names.push(after_mode.get(..nul)?);
+        let after_name = after_mode.get(nul.checked_add(1)?..)?;
+        rest = after_name.get(id_len..)?;
+    }
+    Some(names)
 }
 
 /// Scans a commit or tag object part by part and records each hit in the part it is in. The

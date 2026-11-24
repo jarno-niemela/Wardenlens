@@ -143,14 +143,29 @@ impl Git {
         if let Some(d) = &self.dir {
             c.arg("-C").arg(d);
         }
-        c.arg("--no-optional-locks")
+        c.arg("--no-replace-objects")
+            .arg("--no-optional-locks")
             .args(["-c", "core.quotePath=false", "-c", "core.fsmonitor=false"])
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env_remove("GIT_EXTERNAL_DIFF")
+            // `git push` sends the real objects and ignores replace refs, grafts and a
+            // shallow-file override, so the scan must read the same objects (P10: this is the
+            // one place every git call goes through).
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env_remove("GIT_REPLACE_REF_BASE")
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .env_remove("GIT_SHALLOW_FILE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(test)]
+        c.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         c
     }
 
@@ -208,17 +223,32 @@ impl Git {
         Sha::parse(line).ok_or(GitError::Malformed)
     }
 
-    /// The staged changes as raw diff entries (against `HEAD`, or the empty tree).
+    /// The empty tree of this repository's hash algorithm (nothing is written).
+    fn empty_tree(&self) -> Result<Sha, GitError> {
+        let out = self.capture(&args(&["hash-object", "-t", "tree", "--stdin"]), b"", 1024)?;
+        let line = out.strip_suffix(b"\n").ok_or(GitError::Malformed)?;
+        Sha::parse(line).ok_or(GitError::Malformed)
+    }
+
+    /// The staged changes as raw diff entries (against `HEAD`, or the empty tree when there is
+    /// no commit yet). Plumbing (`diff-index`), which no porcelain configuration such as
+    /// `diff.relative` can change.
     pub(super) fn staged(&self) -> Result<Vec<RawEntry>, GitError> {
+        let base = match self.resolve("HEAD") {
+            Ok(sha) => sha,
+            // No commit yet (or an unborn HEAD): everything staged is new.
+            Err(GitError::Failed) => self.empty_tree()?,
+            Err(e) => return Err(e),
+        };
         let out = self.capture(
             &args(&[
-                "diff",
+                "diff-index",
                 "--cached",
                 "--raw",
                 "-z",
                 "--no-renames",
                 "--no-abbrev",
-                "--no-ext-diff",
+                base.as_str(),
             ]),
             b"",
             MAX_OUTPUT,
@@ -234,6 +264,30 @@ impl Git {
         to: &Sha,
         remote: Option<&str>,
     ) -> Result<Vec<Sha>, GitError> {
+        self.rev_list(std::slice::from_ref(to), false, from, remote)
+    }
+
+    /// The ids of the new objects that are reachable from `commits`: `new_objects`, but with
+    /// these commits as the tips (the objects only a tag or a bare tree leads to are left out).
+    pub(super) fn new_objects_of(
+        &self,
+        commits: &[Sha],
+        from: Option<&Sha>,
+        remote: Option<&str>,
+    ) -> Result<Vec<Sha>, GitError> {
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.rev_list(commits, true, from, remote)
+    }
+
+    fn rev_list(
+        &self,
+        tips: &[Sha],
+        stdin: bool,
+        from: Option<&Sha>,
+        remote: Option<&str>,
+    ) -> Result<Vec<Sha>, GitError> {
         let mut a = args(&["rev-list", "--objects", "--no-object-names"]);
         // `--not --remotes=R --not`: the remote's tracking refs are excluded, then the
         // meaning of the revisions is the usual one again. Options come before
@@ -242,12 +296,24 @@ impl Git {
         if let Some(p) = &pattern {
             a.extend([OsStr::new("--not"), OsStr::new(p), OsStr::new("--not")]);
         }
+        if stdin {
+            a.push(OsStr::new("--stdin"));
+        }
         let exclude = from.map(|f| format!("^{}", f.as_str()));
-        a.extend([OsStr::new("--end-of-options"), OsStr::new(to.as_str())]);
+        a.push(OsStr::new("--end-of-options"));
+        let mut input = Vec::new();
+        for t in tips {
+            if stdin {
+                input.extend_from_slice(t.as_str().as_bytes());
+                input.push(b'\n');
+            } else {
+                a.push(OsStr::new(t.as_str()));
+            }
+        }
         if let Some(e) = &exclude {
             a.push(OsStr::new(e));
         }
-        parse_shas(&self.capture(&a, b"", MAX_OUTPUT)?)
+        parse_shas(&self.capture(&a, &input, MAX_OUTPUT)?)
     }
 
     /// Every path of every commit (`diff-tree -r --root -m`, each parent of a merge diffed

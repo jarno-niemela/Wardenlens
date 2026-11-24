@@ -61,6 +61,11 @@ pub(super) enum Loc<'a> {
         sha: &'a str,
         line: Option<usize>,
     },
+    /// An entry name inside a tree object that no new commit leads to.
+    Tree {
+        path: &'a [u8],
+        sha: &'a str,
+    },
     Commit {
         sha: &'a str,
         part: Part,
@@ -90,6 +95,12 @@ fn with_line(text: String, line: Option<usize>) -> String {
 /// Renders `loc`. The candidates run from the most to the least specific; the first whose text
 /// (and, for a path, whose raw bytes) holds no vault value is returned.
 pub(super) fn render(matcher: &Matcher, loc: &Loc<'_>) -> Safe {
+    render_in(matcher, loc, ("", ""))
+}
+
+/// Like [`render`], for a location printed as `{pre}{location}{post}`: the fixed text around it
+/// is part of what must hold no vault value, as for [`Safe::path`].
+pub(super) fn render_in(matcher: &Matcher, loc: &Loc<'_>, (pre, post): (&str, &str)) -> Safe {
     let mut candidates: Vec<String> = Vec::new();
     match *loc {
         Loc::Index { path, sha, line } => {
@@ -115,6 +126,12 @@ pub(super) fn render(matcher: &Matcher, loc: &Loc<'_>) -> Safe {
             candidates.push(blob("<redacted-path>", line));
             candidates.push(blob("<redacted-path>", None));
         }
+        Loc::Tree { path, sha } => {
+            if clean(matcher, path) {
+                candidates.push(format!("{} tree {sha}", escaped_bytes(path)));
+            }
+            candidates.push(format!("<redacted-path> tree {sha}"));
+        }
         Loc::Commit { sha, part } => {
             candidates.push(format!("commit:{sha}:{}", part.word()));
             candidates.push(format!("commit:<redacted>:{}", part.word()));
@@ -128,7 +145,7 @@ pub(super) fn render(matcher: &Matcher, loc: &Loc<'_>) -> Safe {
     Safe(
         candidates
             .into_iter()
-            .find(|c| clean(matcher, c.as_bytes()))
+            .find(|c| clean(matcher, format!("{pre}{c}{post}").as_bytes()))
             .unwrap_or_else(|| LAST_RESORT.to_owned()),
     )
 }

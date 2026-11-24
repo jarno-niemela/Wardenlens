@@ -5,6 +5,10 @@
 //! (SEC-6). A path that itself contains a hit is replaced by `<redacted-path:N>`, `N` being the
 //! position of the file in this scan. Exit codes: 0 no hit, 1 a hit, 2 the scan could not run
 //! or could not read an input (failing to scan is never a pass).
+//!
+//! `--staged` scans the staged blobs and paths and `--range A..B` what a push publishes (new
+//! blobs, every path, commit and tag objects, ref names, trees no commit leads to) by reading
+//! git objects (ADR 0006 section 9); the code for those sources is in `git_scan`.
 
 use std::fs::{self, File};
 use std::io::Read;
