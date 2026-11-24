@@ -847,3 +847,124 @@ fn public_occurrence_is_only_valid_for_credential_and_secret() {
     }
     assert_eq!(v.list().unwrap().len(), 0);
 }
+
+// ---- probe hardening (#116) ----------------------------------------------------------------
+
+/// A vault with a hot journal left by a writer that died mid-transaction. Returns (main, journal).
+fn crashed_vault(dir: &TempDir) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let path = db(dir);
+    let mut vault = Vault::create(&path, new_key(dir.path(), "k1")).unwrap();
+    vault
+        .set(
+            &id("secret:one"),
+            EntryKind::Secret,
+            &text("synthetic-value-0123456789"),
+            Scan::Normal,
+        )
+        .unwrap();
+    drop(vault);
+    let journal = dir.path().join("vault.db-journal");
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA cache_size = 1; BEGIN IMMEDIATE; UPDATE entries SET updated_at = 9;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+         INSERT INTO entries SELECT 'secret:pad' || i, 6, randomblob(3000), 0, 1, 1 FROM n;",
+        )
+        .unwrap();
+    let main = std::fs::read(&path).unwrap();
+    let jrn = std::fs::read(&journal).unwrap();
+    drop(writer);
+    std::fs::write(&path, &main).unwrap();
+    std::fs::write(&journal, &jrn).unwrap();
+    (path, main, jrn)
+}
+
+fn no_scratch(d: &TempDir) -> bool {
+    !std::fs::read_dir(d.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".wardenlens-probe")
+    })
+}
+
+/// The retry cap is reached deterministically: a hook that changes the journal during every copy
+/// makes each stamp check fail, so the probe copies exactly `MAX_RETRIES_AFTER_TIMEOUT` times
+/// (it only copies after the busy timeout) and then gives up. The count proves the cap branch ran.
+#[test]
+fn a_journal_that_changes_during_every_copy_hits_the_retry_cap() {
+    use std::io::Write;
+    let d = dir();
+    let (path, m, _j) = crashed_vault(&d);
+    let journal = d.path().join("vault.db-journal");
+    let mut calls = 0u32;
+    let start = std::time::Instant::now();
+    let res = Vault::open_with_hooks(&path, same_key(d.path(), "k1"), || {}, &mut || {
+        calls += 1;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap();
+        f.write_all(&[0u8; 512]).unwrap();
+    });
+    assert!(
+        matches!(res, Err(VaultError::PendingJournal)),
+        "{:?}",
+        res.map(drop)
+    );
+    assert_eq!(calls, crate::store::MAX_RETRIES_AFTER_TIMEOUT);
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(std::fs::read(&path).unwrap(), m);
+    assert!(journal.is_file());
+    assert!(no_scratch(&d));
+}
+
+/// A journal renamed over the path during the copy (same size, new inode) is noticed: the first
+/// copy is discarded and the probe copies again.
+#[test]
+fn a_journal_renamed_over_the_path_during_the_copy_is_detected() {
+    let d = dir();
+    let (path, _m, j) = crashed_vault(&d);
+    let journal = d.path().join("vault.db-journal");
+    let mut calls = 0u32;
+    let v = Vault::open_with_hooks(&path, same_key(d.path(), "k1"), || {}, &mut || {
+        calls += 1;
+        if calls == 1 {
+            let other = d.path().join("swap");
+            std::fs::write(&other, &j).unwrap();
+            std::fs::rename(&other, &journal).unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 2, "the swapped journal was not detected");
+    assert!(v.get(&id("secret:one")).unwrap().is_some());
+}
+
+/// A positive verdict is withdrawn when a `-wal` is there; anything else passes through.
+#[test]
+fn confirm_no_wal_withdraws_a_vault_verdict_when_a_wal_exists() {
+    let d = dir();
+    let p = db(&d);
+    assert!(matches!(
+        crate::store::confirm_no_wal(&p, Ok(true)),
+        Ok(true)
+    ));
+    assert!(matches!(
+        crate::store::confirm_no_wal(&p, Ok(false)),
+        Ok(false)
+    ));
+    std::fs::write(d.path().join("vault.db-wal"), b"x").unwrap();
+    assert!(matches!(
+        crate::store::confirm_no_wal(&p, Ok(true)),
+        Ok(false)
+    ));
+    assert!(matches!(
+        crate::store::confirm_no_wal(&p, Ok(false)),
+        Ok(false)
+    ));
+    assert!(matches!(
+        crate::store::confirm_no_wal(&p, Err(VaultError::NotFound)),
+        Err(VaultError::NotFound)
+    ));
+}

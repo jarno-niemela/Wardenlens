@@ -30,19 +30,22 @@ pub enum VaultError {
     #[error("file is not an initialised vault")]
     NotInitialized,
     /// The vault has a non-empty `-journal` that did not go away within the busy timeout and the
-    /// state could not be judged: `create` met it, a copy of the vault with its journal rolled
-    /// back in a private scratch directory is still corrupt, the copy was over the 256 MiB cap, or
-    /// the journal is not a regular file. Nothing was modified. The owner can wait for a running
-    /// writer to finish and retry; if no writer is running, restore the vault from a backup. Do
-    /// not delete the `-journal` file: it holds the data needed to roll the vault back. A wrong
-    /// key, a foreign database or an unknown schema in that state is reported as
-    /// [`VaultError::WrongKey`], [`VaultError::NotInitialized`] or
+    /// state could not be judged. Causes: `create` met a vault with an unfinished transaction; a
+    /// copy of the vault with its journal rolled back in a private scratch directory is still
+    /// corrupt; a read that raced a writer after the busy timeout found the file corrupt; the retry
+    /// cap was exhausted (the journal or the change counter kept moving); the copy was over the
+    /// 256 MiB cap; the journal is not a regular file; or the journal ends in a super-journal
+    /// pointer (a vault never writes one, and following it is unsafe). Nothing was modified. The
+    /// owner can wait for a running writer to finish and retry; if no writer is running, restore
+    /// the vault from a backup. Do not delete the `-journal` file: it holds the data needed to roll
+    /// the vault back. A wrong key, a foreign database or an unknown schema in that state is
+    /// reported as [`VaultError::WrongKey`], [`VaultError::NotInitialized`] or
     /// [`VaultError::UnsupportedSchema`] instead.
     ///
-    /// A process killed in the middle of `create` leaves a non-empty file with a hot journal and
-    /// no vault: `create` then reports [`VaultError::NotEmpty`] and `open` reports
-    /// [`VaultError::NotInitialized`]. The library cannot recover this state (the file holds
-    /// nothing of value); the owner removes both files and runs `create` again.
+    /// A process killed in the middle of `create` leaves a file with a hot journal and no vault:
+    /// `create` then reports [`VaultError::NotEmpty`] (when the rolled-back copy holds no vault)
+    /// and `open` reports [`VaultError::NotInitialized`]. The library cannot recover this state
+    /// (the file holds nothing of value); the owner removes both files and runs `create` again.
     #[error(
         "vault has an unfinished transaction (another process is writing, or a previous write was interrupted); do not delete the -journal file"
     )]

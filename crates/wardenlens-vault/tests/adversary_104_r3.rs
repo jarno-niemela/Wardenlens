@@ -6,7 +6,7 @@
 )]
 
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -68,6 +68,10 @@ fn foreign_with_hot_journal(tmp: &TempDir) -> (PathBuf, Vec<u8>, Vec<u8>) {
     (db, m, j)
 }
 
+/// A name SQLite accepts as a super-journal: it ends in `-mj`, then 9 hex digits whose third from
+/// last is `9` (SQLite's `pagerIsSuperJrnlName`). Names that do not match are ignored by SQLite.
+const VALID_MJ_SUFFIX: &str = "-mj0123459AB";
+
 /// Appends a super-journal pointer (SQLite's on-disk format) naming `target` to a journal image.
 fn with_super_pointer(journal: &[u8], target: &Path) -> Vec<u8> {
     const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
@@ -98,15 +102,16 @@ fn no_scratch_left(tmp: &Path) -> bool {
 fn open_on_a_foreign_db_whose_journal_names_a_super_journal_deletes_nothing() {
     let tmp = dir();
     let (db, m, j) = foreign_with_hot_journal(&tmp);
-    // A super-journal file whose listed children do not exist: SQLite deletes it after rollback.
-    let precious = tmp.path().join("v.db-mj0123ABCD");
+    // A super-journal file under a valid name whose listed children do not exist.
+    let precious = tmp.path().join(format!("v.db{VALID_MJ_SUFFIX}"));
     std::fs::write(&precious, b"synthetic-precious-bytes").unwrap();
     let j2 = with_super_pointer(&j, &precious);
     let journal = tmp.path().join("v.db-journal");
     std::fs::write(&journal, &j2).unwrap();
     let kf = KeyFile::generate(&tmp.path().join("k")).unwrap();
     let res = Vault::open(&db, kf);
-    assert!(matches!(res, Err(VaultError::NotInitialized)), "{res:?}");
+    // A vault never writes a super-journal pointer, so the probe refuses before copying anything.
+    assert!(matches!(res, Err(VaultError::PendingJournal)), "{res:?}");
     assert_eq!(std::fs::read(&db).unwrap(), m);
     assert_eq!(std::fs::read(&journal).unwrap(), j2);
     assert!(
@@ -122,7 +127,7 @@ fn open_on_a_foreign_db_never_deletes_an_unrelated_file_named_by_its_journal() {
     let tmp = dir();
     let elsewhere = dir();
     let (db, _m, j) = foreign_with_hot_journal(&tmp);
-    let precious = elsewhere.path().join("notes.txt");
+    let precious = elsewhere.path().join(format!("notes{VALID_MJ_SUFFIX}"));
     std::fs::write(&precious, b"synthetic notes without any NUL").unwrap();
     std::fs::write(
         tmp.path().join("v.db-journal"),
@@ -131,34 +136,91 @@ fn open_on_a_foreign_db_never_deletes_an_unrelated_file_named_by_its_journal() {
     .unwrap();
     let kf = KeyFile::generate(&tmp.path().join("k")).unwrap();
     let res = Vault::open(&db, kf);
-    assert!(res.is_err(), "{res:?}");
+    assert!(matches!(res, Err(VaultError::PendingJournal)), "{res:?}");
     assert!(precious.exists(), "unrelated file deleted by the probe");
 }
 
-/// A `-journal` that is a FIFO (non-regular): the probe must not block forever opening it.
-#[test]
-fn open_with_a_fifo_journal_does_not_hang() {
-    let tmp = dir();
-    let db = new_vault(&tmp);
-    let fifo = tmp.path().join("v.db-journal");
+fn mkfifo(path: &Path) {
     let st = std::process::Command::new("mkfifo")
-        .arg(&fifo)
+        .arg(path)
         .status()
         .unwrap();
     assert!(st.success());
-    let key = KeyFile::load(&tmp.path().join("k")).unwrap();
+}
+
+/// Runs `Vault::open` on a thread; `None` if it did not return within 20 s (a hang).
+fn open_within_20s(db: &Path, key: KeyFile) -> Option<String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let db2 = db.clone();
+    let db2 = db.to_path_buf();
     std::thread::spawn(move || {
         let res = Vault::open(&db2, key).map(drop);
         let _ = tx.send(format!("{res:?}"));
     });
-    let got = rx.recv_timeout(Duration::from_secs(20));
-    if got.is_err() {
+    rx.recv_timeout(Duration::from_secs(20)).ok()
+}
+
+/// A `-journal` that is a FIFO (non-regular): the probe must not block forever opening it. The
+/// open is refused as `PendingJournal`, the vault bytes are unchanged, the FIFO is still there
+/// and no scratch directory is left.
+#[test]
+fn open_with_a_fifo_journal_is_pending_and_unchanged() {
+    let tmp = dir();
+    let db = new_vault(&tmp);
+    let before = std::fs::read(&db).unwrap();
+    let fifo = tmp.path().join("v.db-journal");
+    mkfifo(&fifo);
+    let key = KeyFile::load(&tmp.path().join("k")).unwrap();
+    let got = open_within_20s(&db, key);
+    if got.is_none() {
         // Unblock the stuck opener so the test process can exit.
         let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
     }
-    assert!(got.is_ok(), "Vault::open hung on a FIFO -journal");
+    assert_eq!(
+        got.as_deref(),
+        Some("Err(PendingJournal)"),
+        "Vault::open hung on, or mishandled, a FIFO -journal"
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert!(no_scratch_left(tmp.path()));
+}
+
+/// A journal whose tail names a super-journal that is a FIFO under a valid `-mj` name: SQLite
+/// would open it while rolling the copy back and block. The probe reads the journal tail first
+/// and refuses before copying anything: `PendingJournal`, promptly, nothing changed.
+#[test]
+fn open_with_a_journal_naming_a_fifo_super_journal_returns_promptly() {
+    let tmp = dir();
+    let (db, m, j) = foreign_with_hot_journal(&tmp);
+    let fifo = tmp.path().join(format!("v.db{VALID_MJ_SUFFIX}"));
+    mkfifo(&fifo);
+    let j2 = with_super_pointer(&j, &fifo);
+    let journal = tmp.path().join("v.db-journal");
+    std::fs::write(&journal, &j2).unwrap();
+    let kf = KeyFile::generate(&tmp.path().join("k")).unwrap();
+    let got = open_within_20s(&db, kf);
+    if got.is_none() {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some("Err(PendingJournal)"),
+        "hung or mishandled"
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), m);
+    assert_eq!(std::fs::read(&journal).unwrap(), j2);
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert!(no_scratch_left(tmp.path()));
 }
 
 /// A `-journal` symlink to a file elsewhere is never followed: refused, target untouched, no
