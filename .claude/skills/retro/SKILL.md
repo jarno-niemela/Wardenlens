@@ -10,7 +10,7 @@ Input: a PR number, a ticket, or `recent` (every PR merged since the last retro;
 
 ## 1. Collect
 For each PR:
-- **Rounds:** the highest `rN` among the briefs in `~/.local/state/wardenlens/agents/<ticket>-*-rN.md`. Completed agents leave `<agentId>.prompt.done` files there too. The ledger itself drops rows once done, and a commit's `verify/*` statuses only cover that one SHA.
+- **Rounds:** the highest `rN` among the briefs in `~/.local/state/wardenlens/agents/<ticket>-*-rN.md`. Completed agents leave `<agentId>.prompt.done.<timestamp>.*` files there too, with no ticket number, so the brief filenames are the only per-ticket round source; skip `*-reverify.md` briefs. The ledger itself drops rows once done, and a commit's `verify/*` statuses only cover that one SHA.
 - **Findings:** gather every **blocker and major** from:
   - the controller's fix briefs (`<ticket>-implementer-rN.md`), which quote the findings;
   - the per-round consolidated PR comments that `/work` step 5 requires (older PRs such as #95, #101, #102 have none, so the briefs are the main source);

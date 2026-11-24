@@ -111,6 +111,12 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   negative/zero, duplicate, concurrent.
 - **TEST-7 Doc examples compile and run** (`cargo test` runs doc-tests); they
   are part of the contract.
+- **TEST-8 Every test can fail.** The tests for a behaviour, taken together
+  (positive and negative cases), must fail if the code under test returned a
+  constant or echoed its input, so compute expected values independently. A generator must reach the branch it targets. A test of a guard,
+  an ordering or a redaction must fail when that guard is removed or reordered:
+  mutation-check it once by hand and say so in the PR. A test that passes only
+  because of scheduler timing is not deterministic (TEST-5).
 
 ## 6. Style & documentation (`DOC`)
 
