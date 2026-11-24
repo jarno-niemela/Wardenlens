@@ -177,8 +177,8 @@ pub(crate) fn is_unscannable(kind: EntryKind, normalized: &str) -> bool {
         EntryKind::Other => collapsed_fold(normalized).len() < MIN_SCANNABLE_LEN,
         EntryKind::DisplayName => {
             // Per-needle rule: the collapsed form and the slug with its spaces removed must
-            // both reach the minimum. The squeeze table is #75's; it recomputes the flag from
-            // the squeezed needles when it builds the matcher.
+            // both reach the minimum. The scan matcher recomputes the rule from the squeezed
+            // needles when it is built.
             let collapsed = collapsed_fold(normalized);
             let joined: Zeroizing<String> = Zeroizing::new(collapsed.replace(' ', ""));
             collapsed.len() < MIN_SCANNABLE_LEN || joined.len() < MIN_SCANNABLE_LEN

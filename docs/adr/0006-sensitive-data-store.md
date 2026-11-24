@@ -459,8 +459,8 @@ sensitive username belongs in an `other` entry).
 
 *`display-name`* and *`other`* (matched in the fold; the value is whitespace-collapsed: any run of Unicode whitespace
 becomes one space). They are matched in a **joined** view of each text, in addition to the four views: every line
-break (`\n`, `\r\n` or a lone `\r`) and the spaces and tabs that follow it become one space, and any run of spaces, tabs and NBSP becomes one space, so
-a name wrapped across lines or indented is found; a hit is reported at the line where it starts. Boundary: not `A`. Minimum
+break (`\n`, `\r\n` or a lone `\r`) and the spaces and tabs that follow it become one space, and any run of Unicode `White_Space` characters (the set the needle collapse uses, one shared definition; none of them adds a line break, lines are counted on `\n`) becomes one space, so
+a name wrapped across lines or indented is found; the stored value itself, folded but not collapsed, is also a needle of the other views, so it is found byte for byte; a hit is reported at the line where it starts. Boundary: not `A`. Minimum
 7 bytes. `display-name` additionally gets the **slug** needles with each space replaced by `-`, by `_`, and removed.
 Example, stored `Back Door North`: found in `back   door north`, `BACK DOOR NORTH`, `back-door-north`,
 `back_door_north`, `BackDoorNorth`, and `Back Door` newline plus four spaces `North`; not found as `Door North`. Not
@@ -481,7 +481,10 @@ the redaction rule of section 8, a path; it is also item 5 of the gap list). A t
   length are never printed** (SEC-6, ERR-5). The report cannot be used to learn a value beyond "this id occurs here".
 - **A path, ref name, commit message or author line that itself contains a hit is never printed**, because printing
   the location would print the value. The tool first runs the matcher over every path, ref name and message it is about to
-  print, in every report, error and notice. Locations are: `path:line` for a clean path in the tree or the index;
+  print, in every report, error and notice, over **the path-derived part of what is printed**: the escaped name with its `:line`, the raw path bytes, and the fixed message text around them. The entry id and kind printed in front of a hit are not part of it (ids are not secret and may legitimately spell a display name or host). If the redacted form `<redacted-path:N>` with its `:line` still spells a value (a number equal to the line or the position), the `:line` is dropped, then the position. This is applied in one place for hit lines, notices and errors. A
+  path is printed with control characters, line and paragraph separators and invisible or bidirectional formatting characters as
+  `\u{..}` escapes, so a name cannot forge a report line. Exit 1 means only that a value was found; every other failure of
+  the scan, an output error included, is exit 2. Locations are: `path:line` for a clean path in the tree or the index;
   `<redacted-path> blob <sha>` (blob id, then `:line` for a content hit) when the path contains a hit or a hit is in
   a blob whose path does; `commit:<sha>:message` for a hit in a commit message, `commit:<sha>:author` and `commit:<sha>:committer` for the author and
   committer lines, and `commit:<sha>:header` for any other commit header (`mergetag`, `gpgsig`, `encoding`, ...);

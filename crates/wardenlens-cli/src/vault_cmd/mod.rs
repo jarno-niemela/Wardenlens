@@ -5,6 +5,7 @@
 mod keys;
 mod legacy;
 mod paths;
+mod scan;
 mod session;
 mod value;
 
@@ -23,8 +24,15 @@ use crate::terminal::{StdoutKind, Terminal};
 /// # Errors
 /// Any [`CliError`]; the caller prints it and maps it to an exit code.
 pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Result<(), CliError> {
-    // ADR 0006 section 6, for every subcommand: the key is a file, never the environment.
-    env.refuse_key_variable()?;
+    // ADR 0006 section 6, for every subcommand: the key is a file, never the environment. For
+    // a scan that refusal is "the scan could not run" (exit 2), never a pass.
+    if let Err(e) = env.refuse_key_variable() {
+        return Err(if matches!(cmd, VaultCommand::Scan(_)) {
+            could_not_scan(e)
+        } else {
+            e
+        });
+    }
     match cmd {
         VaultCommand::Init => init(env, term),
         VaultCommand::Set(a) => set(&a, &env.paths()?, term),
@@ -36,7 +44,12 @@ pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Re
         VaultCommand::Key(crate::args::KeyCommand::Export) => keys::export(&env.paths()?, term),
         VaultCommand::Key(crate::args::KeyCommand::Import) => keys::import(env, term),
         VaultCommand::ImportLegacy(a) => legacy::import(&a, env, term),
+        VaultCommand::Scan(a) => scan::run(&a, &env.paths().map_err(could_not_scan)?, term),
     }
+}
+
+fn could_not_scan(e: CliError) -> CliError {
+    CliError::CouldNotScan(Box::new(e))
 }
 
 fn parse_id(text: &str) -> Result<EntryId, CliError> {
