@@ -625,11 +625,16 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, a stricter pattern than git accepts for a remote name: a URL or an odd name
   excludes nothing and so scans more (it cannot hide a commit).
 - `--ref NAME` (repeatable) adds a ref name to the scan. A name with a hit is reported as `ref:<index>`, the 0-based
-  position among the `--ref` arguments. The pre-push hook passes every ref of the push, in input order, to each scan, and
-  its own refusal also says `ref:<index>`, never the name.
+  position among the `--ref` arguments. The pre-push hook runs the scan first, over every update and before any other
+  refusal can print a name or a path, and passes every remote ref of the push in input order and then the local ref names
+  (deletions excluded) to each scan; its own refusal says `ref:<index>` (the update's index), never the name. A deletion
+  is scanned over the empty range so that its ref name is checked too. If a remote sha is not known locally, the scan
+  cannot run and the push is refused as `ref:<index>` rather than with the "fetch first" message.
 - `--default-paths` makes the scanner use the fixed default vault and key paths and ignore `WARDENLENS_VAULT*`.
-- The entry names of a tree object that no new commit leads to (an annotated tag, or a range, ending at a tree) are scanned
-  too; the paths of a tree a commit leads to come from `diff-tree`.
+- The entry names of **every** new tree object are scanned, not only those of trees no commit leads to: `diff-tree -r`
+  lists files only, so a directory with no file below it (built with `git mktree`) has no path there. A hit on a name that
+  the `diff-tree` paths already reported is not reported a second time. (`diff-tree -t` was not chosen: it would list
+  every parent directory of every changed file and still miss a tree an annotated tag or the end of the range leads to.)
 
 ### 10. Access, in-memory handling and the CLI
 

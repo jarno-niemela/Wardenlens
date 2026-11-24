@@ -97,7 +97,7 @@ fake 0
 : >"$tmp/calls"
 old=$(git -C "$w" rev-parse origin/feat/x); new=$(git -C "$w" rev-parse HEAD)
 check "pre-push, scan clean: allowed" push feat/x
-check "pre-push scans <remote sha>..<local sha> with the fixed options" grep -qx "ARGS vault scan --default-paths --range=$old..$new --remote=origin --ref=refs/heads/feat/x" "$tmp/calls"
+check "pre-push scans <remote sha>..<local sha> with the fixed options" grep -qx "ARGS vault scan --default-paths --range=$old..$new --remote=origin --ref=refs/heads/feat/x --ref=refs/heads/feat/x" "$tmp/calls"
 check "pre-commit, scan clean: allowed" git -C "$w" commit -q -m z
 check "pre-commit scans the staged blobs with the fixed options" grep -qx "ARGS vault scan --default-paths --staged" "$tmp/calls"
 # a new branch: the all-zero remote sha.
@@ -105,7 +105,7 @@ git -C "$w" checkout -q -b feat/new
 more
 : >"$tmp/calls"
 check "pre-push, new branch: allowed" push feat/new
-check "a new branch is scanned from the all-zero sha" grep -qE "^ARGS vault scan --default-paths --range=0{40}\.\.[0-9a-f]{40} --remote=origin --ref=refs/heads/feat/new$" "$tmp/calls"
+check "a new branch is scanned from the all-zero sha" grep -qE "^ARGS vault scan --default-paths --range=0{40}\.\.[0-9a-f]{40} --remote=origin --ref=refs/heads/feat/new --ref=refs/heads/feat/new$" "$tmp/calls"
 # the variables are ignored: the scanner never sees them.
 : >"$tmp/calls"; more
 check "pre-push with WARDENLENS_VAULT* and XDG_DATA_HOME set: allowed" env WARDENLENS_VAULT=/nonexistent WARDENLENS_VAULT_KEY_FILE=/nonexistent XDG_DATA_HOME=/nonexistent git -C "$w" push -q origin feat/new
@@ -138,6 +138,19 @@ check "pre-push to a URL: no --remote option" bash -c "grep -q '^ARGS' '$tmp/cal
 git -C "$w" tag -a -m v1 v1
 : >"$tmp/calls"
 check "pushing a new tag: allowed" git -C "$w" push -q origin v1
-check "the tag object is the end of the range" grep -qE "^ARGS vault scan --default-paths --range=0{40}\.\.$(git -C "$w" rev-parse v1) .* --ref=refs/tags/v1$" "$tmp/calls"
+check "the tag object is the end of the range" grep -qE "^ARGS vault scan --default-paths --range=0{40}\.\.$(git -C "$w" rev-parse v1) .* --ref=refs/tags/v1 --ref=refs/tags/v1$" "$tmp/calls"
+
+# a push of two refs: one scan per update, each given every remote ref name in input order, then the local names.
+fake 0; git -C "$w" checkout -q feat/x; more
+git -C "$w" branch -q -f feat/two HEAD; git -C "$w" update-ref refs/heads/feat/two "$(git -C "$w" rev-parse HEAD)"
+: >"$tmp/calls"
+check "a two-ref push: allowed" git -C "$w" push -q origin feat/x feat/two
+check "a two-ref push: one scan per update" test "$(grep -c '^ARGS' "$tmp/calls")" -eq 2
+check "a two-ref push: every scan gets the remote refs in input order, then the local ones" test "$(grep -c -- ' --ref=refs/heads/feat/x --ref=refs/heads/feat/two --ref=refs/heads/feat/x --ref=refs/heads/feat/two$' "$tmp/calls")" -eq 2
+check "a two-ref push: the updates are scanned in input order" bash -c "grep '^ARGS' '$tmp/calls' | sed -n 1p | grep -q -- '--range=[0-9a-f]*\.\.' && ! diff <(grep '^ARGS' '$tmp/calls' | sed -n 1p | grep -o -- '--range=[^ ]*') <(grep '^ARGS' '$tmp/calls' | sed -n 2p | grep -o -- '--range=[^ ]*') >/dev/null"
+# the scan runs before a refusal can print a name: a hit refuses as ref:<index> with nothing else.
+fake 1
+checkf "a hit refuses a push to main before the policy message" git -C "$w" push -q origin feat/x:refs/heads/main
+check "the refusal names the update by index, not by name" bash -c "git -C '$w' push -q origin feat/x:refs/heads/main 2>&1 | grep -q 'ref:0' && ! git -C '$w' push -q origin feat/x:refs/heads/main 2>&1 | grep -q 'never push to main'"
 
 exit $fail

@@ -61,7 +61,7 @@ pub(super) enum Loc<'a> {
         sha: &'a str,
         line: Option<usize>,
     },
-    /// An entry name inside a tree object that no new commit leads to.
+    /// An entry name inside a new tree object (an empty name: the tree itself).
     Tree {
         path: &'a [u8],
         sha: &'a str,
@@ -127,10 +127,15 @@ pub(super) fn render_in(matcher: &Matcher, loc: &Loc<'_>, (pre, post): (&str, &s
             candidates.push(blob("<redacted-path>", None));
         }
         Loc::Tree { path, sha } => {
-            if clean(matcher, path) {
-                candidates.push(format!("{} tree {sha}", escaped_bytes(path)));
+            if path.is_empty() {
+                // The tree itself (no entry name to show or to hide).
+                candidates.push(format!("tree {sha}"));
+            } else {
+                if clean(matcher, path) {
+                    candidates.push(format!("{} tree {sha}", escaped_bytes(path)));
+                }
+                candidates.push(format!("<redacted-path> tree {sha}"));
             }
-            candidates.push(format!("<redacted-path> tree {sha}"));
         }
         Loc::Commit { sha, part } => {
             candidates.push(format!("commit:{sha}:{}", part.word()));

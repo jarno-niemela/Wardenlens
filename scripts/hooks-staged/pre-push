@@ -24,10 +24,12 @@
 #     and a pre-push hook cannot tell it from `--force`.
 #   - a push that changes .github/workflows/ is allowed when WARDENLENS_ALLOW_WORKFLOWS=1.
 #
-# Vault scan (ADR 0006 section 9): for every ref update, `wardenlens vault scan --range <remote_sha>..<local_sha>` over what
-# the push would publish: the new blobs (binary ones too), every path of the new commits, the raw commit and tag objects
-# (every header and the message) and the remote ref names. All ref names of the push are given to every scan, in input
-# order, so one is reported as ref:<index>; the refusal never prints a ref name.
+# Vault scan (ADR 0006 section 9). It runs FIRST, over every update, before any check below can print a ref name or a
+# path (a name can hold a value). For every ref update: `wardenlens vault scan --range <remote_sha>..<local_sha>` over
+# what the push would publish: the new blobs (binary ones too), every path of the new commits and every entry name of
+# the new trees (empty directories too), the raw commit and tag objects (every header and the message) and the ref names.
+# All ref names of the push (the remote ones first, then the local ones) are given to every scan, in input order, so one
+# is reported as ref:<index>; the refusal never prints a ref name.
 #   - The scanner is the FIXED installed binary $HOME/.cargo/bin/wardenlens (cargo install --locked --path
 #     crates/wardenlens-cli). There is no WARDENLENS_BIN override, and a binary built from the working tree is never used.
 #   - The vault and key are the fixed default paths. WARDENLENS_VAULT*, XDG_* are ignored: they are unset for the scanner,
@@ -48,9 +50,13 @@ vault_noted=0
 all_refs=()   # every remote ref of this push, in input order (0-based): the scanner reports a ref name as ref:<index>
 
 # vault_scan_push LSHA RSHA IDX: scan what pushing LSHA over RSHA (all zeros: a new branch) publishes, and every ref
-# name of the push. A ref name can hold a value, so the refusal says ref:IDX and never the name.
+# name of the push. A ref name can hold a value, so the refusal says ref:IDX and never the name. A deletion (LSHA all
+# zeros) publishes nothing: it scans the empty range, so the ref names are still checked.
 vault_scan_push() {
-  local lsha=$1 rsha=$2 idx=$3 remote_opt=() ref_opts=() r
+  local lsha=$1 rsha=$2 idx=$3 remote_opt=() ref_opts=() r range
+  if ! is_zero "$lsha"; then range="$rsha..$lsha"
+  elif ! is_zero "$rsha"; then range="$rsha..$rsha"
+  else range="HEAD..HEAD"; fi
   if [[ ! -e "$vault_db" && ! -L "$vault_db" ]]; then
     if [[ "${WARDENLENS_REQUIRE_VAULT:-}" == 1 ]]; then refuse "no vault and WARDENLENS_REQUIRE_VAULT=1" "$vault_db"; fi
     if [[ $vault_noted -eq 0 ]]; then echo "vault scan: SKIPPED (no vault at $vault_db)" >&2; vault_noted=1; fi
@@ -61,7 +67,7 @@ vault_scan_push() {
   if [[ "$remote" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then remote_opt=("--remote=$remote"); fi
   for r in "${all_refs[@]}"; do ref_opts+=("--ref=$r"); done
   env -u WARDENLENS_VAULT -u WARDENLENS_VAULT_KEY_FILE -u WARDENLENS_VAULT_KEY -u XDG_DATA_HOME -u XDG_CONFIG_HOME \
-    "$vault_bin" vault scan --default-paths "--range=$rsha..$lsha" ${remote_opt[@]+"${remote_opt[@]}"} "${ref_opts[@]}" </dev/null >&2 \
+    "$vault_bin" vault scan --default-paths "--range=$range" ${remote_opt[@]+"${remote_opt[@]}"} "${ref_opts[@]}" </dev/null >&2 \
     || refuse "vault scan found a vault value, or could not run (see above)" "ref:$idx"
 }
 
@@ -84,9 +90,21 @@ workflow_files() {
 }
 
 input=()
+local_refs=()
 while read -r lref lsha rref rsha; do
   input+=("$lref $lsha $rref $rsha")
   all_refs+=("$rref")
+  if ! is_zero "$lsha"; then local_refs+=("$lref"); fi
+done
+# The local names come after the remote ones, so a remote name keeps its update's index.
+for r in ${local_refs[@]+"${local_refs[@]}"}; do all_refs+=("$r"); done
+# The vault scan runs FIRST, over every update, before any refusal below can print a ref name or a path (a name can hold
+# a value): a hit is refused as ref:<index> and nothing else is printed.
+idx=-1
+for line in ${input[@]+"${input[@]}"}; do
+  idx=$((idx + 1))
+  read -r lref lsha rref rsha <<<"$line"
+  vault_scan_push "$lsha" "$rsha" "$idx"
 done
 idx=-1
 for line in ${input[@]+"${input[@]}"}; do
@@ -117,6 +135,5 @@ for line in ${input[@]+"${input[@]}"}; do
       refuse "changes to .github/workflows/ need the user (WARDENLENS_ALLOW_WORKFLOWS=1, human only)" "$rref: $(head -n1 <<<"$wf")"
     fi
   fi
-  vault_scan_push "$lsha" "$rsha" "$idx"
 done
 exit 0

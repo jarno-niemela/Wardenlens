@@ -7,7 +7,7 @@
 //! or could not read an input (failing to scan is never a pass).
 //!
 //! `--staged` scans the staged blobs and paths and `--range A..B` what a push publishes (new
-//! blobs, every path, commit and tag objects, ref names, trees no commit leads to) by reading
+//! blobs, every path, commit and tag objects, ref names, every tree name) by reading
 //! git objects (ADR 0006 section 9); the code for those sources is in `git_scan`.
 
 use std::fs::{self, File};
@@ -48,6 +48,8 @@ enum Unread {
     TooLarge,
     #[error("is nested deeper than the walk limit")]
     TooDeep,
+    #[error("is not a well formed git object")]
+    Malformed,
 }
 
 /// Something found while walking: a file to scan or one that could not be read.
@@ -453,6 +455,7 @@ mod tests {
             Unread::NotRegular,
             Unread::TooLarge,
             Unread::TooDeep,
+            Unread::Malformed,
         ] {
             assert!(!format!("{u} {u:?}").contains('/'));
         }

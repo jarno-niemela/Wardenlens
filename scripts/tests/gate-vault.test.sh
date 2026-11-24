@@ -22,7 +22,7 @@ cat >"$tmp/stub" <<'STUB'
 shift 3
 printf '%s\n' "$@" >>"$STUB_LOG"
 # A copied symlink target is read now: the scratch directory is gone when the step returns.
-for f in "$@"; do case $f in */symlink-*) printf 'target-of-symlink: %s\n' "$(cat "$f")" >>"$STUB_LOG.links" ;; esac; done
+for f in "$@"; do case $f in */tracked-entry-*) printf 'target-of-symlink: %s\n' "$(cat "$f")" >>"$STUB_LOG.links" ;; esac; done
 exit "${STUB_EXIT:-0}"
 STUB
 chmod +x "$tmp/stub"
@@ -64,10 +64,11 @@ done
 run >/dev/null 2>&1
 rm -f "$STUB_LOG.links"
 run >/dev/null 2>&1
-seen=$(grep -v '/symlink-' "$STUB_LOG" | LC_ALL=C sort | tr '\n' ' ')
+seen=$(grep -v '/tracked-entry-' "$STUB_LOG" | LC_ALL=C sort | tr '\n' ' ')
 check "tracked and untracked files are scanned" test "$seen" = ".gitignore a.txt b.txt untracked.txt "
 check "ignored and deleted files are not" bash -c "! grep -qE 'x.log|gone' '$STUB_LOG'"
 check "a tracked symlink is scanned through its target text" grep -qxF "target-of-symlink: a.txt" "$STUB_LOG.links"
+check "a tracked symlink copy is named by the entry's ordinal, not by its name" bash -c "grep -qE '/tracked-entry-[0-9]+\$' '$STUB_LOG' && ! grep -q 'symlink-\|/link\$' '$STUB_LOG'"
 out=$(run 2>&1)
 check "a missing file is counted, not named" bash -c "grep -q '0 untracked symlink(s) and 1 missing' <<<\"\$1\" && ! grep -q 'gone.txt' <<<\"\$1\"" _ "$out"
 # Scanner failure fails the step.

@@ -27,7 +27,8 @@ vault_check() {
 #   - a tracked file over the size limit is passed on, and the scanner fails on it (exit 2);
 #   - an untracked file over the limit only warns (it is not scanned);
 #   - a tracked symlink is scanned through its target text (the index's blob, copied to a
-#     temporary file); an untracked symlink is counted, not scanned;
+#     temporary file named tracked-entry-N, N the entry's ordinal in `git ls-files --cached`); an untracked symlink is
+#     counted, not scanned;
 #   - files deleted from the work tree are not scanned (counted, never named);
 #   - binary files get the scanner's own notice;
 #   - a file listing that git cannot produce fails the step (never "nothing to scan").
@@ -46,7 +47,7 @@ vault_scan_tree() {
 
 # _vault_scan_tree_in WORKDIR SCANNER...: the body of vault_scan_tree; WORKDIR is a scratch directory.
 _vault_scan_tree_in() {
-  local work=$1 limit=8388608 f size skipped=0 big=0 links=0 target=0
+  local work=$1 limit=8388608 f size skipped=0 big=0 links=0 ord=0
   shift
   local files=()
   # The listings go to files, not process substitutions: the exit status of a failed `git ls-files`
@@ -54,10 +55,12 @@ _vault_scan_tree_in() {
   git ls-files -z --cached >"$work/tracked" || { echo "vault scan: FAILED (cannot list the tracked files)" >&2; return 1; }
   git ls-files -z --others --exclude-standard >"$work/untracked" || { echo "vault scan: FAILED (cannot list the untracked files)" >&2; return 1; }
   while IFS= read -r -d '' f; do
+    ord=$((ord + 1))
     if [[ -L "$f" ]]; then
-      target=$((target + 1))
-      git cat-file blob ":0:$f" >"$work/symlink-$target" || { echo "vault scan: FAILED (cannot read a tracked symlink)" >&2; return 1; }
-      files+=("$work/symlink-$target")
+      # The scanner names the copy it reads: name it by the entry's ordinal in `git ls-files --cached` (1-based), never by
+      # the symlink's own name, which can hold a value.
+      git cat-file blob ":0:$f" >"$work/tracked-entry-$ord" || { echo "vault scan: FAILED (cannot read a tracked symlink)" >&2; return 1; }
+      files+=("$work/tracked-entry-$ord")
       continue
     fi
     if [[ -d "$f" ]]; then skipped=$((skipped + 1)); continue; fi

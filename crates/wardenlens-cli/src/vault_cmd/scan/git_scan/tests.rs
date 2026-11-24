@@ -841,3 +841,104 @@ fn the_names_of_a_tree_no_commit_leads_to_are_scanned_and_reported_without_the_n
         &[],
     );
 }
+
+/// A new commit on top of `HEAD` whose root tree adds an empty directory `dir`; `HEAD` moves to it.
+fn commit_with_empty_dir(r: &Repo, dir: &str) -> String {
+    let empty = r.git_in(&["mktree"], b"");
+    let entries = format!(
+        "{}\n040000 tree {empty}\t{dir}\n",
+        r.git(&[], &["ls-tree", "HEAD"])
+    );
+    let tree = r.git_in(&["mktree"], entries.as_bytes());
+    let parent = r.git(&[], &["rev-parse", "HEAD"]);
+    let c = r.git(
+        &[],
+        &["commit-tree", &tree, "-p", &parent, "-m", "empty dir"],
+    );
+    r.git(&[], &["update-ref", "HEAD", &c]);
+    c
+}
+
+#[test]
+fn an_empty_directory_named_with_a_value_is_found_and_reported_without_the_name() {
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    let c = commit_with_empty_dir(&r, &format!("d-{V_PATH}"));
+    let m = matcher(&[("e:path", V_PATH)]);
+    let found = r.range(Some(&base), &c, Sources::ALL, &m);
+    expect(&ids(&found), &["e:path"]);
+    let shown = render(&m, &loc(&found.findings[0].at, &found.paths)).to_string();
+    assert!(shown.starts_with("<redacted-path> tree "), "{shown}");
+    expect(
+        &ids(&r.range(Some(&base), &c, Sources::ALL.without(Sources::PATHS), &m)),
+        &[],
+    );
+}
+
+#[test]
+fn a_directory_name_found_through_a_file_path_is_reported_once() {
+    // The root tree names the directory and the path of the file below it holds the same name.
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    std::fs::create_dir(r.path().join(format!("d-{V_PATH}"))).unwrap();
+    r.write(&format!("d-{V_PATH}/f.txt"), b"clean\n");
+    let c = r.commit(&[], "dir with a file");
+    let m = matcher(&[("e:path", V_PATH)]);
+    let found = r.range(Some(&base), &c, Sources::ALL, &m);
+    expect(&ids(&found), &["e:path"]);
+    assert_eq!(found.findings.len(), 1, "one place, one finding");
+}
+
+#[test]
+fn a_malformed_tree_is_a_malformed_problem_not_a_size_problem() {
+    // git itself refuses to list a tree it cannot parse, so the problem is built by hand: the
+    // report of a tree with no entry name is `tree <sha>` (no stray space), and the reason is
+    // `Malformed`, which says nothing about size.
+    let m = matcher(&[("e:path", V_PATH)]);
+    let sha = Sha::parse("a".repeat(40).as_bytes()).unwrap();
+    let at = Where::TreePath {
+        path: Vec::new(),
+        sha: sha.clone(),
+    };
+    let post = format!(" {}", Unread::Malformed);
+    let shown = render_in(&m, &loc(&at, &BTreeMap::new()), ("error: ", &post)).to_string();
+    assert_eq!(
+        format!("error: {shown}{post}"),
+        format!(
+            "error: tree {} is not a well formed git object",
+            sha.as_str()
+        )
+    );
+    assert!(!Unread::Malformed.to_string().contains("larger"));
+}
+
+#[test]
+fn an_empty_tree_path_renders_as_the_tree_alone() {
+    let m = matcher(&[("e:path", V_PATH)]);
+    let a = "a".repeat(40);
+    assert_eq!(
+        render(&m, &Loc::Tree { path: b"", sha: &a }).to_string(),
+        format!("tree {a}")
+    );
+}
+
+#[test]
+fn a_graft_does_not_hide_content_from_the_scan() {
+    let r = Repo::new();
+    r.write("a.txt", format!("{V_BLOB}\n").as_bytes());
+    let first = r.commit(&[], "first");
+    r.write("b.txt", b"b\n");
+    let second = r.commit(&[], "second");
+    // The graft makes `second` a root commit: git itself, run plainly, no longer lists `first`.
+    std::fs::write(r.path().join(".git/info/grafts"), format!("{second}\n")).unwrap();
+    let plain = r.git(&[], &["rev-list", &second]);
+    assert_eq!(plain.lines().count(), 1, "the graft is not in effect here");
+    let m = matcher(&[("e:blob", V_BLOB)]);
+    // The scan sets GIT_GRAFT_FILE=/dev/null: the parent and its blob are still read.
+    let found = r.range(None, &second, Sources::ALL, &m);
+    expect(&ids(&found), &["e:blob"]);
+    assert_eq!(found.findings.len(), 1);
+    let _ = first;
+}

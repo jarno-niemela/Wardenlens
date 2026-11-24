@@ -264,30 +264,6 @@ impl Git {
         to: &Sha,
         remote: Option<&str>,
     ) -> Result<Vec<Sha>, GitError> {
-        self.rev_list(std::slice::from_ref(to), false, from, remote)
-    }
-
-    /// The ids of the new objects that are reachable from `commits`: `new_objects`, but with
-    /// these commits as the tips (the objects only a tag or a bare tree leads to are left out).
-    pub(super) fn new_objects_of(
-        &self,
-        commits: &[Sha],
-        from: Option<&Sha>,
-        remote: Option<&str>,
-    ) -> Result<Vec<Sha>, GitError> {
-        if commits.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.rev_list(commits, true, from, remote)
-    }
-
-    fn rev_list(
-        &self,
-        tips: &[Sha],
-        stdin: bool,
-        from: Option<&Sha>,
-        remote: Option<&str>,
-    ) -> Result<Vec<Sha>, GitError> {
         let mut a = args(&["rev-list", "--objects", "--no-object-names"]);
         // `--not --remotes=R --not`: the remote's tracking refs are excluded, then the
         // meaning of the revisions is the usual one again. Options come before
@@ -296,24 +272,13 @@ impl Git {
         if let Some(p) = &pattern {
             a.extend([OsStr::new("--not"), OsStr::new(p), OsStr::new("--not")]);
         }
-        if stdin {
-            a.push(OsStr::new("--stdin"));
-        }
-        let exclude = from.map(|f| format!("^{}", f.as_str()));
         a.push(OsStr::new("--end-of-options"));
-        let mut input = Vec::new();
-        for t in tips {
-            if stdin {
-                input.extend_from_slice(t.as_str().as_bytes());
-                input.push(b'\n');
-            } else {
-                a.push(OsStr::new(t.as_str()));
-            }
-        }
+        a.push(OsStr::new(to.as_str()));
+        let exclude = from.map(|f| format!("^{}", f.as_str()));
         if let Some(e) = &exclude {
             a.push(OsStr::new(e));
         }
-        parse_shas(&self.capture(&a, &input, MAX_OUTPUT)?)
+        parse_shas(&self.capture(&a, b"", MAX_OUTPUT)?)
     }
 
     /// Every path of every commit (`diff-tree -r --root -m`, each parent of a merge diffed

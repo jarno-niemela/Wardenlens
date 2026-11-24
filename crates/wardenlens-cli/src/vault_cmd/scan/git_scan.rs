@@ -153,22 +153,23 @@ impl Collected {
         }
     }
 
-    /// Scans `bytes`; each hit becomes a finding at `at(line)`.
+    /// Scans `bytes`; each hit becomes a finding at `at(line)`. Returns the ids that hit.
     fn scan_with(
         &mut self,
         matcher: &Matcher,
         bytes: &[u8],
         at: &dyn Fn(Option<usize>) -> Where,
         lines: bool,
-    ) {
-        match scan(matcher, bytes) {
-            Ok(report) => {
-                self.truncated |= report.truncated;
-                for h in &report.hits {
-                    self.add(&h.id, h.kind, at(lines.then_some(h.line)));
-                }
+    ) -> Vec<EntryId> {
+        if let Ok(report) = scan(matcher, bytes) {
+            self.truncated |= report.truncated;
+            for h in &report.hits {
+                self.add(&h.id, h.kind, at(lines.then_some(h.line)));
             }
-            Err(_) => self.problems.push((at(None), Unread::TooLarge)),
+            report.hits.into_iter().map(|h| h.id).collect()
+        } else {
+            self.problems.push((at(None), Unread::TooLarge));
+            Vec::new()
         }
     }
 }
@@ -461,29 +462,31 @@ fn collect_range(
         Ok(())
     })?;
     if sources.has(Sources::PATHS) {
-        // A tag can point at a tree and a range can end at one: no new commit leads to it, so
-        // `diff-tree` lists none of its paths. The entry names of such trees are scanned here
-        // (a tree a commit leads to is covered by the full paths of `diff-tree`).
-        let reached: BTreeSet<Sha> = git
-            .new_objects_of(&commits, from, remote)?
-            .into_iter()
-            .collect();
-        trees.retain(|t| !reached.contains(t));
-        git.objects(&trees, |sha, kind, size, body| {
-            if kind == Kind::Tree {
-                scan_tree_names(matcher, &mut found, sha, size, body);
-            }
-            Ok(())
-        })?;
+        // Every path of every new commit, with the blob ids. A name in it is found here ...
+        let mut covered: BTreeSet<(Vec<u8>, EntryId)> = BTreeSet::new();
         for e in git.commit_paths(&commits)? {
             let Some(sha) = e.any_sha() else { continue };
             let at = |_| Where::BlobPath {
                 path: e.path.clone(),
                 sha: sha.clone(),
             };
-            found.scan_with(matcher, &e.path, &at, false);
+            for id in found.scan_with(matcher, &e.path, &at, false) {
+                for part in e.path.split(|&b| b == b'/') {
+                    covered.insert((part.to_vec(), id.clone()));
+                }
+            }
             found.paths.entry(sha.clone()).or_default().push(e.path);
         }
+        // ... but `diff-tree -r` lists files only, so a directory with no file below it (and a
+        // tree only a tag or the end of the range leads to) has no path there. The entry names
+        // of EVERY new tree are scanned; a name whose hit the paths above already reported is
+        // not reported a second time.
+        git.objects(&trees, |sha, kind, size, body| {
+            if kind == Kind::Tree {
+                scan_tree_names(matcher, &mut found, &covered, sha, size, body);
+            }
+            Ok(())
+        })?;
     }
     if sources.has(Sources::REFS) {
         for (i, name) in refs.iter().enumerate() {
@@ -493,11 +496,12 @@ fn collect_range(
     Ok(found)
 }
 
-/// Scans the entry names of a tree object. A tag can point at a tree and a range can end at
-/// one, so no commit leads to it and `diff-tree` lists none of its paths.
+/// Scans the entry names of a tree object. A hit whose (name, entry) the commit paths already
+/// reported (`covered`) is left out: one finding per place, not per way of finding it.
 fn scan_tree_names(
     matcher: &Matcher,
     found: &mut Collected,
+    covered: &BTreeSet<(Vec<u8>, EntryId)>,
     sha: &Sha,
     size: u64,
     body: &mut Body<'_>,
@@ -507,17 +511,32 @@ fn scan_tree_names(
         sha: sha.clone(),
     };
     let mut raw = Vec::new();
-    let too_large = usize::try_from(size).map_or(true, |n| n > MAX_OBJECT_LEN);
-    if too_large || body.read_to_end(&mut raw).is_err() {
+    if usize::try_from(size).map_or(true, |n| n > MAX_OBJECT_LEN) {
         found.problems.push((at(b""), Unread::TooLarge));
         return;
     }
+    if body.read_to_end(&mut raw).is_err() {
+        found
+            .problems
+            .push((at(b""), Unread::Io(std::io::ErrorKind::UnexpectedEof)));
+        return;
+    }
     let Some(names) = tree_names(&raw, sha.as_str().len() / 2) else {
-        found.problems.push((at(b""), Unread::TooLarge));
+        found.problems.push((at(b""), Unread::Malformed));
         return;
     };
     for name in names {
-        found.scan_with(matcher, name, &|_| at(name), false);
+        match scan(matcher, name) {
+            Ok(report) => {
+                found.truncated |= report.truncated;
+                for h in report.hits {
+                    if !covered.contains(&(name.to_vec(), h.id.clone())) {
+                        found.add(&h.id, h.kind, at(name));
+                    }
+                }
+            }
+            Err(_) => found.problems.push((at(name), Unread::TooLarge)),
+        }
     }
 }
 

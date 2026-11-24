@@ -11,10 +11,12 @@ owner copies them in.
 - `pre-push` runs, for every ref update it receives,
   `wardenlens vault scan --default-paths --range=<remote_sha>..<local_sha> --remote=<remote name> --ref=<ref> ...`
   (an all-zero remote sha is a new branch). That covers the blobs that are new to the remote, every path of every new
-  commit (`git diff-tree -r --root -m`, so a renamed unchanged file and a second path of one blob are found), the raw
-  commit and tag objects (every header, `mergetag` included, and the message) and the remote ref names (every ref of the push goes to each scan, in input order; a name with a hit is reported as
-  `ref:<index>` and the hook's refusal never prints a ref name). "New to the
-  remote" is computed against `--remotes=<destination>` only.
+  commit (`git diff-tree -r --root -m`, so a renamed unchanged file and a second path of one blob are found), every
+  entry name of every new tree (so an empty directory is found too), the raw commit and tag objects (every header,
+  `mergetag` included, and the message) and the ref names. Every ref of the push goes to each scan with `--ref=<ref>`, the
+  remote ones first in input order, then the local ones; the scanner reports a name with a hit as `ref:<index>` (its
+  position in that list, so the index of an update is that of its remote ref) and the hook's refusal never prints a ref
+  name. "New to the remote" is computed against `--remotes=<destination>` only.
 - The scanner is the **fixed installed binary** `$HOME/.cargo/bin/wardenlens`. There is no `WARDENLENS_BIN` override and
   a binary built from the working tree is never used (a hook that runs the code it checks can be edited out of the way
   by the change it checks).
@@ -30,13 +32,14 @@ owner copies them in.
 
 `scripts/hooks-staged/pre-push` is the **complete** new hook: the existing `.githooks/pre-push` with lines added and none
 removed. Every existing refusal (main, tags, deletions, unknown remote state, force pushes, workflow changes) is
-untouched and runs first. The vault scan is the last step for each ref update, so a refused push never reaches it. The
-additions are:
+untouched. The vault scan runs **first**, over every ref update, before the policy loop, so that no refusal can print a
+ref name or a workflow path that holds a value (the scan refuses as `ref:<index>`). The additions are:
 
 1. a comment block describing the scan (after the exceptions list);
 2. after `refuse()`: the variables `remote` (the hook's `$1`), `vault_db`, `vault_bin`, `vault_noted`, and the function
-   `vault_scan_push LSHA RSHA RREF`;
-3. one line at the end of the `while read` loop body, after the workflow check: `vault_scan_push "$lsha" "$rsha" "$rref"`.
+   `vault_scan_push LSHA RSHA IDX` (IDX is the update's position in the push, 0-based, never a name);
+3. lines around the `while read` loop that collect the updates and ref names, then scan every update before the policy
+   loop runs (the policy loop is the original loop body, unchanged).
 
 Show the difference with `diff -u .githooks/pre-push scripts/hooks-staged/pre-push` (it has no `-` lines); the tests
 check that (`scripts/tests/hooks-staged.test.sh`) and also run every existing `pre-push.test.sh` case against the staged
