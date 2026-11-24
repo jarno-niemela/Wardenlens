@@ -137,10 +137,15 @@ fn hot_journal_restoring_a_deleted_keycheck_opens_with_the_key() {
     );
 }
 
-/// A writer that keeps growing the journal forever: `open` gives up with `PendingJournal` in
-/// bounded time (busy timeout plus the retry cap), modifies nothing and leaves no scratch.
+/// A writer that keeps growing the journal: `open` returns in bounded time (busy timeout plus the
+/// retry cap). Whether the churn thread lands a write between the probe's stamps depends on the
+/// scheduler, so both outcomes are legitimate: `PendingJournal` (the probe never saw a stable
+/// copy) or `Ok` (it did). What is guaranteed is checked: the bound, the typed outcome, the main
+/// file unchanged whenever the open is refused, and no scratch directory left. The retry-cap
+/// branch itself is reached deterministically in the unit test
+/// `a_journal_that_changes_during_every_copy_hits_the_retry_cap`.
 #[test]
-fn open_against_a_journal_that_never_settles_is_bounded_and_pending() {
+fn open_against_a_churning_journal_is_bounded_and_clean() {
     let tmp = dir();
     let db = new_vault(&tmp);
     let (m, _j) = crash_after(&db, "UPDATE entries SET updated_at = 9;");
@@ -152,7 +157,10 @@ fn open_against_a_journal_that_never_settles_is_bounded_and_pending() {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&j2).unwrap();
         while !s2.load(Ordering::Relaxed) {
-            f.write_all(&[0u8; 512]).unwrap();
+            // The journal may be consumed by a successful open: stop quietly then.
+            if f.write_all(&[0u8; 512]).is_err() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
     });
@@ -161,9 +169,15 @@ fn open_against_a_journal_that_never_settles_is_bounded_and_pending() {
     let took = start.elapsed();
     stop.store(true, Ordering::Relaxed);
     churn.join().unwrap();
-    assert!(matches!(res, Err(VaultError::PendingJournal)), "{res:?}");
     assert!(took < Duration::from_secs(30), "took {took:?}");
-    assert_eq!(std::fs::read(&db).unwrap(), m);
+    match res {
+        Err(VaultError::PendingJournal) => {
+            assert_eq!(std::fs::read(&db).unwrap(), m);
+            assert!(journal.exists());
+        }
+        Ok(_) => {}
+        Err(e) => panic!("unexpected outcome: {e:?}"),
+    }
     assert!(no_scratch_left(tmp.path()));
 }
 
@@ -314,5 +328,52 @@ fn scratch_directory_is_private_while_it_exists() {
             assert_eq!(*mode & 0o077, 0, "scratch file {name} mode {mode:o}");
         }
     }
+    assert!(no_scratch_left(tmp.path()));
+}
+
+/// A crashed `create` that left a valid page 1 and a hot journal (the journal restores a file that
+/// holds a valid page 1 and no vault schema): `create` says `NotEmpty` (a vault was never made;
+/// the advice is to remove both files), `open` says `NotInitialized`. Nothing is modified.
+#[test]
+fn crashed_create_with_a_valid_page_1_and_a_hot_journal_is_not_empty() {
+    let tmp = dir();
+    let db = tmp.path().join("v.db");
+    let journal = tmp.path().join("v.db-journal");
+    std::fs::write(&db, b"").unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let c = rusqlite::Connection::open(&db).unwrap();
+    // Page 1 only: a valid SQLite header, no tables.
+    c.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA user_version = 1;")
+        .unwrap();
+    assert!(
+        std::fs::metadata(&db).unwrap().len() >= 512,
+        "fixture: page 1 written"
+    );
+    c.execute_batch(
+        "PRAGMA cache_size = 1; BEGIN IMMEDIATE;
+         CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB NOT NULL);
+         CREATE TABLE entries(id TEXT PRIMARY KEY, kind INTEGER NOT NULL, record BLOB NOT NULL,
+           unscannable INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+         INSERT INTO entries SELECT 'secret:pad' || i, 2, randomblob(3000), 0, 1, 1 FROM n;",
+    )
+    .unwrap();
+    let main = std::fs::read(&db).unwrap();
+    let j = std::fs::read(&journal).unwrap();
+    assert!(!j.is_empty(), "fixture: the journal is hot (non-empty)");
+    drop(c);
+    std::fs::write(&db, &main).unwrap();
+    std::fs::write(&journal, &j).unwrap();
+    let kf = KeyFile::generate(&tmp.path().join("k")).unwrap();
+    let res = Vault::create(&db, kf);
+    assert!(matches!(res, Err(VaultError::NotEmpty)), "{res:?}");
+    let opened = Vault::open(&db, key(&tmp));
+    assert!(
+        matches!(opened, Err(VaultError::NotInitialized)),
+        "{opened:?}"
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), main);
+    assert_eq!(std::fs::read(&journal).unwrap(), j);
     assert!(no_scratch_left(tmp.path()));
 }
