@@ -19,9 +19,6 @@ const ENCODED_SECRET_LEN: usize = 43;
 /// Longest token (and so header value) the server will look at, in bytes (SEC-2).
 pub const MAX_TOKEN_LEN: usize = 128;
 
-/// The 32-symbol id alphabet, `a-z2-7`.
-const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-
 /// Digest compared against when the id is unknown or revoked, so timing does not
 /// reveal which ids exist. Never equals a real digest (a SHA-256 preimage is needed).
 const DUMMY_DIGEST: [u8; 32] = [0xA5; 32];
@@ -72,14 +69,7 @@ impl Token {
         let mut secret = [0u8; SECRET_LEN];
         getrandom::fill(&mut id_bytes).map_err(|_| RandomUnavailable)?;
         getrandom::fill(&mut secret).map_err(|_| RandomUnavailable)?;
-        // 5 bits of each byte index the 32-symbol alphabet; 32 divides 256 so there is no bias.
-        let mut id_chars = String::with_capacity(TOKEN_ID_LEN);
-        for b in id_bytes {
-            id_chars.push(char::from(
-                ALPHABET.get(usize::from(b & 31)).copied().unwrap_or(b'a'),
-            ));
-        }
-        let id = TokenId::parse(&id_chars).map_err(|_| RandomUnavailable)?;
+        let id = TokenId::from_random(id_bytes);
         Ok(Self {
             id,
             secret: Secret(secret),

@@ -26,14 +26,16 @@ const LOG_FAILURE_EVERY: u64 = 64;
 /// Shared state of the middleware.
 pub(crate) struct AuthState<S> {
     store: Arc<S>,
-    failures: AtomicU64,
+    auth_failures: AtomicU64,
+    store_failures: AtomicU64,
 }
 
 impl<S> AuthState<S> {
     pub(crate) fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            failures: AtomicU64::new(0),
+            auth_failures: AtomicU64::new(0),
+            store_failures: AtomicU64::new(0),
         }
     }
 }
@@ -45,7 +47,10 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     if values.next().is_some() || value.len() > MAX_HEADER_LEN {
         return None;
     }
-    let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+    let (scheme, rest) = value.to_str().ok()?.split_once(' ')?;
+    // RFC 7235: one or more spaces between scheme and credentials. A tab, a trailing
+    // space or a second credential makes the token fail to parse.
+    let token = rest.trim_start_matches(' ');
     scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
@@ -85,24 +90,38 @@ where
     let mut token_id = None;
     match check(state.store.as_ref(), req.headers(), &mut token_id).await {
         Ok(()) => next.run(req).await,
-        Err(failure) => {
-            let n = state.failures.fetch_add(1, Ordering::Relaxed);
-            if n.checked_rem(LOG_FAILURE_EVERY) == Some(0) {
-                let peer = req
-                    .extensions()
-                    .get::<ConnectInfo<SocketAddr>>()
-                    .map(|c| c.0);
+        Err(Failure::Unauthorized) => {
+            if sampled(&state.auth_failures) {
+                let peer = peer(&req);
                 tracing::warn!(?peer, ?token_id, "authentication failed (sampled)");
             }
-            match failure {
-                Failure::Unauthorized => {
-                    let mut resp = error_response(StatusCode::UNAUTHORIZED);
-                    resp.headers_mut()
-                        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-                    resp
-                }
-                Failure::Store => error_response(StatusCode::INTERNAL_SERVER_ERROR),
+            let mut resp = error_response(StatusCode::UNAUTHORIZED);
+            resp.headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            resp
+        }
+        Err(Failure::Store) => {
+            // Own counter: a store outage must not hide behind, or hide, auth failures.
+            // No token id and no detail are logged.
+            if sampled(&state.store_failures) {
+                let peer = peer(&req);
+                tracing::error!(?peer, "token store unavailable (sampled)");
             }
+            error_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// True for the first of every [`LOG_FAILURE_EVERY`] events counted on `counter`.
+fn sampled(counter: &AtomicU64) -> bool {
+    counter
+        .fetch_add(1, Ordering::Relaxed)
+        .checked_rem(LOG_FAILURE_EVERY)
+        == Some(0)
+}
+
+fn peer(req: &Request) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0)
 }

@@ -9,9 +9,14 @@
 //!
 //! Outermost first:
 //!
-//! 1. `SetSensitiveRequestHeadersLayer` marks `Authorization` sensitive before anything
-//!    can log it, so it must wrap the trace layer.
-//! 2. `TraceLayer` logs requests and responses (headers redacted by 1).
+//! The layers wrap the whole router as **one service**, so the concurrency cap is global
+//! (one semaphore for every route, method and unknown path), not per route.
+//!
+//! 1. `SetSensitiveRequestHeadersLayer` marks `Authorization`, `Cookie` and
+//!    `Proxy-Authorization` sensitive before anything can log them, so it must wrap the
+//!    trace layer.
+//! 2. `TraceLayer` logs requests and responses (headers redacted by 1). The span records
+//!    the method, the path and the headers, never the query string.
 //! 3. JSON error mapping turns bodyless error responses into `{"error": code}`.
 //! 4. `ConcurrencyLimitLayer` caps in-flight requests. It sits **outside** the timeout so
 //!    that waiting for a free slot does not consume the request deadline.
@@ -32,7 +37,9 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{Extension, Request};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, PROXY_AUTHORIZATION,
+};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use tower::ServiceBuilder;
@@ -40,7 +47,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
@@ -95,23 +102,24 @@ const LIMITS: Limits = Limits {
 };
 
 /// Replaces non-JSON error responses (from the limit layers, `404`, `405`) with the
-/// JSON error body, keeping status and headers.
+/// JSON error body, keeping the status and every header (multi-valued ones included)
+/// except `Content-Type` and `Content-Length`.
 async fn json_errors(req: Request, next: Next) -> Response {
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
     let status = resp.status();
     let is_json = resp
         .headers()
         .get(CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
     if (status.is_client_error() || status.is_server_error()) && !is_json {
+        let mut headers = std::mem::take(resp.headers_mut());
+        headers.remove(CONTENT_TYPE);
+        headers.remove(CONTENT_LENGTH);
         let mut replacement = error_response(status);
-        for (name, value) in resp.headers() {
-            if name != CONTENT_TYPE && name != CONTENT_LENGTH {
-                replacement
-                    .headers_mut()
-                    .insert(name.clone(), value.clone());
-            }
+        for (name, value) in replacement.headers() {
+            headers.insert(name.clone(), value.clone());
         }
+        *replacement.headers_mut() = headers;
         return replacement;
     }
     resp
@@ -122,22 +130,35 @@ async fn not_found() -> StatusCode {
 }
 
 /// Wraps `router` in the documented middleware stack.
+///
+/// The layers are applied to the finished router as one service, not with
+/// `Router::layer`: that would wrap every route and the fallback separately, each with
+/// its own concurrency semaphore, and the cap would be per route instead of global.
 fn with_layers(router: Router, limits: Limits) -> Router {
-    router.layer(
-        ServiceBuilder::new()
-            .layer(SetSensitiveRequestHeadersLayer::new([AUTHORIZATION]))
-            .layer(
-                TraceLayer::new_for_http()
-                    .make_span_with(DefaultMakeSpan::new().include_headers(true)),
+    let service = ServiceBuilder::new()
+        .layer(SetSensitiveRequestHeadersLayer::new([
+            AUTHORIZATION,
+            COOKIE,
+            PROXY_AUTHORIZATION,
+        ]))
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &Request| {
+            // Path only: a query string may carry a token someone put there by mistake.
+            tracing::info_span!(
+                "request",
+                method = %req.method(),
+                path = %req.uri().path(),
+                headers = ?req.headers(),
             )
-            .layer(middleware::from_fn(json_errors))
-            .layer(ConcurrencyLimitLayer::new(limits.max_in_flight))
-            .layer(TimeoutLayer::with_status_code(
-                StatusCode::REQUEST_TIMEOUT,
-                limits.timeout,
-            ))
-            .layer(RequestBodyLimitLayer::new(limits.max_body_bytes)),
-    )
+        }))
+        .layer(middleware::from_fn(json_errors))
+        .layer(ConcurrencyLimitLayer::new(limits.max_in_flight))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            limits.timeout,
+        ))
+        .layer(RequestBodyLimitLayer::new(limits.max_body_bytes))
+        .service(router);
+    Router::new().fallback_service(service)
 }
 
 fn build<S>(store: Arc<S>, limits: Limits) -> Router
@@ -147,6 +168,8 @@ where
     let auth = Arc::new(AuthState::new(store));
     // Everything except health, unknown paths included, requires a token, so a
     // caller without one learns nothing about which routes exist.
+    // `build` takes only `OpenApiRouter` fragments (`routes!` with `#[utoipa::path]`), so
+    // every route is documented by construction.
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::openapi_json))
         .fallback(not_found)

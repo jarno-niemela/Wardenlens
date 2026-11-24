@@ -39,6 +39,15 @@ impl TokenId {
         }
     }
 
+    /// Builds an id from random bytes; cannot fail. The low 5 bits of each byte pick a
+    /// character of `a-z2-7`; 32 divides 256, so a uniform byte gives a uniform character.
+    #[must_use]
+    pub fn from_random(bytes: [u8; TOKEN_ID_LEN]) -> Self {
+        const ALPHABET: [u8; 32] = *b"abcdefghijklmnopqrstuvwxyz234567";
+        // `b & 31` is below 32, so the lookup is always in range; the fallback is unreachable.
+        Self(bytes.map(|b| ALPHABET.get(usize::from(b & 31)).copied().unwrap_or(b'a')))
+    }
+
     /// The id as a string slice (always ASCII).
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -129,6 +138,16 @@ mod tests {
         ] {
             assert_eq!(TokenId::parse(bad), Err(InvalidTokenId), "{bad}");
         }
+    }
+
+    #[test]
+    fn from_random_maps_every_byte_to_a_valid_id() {
+        for b in 0..=255u8 {
+            let id = TokenId::from_random([b; TOKEN_ID_LEN]);
+            assert_eq!(TokenId::parse(id.as_str()), Ok(id), "byte {b}");
+        }
+        let id = TokenId::from_random([0, 1, 25, 26, 31, 32, 33, 255]);
+        assert_eq!(id.as_str(), "abz27ab7");
     }
 
     #[test]

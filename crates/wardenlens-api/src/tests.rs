@@ -316,13 +316,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
-#[tokio::test]
-async fn token_is_absent_from_trace_output() {
-    // A process-wide subscriber: a thread-local one loses to callsite interest cached
-    // as "disabled" by tests running in parallel. Other tests' output lands in the same
-    // buffer, which only makes the absence check stricter.
+/// Installs (once) a process-wide capturing subscriber and returns its buffer. A
+/// thread-local one loses to callsite interest cached as "disabled" by tests running in
+/// parallel. Tests share the buffer, so each filters on a unique marker.
+fn capture() -> &'static Capture {
     static CAPTURE: OnceLock<Capture> = OnceLock::new();
-    let capture = CAPTURE.get_or_init(|| {
+    CAPTURE.get_or_init(|| {
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(capture.clone())
@@ -331,18 +330,38 @@ async fn token_is_absent_from_trace_output() {
         // Ignoring the error is fine: it only fails if a global subscriber exists already.
         let _ = tracing::subscriber::set_global_default(subscriber);
         capture
-    });
+    })
+}
+
+fn captured() -> String {
+    String::from_utf8(capture().0.lock().unwrap().clone()).unwrap()
+}
+
+#[tokio::test]
+async fn token_is_absent_from_trace_output() {
+    capture();
     let (app, token) = app();
     let secret = token.expose();
     let auth = format!("Bearer {secret}");
     let req = Request::builder()
         .uri("/api/v1/openapi.json")
         .header(header::AUTHORIZATION, &auth)
+        .header(header::COOKIE, format!("session={secret}"))
+        .header(header::PROXY_AUTHORIZATION, format!("Bearer {secret}"))
         .header("x-control", "visible-marker")
         .body(Body::empty())
         .unwrap();
-    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
-    let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // A token in the query string is not accepted, and must not be traced either.
+    let query = format!("/api/v1/openapi.json?access_token={secret}");
+    assert_eq!(
+        app.oneshot(get_req(&query, None)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let out = captured();
     // Positive control: headers are traced, so the absence below is meaningful.
     assert!(out.contains("visible-marker"), "headers not traced: {out}");
     assert!(!out.contains(&secret), "token leaked into trace output");
@@ -351,3 +370,159 @@ async fn token_is_absent_from_trace_output() {
         "secret leaked into trace output"
     );
 }
+
+/// Lines of `out` that mention `marker` and `message`.
+fn count_lines(out: &str, marker: &str, message: &str) -> usize {
+    out.lines()
+        .filter(|l| l.contains(marker) && l.contains(message))
+        .count()
+}
+
+#[tokio::test]
+async fn auth_failures_are_sampled_and_log_only_the_token_id() {
+    capture();
+    let (app, _) = app();
+    let unknown = Token::generate().unwrap();
+    let auth = format!("Bearer {}", unknown.expose());
+    let marker = "/api/v1/sampling-auth-marker";
+    let n = 200usize;
+    for _ in 0..n {
+        let resp = app
+            .clone()
+            .oneshot(get_req(marker, Some(&auth)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let out = captured();
+    assert_eq!(
+        count_lines(&out, marker, "authentication failed"),
+        n.div_ceil(64)
+    );
+    for line in out
+        .lines()
+        .filter(|l| l.contains("authentication failed") && l.contains(marker))
+    {
+        assert!(
+            line.contains(&format!("token_id=Some(\"{}\")", unknown.id())),
+            "{line}"
+        );
+        assert!(!line.contains(&unknown.expose()), "{line}");
+        assert!(!line.contains(&unknown.expose()[12..]), "{line}");
+        assert!(!line.contains("token store unavailable"), "{line}");
+    }
+    assert_eq!(count_lines(&out, marker, "token store unavailable"), 0);
+}
+
+#[tokio::test]
+async fn store_failures_are_sampled_separately_and_log_no_token() {
+    capture();
+    let store = FakeStore {
+        fail: true,
+        ..FakeStore::default()
+    };
+    let (app, token) = app_with(store);
+    let auth = format!("Bearer {}", token.expose());
+    let marker = "/api/v1/sampling-store-marker";
+    let n = 130usize;
+    for _ in 0..n {
+        let resp = app
+            .clone()
+            .oneshot(get_req(marker, Some(&auth)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    // Interleave auth failures: they must not advance the store counter.
+    for _ in 0..3 {
+        let resp = app.clone().oneshot(get_req(marker, None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let out = captured();
+    assert_eq!(
+        count_lines(&out, marker, "token store unavailable"),
+        n.div_ceil(64)
+    );
+    // The auth counter saw only the 3 header-less failures: one warn line.
+    assert_eq!(count_lines(&out, marker, "authentication failed"), 1);
+    for line in out
+        .lines()
+        .filter(|l| l.contains("token store unavailable") && l.contains(marker))
+    {
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(!line.contains(token.id().as_str()), "{line}");
+        assert!(!line.contains("wl_"), "{line}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_for_a_slot_does_not_consume_the_request_deadline() {
+    async fn hold() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        "held"
+    }
+    let router = Router::new()
+        .route("/hold", get(hold))
+        .route("/fast", get(|| async { "fast" }));
+    let app = with_layers(
+        router,
+        Limits {
+            max_in_flight: 1,
+            timeout: Duration::from_secs(10),
+            ..LIMITS
+        },
+    );
+    let start = tokio::time::Instant::now();
+    let spawn = |path: &'static str| {
+        let app = app.clone();
+        tokio::spawn(async move { app.oneshot(get_req(path, None)).await })
+    };
+    let first = spawn("/hold");
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    let second = spawn("/hold");
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    let queued = spawn("/fast");
+    for h in [first, second, queued] {
+        assert_eq!(h.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+    // The last request waited 16 s for its slot: longer than the 10 s deadline.
+    assert!(start.elapsed() >= Duration::from_secs(16));
+}
+
+#[tokio::test]
+async fn health_declares_no_security_requirement() {
+    let (app, token) = app();
+    let auth = format!("Bearer {}", token.expose());
+    let resp = app
+        .oneshot(get_req("/api/v1/openapi.json", Some(&auth)))
+        .await
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        doc["paths"]["/api/v1/health"]["get"]["security"],
+        serde_json::json!([{}])
+    );
+}
+
+#[tokio::test]
+async fn undocumented_path_is_never_served() {
+    let (app, token) = app();
+    let auth = format!("Bearer {}", token.expose());
+    for (a, want) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(auth.as_str()), StatusCode::NOT_FOUND),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(get_req("/api/v1/undocumented", a))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), want);
+    }
+}
+
+mod adversary;
