@@ -40,6 +40,8 @@ pub(super) enum GitError {
     Missing,
     #[error("too many objects for one scan")]
     TooMany,
+    #[error("a path is longer than the scan limit")]
+    PathTooLong,
 }
 
 /// An object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
@@ -279,32 +281,6 @@ impl Git {
             a.push(OsStr::new(e));
         }
         parse_shas(&self.capture(&a, b"", MAX_OUTPUT)?)
-    }
-
-    /// Every path of every commit (`diff-tree -r --root -m`, each parent of a merge diffed
-    /// separately), with the blob ids. Raw output rather than `--name-only` so a path can be
-    /// reported together with its blob.
-    pub(super) fn commit_paths(&self, commits: &[Sha]) -> Result<Vec<RawEntry>, GitError> {
-        if commits.is_empty() {
-            return Ok(Vec::new());
-        }
-        let out = self.capture(
-            &args(&[
-                "diff-tree",
-                "--stdin",
-                "--no-commit-id",
-                "-r",
-                "--raw",
-                "--root",
-                "-m",
-                "-z",
-                "--no-renames",
-                "--no-abbrev",
-            ]),
-            &sha_lines(commits),
-            MAX_OUTPUT,
-        )?;
-        parse_raw(&out)
     }
 
     /// Reads objects with `cat-file --batch`, in order. `each` gets the kind, the size and a

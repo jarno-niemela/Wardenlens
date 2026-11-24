@@ -10,9 +10,10 @@ owner copies them in.
   tree, binary blobs included) and their paths.
 - `pre-push` runs, for every ref update it receives,
   `wardenlens vault scan --default-paths --range=<remote_sha>..<local_sha> --remote=<remote name> --ref=<ref> ...`
-  (an all-zero remote sha is a new branch). That covers the blobs that are new to the remote, every path of every new
-  commit (`git diff-tree -r --root -m`, so a renamed unchanged file and a second path of one blob are found), every
-  entry name of every new tree (so an empty directory is found too), the raw commit and tag objects (every header,
+  (an all-zero remote sha is a new branch). That covers the blobs that are new to the remote, the full path of every entry
+  of every new tree (a walk from the root tree of every new commit and from every tree a tag or the range end points at,
+  descending only into new trees, with an explicit stack and fail-closed limits; so a renamed unchanged file, a second path
+  of one blob, an empty directory and a value spelled across a `/` are found), the raw commit and tag objects (every header,
   `mergetag` included, and the message) and the ref names. Every ref of the push goes to each scan with `--ref=<ref>`, the
   remote ones first in input order, then the local ones; the scanner reports a name with a hit as `ref:<index>` (its
   position in that list, so the index of an update is that of its remote ref) and the hook's refusal never prints a ref

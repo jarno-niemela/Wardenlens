@@ -26,8 +26,8 @@
 #
 # Vault scan (ADR 0006 section 9). It runs FIRST, over every update, before any check below can print a ref name or a
 # path (a name can hold a value). For every ref update: `wardenlens vault scan --range <remote_sha>..<local_sha>` over
-# what the push would publish: the new blobs (binary ones too), every path of the new commits and every entry name of
-# the new trees (empty directories too), the raw commit and tag objects (every header and the message) and the ref names.
+# what the push would publish: the new blobs (binary ones too), the full path of every entry of the new trees (walked from
+# the root of every new commit and from every tree a tag or the range end points at; empty directories too), the raw commit and tag objects (every header and the message) and the ref names.
 # All ref names of the push (the remote ones first, then the local ones) are given to every scan, in input order, so one
 # is reported as ref:<index>; the refusal never prints a ref name.
 #   - The scanner is the FIXED installed binary $HOME/.cargo/bin/wardenlens (cargo install --locked --path
@@ -47,7 +47,7 @@ remote=${1:-}
 vault_db=$HOME/.local/share/wardenlens/dev-vault.db
 vault_bin=$HOME/.cargo/bin/wardenlens
 vault_noted=0
-all_refs=()   # every remote ref of this push, in input order (0-based): the scanner reports a ref name as ref:<index>
+all_refs=()   # the remote refs of this push in input order, then the local ones: index n and up is a local name; the scanner reports a name as ref:<index>
 
 # vault_scan_push LSHA RSHA IDX: scan what pushing LSHA over RSHA (all zeros: a new branch) publishes, and every ref
 # name of the push. A ref name can hold a value, so the refusal says ref:IDX and never the name. A deletion (LSHA all
@@ -68,7 +68,7 @@ vault_scan_push() {
   for r in "${all_refs[@]}"; do ref_opts+=("--ref=$r"); done
   env -u WARDENLENS_VAULT -u WARDENLENS_VAULT_KEY_FILE -u WARDENLENS_VAULT_KEY -u XDG_DATA_HOME -u XDG_CONFIG_HOME \
     "$vault_bin" vault scan --default-paths "--range=$range" ${remote_opt[@]+"${remote_opt[@]}"} "${ref_opts[@]}" </dev/null >&2 \
-    || refuse "vault scan found a vault value, or could not run (see above)" "ref:$idx"
+    || refuse "vault scan found a vault value, or could not run (see above; fetch first if the remote moved)" "ref:$idx"
 }
 
 # workflow_files LSHA RSHA: print the paths under .github/workflows/ touched by the pushed commits

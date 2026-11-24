@@ -144,13 +144,23 @@ check "the tag object is the end of the range" grep -qE "^ARGS vault scan --defa
 fake 0; git -C "$w" checkout -q feat/x; more
 git -C "$w" branch -q -f feat/two HEAD; git -C "$w" update-ref refs/heads/feat/two "$(git -C "$w" rev-parse HEAD)"
 : >"$tmp/calls"
+oldx=$(git -C "$tmp/remote.git" rev-parse refs/heads/feat/x); newx=$(git -C "$w" rev-parse feat/x); newtwo=$(git -C "$w" rev-parse feat/two)
 check "a two-ref push: allowed" git -C "$w" push -q origin feat/x feat/two
 check "a two-ref push: one scan per update" test "$(grep -c '^ARGS' "$tmp/calls")" -eq 2
 check "a two-ref push: every scan gets the remote refs in input order, then the local ones" test "$(grep -c -- ' --ref=refs/heads/feat/x --ref=refs/heads/feat/two --ref=refs/heads/feat/x --ref=refs/heads/feat/two$' "$tmp/calls")" -eq 2
-check "a two-ref push: the updates are scanned in input order" bash -c "grep '^ARGS' '$tmp/calls' | sed -n 1p | grep -q -- '--range=[0-9a-f]*\.\.' && ! diff <(grep '^ARGS' '$tmp/calls' | sed -n 1p | grep -o -- '--range=[^ ]*') <(grep '^ARGS' '$tmp/calls' | sed -n 2p | grep -o -- '--range=[^ ]*') >/dev/null"
+ranges=$(grep '^ARGS' "$tmp/calls" | grep -o -- '--range=[^ ]*')
+check "a two-ref push: the first scan is the first update's range" test "$(sed -n 1p <<<"$ranges")" = "--range=$oldx..$newx"
+check "a two-ref push: the second scan is the second update's range" test "$(sed -n 2p <<<"$ranges")" = "--range=0000000000000000000000000000000000000000..$newtwo"
 # the scan runs before a refusal can print a name: a hit refuses as ref:<index> with nothing else.
 fake 1
 checkf "a hit refuses a push to main before the policy message" git -C "$w" push -q origin feat/x:refs/heads/main
 check "the refusal names the update by index, not by name" bash -c "git -C '$w' push -q origin feat/x:refs/heads/main 2>&1 | grep -q 'ref:0' && ! git -C '$w' push -q origin feat/x:refs/heads/main 2>&1 | grep -q 'never push to main'"
+
+# a deletion is scanned over the empty range <rsha>..<rsha> (so the ref name is still checked), then refused by policy.
+fake 0; : >"$tmp/calls"
+rsha=$(git -C "$tmp/remote.git" rev-parse refs/heads/feat/two)
+del=":refs/heads/feat/two"
+checkf "a deletion with a clean scan: still refused by the policy" git -C "$w" push -q origin "$del"
+check "a deletion is scanned over --range=<rsha>..<rsha>" grep -q -- "^ARGS vault scan --default-paths --range=$rsha\.\.$rsha " "$tmp/calls"
 
 exit $fail

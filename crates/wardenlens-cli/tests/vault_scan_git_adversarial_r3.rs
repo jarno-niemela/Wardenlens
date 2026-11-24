@@ -461,7 +461,7 @@ fn with_a_vault_the_staged_pre_push_lets_a_clean_feature_push_through() {
 #[test]
 fn a_value_in_a_ref_name_of_a_deletion_is_refused_by_index_without_the_name() {
     let s = Setup::new();
-    let _remote = s.with_hooks();
+    let remote = s.with_hooks();
     let name = format!("refs/heads/g-{OTHER}");
     s.git(&[
         "-c",
@@ -474,5 +474,13 @@ fn a_value_in_a_ref_name_of_a_deletion_is_refused_by_index_without_the_name() {
     let o = s.git_out(&["push", "-q", "origin", &format!(":{name}")]);
     assert!(!o.status.success());
     assert!(err(&o).contains("ref:0"), "{}", err(&o));
+    // Refused by the scan (which prints the index), not by the policy message that names the ref.
+    assert!(!err(&o).contains("deleting remote branches"), "{}", err(&o));
     Setup::never_prints(&o);
+    let still = s
+        .git_cmd(&remote)
+        .args(["rev-parse", "--verify", &name])
+        .output()
+        .unwrap();
+    assert!(still.status.success(), "the remote branch was deleted");
 }

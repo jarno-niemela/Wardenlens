@@ -631,10 +631,18 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   is scanned over the empty range so that its ref name is checked too. If a remote sha is not known locally, the scan
   cannot run and the push is refused as `ref:<index>` rather than with the "fetch first" message.
 - `--default-paths` makes the scanner use the fixed default vault and key paths and ignore `WARDENLENS_VAULT*`.
-- The entry names of **every** new tree object are scanned, not only those of trees no commit leads to: `diff-tree -r`
-  lists files only, so a directory with no file below it (built with `git mktree`) has no path there. A hit on a name that
-  the `diff-tree` paths already reported is not reported a second time. (`diff-tree -t` was not chosen: it would list
-  every parent directory of every changed file and still miss a tree an annotated tag or the end of the range leads to.)
+- **Paths are scanned as full paths, by a walk of the new trees.** A path can spell a value and a value can hold a `/`,
+  so the unit scanned is the full path of an entry (`parent/child`), never a name alone. The walk starts at the roots (the
+  root tree of every new commit, and every new tree a tag or the end of the range points at directly) and descends only
+  into trees that are new: every ancestor of a new tree is itself new, so every changed path is visited and a published
+  subtree is never walked again. It uses an explicit stack over one path buffer (no recursion) and fails closed (exit 2)
+  on a path longer than 4096 bytes, on more than 500 000 distinct (path, entry) places, or on more than 32 MiB of raw
+  trees. A place is visited once (key: full path and entry id), so a tree shared by many commits is not rescanned. A value
+  in a directory's path is reported at the files and directories below it (where it is published); only when nothing below
+  reports it is it reported at the directory itself (an empty one). The `diff-tree` path scan was removed: the walk covers
+  everything it did (renames and second paths of a blob are paths in a new tree; a merge's tree is a root) and what it
+  could not (empty directories, trees only a tag or the range end leads to), and keeping both would report each place
+  twice. A tree git cannot list makes `git rev-list --objects` fail, which stops the scan (exit 2).
 
 ### 10. Access, in-memory handling and the CLI
 

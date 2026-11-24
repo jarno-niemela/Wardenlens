@@ -363,10 +363,10 @@ fn a_merge_is_diffed_against_each_parent() {
     r.commit(&[], "main");
     r.git(&[], &["merge", "-q", "--no-ff", "-m", "merge", "side"]);
     let m = matcher(&[("e:path", V_PATH)]);
-    // Against the first parent the side file is the merge's own change; against the second it
-    // is unchanged: `-m` reports it for the merge commit as well as for the side commit.
+    // The side file is in the tree of the side commit and in the merge's: the walk visits the
+    // path in both roots but it is one place (same path, same blob), so one finding.
     let c = r.range(Some(&base), "HEAD", Sources::ALL, &m);
-    assert!(c.findings.len() >= 2, "{:?}", c.findings);
+    assert_eq!(c.findings.len(), 1, "{:?}", c.findings);
     expect(&ids(&c), &["e:path"]);
 }
 
@@ -767,30 +767,48 @@ fn addresses_stored_in_a_staged_binary_blob_are_found() {
 }
 
 #[test]
-fn tree_entry_names_are_parsed_with_bounds_checks() {
+fn tree_entries_are_parsed_with_bounds_checks() {
     let mut raw = Vec::new();
     let mut bounds = vec![0usize];
-    for name in [&b"a b"[..], b"x\xff", b"dir"] {
-        raw.extend_from_slice(b"100644 ");
+    for (mode, name) in [
+        (&b"100644"[..], &b"a b"[..]),
+        (b"100755", b"x\xff"),
+        (b"40000", b"dir"),
+        (b"160000", b"sub"),
+    ] {
+        raw.extend_from_slice(mode);
+        raw.push(b' ');
         raw.extend_from_slice(name);
         raw.push(0);
         raw.extend_from_slice(&[7u8; 20]);
         bounds.push(raw.len());
     }
-    let names = tree_names(&raw, 20).unwrap();
-    assert_eq!(names, [&b"a b"[..], b"x\xff", b"dir"]);
-    assert_eq!(tree_names(b"", 20), Some(Vec::new()));
+    let got = tree_entries(&raw, 20).unwrap();
+    let names: Vec<&[u8]> = got.iter().map(|e| e.name.as_slice()).collect();
+    assert_eq!(names, [&b"a b"[..], b"x\xff", b"dir", b"sub"]);
+    let modes: Vec<walk::EntryMode> = got.iter().map(|e| e.mode).collect();
+    assert_eq!(
+        modes,
+        [
+            walk::EntryMode::Blob,
+            walk::EntryMode::Blob,
+            walk::EntryMode::Tree,
+            walk::EntryMode::Gitlink
+        ]
+    );
+    assert_eq!(got[0].id.as_str(), "07".repeat(20));
+    assert_eq!(tree_entries(b"", 20), Some(Vec::new()));
     // Cut anywhere: no panic, and an error unless the cut falls on an entry boundary.
     for n in 1..raw.len() {
         let cut = raw.get(..n).unwrap();
         let ok = bounds.contains(&n);
-        assert_eq!(tree_names(cut, 20).is_some(), ok, "{n}");
+        assert_eq!(tree_entries(cut, 20).is_some(), ok, "{n}");
     }
     // A 32-byte id (SHA-256) and a missing NUL.
     let mut wide = b"40000 d\0".to_vec();
     wide.extend_from_slice(&[1u8; 32]);
-    assert_eq!(tree_names(&wide, 32).unwrap(), [&b"d"[..]]);
-    assert!(tree_names(b"100644 nonul", 20).is_none());
+    assert_eq!(tree_entries(&wide, 32).unwrap().len(), 1);
+    assert!(tree_entries(b"100644 nonul", 20).is_none());
 }
 
 #[test]
@@ -835,7 +853,7 @@ fn the_names_of_a_tree_no_commit_leads_to_are_scanned_and_reported_without_the_n
     let c = r.range(None, &tree, Sources::ALL, &m);
     expect(&ids(&c), &["e:path"]);
     let shown = render(&m, &loc(&c.findings[0].at, &c.paths)).to_string();
-    assert_eq!(shown, format!("<redacted-path> tree {tree}"));
+    assert_eq!(shown, format!("<redacted-path> blob {blob}"));
     expect(
         &ids(&r.range(None, &tree, Sources::ALL.without(Sources::PATHS), &m)),
         &[],
@@ -891,27 +909,225 @@ fn a_directory_name_found_through_a_file_path_is_reported_once() {
     assert_eq!(found.findings.len(), 1, "one place, one finding");
 }
 
+/// A tree git's own tools refuse to list, written with the plumbing that skips the checks.
+fn malformed_tree(r: &Repo) -> Sha {
+    let t = r.git_in(
+        &["hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
+        b"100644 name\0short",
+    );
+    Sha::parse(t.as_bytes()).unwrap()
+}
+
 #[test]
 fn a_malformed_tree_is_a_malformed_problem_not_a_size_problem() {
-    // git itself refuses to list a tree it cannot parse, so the problem is built by hand: the
-    // report of a tree with no entry name is `tree <sha>` (no stray space), and the reason is
-    // `Malformed`, which says nothing about size.
+    let r = Repo::new();
+    let tree = malformed_tree(&r);
+    // The real object, read the way the scan reads it: one problem, `Malformed`, at the tree
+    // itself (reported as `tree <sha>`, no stray space) and nothing in the walk's input.
+    let mut found = Collected::default();
+    let mut trees = HashMap::new();
+    Git::at(r.path())
+        .objects(std::slice::from_ref(&tree), |sha, kind, size, body| {
+            assert_eq!(kind, Kind::Tree);
+            take_tree(&mut found, &mut trees, sha, size, body)
+        })
+        .unwrap();
+    assert!(trees.is_empty());
+    assert_eq!(found.problems.len(), 1);
+    let (at, why) = &found.problems[0];
+    assert_eq!(*why, Unread::Malformed);
+    assert_eq!(
+        *at,
+        Where::TreePath {
+            path: Vec::new(),
+            sha: tree.clone()
+        }
+    );
     let m = matcher(&[("e:path", V_PATH)]);
-    let sha = Sha::parse("a".repeat(40).as_bytes()).unwrap();
-    let at = Where::TreePath {
-        path: Vec::new(),
-        sha: sha.clone(),
-    };
-    let post = format!(" {}", Unread::Malformed);
-    let shown = render_in(&m, &loc(&at, &BTreeMap::new()), ("error: ", &post)).to_string();
+    let post = format!(" {why}");
+    let shown = render_in(&m, &loc(at, &BTreeMap::new()), ("error: ", &post)).to_string();
     assert_eq!(
         format!("error: {shown}{post}"),
         format!(
             "error: tree {} is not a well formed git object",
-            sha.as_str()
+            tree.as_str()
         )
     );
     assert!(!Unread::Malformed.to_string().contains("larger"));
+}
+
+#[test]
+fn a_malformed_tree_at_a_tag_or_the_range_end_fails_the_scan_closed() {
+    // git's own listing of the objects a push publishes refuses such a tree, so the scan
+    // stops (exit 2) rather than skipping it.
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    r.commit(&[], "base");
+    let tree = malformed_tree(&r);
+    r.git(&[], &["tag", "-a", "-m", "t", "bad", tree.as_str()]);
+    let m = matcher(&[("e:path", V_PATH)]);
+    for end in ["bad", tree.as_str()] {
+        let got = collect_range(
+            &m,
+            &Git::at(r.path()),
+            (None, &r.sha(end), None),
+            &[],
+            Sources::ALL,
+        );
+        assert_eq!(got.err(), Some(GitError::Failed), "{end}");
+    }
+}
+
+/// `n` directories nested below `leaf` (a tree id), each named `name`; returns the outer tree.
+fn nest(r: &Repo, leaf: &str, name: &str, n: usize) -> String {
+    let mut tree = leaf.to_owned();
+    for _ in 0..n {
+        tree = r.git_in(
+            &["mktree"],
+            format!("040000 tree {tree}\t{name}\n").as_bytes(),
+        );
+    }
+    tree
+}
+
+#[test]
+fn a_path_longer_than_the_limit_fails_the_scan_closed() {
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    let empty = r.git_in(&["mktree"], b"");
+    let name = "n".repeat(250);
+    let tree = nest(&r, &empty, &name, 20);
+    let c = r.git(&[], &["commit-tree", &tree, "-p", &base, "-m", "deep"]);
+    let m = matcher(&[("e:path", V_PATH)]);
+    let got = collect_range(
+        &m,
+        &Git::at(r.path()),
+        (None, &r.sha(&c), None),
+        &[],
+        Sources::ALL,
+    );
+    assert_eq!(got.err(), Some(GitError::PathTooLong));
+    // Under the limit it is walked.
+    let tree = nest(&r, &empty, &name, 10);
+    let c = r.git(&[], &["commit-tree", &tree, "-p", &base, "-m", "less deep"]);
+    assert!(
+        collect_range(
+            &m,
+            &Git::at(r.path()),
+            (None, &r.sha(&c), None),
+            &[],
+            Sources::ALL
+        )
+        .is_ok()
+    );
+}
+
+fn fake_sha(n: u8) -> Sha {
+    Sha::parse(format!("{n:02x}").repeat(20).as_bytes()).unwrap()
+}
+
+fn dir_entry(name: &str, id: &Sha) -> TreeEntry {
+    TreeEntry {
+        name: name.as_bytes().to_vec(),
+        mode: walk::EntryMode::Tree,
+        id: id.clone(),
+    }
+}
+
+#[test]
+fn a_very_deep_tree_fails_closed_without_recursing() {
+    // 20 000 levels, each one directory `a`: a recursive walk would overflow the stack.
+    let m = matcher(&[("e:path", V_PATH)]);
+    let mut trees = HashMap::new();
+    let levels = 20_000u32;
+    let id = |i: u32| Sha::parse(format!("{i:040x}").as_bytes()).unwrap();
+    for i in 1..=levels {
+        trees.insert(id(i), vec![dir_entry("a", &id(i + 1))]);
+    }
+    let mut found = Collected::default();
+    let root = id(1);
+    assert_eq!(
+        walk::walk(&m, &mut found, &trees, [&root]),
+        Err(GitError::PathTooLong)
+    );
+}
+
+#[test]
+fn a_tree_that_repeats_itself_in_a_hundred_thousand_places_fails_closed() {
+    // Two entries per level, both leading to the next level: 2^k distinct paths from k levels.
+    let m = matcher(&[("e:path", V_PATH)]);
+    let mut trees = HashMap::new();
+    for i in 1..=40u8 {
+        let next = fake_sha(i + 1);
+        trees.insert(
+            fake_sha(i),
+            vec![dir_entry("a", &next), dir_entry("b", &next)],
+        );
+    }
+    let mut found = Collected::default();
+    let root = fake_sha(1);
+    assert_eq!(
+        walk::walk(&m, &mut found, &trees, [&root]),
+        Err(GitError::TooMany)
+    );
+}
+
+#[test]
+fn the_same_place_reached_from_two_roots_is_scanned_once() {
+    let m = matcher(&[("e:path", V_PATH)]);
+    let blob = fake_sha(9);
+    let file = |n: &str| TreeEntry {
+        name: n.as_bytes().to_vec(),
+        mode: walk::EntryMode::Blob,
+        id: blob.clone(),
+    };
+    let shared = fake_sha(3);
+    let mut trees = HashMap::new();
+    trees.insert(shared.clone(), vec![file(&format!("f-{V_PATH}"))]);
+    trees.insert(fake_sha(1), vec![dir_entry("d", &shared)]);
+    trees.insert(fake_sha(2), vec![dir_entry("d", &shared)]);
+    let (r1, r2) = (fake_sha(1), fake_sha(2));
+    let mut found = Collected::default();
+    walk::walk(&m, &mut found, &trees, [&r1, &r2]).unwrap();
+    assert_eq!(found.findings.len(), 1);
+}
+
+#[test]
+fn a_value_spelled_across_a_slash_is_found_in_a_full_path_only() {
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    let blob = r.git_in(&["hash-object", "-w", "--stdin"], b"clean\n");
+    let inner = r.git_in(
+        &["mktree"],
+        format!("100644 blob {blob}\tmark-1\n").as_bytes(),
+    );
+    let outer = r.git_in(
+        &["mktree"],
+        format!("040000 tree {inner}\tzqsplit\n").as_bytes(),
+    );
+    let c = r.git(&[], &["commit-tree", &outer, "-p", &base, "-m", "split"]);
+    let m = matcher(&[("e:split", "zqsplit/mark-1")]);
+    let found = r.range(Some(&base), &c, Sources::ALL, &m);
+    expect(&ids(&found), &["e:split"]);
+    assert_eq!(found.findings.len(), 1);
+}
+
+#[test]
+fn a_submodule_entry_named_with_a_value_is_found() {
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    let tree = r.git_in(
+        &["mktree"],
+        format!("160000 commit {base}\tsub-{V_PATH}\n").as_bytes(),
+    );
+    let c = r.git(&[], &["commit-tree", &tree, "-p", &base, "-m", "gitlink"]);
+    let m = matcher(&[("e:path", V_PATH)]);
+    let found = r.range(Some(&base), &c, Sources::ALL, &m);
+    expect(&ids(&found), &["e:path"]);
+    assert!(matches!(found.findings[0].at, Where::TreePath { .. }));
 }
 
 #[test]
@@ -940,5 +1156,6 @@ fn a_graft_does_not_hide_content_from_the_scan() {
     let found = r.range(None, &second, Sources::ALL, &m);
     expect(&ids(&found), &["e:blob"]);
     assert_eq!(found.findings.len(), 1);
-    let _ = first;
+    // Without the graft override `first` would be missing from the listing; here it is there.
+    assert_eq!(r.git(&[], &["cat-file", "-t", &first]), "commit");
 }

@@ -5,8 +5,8 @@
 //!
 //! - the new blobs, text and binary alike (a binary blob is matched on its raw bytes, so the
 //!   literal needles and the address tokenisers still find a value stored in the clear);
-//! - every path of every new commit (`diff-tree -r --root -m`), which also covers a rename of
-//!   unchanged content and a second path of one blob;
+//! - the full path of every entry of every new tree (empty directories, renames of unchanged
+//!   content, a second path of one blob, trees only a tag or the range end leads to), see [`walk`];
 //! - the raw commit and tag objects, every header and the message, each reported as the part
 //!   it is in;
 //! - the ref names the push publishes.
@@ -19,6 +19,7 @@ use std::io::Read;
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_vault::{Content, Matcher, classify, scan};
 
+use self::walk::{TreeEntry, tree_entries};
 use super::Unread;
 use super::git::{Body, Git, GitError, Kind, MAX_OBJECT_LEN, RawEntry, Sha};
 use super::redact::{Loc, Part, render, render_in};
@@ -128,6 +129,8 @@ struct Collected {
     problems: Vec<(Where, Unread)>,
     objects: usize,
     truncated: bool,
+    /// Bytes of raw tree objects held so far (bounded by `walk::MAX_TREE_BYTES`).
+    tree_bytes: usize,
     /// Paths by blob id (range scans), for naming a blob in a report.
     paths: BTreeMap<Sha, Vec<Vec<u8>>>,
 }
@@ -233,6 +236,7 @@ fn git_error(e: GitError) -> CliError {
         GitError::Io => "reading git output failed",
         GitError::Missing => "an object listed by git is missing; fetch it and retry",
         GitError::TooMany => "too many objects for one scan; scan a smaller range",
+        GitError::PathTooLong => "a path in the pushed trees is longer than the scan limit",
     })
 }
 
@@ -420,19 +424,39 @@ fn collect_range(
 ) -> Result<Collected, GitError> {
     let objects = git.new_objects(from, to, remote)?;
     let mut found = Collected::default();
-    let mut commits = Vec::new();
-    let mut trees = Vec::new();
+    // The new trees (parsed), and where a walk of them starts: the root tree of every new
+    // commit and every tree a tag or the end of the range points at directly.
+    let mut trees: HashMap<Sha, Vec<TreeEntry>> = HashMap::new();
+    let mut roots: BTreeSet<Sha> = BTreeSet::new();
     git.objects(&objects, |sha, kind, size, body| {
         found.objects = found.objects.saturating_add(1);
         match kind {
-            Kind::Commit => {
-                commits.push(sha.clone());
-                if sources.has(Sources::COMMITS) {
-                    scan_object_parts(matcher, &mut found, (sha, kind), size, body);
+            Kind::Commit | Kind::Tag => {
+                let Ok(raw) = read_object(size, body) else {
+                    found.problems.push((
+                        if kind == Kind::Tag {
+                            Where::Tag(sha.clone(), Part::Header)
+                        } else {
+                            Where::Commit(sha.clone(), Part::Header)
+                        },
+                        Unread::TooLarge,
+                    ));
+                    return Ok(());
+                };
+                let target = if kind == Kind::Commit {
+                    header_sha(&raw, b"tree ")
+                } else {
+                    tagged_tree(&raw)
+                };
+                roots.extend(target);
+                let wanted = if kind == Kind::Commit {
+                    Sources::COMMITS
+                } else {
+                    Sources::TAGS
+                };
+                if sources.has(wanted) {
+                    scan_object_parts(matcher, &mut found, (sha, kind), &raw);
                 }
-            }
-            Kind::Tag if sources.has(Sources::TAGS) => {
-                scan_object_parts(matcher, &mut found, (sha, kind), size, body);
             }
             Kind::Blob if sources.has(Sources::BLOBS) => match scan_blob(matcher, size, body) {
                 BlobScan::Hits(hits, truncated) => {
@@ -456,37 +480,21 @@ fn collect_range(
                     why,
                 )),
             },
-            Kind::Tree if sources.has(Sources::PATHS) => trees.push(sha.clone()),
+            Kind::Tree if sources.has(Sources::PATHS) => {
+                if sha == to {
+                    roots.insert(sha.clone());
+                }
+                take_tree(&mut found, &mut trees, sha, size, body)?;
+            }
             _ => {}
         }
         Ok(())
     })?;
     if sources.has(Sources::PATHS) {
-        // Every path of every new commit, with the blob ids. A name in it is found here ...
-        let mut covered: BTreeSet<(Vec<u8>, EntryId)> = BTreeSet::new();
-        for e in git.commit_paths(&commits)? {
-            let Some(sha) = e.any_sha() else { continue };
-            let at = |_| Where::BlobPath {
-                path: e.path.clone(),
-                sha: sha.clone(),
-            };
-            for id in found.scan_with(matcher, &e.path, &at, false) {
-                for part in e.path.split(|&b| b == b'/') {
-                    covered.insert((part.to_vec(), id.clone()));
-                }
-            }
-            found.paths.entry(sha.clone()).or_default().push(e.path);
-        }
-        // ... but `diff-tree -r` lists files only, so a directory with no file below it (and a
-        // tree only a tag or the end of the range leads to) has no path there. The entry names
-        // of EVERY new tree are scanned; a name whose hit the paths above already reported is
-        // not reported a second time.
-        git.objects(&trees, |sha, kind, size, body| {
-            if kind == Kind::Tree {
-                scan_tree_names(matcher, &mut found, &covered, sha, size, body);
-            }
-            Ok(())
-        })?;
+        // `diff-tree -r` lists files only and never runs for a tree a tag or the end of the
+        // range leads to, and a name alone cannot spell a value with a `/`: the full path of
+        // every entry of every new tree is scanned instead (see `walk`).
+        walk::walk(matcher, &mut found, &trees, roots.iter())?;
     }
     if sources.has(Sources::REFS) {
         for (i, name) in refs.iter().enumerate() {
@@ -496,64 +504,64 @@ fn collect_range(
     Ok(found)
 }
 
-/// Scans the entry names of a tree object. A hit whose (name, entry) the commit paths already
-/// reported (`covered`) is left out: one finding per place, not per way of finding it.
-fn scan_tree_names(
-    matcher: &Matcher,
+/// Parses a new tree into `trees`. A tree that cannot be read or parsed is a problem (reported
+/// once, at the tree), not an error; too many tree bytes held for one scan is an error.
+fn take_tree(
     found: &mut Collected,
-    covered: &BTreeSet<(Vec<u8>, EntryId)>,
+    trees: &mut HashMap<Sha, Vec<TreeEntry>>,
     sha: &Sha,
     size: u64,
     body: &mut Body<'_>,
-) {
-    let at = |path: &[u8]| Where::TreePath {
-        path: path.to_vec(),
+) -> Result<(), GitError> {
+    let at = Where::TreePath {
+        path: Vec::new(),
         sha: sha.clone(),
     };
-    let mut raw = Vec::new();
-    if usize::try_from(size).map_or(true, |n| n > MAX_OBJECT_LEN) {
-        found.problems.push((at(b""), Unread::TooLarge));
-        return;
-    }
-    if body.read_to_end(&mut raw).is_err() {
-        found
-            .problems
-            .push((at(b""), Unread::Io(std::io::ErrorKind::UnexpectedEof)));
-        return;
-    }
-    let Some(names) = tree_names(&raw, sha.as_str().len() / 2) else {
-        found.problems.push((at(b""), Unread::Malformed));
-        return;
-    };
-    for name in names {
-        match scan(matcher, name) {
-            Ok(report) => {
-                found.truncated |= report.truncated;
-                for h in report.hits {
-                    if !covered.contains(&(name.to_vec(), h.id.clone())) {
-                        found.add(&h.id, h.kind, at(name));
-                    }
-                }
+    match read_object(size, body) {
+        Err(why) => found.problems.push((at, why)),
+        Ok(raw) => {
+            found.tree_bytes = found.tree_bytes.saturating_add(raw.len());
+            if found.tree_bytes > walk::MAX_TREE_BYTES {
+                return Err(GitError::TooLarge);
             }
-            Err(_) => found.problems.push((at(name), Unread::TooLarge)),
+            match tree_entries(&raw, sha.as_str().len() / 2) {
+                Some(entries) => {
+                    trees.insert(sha.clone(), entries);
+                }
+                None => found.problems.push((at, Unread::Malformed)),
+            }
         }
     }
+    Ok(())
 }
 
-/// The entry names of a raw tree (`mode SP name NUL id`, `id_len` raw bytes), or `None` when the
-/// tree is not well formed. Bounds are checked with `get`; nothing is sliced by position.
-pub(super) fn tree_names(raw: &[u8], id_len: usize) -> Option<Vec<&[u8]>> {
-    let mut names = Vec::new();
-    let mut rest = raw;
-    while !rest.is_empty() {
-        let sp = rest.iter().position(|&b| b == b' ')?;
-        let after_mode = rest.get(sp.checked_add(1)?..)?;
-        let nul = after_mode.iter().position(|&b| b == 0)?;
-        names.push(after_mode.get(..nul)?);
-        let after_name = after_mode.get(nul.checked_add(1)?..)?;
-        rest = after_name.get(id_len..)?;
+/// Reads a whole object, or says why it was not read.
+fn read_object(size: u64, body: &mut Body<'_>) -> Result<Vec<u8>, Unread> {
+    if usize::try_from(size).map_or(true, |n| n > MAX_OBJECT_LEN) {
+        return Err(Unread::TooLarge);
     }
-    Some(names)
+    let mut raw = Vec::new();
+    body.read_to_end(&mut raw)
+        .map_err(|_| Unread::Io(std::io::ErrorKind::UnexpectedEof))?;
+    Ok(raw)
+}
+
+/// The id after `key` in the first header line that starts with it (headers end at the first
+/// empty line).
+fn header_sha(raw: &[u8], key: &[u8]) -> Option<Sha> {
+    raw.split(|&b| b == b'\n')
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(Sha::parse)
+}
+
+/// The tree an annotated tag points at directly (`type tree`), if it does.
+fn tagged_tree(raw: &[u8]) -> Option<Sha> {
+    let direct = raw
+        .split(|&b| b == b'\n')
+        .take_while(|l| !l.is_empty())
+        .any(|l| l == b"type tree");
+    direct.then(|| header_sha(raw, b"object ")).flatten()
 }
 
 /// Scans a commit or tag object part by part and records each hit in the part it is in. The
@@ -563,20 +571,13 @@ fn scan_object_parts(
     matcher: &Matcher,
     found: &mut Collected,
     (sha, kind): (&Sha, Kind),
-    size: u64,
-    body: &mut Body<'_>,
+    raw: &[u8],
 ) {
     let at = |part| match kind {
         Kind::Tag => Where::Tag(sha.clone(), part),
         _ => Where::Commit(sha.clone(), part),
     };
-    let mut raw = Vec::new();
-    let too_large = usize::try_from(size).map_or(true, |n| n > MAX_OBJECT_LEN);
-    if too_large || body.read_to_end(&mut raw).is_err() {
-        found.problems.push((at(Part::Header), Unread::TooLarge));
-        return;
-    }
-    for (part, bytes) in split_object(&raw, kind) {
+    for (part, bytes) in split_object(raw, kind) {
         found.scan_with(matcher, &bytes, &|_| at(part), false);
     }
 }
@@ -612,6 +613,8 @@ pub(super) fn split_object(raw: &[u8], kind: Kind) -> Vec<(Part, Vec<u8>)> {
     }
     parts
 }
+
+mod walk;
 
 #[cfg(test)]
 mod tests;
