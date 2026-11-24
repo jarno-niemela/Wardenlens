@@ -595,42 +595,60 @@ fn unreachable_archive_floor_plans_no_move_and_deletes_hot_instead() {
 
 /// Floor 250 reachable (free 200 + 55 video) but target 260 not: not unsatisfiable.
 #[test]
-fn hot_floor_reachable_but_target_not_with_archive_moves_all_and_is_not_unsatisfiable() {
-    let segments = [seg(1, Tier::Hot, 25, 1), seg(2, Tier::Hot, 30, 2)];
-    let p = plan(&input(
-        vol(1000, 200),
-        ArchiveState::Available(vol(1000, 900)),
-        &segments,
-        999,
-    ))
-    .unwrap();
-    assert_eq!(p.hot, HotState::Ok);
-    assert_eq!(
-        ids(&p),
-        vec![
-            Action::MoveToArchive(SegmentId::new(1)),
-            Action::MoveToArchive(SegmentId::new(2))
-        ]
-    );
-}
-
-#[test]
-fn hot_floor_reachable_but_target_not_without_archive_deletes_all_and_no_rolling_buffer() {
-    let segments = [seg(1, Tier::Hot, 25, 1), seg(2, Tier::Hot, 30, 2)];
+fn hot_floor_reachable_but_target_not_without_archive_stops_at_the_floor() {
+    let segments = [seg(1, Tier::Hot, 50, 1), seg(2, Tier::Hot, 5, 2)];
     for state in [
         ArchiveState::Unavailable,
         ArchiveState::Available(vol(1000, 10)),
     ] {
         let p = plan(&input(vol(1000, 200), state, &segments, 999)).unwrap();
         assert_eq!(p.hot, HotState::Ok);
-        assert_eq!(
-            ids(&p),
-            vec![
-                Action::Delete(SegmentId::new(1)),
-                Action::Delete(SegmentId::new(2))
-            ]
-        );
+        assert_eq!(ids(&p), vec![Action::Delete(SegmentId::new(1))]);
     }
+}
+
+#[test]
+fn full_archive_covering_the_ingest_reports_unsatisfiable_not_rolling_buffer() {
+    // Floor 250, free 0, hot video 100: unreachable. The archive takes 40 B and is then full.
+    let segments = [seg(1, Tier::Hot, 40, 1), seg(2, Tier::Hot, 60, 2)];
+    let p = plan(&input(
+        vol(1000, 0),
+        ArchiveState::Available(vol(1000, 290)),
+        &segments,
+        40,
+    ))
+    .unwrap();
+    assert_eq!(p.archive, ArchiveStatus::Full);
+    assert_eq!(ids(&p), vec![Action::MoveToArchive(SegmentId::new(1))]);
+    assert_eq!(p.hot, HotState::Unsatisfiable);
+}
+
+#[test]
+fn full_takes_precedence_over_below_floor_but_the_flag_survives() {
+    let segments = [seg(1, Tier::Hot, 40, 1)];
+    let p = plan(&input(
+        vol(1000, 0),
+        ArchiveState::Available(vol(1000, 100)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(p.archive, ArchiveStatus::Full);
+    assert!(p.archive_below_floor);
+}
+
+#[test]
+fn move_size_plus_floor_overflow_is_reported() {
+    let segments = [seg(1, Tier::Hot, u64::MAX, 1)];
+    assert_eq!(
+        plan(&input(
+            vol(1000, 0),
+            ArchiveState::Available(vol(1000, 900)),
+            &segments,
+            0
+        )),
+        Err(PlanError::Overflow(OverflowQuantity::EvictionGoal))
+    );
 }
 
 #[test]

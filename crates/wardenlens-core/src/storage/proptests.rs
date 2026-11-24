@@ -115,4 +115,39 @@ proptest! {
             prop_assert!(ranks.iter().all(|r| *r == 2));
         }
     }
+
+    #[test]
+    fn rolling_buffer_deletes_no_more_than_ingest_beyond_moves_plus_one_segment(
+        hot in volume(),
+        segs in segments(),
+        hot_pct in 0_u8..=90,
+        ingested in 0_u64..100_000,
+        archive in prop::option::of(volume()),
+    ) {
+        let policy = Policy {
+            hot_min_free: MinFreePercent::new(hot_pct).unwrap(),
+            archive_min_free: MinFreePercent::default(),
+            hot_max_age: DurationMs::from_millis(u64::MAX / 2),
+        };
+        let state = archive.map_or(ArchiveState::Unavailable, ArchiveState::Available);
+        let input = PlanInput {
+            hot, archive: state, segments: &segs,
+            now: Timestamp::from_unix_millis(2_000_000), policy, ingested_bytes: ingested,
+        };
+        let p = plan(&input).unwrap();
+        if p.hot == HotState::RollingBuffer {
+            let bytes_of = |id: &SegmentId| segs.iter().find(|s| s.id == *id).map_or(0, |s| s.bytes);
+            let moved: u64 = p.actions.iter()
+                .filter_map(|a| if let Action::MoveToArchive(id) = a { Some(bytes_of(id)) } else { None })
+                .sum();
+            let deleted: u64 = p.actions.iter()
+                .filter_map(|a| match a {
+                    Action::Delete(id) if segs.iter().any(|s| s.id == *id && s.tier == Tier::Hot) => Some(bytes_of(id)),
+                    _ => None,
+                })
+                .sum();
+            let biggest = segs.iter().map(|s| s.bytes).max().unwrap_or(0);
+            prop_assert!(deleted <= ingested.saturating_sub(moved) + biggest);
+        }
+    }
 }

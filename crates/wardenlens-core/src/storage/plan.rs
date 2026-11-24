@@ -42,13 +42,16 @@ pub enum ArchiveStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HotState {
-    /// The floor is restored (or was never breached) by the plan.
+    /// The floor is reachable: free space plus all hot video is at least the floor, so the
+    /// plan restores it or it was never breached.
     Ok,
     /// The floor cannot be restored even by removing all hot video (something else fills
-    /// the volume) and the archive absorbs the video. State, never an error.
+    /// the volume), and this tick's plan deletes no hot video to stop growth: the archive
+    /// absorbs the ingest, there is nothing ingested, or the moves already cover it.
+    /// State, never an error.
     Unsatisfiable,
-    /// As `Unsatisfiable`, and the archive cannot help: hot video is deleted as fast as it
-    /// arrives to stop it growing. Raise an alert.
+    /// As `Unsatisfiable`, and this tick's plan deletes hot video as fast as it arrives
+    /// because the archive cannot absorb it. Raise an alert.
     RollingBuffer,
 }
 
@@ -62,6 +65,10 @@ pub struct Plan {
     pub archive: ArchiveStatus,
     /// State of the hot volume.
     pub hot: HotState,
+    /// Foreign or quarantined data keeps the archive below its floor even when everything
+    /// it holds is evicted. Kept separate because `ArchiveStatus::Full` takes precedence
+    /// over `BelowFloor` in `archive`.
+    pub archive_below_floor: bool,
 }
 
 /// Why no plan could be made.
@@ -180,6 +187,9 @@ struct Moves {
 struct HotNeed {
     /// Bytes that must leave the hot volume to reach the target (0 when not below the floor).
     needed: u64,
+    /// Bytes hot deletes must free: 0 when not below the floor; the target shortfall when the
+    /// target is reachable by deleting all hot video, else the floor shortfall.
+    delete_goal: u64,
     /// The floor cannot be restored even by deleting all hot video.
     unsatisfiable: bool,
 }
@@ -218,14 +228,25 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     let (hot_floor, hot_target) =
         floor_and_target(input.hot.capacity_bytes, input.policy.hot_min_free.get())?;
     let hot_total = sum_bytes(&hot, OverflowQuantity::HotTotal)?;
-    let below = input.hot.free_bytes < hot_floor;
+    let free = input.hot.free_bytes;
+    let reachable = free
+        .checked_add(hot_total)
+        .ok_or(PlanError::Overflow(OverflowQuantity::HotTotal))?;
+    let below = free < hot_floor;
+    let unsatisfiable = reachable < hot_floor;
     let need = HotNeed {
         needed: if below {
-            hot_target.saturating_sub(input.hot.free_bytes)
+            hot_target.saturating_sub(free)
         } else {
             0
         },
-        unsatisfiable: input.hot.free_bytes.saturating_add(hot_total) < hot_floor,
+        delete_goal: match (below, unsatisfiable, reachable >= hot_target) {
+            (false, _, _) => 0,
+            (true, true, _) => input.ingested_bytes,
+            (true, false, true) => hot_target.saturating_sub(free),
+            (true, false, false) => hot_floor.saturating_sub(free),
+        },
+        unsatisfiable,
     };
     let mut actions = Vec::new();
     let mut below_floor = false;
@@ -241,8 +262,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             archive_full: false,
         },
     };
-    let rolling_buffer =
-        plan_hot_deletes(input, &hot, &need, &moves, archive.is_some(), &mut actions);
+    let rolling_buffer = plan_hot_deletes(&hot, &need, &moves, archive.is_some(), &mut actions);
     let archive_status = match (input.archive, archive) {
         (ArchiveState::Available(_), None) => ArchiveStatus::Unusable,
         (_, None) => ArchiveStatus::Unavailable,
@@ -253,6 +273,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     Ok(Plan {
         actions,
         archive: archive_status,
+        archive_below_floor: below_floor,
         hot: match (need.unsatisfiable, rolling_buffer) {
             (false, _) => HotState::Ok,
             (true, false) => HotState::Unsatisfiable,
@@ -345,7 +366,10 @@ fn choose_moves(
             .bytes
             .checked_add(seg.bytes)
             .ok_or(PlanError::Overflow(OverflowQuantity::MoveBytes))?;
-        if facts.room < after.saturating_add(facts.floor) {
+        let needed_room = after
+            .checked_add(facts.floor)
+            .ok_or(PlanError::Overflow(OverflowQuantity::EvictionGoal))?;
+        if facts.room < needed_room {
             moves.archive_full = true;
             break;
         }
@@ -355,10 +379,12 @@ fn choose_moves(
     Ok(moves)
 }
 
-/// Pushes hot deletions when the archive cannot take the load; returns whether the
-/// rolling buffer is in effect.
+/// Pushes hot deletions when the archive cannot take the load; returns whether any hot
+/// segment was deleted to stop an unreachable floor from growing (the rolling buffer).
+///
+/// Deletion goes to the target only when deleting all hot video can reach it; when only the
+/// floor is reachable it stops there, since deleting further loses recordings for no gain.
 fn plan_hot_deletes(
-    input: &PlanInput<'_>,
     hot: &[&StoredSegment],
     need: &HotNeed,
     moves: &Moves,
@@ -366,23 +392,18 @@ fn plan_hot_deletes(
     actions: &mut Vec<Action>,
 ) -> bool {
     let archive_cannot_help = !archive_available || moves.archive_full;
-    if !archive_cannot_help || moves.bytes >= need.needed {
+    if !archive_cannot_help {
         return false;
     }
-    // Reachable floor: head for the target and stop when segments run out. Unreachable:
-    // only stop growth.
-    let goal = if need.unsatisfiable {
-        input.ingested_bytes
-    } else {
-        need.needed
-    };
     let mut gone = moves.bytes;
+    let mut deleted = false;
     for seg in hot.iter().skip(moves.count) {
-        if gone >= goal {
+        if gone >= need.delete_goal {
             break;
         }
         actions.push(Action::Delete(seg.id));
+        deleted = true;
         gone = gone.saturating_add(seg.bytes);
     }
-    need.unsatisfiable
+    deleted && need.unsatisfiable
 }
