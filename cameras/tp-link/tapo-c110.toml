@@ -1,0 +1,77 @@
+vendor = "TP-Link"
+model = "Tapo C110"
+support = "partial"
+firmware = ["1.5"]
+quirks = [
+  "ONVIF PullMessages with Timeout=PT10S returns an empty reply; PT5S works.",
+  "ONVIF needs the Camera Account created in the Tapo app, not the cloud account.",
+  "Community implementations report that the local HTTPS API needs the cloud account password, not the Camera Account; this was not verified here and Wardenlens does not use that API.",
+  "Person and motion notifications have not been observed live, only advertised by GetEventProperties.",
+  "Camera RTP timestamps are jittery; use an own arrival clock.",
+]
+
+[[streams]]
+role = "main"
+codec = "h264"
+width = 1920
+height = 1080
+fps = 15.0
+gop = 30
+
+[[streams]]
+role = "sub"
+codec = "h264"
+width = 640
+height = 360
+fps = 15.0
+gop = 30
+
+[[protocols]]
+kind = "rtsp"
+paths = ["/stream1", "/stream2"]
+
+[[protocols]]
+kind = "onvif"
+port = 2020
+
+[[protocols]]
+kind = "tapo_https"
+port = 443
+
+[[events]]
+kind = "motion"
+source = "onvif"
+status = "advertised"
+
+[[events]]
+kind = "person"
+source = "onvif"
+status = "advertised"
+
+[[events]]
+kind = "intrusion"
+source = "onvif"
+status = "advertised"
+
+[[events]]
+kind = "line_cross"
+source = "onvif"
+status = "advertised"
+
+[[events]]
+kind = "tamper"
+source = "onvif"
+status = "advertised"
+
+[[events]]
+kind = "smart_event"
+source = "onvif"
+status = "advertised"
+
+[[evidence]]
+reference = "docs/adr/0002-camera-integration.md"
+section = "4. Tapo"
+
+[[evidence]]
+reference = "docs/adr/0002-camera-integration.md"
+section = "1. Two-client RTSP tolerance"

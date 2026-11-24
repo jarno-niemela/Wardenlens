@@ -9,9 +9,11 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
-proptest = { version = "1", default-features = false, features = ["std"] }
+proptest.workspace = true
 
 [lints]
 workspace = true
