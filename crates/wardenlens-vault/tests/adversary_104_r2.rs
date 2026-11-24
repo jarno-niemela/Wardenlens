@@ -112,9 +112,9 @@ fn crash_mid_rekey(tmp: &TempDir) -> (PathBuf, Vec<u8>, Vec<u8>, Vec<u8>) {
 
 /// `Vault::rekey` rustdoc: "On any failure the transaction rolls back and the vault is
 /// unchanged: the old key still opens it." A crash (power loss, SIGKILL) during rekey's commit
-/// is such a failure. SQLite's own recovery would roll the journal back, so the old key should
-/// open the vault. The probe instead reads the torn main file (new keycheck), sees `WrongKey` for
-/// the old key, and refuses with `PendingJournal` without ever letting SQLite roll back.
+/// is such a failure. SQLite's own recovery rolls the journal back, so the old key opens the
+/// vault. The probe judges a private copy with the journal rolled back (not the torn main file),
+/// so the old key is accepted and SQLite then rolls back the real files.
 #[test]
 fn crash_mid_rekey_commit_still_opens_with_the_old_key() {
     let tmp = dir();
@@ -125,26 +125,19 @@ fn crash_mid_rekey_commit_still_opens_with_the_old_key() {
     assert!(got.is_some(), "entry lost after rollback");
 }
 
-/// The same state with the old key must at least be retried successfully: a second attempt
-/// with the old key also ends in `PendingJournal` (it is a permanent state, not a transient
-/// one), so the vault is unopenable with the key the caller actually holds.
+/// The same state with the old key is not a permanent refusal: the first open succeeds (and
+/// recovers the vault), and so does a second one.
 #[test]
 fn crash_mid_rekey_is_not_permanently_pending_for_the_old_key() {
     let tmp = dir();
     let (db, main, j, _) = crash_mid_rekey(&tmp);
     let k = || KeyFile::load(&tmp.path().join("k")).unwrap();
+    let _ = (&main, &j);
     let first = Vault::open(&db, k());
+    assert!(first.is_ok(), "old key refused: {first:?}");
+    drop(first);
     let second = Vault::open(&db, k());
-    // Whatever the first attempt did, the files must not have been modified by a refusal ...
-    if first.is_err() {
-        assert_eq!(std::fs::read(&db).unwrap(), main);
-        assert_eq!(std::fs::read(tmp.path().join("v.db-journal")).unwrap(), j);
-    }
-    // ... and the vault must open eventually with the old key.
-    assert!(
-        first.is_ok() || second.is_ok(),
-        "old key never opens: {first:?} / {second:?}"
-    );
+    assert!(second.is_ok(), "old key refused on reopen: {second:?}");
 }
 
 /// The "new key" side of the same crash: the main file holds the new keycheck but the rolled-back
@@ -248,7 +241,15 @@ fn crash_mid_create_is_refused_without_modification() {
     let kf = KeyFile::generate(&tmp.path().join("k")).unwrap();
     let names = listing(tmp.path());
     let res = Vault::create(&db, kf);
-    assert!(res.is_err(), "create over a crashed create: {res:?}");
+    assert!(
+        matches!(res, Err(VaultError::NotEmpty)),
+        "create over a crashed create: {res:?}"
+    );
+    let opened = Vault::open(&db, KeyFile::load(&tmp.path().join("k")).unwrap());
+    assert!(
+        matches!(opened, Err(VaultError::NotInitialized)),
+        "open over a crashed create: {opened:?}"
+    );
     assert_eq!(std::fs::read(&db).unwrap(), main);
     assert_eq!(std::fs::read(&journal).unwrap(), j);
     assert_eq!(listing(tmp.path()), names);

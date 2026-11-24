@@ -255,6 +255,9 @@ fn file_len(file: &PrivateFile) -> Result<u64, VaultError> {
 /// How often a pending `-journal` is re-checked while waiting for it to go away.
 const JOURNAL_POLL: Duration = Duration::from_millis(50);
 
+/// Loop iterations allowed after the busy timeout before a still-moving journal is refused.
+const MAX_RETRIES_AFTER_TIMEOUT: u32 = 20;
+
 fn sidecar(path: &Path, suffix: &str) -> std::ffi::OsString {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -332,17 +335,26 @@ fn probe_existing(
         return Ok(false);
     }
     let start = std::time::Instant::now();
+    let mut retries_after_timeout = 0u32;
     loop {
         let timed_out = start.elapsed() >= BUSY_TIMEOUT;
+        if timed_out {
+            retries_after_timeout = retries_after_timeout.saturating_add(1);
+            if retries_after_timeout > MAX_RETRIES_AFTER_TIMEOUT {
+                return Err(VaultError::PendingJournal);
+            }
+        }
         if journal_present(path)? {
             if timed_out {
                 let Some(key) = key else {
                     return Err(VaultError::PendingJournal);
                 };
-                match probe_rolled_back_copy(path, file, key)? {
-                    Some(verdict) => return Ok(verdict),
-                    None => continue, // the journal went away: probe the main file again
+                if let Some(verdict) = probe_rolled_back_copy(path, file, key)? {
+                    return Ok(verdict && !wal_present(path)?);
                 }
+                // The journal went away or a writer raced the copy: look again.
+                std::thread::sleep(JOURNAL_POLL);
+                continue;
             }
             std::thread::sleep(JOURNAL_POLL);
             continue;
@@ -350,6 +362,9 @@ fn probe_existing(
         let before = change_counter(file)?;
         let result = immutable_probe(path, file, key);
         if before == change_counter(file)? && !journal_present(path)? {
+            if matches!(result, Ok(true)) && wal_present(path)? {
+                return Ok(false);
+            }
             return result;
         }
         // A writer got in between the checks and the read.
@@ -466,30 +481,48 @@ fn probe_rolled_back_copy(
     file: &PrivateFile,
     key: &KeyFile,
 ) -> Result<Option<bool>, VaultError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = parent_of(path)?;
+    let journal_path = sidecar(path, "-journal");
+    match Path::new(&journal_path).symlink_metadata() {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(VaultError::PendingJournal),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(VaultError::io("inspecting journal")(e)),
+    }
+    // O_NONBLOCK: a FIFO in place of the journal must not block the open.
     let journal = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(sidecar(path, "-journal"))
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                .bits()
+                .cast_signed(),
+        )
+        .open(&journal_path)
     {
         Ok(j) => j,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(VaultError::io("opening journal")(e)),
     };
-    if !journal
-        .metadata()
-        .map_err(VaultError::io("inspecting journal"))?
-        .is_file()
-    {
+    let stamp = |j: &std::fs::File| -> Result<(bool, u64, u64, u64), VaultError> {
+        let m = j.metadata().map_err(VaultError::io("inspecting journal"))?;
+        Ok((m.is_file(), m.dev(), m.ino(), m.len()))
+    };
+    let journal_before = stamp(&journal)?;
+    if !journal_before.0 {
         return Err(VaultError::PendingJournal);
     }
+    let counter_before = change_counter(file)?;
     let scratch = Scratch::new(parent)?;
     let copy = scratch.0.join("vault.db");
     let copied = copy_bounded(file.file(), &copy)?
         && copy_bounded(&journal, Path::new(&sidecar(&copy, "-journal")))?;
     if !copied {
         return Err(VaultError::PendingJournal);
+    }
+    if change_counter(file)? != counter_before || stamp(&journal)? != journal_before {
+        // A writer was active during the copy: the copy may be torn. Probe again.
+        return Ok(None);
     }
     file.verify_path_unchanged(path)?;
     match identify_copy(&copy, key) {
@@ -519,8 +552,11 @@ fn identify_copy(copy: &Path, key: &KeyFile) -> Result<bool, VaultError> {
     {
         use std::os::unix::fs::FileExt;
         let mut mode = [0u8; 2];
-        if head.read_exact_at(&mut mode, 18).is_err() || mode != [1, 1] {
-            return Ok(false);
+        match head.read_exact_at(&mut mode, 18) {
+            Ok(()) if mode == [1, 1] => {}
+            Ok(()) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(VaultError::io("reading scratch copy")(e)),
         }
     }
     judge(rows, key)?;
