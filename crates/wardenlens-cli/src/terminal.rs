@@ -98,7 +98,8 @@ impl Terminal for StdTerminal {
         write!(self.stderr, "{label}: ")?;
         self.stderr.flush()?;
         let guard = EchoOff::new(&stdin)?;
-        let mut line = Zeroizing::new(Vec::new());
+        // Full capacity up front: a reallocation would leave an unzeroed copy behind.
+        let mut line = Zeroizing::new(Vec::with_capacity(MAX_PROMPT_LINE));
         let n = stdin
             .lock()
             .take(u64::try_from(MAX_PROMPT_LINE).unwrap_or(u64::MAX))
@@ -119,7 +120,8 @@ impl Terminal for StdTerminal {
     }
 
     fn read_piped(&mut self, limit: usize) -> io::Result<Zeroizing<Vec<u8>>> {
-        let mut buf = Zeroizing::new(Vec::new());
+        // Full capacity up front: a reallocation would leave an unzeroed copy behind.
+        let mut buf = Zeroizing::new(Vec::with_capacity(limit.saturating_add(1)));
         let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
         io::stdin().lock().take(cap).read_to_end(&mut buf)?;
         if buf.len() > limit {

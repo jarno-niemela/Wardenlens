@@ -64,17 +64,26 @@ impl Env {
         }
     }
 
+    /// Refuses when `WARDENLENS_VAULT_KEY` is set (its value is never read).
+    ///
+    /// # Errors
+    /// [`CliError::Refused`].
+    pub(crate) fn refuse_key_variable(&self) -> Result<(), CliError> {
+        if self.key_var_set {
+            return Err(CliError::Refused(
+                "WARDENLENS_VAULT_KEY is set: the key is read from a file, never from the environment; unset it",
+            ));
+        }
+        Ok(())
+    }
+
     /// The vault and key paths for a command. `WARDENLENS_VAULT_KEY` is always refused: the key
     /// is a file, never an environment variable.
     ///
     /// # Errors
     /// `HOME` unusable, a relative override, or `WARDENLENS_VAULT_KEY` set.
     pub(crate) fn paths(&self) -> Result<Paths, CliError> {
-        if self.key_var_set {
-            return Err(CliError::Refused(
-                "WARDENLENS_VAULT_KEY is set: the key is read from a file, never from the environment; unset it",
-            ));
-        }
+        self.refuse_key_variable()?;
         let db = match &self.vault {
             Some(v) => Self::require_absolute(v)?,
             None => self.home()?.join(DATA_REL).join(DB_NAME),

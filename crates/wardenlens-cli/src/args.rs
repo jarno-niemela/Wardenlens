@@ -30,6 +30,11 @@ pub(crate) enum VaultCommand {
     /// Create the developer vault and its key at the fixed paths.
     Init,
     /// Store a value read from stdin or a no-echo prompt (never from arguments).
+    ///
+    /// On a terminal each field is a no-echo prompt. On a pipe the value is the whole of stdin
+    /// minus its end: one trailing line ending (LF or CRLF) and, if that was present, one
+    /// further blank line. A credential is exactly two lines, username then password; a
+    /// third line is refused. Other line breaks inside a value are kept.
     Set(SetArgs),
     /// Write one value to stdout with no trailing text (pipe or terminal only).
     Get(GetArgs),

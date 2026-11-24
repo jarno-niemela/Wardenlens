@@ -14,6 +14,8 @@ use crate::env::Paths;
 use crate::error::CliError;
 use crate::terminal::Terminal;
 
+const UNSAFE_NEXT: &str = "the key does not open the vault and a pending <key>.next exists, but it fails the key file rules (regular file, owner, mode 0600, 32 bytes, no symlink, no work tree); nothing was changed, inspect it by hand";
+
 /// An exclusive lock on the key directory. Released when dropped (the descriptor closes).
 ///
 /// This is the "write lock" of ADR 0006 section 6 for key-file recovery: two processes cannot
@@ -30,7 +32,14 @@ impl DirLock {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|e| CliError::io("opening key directory")(e.into()))?;
+        .map_err(|e| {
+            if e == rustix::io::Errno::NOENT {
+                // No key directory means no vault: the same refusal the read commands give.
+                CliError::Vault(VaultError::NotInitialized)
+            } else {
+                CliError::io("opening key directory")(e.into())
+            }
+        })?;
         match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Self { _fd: fd }),
             Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(CliError::Refused(
@@ -69,12 +78,14 @@ fn open_with_key(p: &Paths, key_path: &Path) -> Result<Vault, CliError> {
 /// renames or deletes a key file.
 pub(super) fn open_read(p: &Paths) -> Result<Vault, CliError> {
     open_with_key(p, &p.key).map_err(|e| match e {
-        CliError::Vault(VaultError::WrongKey)
-            if p.next_key().symlink_metadata().is_ok() =>
-        {
-            CliError::KeyMismatch(
-                "the key does not open the vault and a pending <key>.next exists: an interrupted rekey; run `wardenlens vault rekey` (or any write command) to recover",
-            )
+        CliError::Vault(VaultError::WrongKey) if p.next_key().symlink_metadata().is_ok() => {
+            if KeyFile::load(&p.next_key()).is_err() {
+                CliError::KeyMismatch(UNSAFE_NEXT)
+            } else {
+                CliError::KeyMismatch(
+                    "the key does not open the vault and a pending <key>.next exists: an interrupted rekey; run `wardenlens vault rekey` (or any write command) to recover",
+                )
+            }
         }
         other => other,
     })
@@ -110,7 +121,14 @@ pub(super) fn recover(p: &Paths, term: &mut impl Terminal) -> Result<(), CliErro
         );
     };
     // Same checks as any key: regular file, owner, mode, length, not a symlink, no work tree.
-    open_with_key(p, &next).map_err(|_| current_err)?;
+    if let Err(next_err) = open_with_key(p, &next) {
+        // A pending key that fails the key rules is the problem to report; one that is merely
+        // not the vault's key leaves the original error.
+        return Err(match next_err {
+            CliError::Key(_) => CliError::KeyMismatch(UNSAFE_NEXT),
+            _ => current_err,
+        });
+    }
     std::fs::rename(&next, &p.key).map_err(CliError::io("completing key rename"))?;
     fsync_dir(dir)?;
     warn(

@@ -18,9 +18,23 @@ fn utf8(bytes: &[u8]) -> Result<Zeroizing<String>, CliError> {
         .map_err(|_| CliError::Refused("value is not valid UTF-8"))
 }
 
+/// Removes one line ending (`\n` or `\r\n`), if there is one.
 fn strip_line_end(bytes: &[u8]) -> &[u8] {
-    let b = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    b.strip_suffix(b"\r").unwrap_or(b)
+    match bytes.strip_suffix(b"\n") {
+        Some(b) => b.strip_suffix(b"\r").unwrap_or(b),
+        None => bytes,
+    }
+}
+
+/// Removes the end of piped input: one line ending, and if there was one, one blank line after
+/// it (what `echo` adds when the data already ends in a newline). Nothing else is touched.
+fn strip_trailing(bytes: &[u8]) -> &[u8] {
+    let once = strip_line_end(bytes);
+    if once.len() == bytes.len() {
+        return bytes;
+    }
+    // A second line ending is the blank line; a value that merely ends in `\r` keeps it.
+    strip_line_end(once)
 }
 
 fn input_error(e: &std::io::Error) -> CliError {
@@ -51,8 +65,15 @@ pub(super) fn read(kind: EntryKind, term: &mut impl Terminal) -> Result<Value, C
                     "a credential is two lines on stdin: username, then password",
                 ))?;
             let (u, rest) = raw.split_at(at);
-            let p = rest.get(1..).unwrap_or_default();
-            (utf8(strip_line_end(u))?, utf8(strip_line_end(p))?)
+            let p = strip_trailing(rest.get(1..).unwrap_or_default());
+            // Exactly two lines: anything left that spans another line is refused, unnamed.
+            if p.contains(&b'\n') {
+                return Err(CliError::Refused(
+                    "a credential is exactly two lines on stdin: a third line was refused",
+                ));
+            }
+            let u = u.strip_suffix(b"\r").unwrap_or(u);
+            (utf8(u)?, utf8(p)?)
         };
         return Ok(Value::Credential(Credentials::new(
             user.as_str(),
@@ -63,7 +84,7 @@ pub(super) fn read(kind: EntryKind, term: &mut impl Terminal) -> Result<Value, C
         utf8(&term.prompt_secret("value").map_err(|e| input_error(&e))?)?
     } else {
         let raw = term.read_piped(PIPED_LIMIT).map_err(|e| input_error(&e))?;
-        utf8(strip_line_end(&raw))?
+        utf8(strip_trailing(&raw))?
     };
     Ok(Value::Text(SecretString::from(text.as_str().to_owned())))
 }

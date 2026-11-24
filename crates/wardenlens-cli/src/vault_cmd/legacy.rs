@@ -8,7 +8,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use wardenlens_vault::legacy::{MAX_REPORTED_KEYS, map_legacy};
+use rustix::fs::{Mode, OFlags};
+use wardenlens_vault::legacy::{LegacyImport as Mapped, MAX_REPORTED_KEYS, map_legacy};
 use wardenlens_vault::{Scan, Scannability};
 use zeroize::Zeroizing;
 
@@ -24,10 +25,12 @@ const MAX_LEGACY_BYTES: u64 = 1024 * 1024;
 
 /// Reads one legacy file. A missing default file is `None`; a missing explicit one is an error.
 fn read_file(path: &Path, explicit: bool) -> Result<Option<Zeroizing<String>>, CliError> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => return Ok(None),
-        Err(e) => return Err(CliError::io("opening legacy file")(e)),
+    // Non-blocking and no controlling terminal: opening a FIFO must not wait for a writer.
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(e) if e == rustix::io::Errno::NOENT && !explicit => return Ok(None),
+        Err(e) => return Err(CliError::io("opening legacy file")(e.into())),
     };
     let meta = file
         .metadata()
@@ -108,23 +111,51 @@ pub(super) fn import<T: Terminal>(
 
     let mut session = open_write(&paths, term)?;
     let mut unscannable = Vec::new();
+    let total = mapped.entries.len();
+    let mut done = 0_usize;
+    let mut failure = None;
     for e in &mapped.entries {
-        let how = session
-            .vault
-            .set(&e.id, e.kind, &e.value, Scan::Normal)
-            .map_err(|err| CliError::RefusedWith(format!("entry {}: {err}", e.id)))?;
-        if how == Scannability::Unscannable {
-            unscannable.push(e.id.to_string());
+        match session.vault.set(&e.id, e.kind, &e.value, Scan::Normal) {
+            Ok(how) => {
+                if how == Scannability::Unscannable {
+                    unscannable.push(e.id.to_string());
+                }
+                done = done.saturating_add(1);
+                say(term, &format!("imported {} ({})", e.id, e.kind))?;
+            }
+            Err(err) => {
+                failure = Some((e.id.to_string(), err));
+                break;
+            }
         }
-        say(term, &format!("imported {} ({})", e.id, e.kind))?;
     }
-    say(term, &format!("imported {} entries", mapped.entries.len()))?;
+    if failure.is_none() {
+        say(term, &format!("imported {total} entries"))?;
+    }
     for id in &unscannable {
         warn(
             term,
             &format!("warning: {id} stored as unscannable (too short for the leak scan)"),
         )?;
     }
+    report_unknown(&mapped, term)?;
+    if let Some((id, err)) = failure {
+        // The typed error keeps its exit code; the id and the progress are the context.
+        warn(
+            term,
+            &format!(
+                "stopped at entry {id}: {done} of {total} imported before the failure; re-run is safe"
+            ),
+        )?;
+        return Err(err.into());
+    }
+    warn(
+        term,
+        "the legacy files are still plaintext: after `wardenlens vault key export` is safe in your password manager, delete them yourself",
+    )
+}
+
+fn report_unknown(mapped: &Mapped, term: &mut impl Terminal) -> Result<(), CliError> {
     if !mapped.unknown_keys.is_empty() {
         say(
             term,
@@ -140,8 +171,5 @@ pub(super) fn import<T: Terminal>(
             &format!("  (list cut at {MAX_REPORTED_KEYS} keys; more were not imported)"),
         )?;
     }
-    warn(
-        term,
-        "the legacy files are still plaintext: after `wardenlens vault key export` is safe in your password manager, delete them yourself",
-    )
+    Ok(())
 }

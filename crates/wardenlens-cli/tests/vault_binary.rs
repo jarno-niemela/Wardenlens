@@ -149,3 +149,27 @@ fn core_dumps_are_disabled_at_start() {
         "{line}"
     );
 }
+
+#[test]
+fn an_error_prints_one_exact_line_with_its_cause_once() {
+    let h = home();
+    let out = vault(&h, &["list"], "");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        err,
+        "error: the key file cannot be used: key file i/o failed during resolving directory: No such file or directory (os error 2)\n"
+    );
+}
+
+#[test]
+fn help_and_version_still_print() {
+    let h = home();
+    let help = vault(&h, &["set", "--help"], "");
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("exactly two lines")
+    );
+}

@@ -13,9 +13,6 @@ pub(crate) enum CliError {
     /// The key does not open the vault and a rekey may be pending (exit 2).
     #[error("{0}")]
     KeyMismatch(&'static str),
-    /// A refusal that names an id or a path (never a value).
-    #[error("{0}")]
-    RefusedWith(String),
     /// No entry has this id.
     #[error("no entry with id {0}")]
     NoEntry(String),
@@ -23,13 +20,13 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Vault(#[from] VaultError),
     /// The key file was refused.
-    #[error("key file: {0}")]
+    #[error("the key file cannot be used")]
     Key(#[from] SecretsError),
     /// A legacy file could not be mapped.
-    #[error("legacy import: {0}")]
+    #[error("legacy import")]
     Legacy(#[from] LegacyError),
     /// An I/O failure; `op` names the step, never a value.
-    #[error("i/o failed during {op}: {source}")]
+    #[error("i/o failed during {op}")]
     Io {
         op: &'static str,
         #[source]
@@ -45,6 +42,8 @@ impl CliError {
     /// Exit code: 2 when the vault or its key cannot be used (ADR 0006 section 8), else 1.
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
+            // Refusals the owner can act on directly, not an unusable vault or key.
+            Self::Key(SecretsError::KeyFileExists | SecretsError::InvalidKeyEncoding) => 1,
             Self::Key(_)
             | Self::KeyMismatch(_)
             | Self::Vault(

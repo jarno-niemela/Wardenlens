@@ -23,6 +23,8 @@ use crate::terminal::{StdoutKind, Terminal};
 /// # Errors
 /// Any [`CliError`]; the caller prints it and maps it to an exit code.
 pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Result<(), CliError> {
+    // ADR 0006 section 6, for every subcommand: the key is a file, never the environment.
+    env.refuse_key_variable()?;
     match cmd {
         VaultCommand::Init => init(env, term),
         VaultCommand::Set(a) => set(&a, &env.paths()?, term),

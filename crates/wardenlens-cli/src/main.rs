@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
+use clap::error::ErrorKind;
 use rustix::process::{Resource, Rlimit, setrlimit};
 
 use crate::args::{Cli, Command};
@@ -28,7 +29,10 @@ fn main() -> ExitCode {
     if setrlimit(Resource::Core, zero).is_err() {
         return fail("error: could not disable core dumps", 1);
     }
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return usage_error(&e),
+    };
     match cli.command {
         None => version(),
         Some(Command::Vault(cmd)) => {
@@ -41,6 +45,18 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+/// Clap echoes the offending text for these kinds, and a value put on argv by mistake must not
+/// reach a terminal log, so a fixed message replaces it. Help, version and the rest print as is.
+fn usage_error(e: &clap::Error) -> ExitCode {
+    match e.kind() {
+        ErrorKind::UnknownArgument | ErrorKind::InvalidValue => fail(
+            "error: invalid arguments; values are never arguments (run `wardenlens vault --help`)",
+            2,
+        ),
+        _ => e.exit(),
     }
 }
 
