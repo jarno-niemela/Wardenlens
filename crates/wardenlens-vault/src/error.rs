@@ -27,6 +27,9 @@ pub enum VaultError {
     /// The file exists but holds no vault (no `meta` table).
     #[error("file is not an initialised vault")]
     NotInitialized,
+    /// `create` found a file that is not empty and holds no vault.
+    #[error("file exists and is not empty")]
+    NotEmpty,
     /// `create` found a vault that already exists.
     #[error("vault already initialised")]
     AlreadyInitialized,
@@ -62,6 +65,12 @@ pub enum VaultError {
     /// The value shape does not fit the kind (credential vs text).
     #[error("value shape does not match kind {kind}")]
     ValueKindMismatch {
+        /// The kind that was being stored.
+        kind: EntryKind,
+    },
+    /// `Scan::PublicOccurrence` was used with a kind other than credential or secret.
+    #[error("a public occurrence applies only to credential and secret entries, not {kind}")]
+    PublicOccurrenceKind {
         /// The kind that was being stored.
         kind: EntryKind,
     },

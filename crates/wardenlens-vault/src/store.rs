@@ -23,12 +23,16 @@ use crate::validate::{check_credential, is_unscannable, normalize_text};
 pub enum Scan {
     /// Mark the entry unscannable only when the value is too short.
     Normal,
-    /// The value is a credential or secret that already appears in tracked files (ADR 0006
+    /// Only valid for the credential and secret kinds. The value is a credential or secret that already appears in tracked files (ADR 0006
     /// section 4): it would match its own public occurrences, so it is always unscannable.
     PublicOccurrence,
 }
 
 /// Whether the leak scan can use a stored value.
+///
+/// The flag does not yet apply the ADR 0006 section 7 squeeze table (zero-width characters,
+/// soft hyphens): a value made only of those is flagged `Scannable` here. #75 recomputes the
+/// flag for all kinds when it builds the matcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Scannability {
@@ -195,8 +199,8 @@ fn connect(
             .metadata()
             .map_err(VaultError::io("inspecting vault file"))?
             .len();
-        if len > 0 {
-            return Err(VaultError::AlreadyInitialized);
+        if len > 0 && !has_sqlite_header(file.file()) {
+            return Err(VaultError::NotEmpty);
         }
     }
     between();
@@ -217,6 +221,14 @@ fn connect(
     Ok((conn, file))
 }
 
+/// True if the file starts with the SQLite header; only such a file is handed to SQLite by
+/// `create`, which then tells a vault (`AlreadyInitialized`) from another database (`NotEmpty`).
+fn has_sqlite_header(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0u8; 16];
+    file.read_exact_at(&mut head, 0).is_ok() && &head == b"SQLite format 3\0"
+}
+
 fn seal_keycheck(key: &KeyFile) -> Result<Vec<u8>, VaultError> {
     Ok(seal(
         key,
@@ -230,7 +242,8 @@ impl Vault {
     /// Creates and initialises a new vault file (mode 0600) sealed under `key`.
     ///
     /// # Errors
-    /// [`VaultError::AlreadyInitialized`] if the file already holds a vault or any data; the open-sequence
+    /// [`VaultError::AlreadyInitialized`] if the file already holds a vault, [`VaultError::NotEmpty`] if it
+    /// holds anything else; the open-sequence
     /// refusals (symlink, wrong owner or mode, identity mismatch, unsafe parent, work tree).
     pub fn create(path: &Path, key: KeyFile) -> Result<Self, VaultError> {
         Self::create_with(path, key, || {})
@@ -247,6 +260,15 @@ impl Vault {
             .map_err(VaultError::sqlite("begin"))?;
         if has_meta(&tx)? {
             return Err(VaultError::AlreadyInitialized);
+        }
+        let len = file
+            .file()
+            .metadata()
+            .map_err(VaultError::io("inspecting vault file"))?
+            .len();
+        if len > 0 {
+            // Some other SQLite database: never add vault tables to it.
+            return Err(VaultError::NotEmpty);
         }
         tx.execute_batch(
             "CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -378,7 +400,9 @@ impl Vault {
     ///
     /// # Errors
     /// [`VaultError::InvalidValue`], [`VaultError::ValueTooLarge`],
-    /// [`VaultError::ValueKindMismatch`], [`VaultError::TooManyEntries`], or a store failure.
+    /// [`VaultError::ValueKindMismatch`], [`VaultError::TooManyEntries`],
+    /// [`VaultError::PublicOccurrenceKind`] (`Scan::PublicOccurrence` for a kind other than
+    /// credential or secret), or a store failure.
     pub fn set(
         &mut self,
         id: &EntryId,
@@ -386,6 +410,11 @@ impl Vault {
         value: &Value,
         scan: Scan,
     ) -> Result<Scannability, VaultError> {
+        if scan == Scan::PublicOccurrence
+            && !matches!(kind, EntryKind::Credential | EntryKind::Secret)
+        {
+            return Err(VaultError::PublicOccurrenceKind { kind });
+        }
         let (record, short) = match (kind, value) {
             (EntryKind::Credential, Value::Credential(c)) => {
                 check_credential(&c.username, c.password.expose_secret())?;

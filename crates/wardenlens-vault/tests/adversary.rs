@@ -437,15 +437,18 @@ fn host_validation_edges() {
 }
 
 #[test]
-#[ignore = "ADR 0006 accepts any separator layout"]
-fn mac_with_single_digit_groups_is_refused() {
+fn mac_with_any_separator_layout_is_accepted() {
     let (_d, _p, mut v) = fresh();
-    // 12 hex digits but not a MAC layout: separators between every digit.
-    let r = v.set(
+    v.set(
         &id("cam:a:mac"),
         EntryKind::Mac,
         &text("0:2:0:0:5:e:0:0:5:3:a:f"),
         Scan::Normal,
-    );
-    assert!(r.is_err(), "accepted a non-MAC layout");
+    )
+    .unwrap();
+    let e = v.get(&id("cam:a:mac")).unwrap().unwrap();
+    let Value::Text(t) = e.value else {
+        panic!("shape")
+    };
+    assert_eq!(t.expose_secret(), "02:00:5e:00:53:af");
 }

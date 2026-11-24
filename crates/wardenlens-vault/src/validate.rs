@@ -161,7 +161,14 @@ pub(crate) fn is_unscannable(kind: EntryKind, normalized: &str) -> bool {
             }
         }
         EntryKind::Serial => {
-            normalized
+            // Needles are matched in the fold, so the compact form is measured after it.
+            let folded = Zeroizing::new(
+                normalized
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>(),
+            );
+            folded
                 .bytes()
                 .filter(|b| !matches!(b, b'-' | b'_' | b'.' | b' '))
                 .count()

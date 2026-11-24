@@ -775,7 +775,7 @@ fn open_never_creates_a_file_and_create_refuses_foreign_data() {
     std::fs::write(db(&d), b"not a database, but somebody's data").unwrap();
     std::fs::set_permissions(db(&d), std::fs::Permissions::from_mode(0o600)).unwrap();
     let e = Vault::create(&db(&d), same_key(d.path(), "k1")).unwrap_err();
-    assert!(matches!(e, VaultError::AlreadyInitialized), "{e}");
+    assert!(matches!(e, VaultError::NotEmpty), "{e}");
     assert_eq!(
         std::fs::read(db(&d)).unwrap(),
         b"not a database, but somebody's data"
@@ -825,21 +825,25 @@ fn rekey_reports_a_placeholder_for_an_invalid_id() {
     );
 }
 
-proptest::proptest! {
-    #[test]
-    fn entry_id_accepts_exactly_the_charset(s in "\\PC{0,140}") {
-        let allowed = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b':' | b'_' | b'.' | b'-');
-        let expected = !s.is_empty()
-            && s.len() <= 128
-            && (s.as_bytes()[0].is_ascii_lowercase() || s.as_bytes()[0].is_ascii_digit())
-            && s.bytes().all(allowed)
-            && !s.starts_with("meta:");
-        proptest::prop_assert_eq!(EntryId::new(&s).is_ok(), expected);
+#[test]
+fn public_occurrence_is_only_valid_for_credential_and_secret() {
+    let (_d, mut v) = fresh();
+    for kind in [
+        EntryKind::Host,
+        EntryKind::Mac,
+        EntryKind::Serial,
+        EntryKind::DisplayName,
+        EntryKind::Other,
+    ] {
+        let e = v
+            .set(
+                &id("a"),
+                kind,
+                &text("a-perfectly-long-value"),
+                Scan::PublicOccurrence,
+            )
+            .unwrap_err();
+        assert!(matches!(e, VaultError::PublicOccurrenceKind { .. }), "{e}");
     }
-
-    #[test]
-    fn entry_id_accepts_every_charset_string(s in "[a-z0-9][a-z0-9:_.-]{0,127}") {
-        proptest::prop_assume!(!s.starts_with("meta:"));
-        proptest::prop_assert!(EntryId::new(&s).is_ok());
-    }
+    assert_eq!(v.list().unwrap().len(), 0);
 }

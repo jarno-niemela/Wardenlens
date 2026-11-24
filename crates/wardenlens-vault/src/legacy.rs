@@ -4,9 +4,15 @@
 //! is guessed and nothing is dropped silently (ADR 0006 section 4). Ids come from inventory ids
 //! (or a per-file ordinal), never from a value (section 1). Reading the files is the CLI's job.
 //!
-//! The two files use distinct ordinal namespaces (`import-json-<n>` and `import-toml-<n>`), so
+//! **The CLI (#94) must import through [`map_legacy`]**, never by calling the two mappers and
+//! storing both results: `Vault::set` is an upsert, so two files that produce the same entry id
+//! (a JSON camera mapped to `tapo` and a `[cameras.tapo]` section both give `cam:tapo:name`)
+//! would silently overwrite each other. [`map_legacy`] checks the union and refuses any overlap.
+//!
+//! An inventory id or section name starting with `import-` is reserved for ordinals: it falls
+//! back to an ordinal id and is reported by name. The two files use distinct ordinal namespaces (`import-json-<n>` and `import-toml-<n>`), so
 //! an unnamed camera of one file can never be merged with an unusable section of the other. A
-//! duplicate entry id inside one mapping result is reftaken ([`LegacyError::DuplicateId`]); it is
+//! duplicate entry id inside one mapping result is refused ([`LegacyError::DuplicateId`]); it is
 //! never overwritten.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +22,7 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_secrets::Credentials;
 
 use crate::store::Value;
+use crate::validate::{check_credential, normalize_text};
 
 /// Most cameras accepted from one legacy file (SEC-2).
 pub const MAX_LEGACY_CAMERAS: usize = 256;
@@ -25,6 +32,8 @@ pub const MAX_REPORTED_KEYS: usize = 1024;
 const MAX_REPORTED_KEY_LEN: usize = 64;
 /// The longest field suffix an inventory id must leave room for.
 const LONGEST_FIELD: &str = "credential";
+/// Ids starting with this are the ordinal fallbacks; real ids never use it.
+const RESERVED_PREFIX: &str = "import-";
 
 /// An entry ready for `Vault::set`.
 #[derive(Debug)]
@@ -54,6 +63,30 @@ pub struct LegacyImport {
 }
 
 impl LegacyImport {
+    /// Combines two mapping results into one, for a single import.
+    ///
+    /// # Errors
+    /// [`LegacyError::DuplicateId`] if any entry id occurs in both (or twice in either).
+    /// Nothing is combined then; the second result never overwrites the first.
+    pub fn merge(mut self, other: Self) -> Result<Self, LegacyError> {
+        let mut taken = BTreeSet::new();
+        for e in self.entries.iter().chain(other.entries.iter()) {
+            if !taken.insert(e.id.as_str().to_owned()) {
+                return Err(LegacyError::DuplicateId(e.id.to_string()));
+            }
+        }
+        self.entries.extend(other.entries);
+        self.keys_truncated |= other.keys_truncated;
+        for key in other.unknown_keys {
+            if self.unknown_keys.len() >= MAX_REPORTED_KEYS {
+                self.keys_truncated = true;
+                break;
+            }
+            self.unknown_keys.push(key);
+        }
+        Ok(self)
+    }
+
     fn report(&mut self, inv: Option<&str>, key: &str) {
         if self.unknown_keys.len() >= MAX_REPORTED_KEYS {
             self.keys_truncated = true;
@@ -114,6 +147,29 @@ pub enum LegacyError {
     TooMany,
 }
 
+/// Maps both legacy files for one import and refuses any entry id the two would share.
+///
+/// **This is the entry point the CLI (#94) must import through.** Either file may be absent.
+///
+/// # Errors
+/// Any error of [`map_secret_json`] or [`map_inventory_toml`], and
+/// [`LegacyError::DuplicateId`] if the two results overlap.
+pub fn map_legacy(
+    json: Option<&serde_json::Value>,
+    names_to_ids: &BTreeMap<String, String>,
+    toml: Option<&toml::Table>,
+) -> Result<LegacyImport, LegacyError> {
+    let j = json
+        .map(|j| map_secret_json(j, names_to_ids))
+        .transpose()?
+        .unwrap_or_default();
+    let t = toml
+        .map(map_inventory_toml)
+        .transpose()?
+        .unwrap_or_default();
+    j.merge(t)
+}
+
 /// Keys of the inventory TOML that are public configuration (ADR 0006 section 1): skipped
 /// silently rather than reported as unknown.
 const PUBLIC_TOML_KEYS: [&str; 6] = [
@@ -131,12 +187,23 @@ fn entry_id(inv: &str, field: &str) -> Result<EntryId, LegacyError> {
 
 /// A usable inventory id for a section, else the ordinal fallback `import-<ns>-<n>` (1-based).
 /// Usable means every field id, including the longest (`:credential`), fits the id rules, so
-/// no field is ever dropped for length.
-fn inventory_id(candidate: Option<&str>, namespace: &str, ordinal: usize) -> String {
+/// no field is ever dropped for length, and the id does not start with the reserved `import-`
+/// prefix. The returned flag is true when a real candidate was refused for the prefix.
+fn inventory_id(candidate: Option<&str>, namespace: &str, ordinal: usize) -> (String, bool) {
     match candidate {
-        Some(c) if entry_id(c, LONGEST_FIELD).is_ok() => c.to_owned(),
-        _ => format!("import-{namespace}-{}", ordinal.saturating_add(1)),
+        Some(c) if c.starts_with(RESERVED_PREFIX) => (ordinal_id(namespace, ordinal), true),
+        Some(c) if entry_id(c, LONGEST_FIELD).is_ok() => (c.to_owned(), false),
+        _ => (ordinal_id(namespace, ordinal), false),
     }
+}
+
+fn ordinal_id(namespace: &str, ordinal: usize) -> String {
+    format!("{RESERVED_PREFIX}{namespace}-{}", ordinal.saturating_add(1))
+}
+
+/// True if the mapper may emit `value` for `kind`: the vault would accept it.
+fn storable(kind: EntryKind, value: &str) -> bool {
+    normalize_text(kind, value).is_ok()
 }
 
 /// A key name safe to print: cut to 64 characters, control and non-printable characters
@@ -179,29 +246,49 @@ pub fn map_secret_json(
     let mut taken = BTreeSet::new();
     for (ordinal, camera) in cameras.iter().enumerate() {
         let obj = camera.as_object().ok_or(LegacyError::NotAnObject)?;
+        let mut skipped: Vec<&str> = Vec::new();
         let name = string_field(obj.get("name"))?;
         if let Some(n) = name
             && !seen.insert(n.to_owned())
         {
             return Err(LegacyError::DuplicateName);
         }
+        let name = name.filter(|n| {
+            let ok = storable(EntryKind::DisplayName, n);
+            if !ok {
+                skipped.push("name");
+            }
+            ok
+        });
         let mapped = name.and_then(|n| names_to_ids.get(n)).map(String::as_str);
-        let inv = inventory_id(mapped, "json", ordinal);
-        let login = string_field(obj.get("login"))?;
-        let username = string_field(obj.get("username"))?;
+        let (inv, renamed) = inventory_id(mapped, "json", ordinal);
+        if renamed && let Some(m) = mapped {
+            out.report(Some("cameras"), m);
+        }
+        let login = non_empty(string_field(obj.get("login"))?, "login", &mut skipped);
+        let username = non_empty(string_field(obj.get("username"))?, "username", &mut skipped);
         let password = string_field(obj.get("password"))?;
-        let account = login.or(username);
+        let account = login
+            .map(|l| (l, "login"))
+            .or(username.map(|u| (u, "username")));
         if let Some(n) = name {
             out.push(&mut taken, &inv, "name", EntryKind::DisplayName, text(n))?;
         }
         match (account, password) {
-            (Some(account), password) => out.push(
-                &mut taken,
-                &inv,
-                "credential",
-                EntryKind::Credential,
-                Value::Credential(Credentials::new(account, password.unwrap_or_default())),
-            )?,
+            (Some((account, key)), password) => {
+                let password = password.unwrap_or_default();
+                if check_credential(account, password).is_ok() {
+                    out.push(
+                        &mut taken,
+                        &inv,
+                        "credential",
+                        EntryKind::Credential,
+                        Value::Credential(Credentials::new(account, password)),
+                    )?;
+                } else {
+                    skipped.push(key);
+                }
+            }
             (None, Some(_)) => out.report(Some(&inv), "password"),
             (None, None) => {}
         }
@@ -210,6 +297,9 @@ pub fn map_secret_json(
         {
             out.report(Some(&inv), "username");
         }
+        for key in skipped {
+            out.report(Some(&inv), key);
+        }
         for key in obj.keys() {
             if !matches!(key.as_str(), "name" | "login" | "username" | "password") {
                 out.report(Some(&inv), key);
@@ -217,6 +307,21 @@ pub fn map_secret_json(
         }
     }
     Ok(out)
+}
+
+/// An empty string is the same as an absent field; its key is reported by name.
+fn non_empty<'a>(
+    v: Option<&'a str>,
+    key: &'static str,
+    skipped: &mut Vec<&'static str>,
+) -> Option<&'a str> {
+    match v {
+        Some("") => {
+            skipped.push(key);
+            None
+        }
+        other => other,
+    }
 }
 
 fn string_field(v: Option<&serde_json::Value>) -> Result<Option<&str>, LegacyError> {
@@ -252,7 +357,10 @@ pub fn map_inventory_toml(table: &toml::Table) -> Result<LegacyImport, LegacyErr
     }
     for (ordinal, (section, camera)) in cameras.iter().enumerate() {
         let obj = camera.as_table().ok_or(LegacyError::NotAnObject)?;
-        let inv = inventory_id(Some(section), "toml", ordinal);
+        let (inv, renamed) = inventory_id(Some(section), "toml", ordinal);
+        if renamed {
+            out.report(Some("cameras"), section);
+        }
         for (key, value) in obj {
             let (kind, field) = match key.as_str() {
                 "host" => (EntryKind::Host, "host"),
@@ -267,7 +375,11 @@ pub fn map_inventory_toml(table: &toml::Table) -> Result<LegacyImport, LegacyErr
                 }
             };
             let s = value.as_str().ok_or(LegacyError::NotAString)?;
-            out.push(&mut taken, &inv, field, kind, text(s))?;
+            if storable(kind, s) {
+                out.push(&mut taken, &inv, field, kind, text(s))?;
+            } else {
+                out.report(Some(&inv), key);
+            }
         }
     }
     Ok(out)
@@ -419,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn json_inventory_id_collision_is_reftaken() {
+    fn json_inventory_id_collision_is_refused() {
         let m = BTreeMap::from([
             ("A".to_owned(), "same".to_owned()),
             ("B".to_owned(), "same".to_owned()),
@@ -434,33 +546,87 @@ mod tests {
     }
 
     #[test]
-    fn json_real_id_equal_to_an_ordinal_is_reftaken_not_overwritten() {
+    fn json_real_id_with_the_reserved_prefix_becomes_an_ordinal_and_is_reported() {
         let m = BTreeMap::from([("A".to_owned(), "import-json-2".to_owned())]);
         let v = json(r#"[{"name":"A","login":"u","password":"p"},{"login":"v","password":"q"}]"#);
-        assert!(matches!(
-            map_secret_json(&v, &m),
-            Err(LegacyError::DuplicateId(_))
-        ));
+        let i = map_secret_json(&v, &m).unwrap();
+        assert_eq!(
+            entry_ids(&i),
+            [
+                "cam:import-json-1:name",
+                "cam:import-json-1:credential",
+                "cam:import-json-2:credential"
+            ]
+        );
+        assert_eq!(i.unknown_keys, ["cameras.import-json-2"]);
     }
 
     #[test]
-    fn toml_real_import_section_is_reftaken_not_overwritten() {
+    fn toml_section_with_the_reserved_prefix_becomes_an_ordinal_and_is_reported() {
         let t = toml_of(
             "[cameras.\"Front Gate\"]\nhost = \"192.0.2.10\"\n[cameras.import-toml-1]\nhost = \"192.0.2.11\"\n",
-        );
-        assert_eq!(
-            map_inventory_toml(&t).unwrap_err(),
-            LegacyError::DuplicateId("cam:import-toml-1:host".to_owned())
-        );
-        // A section literally named `import-1` is a plain id and collides with nothing.
-        let t = toml_of(
-            "[cameras.\"Front Gate\"]\nhost = \"192.0.2.10\"\n[cameras.import-1]\nhost = \"192.0.2.11\"\n",
         );
         let i = map_inventory_toml(&t).unwrap();
         assert_eq!(
             entry_ids(&i),
-            ["cam:import-toml-1:host", "cam:import-1:host"]
+            ["cam:import-toml-1:host", "cam:import-toml-2:host"]
         );
+        assert_eq!(i.unknown_keys, ["cameras.import-toml-1"]);
+    }
+
+    #[test]
+    fn map_legacy_refuses_ids_shared_by_the_two_files() {
+        let t = toml_of("[cameras.tapo]\nname = \"Garage Side\"\n");
+        let j = json(r#"[{"name":"Garage","login":"u","password":"p"}]"#);
+        assert_eq!(
+            map_legacy(Some(&j), &ids(), Some(&t)).unwrap_err(),
+            LegacyError::DuplicateId("cam:tapo:name".to_owned())
+        );
+    }
+
+    #[test]
+    fn map_legacy_with_a_section_named_like_an_ordinal_collides_with_nothing() {
+        let t = toml_of("[cameras.import-json-1]\nname = \"Back Door North\"\n");
+        let j = json(r#"[{"name":"Front Gate","login":"svc-reader","password":"x"}]"#);
+        let i = map_legacy(Some(&j), &BTreeMap::new(), Some(&t)).unwrap();
+        let mut seen = BTreeSet::new();
+        for e in &i.entries {
+            assert!(seen.insert(e.id.as_str()), "duplicate {}", e.id);
+        }
+    }
+
+    #[test]
+    fn map_legacy_combines_and_bounds_the_reports() {
+        let big = |n: usize| {
+            let mut obj = serde_json::Map::new();
+            for k in 0..n {
+                obj.insert(format!("k{k}"), serde_json::Value::Null);
+            }
+            serde_json::Value::Array(vec![serde_json::Value::Object(obj)])
+        };
+        let j = big(MAX_REPORTED_KEYS - 1);
+        let t = toml_of("[site]\na = 1\n[other]\nb = 2\n[cameras.a]\nhost = \"192.0.2.10\"\n");
+        let i = map_legacy(Some(&j), &ids(), Some(&t)).unwrap();
+        assert_eq!(i.unknown_keys.len(), MAX_REPORTED_KEYS);
+        assert!(i.keys_truncated);
+        assert_eq!(entry_ids(&i), ["cam:a:host"]);
+        let none = map_legacy(None, &ids(), None).unwrap();
+        assert!(none.entries.is_empty() && !none.keys_truncated);
+    }
+
+    #[test]
+    fn empty_fields_are_absent_and_reported_by_name() {
+        let v = json(r#"[{"name":"","login":"","username":"svc-reader","password":"p"}]"#);
+        let i = map_secret_json(&v, &BTreeMap::new()).unwrap();
+        assert_eq!(entry_ids(&i), ["cam:import-json-1:credential"]);
+        assert_eq!(
+            i.unknown_keys,
+            ["import-json-1.name", "import-json-1.login"]
+        );
+        let t = toml_of("[cameras.a]\nhost = \"\"\n");
+        let i = map_inventory_toml(&t).unwrap();
+        assert!(i.entries.is_empty());
+        assert_eq!(i.unknown_keys, ["a.host"]);
     }
 
     #[test]

@@ -244,4 +244,23 @@ mod tests {
             Err(EntryError::UnknownKind)
         );
     }
+
+    proptest::proptest! {
+        #[test]
+        fn entry_id_accepts_exactly_the_charset(s in "\\PC{0,140}") {
+            let allowed = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b':' | b'_' | b'.' | b'-');
+            let expected = !s.is_empty()
+                && s.len() <= 128
+                && (s.as_bytes()[0].is_ascii_lowercase() || s.as_bytes()[0].is_ascii_digit())
+                && s.bytes().all(allowed)
+                && !s.starts_with("meta:");
+            proptest::prop_assert_eq!(EntryId::new(&s).is_ok(), expected);
+        }
+
+        #[test]
+        fn entry_id_accepts_every_charset_string(s in "[a-z0-9][a-z0-9:_.-]{0,127}") {
+            proptest::prop_assume!(!s.starts_with("meta:"));
+            proptest::prop_assert!(EntryId::new(&s).is_ok());
+        }
+    }
 }
