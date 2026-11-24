@@ -194,16 +194,14 @@ fn connect(
     if !must_exist {
         // A non-empty file is a vault or somebody's data: never initialise over it, and
         // refuse before SQLite touches it.
-        let len = file
-            .file()
-            .metadata()
-            .map_err(VaultError::io("inspecting vault file"))?
-            .len();
-        if len > 0 && !has_sqlite_header(file.file()) {
+        if file_len(&file)? > 0 && !has_sqlite_header(file.file()) {
             return Err(VaultError::NotEmpty);
         }
     }
     between();
+    if !must_exist && file_len(&file)? > 0 {
+        probe_existing(path, &file)?;
+    }
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -219,6 +217,46 @@ fn connect(
     )
     .map_err(VaultError::sqlite("pragma"))?;
     Ok((conn, file))
+}
+
+fn file_len(file: &PrivateFile) -> Result<u64, VaultError> {
+    Ok(file
+        .file()
+        .metadata()
+        .map_err(VaultError::io("inspecting vault file"))?
+        .len())
+}
+
+/// Tells a vault from another database in a non-empty file for `create`, which refuses both.
+/// Opened `immutable=1` and read-only: no pragma, lock, journal, `-wal` or `-shm` file is ever
+/// written, so the foreign bytes stay exactly as they were. (A vault is always in rollback mode,
+/// so its main file is complete.)
+fn probe_existing(path: &Path, file: &PrivateFile) -> Result<(), VaultError> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut uri = b"file:".to_vec();
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(b);
+        } else {
+            uri.extend_from_slice(format!("%{b:02X}").as_bytes());
+        }
+    }
+    uri.extend_from_slice(b"?immutable=1");
+    let conn = Connection::open_with_flags(
+        OsString::from_vec(uri),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(VaultError::sqlite("open"))?;
+    file.verify_path_unchanged(path)?;
+    // A header with no readable schema is not a vault either.
+    match has_meta(&conn) {
+        Ok(true) => Err(VaultError::AlreadyInitialized),
+        _ => Err(VaultError::NotEmpty),
+    }
 }
 
 /// True if the file starts with the SQLite header; only such a file is handed to SQLite by

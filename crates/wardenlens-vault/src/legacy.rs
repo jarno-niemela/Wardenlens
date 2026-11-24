@@ -53,10 +53,13 @@ pub struct NewEntry {
 pub struct LegacyImport {
     /// Entries for the mapped fields.
     pub entries: Vec<NewEntry>,
-    /// Keys that were not imported, as `<inventory id>.<key>` (or the bare key for a top-level
-    /// TOML key): unmapped keys, a `password` without a login, a `username` shadowed by a
-    /// different `login`, and a `display_name` next to a `name`. Names only, never values;
-    /// control and non-printable characters are escaped. At most [`MAX_REPORTED_KEYS`].
+    /// Everything not imported, as `<inventory id>.<key>` (or the bare key for a top-level TOML
+    /// key): unknown keys; skipped or shadowed fields (a `password` without a login, a `username`
+    /// shadowed by a different `login`, a `display_name` next to a `name`, a JSON `name` of a
+    /// camera whose inventory owns it); values that fail validation (reported under the key that
+    /// failed); and refused or reserved ids (`cameras.<name>` for a mapped id or section name
+    /// that fell back to an ordinal). Names only, never values; control and non-printable
+    /// characters are escaped. At most [`MAX_REPORTED_KEYS`].
     pub unknown_keys: Vec<String>,
     /// True if more keys than [`MAX_REPORTED_KEYS`] were skipped and the list was cut.
     pub keys_truncated: bool,
@@ -188,12 +191,14 @@ fn entry_id(inv: &str, field: &str) -> Result<EntryId, LegacyError> {
 /// A usable inventory id for a section, else the ordinal fallback `import-<ns>-<n>` (1-based).
 /// Usable means every field id, including the longest (`:credential`), fits the id rules, so
 /// no field is ever dropped for length, and the id does not start with the reserved `import-`
-/// prefix. The returned flag is true when a real candidate was refused for the prefix.
+/// prefix. The returned flag is true when a real candidate was refused (reserved prefix or not
+/// a valid id) and the ordinal was used instead.
 fn inventory_id(candidate: Option<&str>, namespace: &str, ordinal: usize) -> (String, bool) {
     match candidate {
         Some(c) if c.starts_with(RESERVED_PREFIX) => (ordinal_id(namespace, ordinal), true),
         Some(c) if entry_id(c, LONGEST_FIELD).is_ok() => (c.to_owned(), false),
-        _ => (ordinal_id(namespace, ordinal), false),
+        Some(_) => (ordinal_id(namespace, ordinal), true),
+        None => (ordinal_id(namespace, ordinal), false),
     }
 }
 
@@ -248,11 +253,6 @@ pub fn map_secret_json(
         let obj = camera.as_object().ok_or(LegacyError::NotAnObject)?;
         let mut skipped: Vec<&str> = Vec::new();
         let name = string_field(obj.get("name"))?;
-        if let Some(n) = name
-            && !seen.insert(n.to_owned())
-        {
-            return Err(LegacyError::DuplicateName);
-        }
         let name = name.filter(|n| {
             let ok = storable(EntryKind::DisplayName, n);
             if !ok {
@@ -260,6 +260,11 @@ pub fn map_secret_json(
             }
             ok
         });
+        if let Some(n) = name
+            && !seen.insert(n.to_owned())
+        {
+            return Err(LegacyError::DuplicateName);
+        }
         let mapped = name.and_then(|n| names_to_ids.get(n)).map(String::as_str);
         let (inv, renamed) = inventory_id(mapped, "json", ordinal);
         if renamed && let Some(m) = mapped {
@@ -272,12 +277,20 @@ pub fn map_secret_json(
             .map(|l| (l, "login"))
             .or(username.map(|u| (u, "username")));
         if let Some(n) = name {
-            out.push(&mut taken, &inv, "name", EntryKind::DisplayName, text(n))?;
+            if mapped.is_some() && !renamed {
+                // The inventory owns the display name of a mapped camera: the two files can
+                // never both emit `cam:<inv>:name`.
+                out.report(Some(&inv), "name");
+            } else {
+                out.push(&mut taken, &inv, "name", EntryKind::DisplayName, text(n))?;
+            }
         }
         match (account, password) {
             (Some((account, key)), password) => {
                 let password = password.unwrap_or_default();
-                if check_credential(account, password).is_ok() {
+                if let Some(bad) = refused_credential_keys(account, key, password) {
+                    skipped.extend(bad);
+                } else {
                     out.push(
                         &mut taken,
                         &inv,
@@ -285,8 +298,6 @@ pub fn map_secret_json(
                         EntryKind::Credential,
                         Value::Credential(Credentials::new(account, password)),
                     )?;
-                } else {
-                    skipped.push(key);
                 }
             }
             (None, Some(_)) => out.report(Some(&inv), "password"),
@@ -307,6 +318,28 @@ pub fn map_secret_json(
         }
     }
     Ok(out)
+}
+
+/// `None` if the pair is storable, else the keys to report: the one that failed under its own
+/// name; a bad account also shadows a present password, so both are named.
+fn refused_credential_keys(
+    account: &str,
+    account_key: &'static str,
+    password: &str,
+) -> Option<Vec<&'static str>> {
+    let bad_account = check_credential(account, "").is_err();
+    let bad_password = check_credential("x", password).is_err();
+    if !bad_account && !bad_password {
+        return None;
+    }
+    let mut keys = Vec::new();
+    if bad_account {
+        keys.push(account_key);
+    }
+    if bad_password || (bad_account && !password.is_empty()) {
+        keys.push("password");
+    }
+    Some(keys)
 }
 
 /// An empty string is the same as an absent field; its key is reported by name.
@@ -420,12 +453,12 @@ mod tests {
         let imp = map_secret_json(&doc, &ids()).unwrap();
         assert_eq!(
             entry_ids(&imp),
-            [
-                "cam:reolink-1:name",
-                "cam:reolink-1:credential",
-                "cam:tapo:name",
-                "cam:tapo:credential"
-            ]
+            ["cam:reolink-1:credential", "cam:tapo:credential"]
+        );
+        // The inventory owns the display name of a mapped camera.
+        assert_eq!(
+            imp.unknown_keys,
+            ["reolink-1.name", "reolink-1.onvif", "tapo.name"]
         );
         let cred = find(&imp, "cam:reolink-1:credential");
         assert_eq!(cred.kind, EntryKind::Credential);
@@ -434,7 +467,10 @@ mod tests {
         };
         assert_eq!(pair.username, "svc-reader");
         assert_eq!(pair.password.expose_secret(), "Tr0ub4dor-x9");
-        let name = find(&imp, "cam:tapo:name");
+        // An unmapped camera keeps its own display name.
+        let unmapped = json(r#"[{"name":"Garage"}]"#);
+        let imp = map_secret_json(&unmapped, &BTreeMap::new()).unwrap();
+        let name = find(&imp, "cam:import-json-1:name");
         assert_eq!(name.kind, EntryKind::DisplayName);
         let Value::Text(shown) = &name.value else {
             panic!("shape")
@@ -448,7 +484,10 @@ mod tests {
             r#"[{"name":"Front Gate","login":"u","password":"p","onvif":"http://192.0.2.10/","ptz":true}]"#,
         );
         let i = map_secret_json(&v, &ids()).unwrap();
-        assert_eq!(i.unknown_keys, ["reolink-1.onvif", "reolink-1.ptz"]);
+        assert_eq!(
+            i.unknown_keys,
+            ["reolink-1.name", "reolink-1.onvif", "reolink-1.ptz"]
+        );
         let all = format!("{:?}", i.unknown_keys);
         assert!(!all.contains("192.0.2.10") && !all.contains("Front Gate"));
     }
@@ -491,8 +530,8 @@ mod tests {
     fn json_without_login_imports_no_credential() {
         let v = json(r#"[{"name":"Garage","password":"orphan"}]"#);
         let i = map_secret_json(&v, &ids()).unwrap();
-        assert_eq!(entry_ids(&i), ["cam:tapo:name"]);
-        assert_eq!(i.unknown_keys, ["tapo.password"]);
+        assert!(i.entries.is_empty());
+        assert_eq!(i.unknown_keys, ["tapo.name", "tapo.password"]);
     }
 
     #[test]
@@ -541,7 +580,7 @@ mod tests {
         );
         assert_eq!(
             map_secret_json(&v, &m).unwrap_err(),
-            LegacyError::DuplicateId("cam:same:name".to_owned())
+            LegacyError::DuplicateId("cam:same:credential".to_owned())
         );
     }
 
@@ -571,17 +610,54 @@ mod tests {
             entry_ids(&i),
             ["cam:import-toml-1:host", "cam:import-toml-2:host"]
         );
-        assert_eq!(i.unknown_keys, ["cameras.import-toml-1"]);
+        assert_eq!(
+            i.unknown_keys,
+            ["cameras.Front Gate", "cameras.import-toml-1"]
+        );
     }
 
     #[test]
-    fn map_legacy_refuses_ids_shared_by_the_two_files() {
+    fn json_and_toml_names_for_one_camera_do_not_collide() {
         let t = toml_of("[cameras.tapo]\nname = \"Garage Side\"\n");
         let j = json(r#"[{"name":"Garage","login":"u","password":"p"}]"#);
+        let i = map_legacy(Some(&j), &ids(), Some(&t)).unwrap();
+        assert_eq!(entry_ids(&i), ["cam:tapo:credential", "cam:tapo:name"]);
+        assert_eq!(i.unknown_keys, ["tapo.name"]);
+    }
+
+    #[test]
+    fn merge_refuses_a_real_overlap() {
+        let a = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Garage\"\n")).unwrap();
+        let b = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Side\"\n")).unwrap();
         assert_eq!(
-            map_legacy(Some(&j), &ids(), Some(&t)).unwrap_err(),
+            a.merge(b).unwrap_err(),
             LegacyError::DuplicateId("cam:tapo:name".to_owned())
         );
+    }
+
+    #[test]
+    fn two_cameras_with_empty_names_are_not_duplicates() {
+        let v = json(
+            r#"[{"name":"","login":"a","password":"p"},{"name":"","login":"b","password":"q"}]"#,
+        );
+        let i = map_secret_json(&v, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            entry_ids(&i),
+            [
+                "cam:import-json-1:credential",
+                "cam:import-json-2:credential"
+            ]
+        );
+        assert_eq!(i.unknown_keys, ["import-json-1.name", "import-json-2.name"]);
+    }
+
+    #[test]
+    fn a_mapped_id_that_fails_the_id_rules_is_reported_escaped() {
+        let m = BTreeMap::from([("A".to_owned(), "Front\tGate".to_owned())]);
+        let v = json(r#"[{"name":"A","login":"u","password":"p"}]"#);
+        let i = map_secret_json(&v, &m).unwrap();
+        assert_eq!(i.unknown_keys, ["cameras.Front\\tGate"]);
+        assert_eq!(entry_ids(&i)[0], "cam:import-json-1:name");
     }
 
     #[test]
@@ -645,7 +721,10 @@ mod tests {
             r#"[{"name":"Garage","login":"a","username":"b","password":"p"},{"name":"Front Gate","username":"u2"}]"#,
         );
         let i = map_secret_json(&v, &ids()).unwrap();
-        assert_eq!(i.unknown_keys, ["tapo.username"]);
+        assert_eq!(
+            i.unknown_keys,
+            ["tapo.name", "tapo.username", "reolink-1.name"]
+        );
         // `username` alone is taken as the login.
         assert!(entry_ids(&i).contains(&"cam:reolink-1:credential"));
         // Equal login and username: nothing to report.
@@ -820,8 +899,7 @@ a = 1"
             [
                 "cam:reolink-1:credential",
                 "cam:reolink-1:host",
-                "cam:reolink-1:mac",
-                "cam:reolink-1:name"
+                "cam:reolink-1:mac"
             ]
         );
     }

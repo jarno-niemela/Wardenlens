@@ -13,7 +13,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_secrets::{Credentials, KeyFile};
-use wardenlens_vault::legacy::{LegacyError, map_inventory_toml, map_legacy, map_secret_json};
+use wardenlens_vault::legacy::{map_inventory_toml, map_legacy, map_secret_json};
 use wardenlens_vault::{Scan, Scannability, Value, Vault};
 
 fn dir() -> TempDir {
@@ -156,18 +156,22 @@ fn json_and_toml_results_never_share_an_entry_id() {
     }
 }
 
-/// Same, with a real inventory id on both sides: the `AgentDVR` name and the inventory name
-/// differ, and both land on `cam:tapo:name`. The combined entry point refuses it.
+/// A real inventory id on both sides: the inventory owns the display name, so the import
+/// succeeds and the JSON name is reported by key.
 #[test]
 fn json_name_and_toml_name_for_one_camera_are_refused_by_map_legacy() {
     let toml: toml::Table = toml::from_str("[cameras.tapo]\nname = \"Garage Side\"\n").unwrap();
     let json: serde_json::Value =
         serde_json::from_str(r#"[{"name":"Garage","login":"u","password":"p"}]"#).unwrap();
     let m = BTreeMap::from([("Garage".to_owned(), "tapo".to_owned())]);
-    let r = map_legacy(Some(&json), &m, Some(&toml));
-    assert!(
-        matches!(r, Err(LegacyError::DuplicateId(ref i)) if i == "cam:tapo:name"),
-        "{r:?}"
+    let i = map_legacy(Some(&json), &m, Some(&toml)).unwrap();
+    assert!(i.unknown_keys.iter().any(|k| k == "tapo.name"));
+    assert_eq!(
+        i.entries
+            .iter()
+            .filter(|e| e.id.as_str() == "cam:tapo:name")
+            .count(),
+        1
     );
 }
 
