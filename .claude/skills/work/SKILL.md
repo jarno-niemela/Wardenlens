@@ -26,7 +26,7 @@ For every subagent: write its exact prompt to a file in the scratchpad, run `scr
 ## 1. Select and claim
 - Ticket = the argument, else `scripts/ticket next`. If none: report "queue empty", show `scripts/ticket list`, stop.
 - `gh issue view N` — read it fully. If acceptance criteria are missing or vague, refine the ticket body first (or label `agent:human` and ask) — never implement a vague ticket.
-- **Split before implementing** when the ticket spans a library and its CLI or git/workflow integration, or carries several rounds of amendments. Keep the pure library in N, file the rest as a new ticket blocked by N, and record the split as an amendment comment on N. The unsplit #74 vault and #32 catalogue hit the 5-round cap; the split #94 CLI took 3 rounds.
+- **Split before implementing** when the ticket spans a library and its CLI or git/workflow integration, or carries several rounds of amendments. Keep the pure library in N, file the rest as a new ticket blocked by N, and record the split as an amendment comment on N. Strike the moved criteria in N's body, with a pointer to the new ticket, so merge rule 3 does not still require them. The unsplit #74 vault and #32 catalogue hit the 5-round cap; the split #94 CLI took 3 rounds.
 - **Amending a ticket:** if the rule comes from an ADR, change the ADR first and mirror it into the ticket. Never add new rules to a ticket while its ADR is still under verification. In PR #77, ticket bullets drifted from the ADR, which wins, and that cost a major.
 - **Real devices and site data:** spike tickets are read-only towards cameras. A write needs the owner's approval for that one change: read and record the old value first, change nothing else, and revert when done. Code, docs and briefs name cameras by inventory id only; LAN addresses, credentials, serials and display names never enter the repo or a brief.
 - `scripts/ticket claim N`
@@ -49,7 +49,7 @@ git -C .claude/worktrees/N push -u origin <branch>
 gh pr create --head <branch> --title "<conventional title> (#N)" --body-file <filled .github/pull_request_template.md with Closes #N>
 gh pr edit <pr> --add-label agent:sonnet
 ```
-**Bring the branch up to date before every verification round.** If `origin/main` moved, run `git merge origin/main` in the worktree. Resolve a `Cargo.lock` conflict with `git checkout --theirs Cargo.lock` and a cargo re-resolve, and resolve `lib.rs` module lists by union. Then run the gate and push. A branch verified while behind would need re-verification after the merge.
+**Bring the branch up to date before every verification round.** If `origin/main` moved, run `git merge origin/main` in the worktree. Resolve a `Cargo.lock` conflict with `git checkout --theirs Cargo.lock` and a cargo re-resolve, and resolve `lib.rs` module lists by union. Then run the gate and push, in that order and chained with `&&`. Updating first means the verified head is the one that merges; updating after verification changes the head and needs re-verification.
 
 **Pipeline:** while one PR verifies, start the next ticket's implementer in its own worktree. Never verify two branches that conflict (5b).
 
@@ -95,13 +95,14 @@ Collect verdicts:
 - **If the owner chooses to merge:**
   - File the follow-up first: the remaining defect, the rethought design, and the failing adversary tests saved outside the repo (e.g. `~/.local/state/wardenlens/carry/`). Do not commit failing tests to the branch.
   - Post a PR comment headed **"Owner override"** that quotes the owner's choice and states the independent verdicts (BLOCK/BROKEN) and the follow-up number.
+  - Leave each acceptance criterion the remaining defect breaks unticked in the PR body, marked "deferred to #M under owner override" with the follow-up's number.
   - Only then set the `verify/*` statuses to success. They record the override, not an independent pass.
 
 ## 5b. Running verification in parallel
 Two PRs can be verified at once only if a trial merge of both onto `origin/main` is clean. Use a scratch clone (`/tmp/claude-1000/mt`) with a throwaway identity (`git -c user.name=t -c user.email=t@example.invalid merge …`) for the trial only. **Never push from the scratch clone**: it has no `core.hooksPath`, so `.githooks/pre-push` would not run. Almost every core PR adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`, so two such PRs conflict. Verify those one after another, and merge whichever is closer to passing first. Resolve the real conflict in the PR's own hooked worktree (`git merge origin/main`, the union of both module lists, sorted), then run the gate and push. The new head needs all three verifiers again. That re-verification is not a fix round and does not count toward the cap; name its briefs `<ticket>-<role>-rN-reverify.md` so `/retro` does not count them. It costs as much as a round, so prefer merging the closer PR first over verifying both.
 
 ## 6. Keep adversary tests and merge
-Passing adversary tests listed under WORTH KEEPING: copy them from the adversary worktree into the PR branch, commit them (test-only), run the gate, push, then:
+Passing adversary tests listed under WORTH KEEPING: first read them for sleeps, racing threads or wall-clock bounds (a timing-dependent test goes to a follow-up ticket, never to main), and check their location: only files under `crates/*/tests/**` or `scripts/tests/**` can be carried; tests in a `src/` test module are saved outside the repo and go to the follow-up. Copy the rest from the adversary worktree into the PR branch, commit them (test-only), run the gate, push, then:
 ```bash
 scripts/verify carry <pr> $SHA        # refuses unless the diff since $SHA touches only crates/*/tests/** or scripts/tests/**
 ```
@@ -114,7 +115,7 @@ git worktree remove .claude/worktrees/N && git fetch -q origin
 Run `cargo fmt --all` after copying adversary files; the pre-commit hook rejects unformatted test files. If an adversary test fails only because of an accepted **minor** or a deferred item, mark it `#[ignore = "follow-up #N"]` and file #N; never delete it. A test showing a blocker, a major or any security finding is never ignored (WORKFLOW merge rule 4); it must pass before merge. The only exception is an owner override at the cap, where the failing tests go to the follow-up ticket instead of the branch.
 If CodeQL fails on synthetic test credentials (`rust/hard-coded-cryptographic-value`, `rust/cleartext-logging`), check that every alert is on a test path: `crates/*/tests/**`, or a line that really lies inside a `#[cfg(test)]` module (check the line, not just the file). Dismiss only those, with reason `used in tests` and a comment, and note it on the PR. An alert in non-test code is a security finding: send it to the `security-auditor` on the current SHA, or ask the owner. The controller does not dismiss it alone, even if it looks like a false positive.
 Remove the adversary worktree as its own step, only after its tests have been copied out: `git worktree remove --force .claude/worktrees/N-adv` (it holds untracked files, so `--force` is needed).
-`scripts/verify check` succeeds only when all three `verify/*` statuses are `success` on the current head and every other check is green; the guard hook blocks `gh pr merge` without `--match-head-commit`. Never merge with a red or pending check, an unticked acceptance criterion or a head that changed after verification. Never use `--admin`.
+`scripts/verify check` succeeds only when all three `verify/*` statuses are `success` on the current head and every other check is green; the guard hook blocks `gh pr merge` without `--match-head-commit`. Never merge with a red or pending check, an unticked acceptance criterion (other than one deferred under an owner override at the cap) or a head that changed after verification. Never use `--admin`.
 
 ## 7. Close out
 - Confirm the issue closed and is `status:done` (`ticket-sync.yml`); fix if not.

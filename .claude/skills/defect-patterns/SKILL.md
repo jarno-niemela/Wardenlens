@@ -63,8 +63,8 @@ Keep it current with `/retro` (the `retro` skill).
   - with a hot `-journal`, the main file may be torn (for example a crash mid-rekey leaves the new
     keycheck page), so identify a **private rolled-back copy** of main file + journal instead (#104 r3).
   - Enumerate **every entry point** (`open`, `create`, `rekey`, the empty-file path) and every sidecar (`-wal`, `-journal`).
-  - The rolled-back copy is safe only with all of: copying through the already-verified descriptor, a 0700 scratch directory with `create_new` 0600 files, a size cap, removal on every return path, and no super-journal pointer followed (PR #106).
-- **Rule.** Every open of a path you do not control uses `O_NOFOLLOW | O_NONBLOCK`, rejects a non-regular `symlink_metadata` first, and re-checks `is_file` on the descriptor. That includes paths a library opens for you: SQLite follows a super-journal name stored inside a journal (#104 r3 FIFO `-journal` hang; r4 FIFO super-journal hang, #116).
+  - The rolled-back copy is safe only with all of: copying through the already-verified descriptor, a 0700 scratch directory with `create_new` 0600 files, a size cap, removal on every return path, an `O_NOFOLLOW | O_NONBLOCK` journal open, and refusing a journal whose tail holds a super-journal pointer (PR #106, PR #119).
+- **Rule.** Every open of a path the program discovered (a sidecar, a directory-walk entry, a path named inside a file), as opposed to one the owner named explicitly, uses `O_NOFOLLOW | O_NONBLOCK`, rejects a non-regular `symlink_metadata` first, and re-checks `is_file` on the descriptor. When a library would open such a path itself, keep it from doing so: SQLite follows a super-journal name stored inside a journal, so the probe refuses that journal first (#104 r3 FIFO `-journal` hang; r4 FIFO super-journal hang, fixed in PR #119). A path the owner names (for example `import-legacy` input) still opens with `O_NONBLOCK`.
 - **Rule.** Separate "foreign" from "mine, mid-write or crashed":
   - wait for a live writer up to the busy timeout;
   - let a proven own file recover;
@@ -136,17 +136,7 @@ Keep it current with `/retro` (the `retro` skill).
   variant in the tests; an untested variant is a finding.
 
 ## P7. Tests that cannot fail (promoted to TEST-8)
-- **Rule.** A tautological assertion does not count, for example
-  `ended == started + duration` where `ended` is derived from those values. Compute
-  the expected value independently.
-- **Rule.** Check that a generator reaches the interesting path. Random `u32` RTP values
-  re-base on every frame, so a proptest built on them never hits the hard maximum. Add
-  bounded-delta strategies.
-- **Rule.** A test that locks in wrong behaviour is a defect. Fix or rename tests and
-  doc comments when behaviour changes; stale "Observed: stays in Connecting forever"
-  notes were flagged.
-- **Rule.** Boundaries mean exact, minus one and plus one, for every cap:
-  8 MiB / 8 MiB + 1, 16 MiB, 600 000 ms, u32::MAX.
+- **Rule.** TEST-8 is the rule: compute expected values independently, make generators reach the target branch, mutation-check guards and orderings once, and never depend on timing. Fix or rename tests and doc comments when behaviour changes. Boundaries are exact, -1 and +1 for every cap.
 - **Example.**
   - #45 (PR #102) r1 reviewer: the "sum of durations" proptest asserted `ended == started + duration`, which is true by construction. In r2: random-u32 RTP never reached the hard maximum.
   - #74 (PR #97) r1: `json_without_login_imports_no_credential` locked in the dropped password.
@@ -178,7 +168,8 @@ Keep it current with `/retro` (the `retro` skill).
 - **Guard hook quirks:**
   - The guard cannot resolve git after `cd $VAR` or a relative `cd`. Use `cd /abs/path &&` or `git -C /abs/path`, one worktree per Bash call.
   - Any command text containing the literal merge command without `--match-head-commit`, even inside a heredoc, is blocked. Write such text to a file with the Write tool.
-  - Only dangerous `git -c` keys (hooks, push, alias, editor) are blocked; `user.name` and `user.email` pass.
+  - Only dangerous `git -c` keys are blocked (for example hooks, push, alias, editor, `include.path`, `includeIf.*`, `extensions.worktreeconfig`); `user.name` and `user.email` pass.
+  - These notes are for writing prose and briefs, never for getting a command past the guard.
 - **Gate then push:** chain them with `&&`, never `;`. With `;` a failed gate still pushes (it happened on #75's branch; there was no PR, so nothing merged).
 - **Escapes in tool input:** `\uXXXX` text in a tool call can be decoded into the real character. In issue bodies and briefs, describe such escapes in words ("the JSON escape for U+2028").
 - **Kept adversary tests:** `scripts/verify carry` accepts only `crates/*/tests/**` and `scripts/tests/**`. Tests in a `src/` test module need re-verification, so they go to the follow-up ticket instead (PR #115). Before committing kept tests, read them for sleeps or racing threads; a timing-dependent test goes to a follow-up, not to main (#116).
@@ -206,4 +197,4 @@ Keep it current with `/retro` (the `retro` skill).
 9. **P10:** for each policy, is it enforced at one choke point, as an allowlist, and tested over every entry point?
 10. Are deviations, assumptions and anything left undone listed in NOTES FOR VERIFIERS?
 
-Last retro: 2026-11-24, covering PRs #93, #95, #97, #98, #101, #102, #106, #109, #110 and #115.
+Last retro: 2026-11-24, covering PRs #93, #95, #97, #98, #101, #102, #106, #109, #110, #115 and #119.
