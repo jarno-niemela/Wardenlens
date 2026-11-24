@@ -481,7 +481,7 @@ the redaction rule of section 8, a path; it is also item 5 of the gap list). A t
   length are never printed** (SEC-6, ERR-5). The report cannot be used to learn a value beyond "this id occurs here".
 - **A path, ref name, commit message or author line that itself contains a hit is never printed**, because printing
   the location would print the value. The tool first runs the matcher over every path, ref name and message it is about to
-  print, in every report, error and notice, **as the complete printed text** (`path:line` and the line around it, not the bare path). A
+  print, in every report, error and notice, over **the path-derived part of what is printed**: the escaped name with its `:line`, the raw path bytes, and the fixed message text around them. The entry id and kind printed in front of a hit are not part of it (ids are not secret and may legitimately spell a display name or host). If the redacted form `<redacted-path:N>` with its `:line` still spells a value (a number equal to the line or the position), the `:line` is dropped, then the position. This is applied in one place for hit lines, notices and errors. A
   path is printed with control characters, line and paragraph separators and invisible or bidirectional formatting characters as
   `\u{..}` escapes, so a name cannot forge a report line. Exit 1 means only that a value was found; every other failure of
   the scan, an output error included, is exit 2. Locations are: `path:line` for a clean path in the tree or the index;

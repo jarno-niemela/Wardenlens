@@ -13,7 +13,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
-use wardenlens_vault::{BINARY_PROBE_LEN, Content, MAX_FILE_LEN, Matcher, classify, scan};
+use wardenlens_vault::{
+    BINARY_PROBE_LEN, Content, MAX_FILE_LEN, Matcher, classify, is_invisible, scan,
+};
 
 use super::session::open_read;
 use super::{say, warn};
@@ -141,7 +143,7 @@ fn walk(paths: &[PathBuf], limit: usize) -> Result<Walk, CliError> {
 /// Opens a regular file without ever blocking on it (a FIFO would hang a plain open). A path
 /// found while walking is never followed if it is a symlink.
 fn open_regular(path: &Path, explicit: bool) -> Result<File, Unread> {
-    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY;
     if !explicit {
         flags |= OFlags::NOFOLLOW;
     }
@@ -203,48 +205,65 @@ struct Tally {
     truncated: usize,
 }
 
-/// True for a character that must not reach a terminal or a log as it is: control characters
-/// (C0, DEL, C1), the line and paragraph separators, and the invisible and bidirectional
-/// formatting characters.
-fn is_unsafe_to_print(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            u32::from(c),
-            0x2028 | 0x2029 | 0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF
-        )
+/// True for a character that may be printed as it is: a graphic, visible one. This is an
+/// allowlist: everything else (controls, `Cf` format characters, separators, invisible
+/// fillers, white space other than the plain space) is escaped.
+fn is_printable(c: char) -> bool {
+    c == ' ' || !(c.is_control() || c.is_whitespace() || is_invisible(c))
 }
 
-/// A path as it may be printed: unsafe characters are written as `\u{..}` escapes, so a file
-/// name can neither forge a report line nor send terminal escapes.
+/// A path as it may be printed: characters that are not printable are written as `\u{..}`
+/// escapes, so a file name can neither forge a report line nor send terminal escapes.
 fn escaped(path: &Path) -> String {
     let mut out = String::new();
     for c in path.to_string_lossy().chars() {
-        if is_unsafe_to_print(c) {
-            out.extend(c.escape_unicode());
-        } else {
+        if is_printable(c) {
             out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
         }
     }
     out
 }
 
-/// One printed line that mentions a path. `build` makes the line from the name to show; the
-/// **whole line** (not just the path) is scanned, and when it, or the raw path, holds a vault
-/// value, the line is built again with `<redacted-path:N>` (`N` is the position of the file in
-/// this scan). A line that cannot be scanned is redacted too (fail closed).
-fn line_for(
+/// The text one printed line shows about a path: `{pre}{name}[:{line}]{post}`, where `pre` and
+/// `post` are the fixed message text around it (never the entry id or kind, which are printed
+/// by the caller and are not secret). Redaction (ADR 0006 section 8) considers exactly this
+/// text and the raw path bytes. When either holds a vault value the name becomes
+/// `<redacted-path:N>` (`N` is the position of the file in this scan); if that text still
+/// spells a value (a number equal to the line or the position) the line is dropped, then the
+/// position. A text that cannot be scanned counts as holding a value (fail closed).
+fn location(
     matcher: &Matcher,
     path: &Path,
     ordinal: usize,
-    build: impl Fn(&str) -> String,
+    line: Option<usize>,
+    (pre, post): (&str, &str),
 ) -> String {
-    let line = build(&escaped(path));
-    let clean = |bytes: &[u8]| scan(matcher, bytes).is_ok_and(|r| r.hits.is_empty());
-    if clean(line.as_bytes()) && clean(path.as_os_str().as_bytes()) {
-        line
-    } else {
-        build(&format!("<redacted-path:{ordinal}>"))
+    let raw_clean = scan(matcher, path.as_os_str().as_bytes()).is_ok_and(|r| r.hits.is_empty());
+    let show = |name: &str, line: Option<usize>| match line {
+        Some(n) => format!("{name}:{n}"),
+        None => name.to_owned(),
+    };
+    let clean = |shown: &str| {
+        scan(matcher, format!("{pre}{shown}{post}").as_bytes()).is_ok_and(|r| r.hits.is_empty())
+    };
+    let plain = show(&escaped(path), line);
+    if raw_clean && clean(&plain) {
+        return plain;
     }
+    let numbered = format!("<redacted-path:{ordinal}>");
+    for candidate in [
+        show(&numbered, line),
+        show(&numbered, None),
+        show("<redacted-path>", None),
+    ] {
+        if clean(&candidate) {
+            return candidate;
+        }
+    }
+    // Nothing but the fixed marker is left to print.
+    "<redacted-path>".to_owned()
 }
 
 fn scan_input<T: Terminal>(
@@ -254,8 +273,12 @@ fn scan_input<T: Terminal>(
     tally: &mut Tally,
     term: &mut T,
 ) -> Result<(), CliError> {
-    let at = |build: &dyn Fn(&str) -> String| line_for(matcher, &input.path, ordinal, build);
-    let binary_notice = || at(&|name| format!("notice: skipped binary file {name}"));
+    // One printed line: `pre`, the location (redacted as a whole by `location`), `post`.
+    let at = |line: Option<usize>, pre: &str, post: &str| {
+        let loc = location(matcher, &input.path, ordinal, line, (pre, post));
+        format!("{pre}{loc}{post}")
+    };
+    let binary_notice = || at(None, "notice: skipped binary file ", "");
     let outcome = match input.problem {
         Some(p) => Err(p),
         None => open_regular(&input.path, input.explicit).and_then(load),
@@ -267,7 +290,7 @@ fn scan_input<T: Terminal>(
         }
         Err(why) => {
             tally.unread = tally.unread.saturating_add(1);
-            return warn(term, &at(&|name| format!("error: {name} {why}")));
+            return warn(term, &at(None, "error: ", &format!(" {why}")));
         }
     };
     let text = match classify(&bytes) {
@@ -278,27 +301,23 @@ fn scan_input<T: Terminal>(
         // A kind of content added later is not silently passed over.
         _ => {
             tally.unread = tally.unread.saturating_add(1);
-            return warn(
-                term,
-                &at(&|name| format!("error: {name} has an unknown content type")),
-            );
+            return warn(term, &at(None, "error: ", " has an unknown content type"));
         }
     };
     tally.files = tally.files.saturating_add(1);
     let Ok(report) = scan(matcher, &text) else {
         tally.unread = tally.unread.saturating_add(1);
-        return warn(
-            term,
-            &at(&|name| format!("error: {name} could not be scanned")),
-        );
+        return warn(term, &at(None, "error: ", " could not be scanned"));
     };
     if report.truncated {
         tally.truncated = tally.truncated.saturating_add(1);
     }
     for h in &report.hits {
         tally.hits = tally.hits.saturating_add(1);
-        let report_line = at(&|name| format!("{} {} {name}:{}", h.id, h.kind, h.line));
-        say(term, &report_line)?;
+        // The id and kind are printed as they are (not secret, ADR 0006 section 8); only the
+        // location is checked.
+        let loc = location(matcher, &input.path, ordinal, Some(h.line), ("", ""));
+        say(term, &format!("{} {} {loc}", h.id, h.kind))?;
     }
     Ok(())
 }
@@ -444,6 +463,86 @@ mod tests {
             1
         );
         assert!(w.inputs.iter().all(|i| !i.path.ends_with("leaf.txt")));
+    }
+
+    fn matcher_of(kind: wardenlens_core::entry::EntryKind, value: &str) -> Matcher {
+        let m = Matcher::new(&[wardenlens_vault::ScanEntry {
+            id: wardenlens_core::entry::EntryId::new("e:one").unwrap(),
+            kind,
+            value: secrecy::SecretString::from(value.to_owned()),
+            unscannable: false,
+        }])
+        .unwrap();
+        assert!(m.unscannable().is_empty(), "{value:?} is unscannable");
+        m
+    }
+
+    #[test]
+    fn a_number_that_equals_the_line_or_the_position_is_not_printed() {
+        use wardenlens_core::entry::EntryKind::Other;
+        // The value is the line number: `:1234567` would print it.
+        let m = matcher_of(Other, "1234567");
+        let p = Path::new("/w/a-1234567-b.txt");
+        assert_eq!(
+            location(&m, p, 3, Some(1_234_567), ("", "")),
+            "<redacted-path:3>"
+        );
+        // The value is the position: the position goes too.
+        let m = matcher_of(Other, "1234567");
+        let p = Path::new("/w/a-1234567-b.txt");
+        assert_eq!(
+            location(&m, p, 1_234_567, Some(2), ("", "")),
+            "<redacted-path>"
+        );
+        // A clean path with an id-like or unrelated value is printed as it is.
+        let m = matcher_of(Other, "zq-synthetic-mark");
+        assert_eq!(
+            location(&m, Path::new("/w/a.txt"), 0, Some(4), ("", "")),
+            "/w/a.txt:4"
+        );
+    }
+
+    #[test]
+    fn every_unicode_format_character_is_escaped() {
+        let cf: &[(u32, u32)] = &[
+            (0xAD, 0xAD),
+            (0x600, 0x605),
+            (0x61C, 0x61C),
+            (0x6DD, 0x6DD),
+            (0x70F, 0x70F),
+            (0x890, 0x891),
+            (0x8E2, 0x8E2),
+            (0x180E, 0x180E),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x2064),
+            (0x2066, 0x206F),
+            (0xFEFF, 0xFEFF),
+            (0xFFF9, 0xFFFB),
+            (0x110BD, 0x110BD),
+            (0x110CD, 0x110CD),
+            (0x13430, 0x1343F),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0001, 0xE0001),
+            (0xE0020, 0xE007F),
+        ];
+        for &(lo, hi) in cf {
+            for n in lo..=hi {
+                let c = char::from_u32(n).unwrap();
+                assert!(!is_printable(c), "U+{n:04X}");
+                let shown = escaped(Path::new(&format!("a{c}b")));
+                assert!(!shown.contains(c), "U+{n:04X}");
+            }
+        }
+        for c in [
+            '\u{2028}', '\u{2029}', '\u{85}', '\u{A0}', '\u{7F}', '\n', '\u{3000}',
+        ] {
+            assert!(!is_printable(c), "{c:?}");
+        }
+        for c in ['a', ' ', '/', '\u{e9}', '\u{4e2d}'] {
+            assert!(is_printable(c), "{c:?}");
+        }
     }
 
     #[test]

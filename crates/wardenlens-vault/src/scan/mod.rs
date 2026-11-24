@@ -26,6 +26,7 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 use crate::error::VaultError;
 
 pub use matcher::Matcher;
+pub use squeeze::is_invisible;
 
 /// Largest input, in bytes, that [`scan`] accepts. It is above [`MAX_FILE_LEN`] so that a
 /// UTF-16 file at the file cap, once decoded to UTF-8, still fits.
