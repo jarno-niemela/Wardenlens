@@ -8,8 +8,8 @@ use crate::time::{DurationMs, Timestamp};
 
 use super::tests::simulate;
 use super::{
-    Action, ArchiveState, MinFreePercent, PlanInput, Policy, SegmentId, StoredSegment, Tier,
-    VolumeSpace, plan,
+    Action, ArchiveState, ArchiveStatus, HotState, MinFreePercent, PlanInput, Policy, SegmentId,
+    StoredSegment, Tier, VolumeSpace, plan,
 };
 
 fn volume() -> impl Strategy<Value = VolumeSpace> {
@@ -65,15 +65,41 @@ proptest! {
         }
         let (hot_after, arch_after, _) = simulate(hot.free_bytes, archive.map(|a| a.free_bytes), &segs, &p);
 
-        // Hot floor holds unless the plan reports the state.
+        // Hot floor holds unless the plan reports the state; the state is measured
+        // against the floor, computed independently.
         let hot_floor = hot.capacity_bytes * u64::from(hot_pct) / 100;
-        if !p.unsatisfiable {
+        let hot_total: u64 = segs.iter().filter(|s| s.tier == Tier::Hot).map(|s| s.bytes).sum();
+        let unsat = hot.free_bytes + hot_total < hot_floor;
+        prop_assert_eq!(p.hot != HotState::Ok, unsat);
+        if !unsat {
             prop_assert!(hot_after >= hot_floor);
         }
         // Moves keep the archive at or above its floor.
         let moved = p.actions.iter().any(|a| matches!(a, Action::MoveToArchive(_)));
-        if let (true, Some(a), Some(after)) = (moved, archive, arch_after) {
+        let is_archive = |id: &SegmentId| segs.iter().any(|s| s.id == *id && s.tier == Tier::Archive);
+        let arch_deleted = p.actions.iter().any(|a| matches!(a, Action::Delete(id) if is_archive(id)));
+        if let (true, Some(a), Some(after)) = (moved || arch_deleted, archive, arch_after) {
             prop_assert!(after >= a.capacity_bytes * u64::from(arch_pct) / 100);
+        }
+        // With a usable, non-full archive no hot video is deleted.
+        let hot_deleted = p.actions.iter().any(|a| matches!(a, Action::Delete(id) if !is_archive(id)));
+        if matches!(p.archive, ArchiveStatus::Available | ArchiveStatus::BelowFloor) {
+            prop_assert!(!hot_deleted);
+        }
+        // Per tier, planned segments are the oldest-first prefix, and all ids exist.
+        for tier in [Tier::Hot, Tier::Archive] {
+            let mut sorted: Vec<&StoredSegment> = segs.iter().filter(|s| s.tier == tier).collect();
+            sorted.sort_by_key(|s| (s.ended_at, s.id));
+            let picked: Vec<SegmentId> = p.actions.iter()
+                .map(|a| match a { Action::MoveToArchive(id) | Action::Delete(id) => *id })
+                .filter(|id| sorted.iter().any(|s| s.id == *id))
+                .collect();
+            let prefix: Vec<SegmentId> = sorted.iter().take(picked.len()).map(|s| s.id).collect();
+            prop_assert_eq!(picked, prefix);
+        }
+        for a in &p.actions {
+            let (Action::MoveToArchive(id) | Action::Delete(id)) = a;
+            prop_assert!(segs.iter().any(|s| s.id == *id));
         }
         // Archive deletions precede moves, which precede hot deletions.
         let rank = |a: &Action, segs: &[StoredSegment]| match a {

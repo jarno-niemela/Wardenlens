@@ -25,9 +25,31 @@ pub enum ArchiveStatus {
     Available,
     /// The archive is unavailable; hot video is deleted to hold the floor.
     Unavailable,
+    /// The archive is `Available` but its space report is unusable (zero capacity or more
+    /// free space than capacity); it is treated like an unavailable archive and its rows
+    /// are not touched.
+    Unusable,
     /// The archive is available but cannot absorb a wanted move even after
     /// evicting everything it holds.
     Full,
+    /// Foreign or quarantined data keeps the archive below its floor: even evicting every
+    /// archived segment cannot restore it. Nothing is evicted (it would only lose
+    /// recordings, ADR 0005 section 6 case 4) and no move that needs eviction is planned.
+    BelowFloor,
+}
+
+/// State of the hot volume after the plan, for health and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HotState {
+    /// The floor is restored (or was never breached) by the plan.
+    Ok,
+    /// The floor cannot be restored even by removing all hot video (something else fills
+    /// the volume) and the archive absorbs the video. State, never an error.
+    Unsatisfiable,
+    /// As `Unsatisfiable`, and the archive cannot help: hot video is deleted as fast as it
+    /// arrives to stop it growing. Raise an alert.
+    RollingBuffer,
 }
 
 /// The planner output: ordered actions plus the state to report.
@@ -38,11 +60,8 @@ pub struct Plan {
     pub actions: Vec<Action>,
     /// State of the archive for health and metrics.
     pub archive: ArchiveStatus,
-    /// The hot floor cannot be restored even by deleting all hot video (something
-    /// else fills the volume). Reported as state, never as an error.
-    pub unsatisfiable: bool,
-    /// Hot video is deleted as fast as it arrives to stop it growing; raise an alert.
-    pub rolling_buffer: bool,
+    /// State of the hot volume.
+    pub hot: HotState,
 }
 
 /// Why no plan could be made.
@@ -53,8 +72,40 @@ pub enum PlanError {
     HotVolumeUnusable,
     /// Two segments share an id.
     DuplicateSegment(SegmentId),
-    /// Byte arithmetic overflowed `u64`.
-    Overflow,
+    /// Byte arithmetic overflowed `u64`; names the quantity. The input is implausible
+    /// (corrupt index or probe), so the adapter must alert on this error.
+    Overflow(OverflowQuantity),
+}
+
+/// The quantity whose computation overflowed in [`PlanError::Overflow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OverflowQuantity {
+    /// A floor or target computed from a capacity.
+    FloorOrTarget,
+    /// The summed size of the hot segments.
+    HotTotal,
+    /// The summed size of the archive segments.
+    ArchiveTotal,
+    /// Archive free space plus archive segment sizes.
+    ArchiveRoom,
+    /// The summed size of the hot segments chosen for moving.
+    MoveBytes,
+    /// Moved bytes plus the archive floor or target.
+    EvictionGoal,
+}
+
+impl fmt::Display for OverflowQuantity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::FloorOrTarget => "floor or target",
+            Self::HotTotal => "hot segment total",
+            Self::ArchiveTotal => "archive segment total",
+            Self::ArchiveRoom => "archive free space plus segments",
+            Self::MoveBytes => "bytes to move",
+            Self::EvictionGoal => "archive eviction goal",
+        })
+    }
 }
 
 impl fmt::Display for PlanError {
@@ -62,7 +113,7 @@ impl fmt::Display for PlanError {
         match self {
             Self::HotVolumeUnusable => write!(f, "hot volume is unusable"),
             Self::DuplicateSegment(id) => write!(f, "duplicate segment id {}", id.as_u64()),
-            Self::Overflow => write!(f, "byte arithmetic overflowed"),
+            Self::Overflow(q) => write!(f, "byte arithmetic overflowed computing {q}"),
         }
     }
 }
@@ -88,10 +139,11 @@ pub struct PlanInput<'a> {
 
 /// Percent of `capacity` rounded down.
 fn percent_of(capacity: u64, percent: u64) -> Result<u64, PlanError> {
+    let overflow = PlanError::Overflow(OverflowQuantity::FloorOrTarget);
     let scaled = u128::from(capacity)
         .checked_mul(u128::from(percent))
-        .ok_or(PlanError::Overflow)?;
-    u64::try_from(scaled / 100).map_err(|_| PlanError::Overflow)
+        .ok_or(overflow)?;
+    u64::try_from(scaled / 100).map_err(|_| overflow)
 }
 
 /// Floor and target (floor plus 1 pp headroom) in bytes of free space.
@@ -103,11 +155,11 @@ fn floor_and_target(capacity: u64, floor_percent: u8) -> Result<(u64, u64), Plan
     ))
 }
 
-fn sum_bytes(segments: &[&StoredSegment]) -> Result<u64, PlanError> {
+fn sum_bytes(segments: &[&StoredSegment], what: OverflowQuantity) -> Result<u64, PlanError> {
     segments
         .iter()
         .try_fold(0_u64, |acc, s| acc.checked_add(s.bytes))
-        .ok_or(PlanError::Overflow)
+        .ok_or(PlanError::Overflow(what))
 }
 
 /// Segments of one tier, oldest first by `ended_at`, ties by id.
@@ -132,12 +184,21 @@ struct HotNeed {
     unsatisfiable: bool,
 }
 
+/// Archive-side facts.
+struct ArchiveFacts {
+    floor: u64,
+    /// Most free space the archive can offer once everything it holds is evicted.
+    room: u64,
+}
+
 /// Plans one tick.
 ///
 /// Order of actions: archive deletions, then `MoveToArchive` oldest first, then hot deletions.
-/// Hot video is deleted only when the archive cannot take it, never when the floor cannot be
-/// restored by deleting it; in that case moves are still planned and, without a usable archive,
-/// a rolling buffer deletes hot video as fast as `ingested_bytes` arrives.
+/// Hot video is deleted only when the archive cannot take it, and never to restore a floor that
+/// deleting it cannot reach (ADR 0005 section 6 case 4); then moves are still planned and,
+/// without a usable archive, a rolling buffer deletes hot video as fast as `ingested_bytes`
+/// arrives. The same holds for the archive: its video is evicted only when that can restore
+/// its floor.
 ///
 /// # Errors
 /// [`PlanError`] for an unusable hot volume, duplicate segment ids or byte overflow.
@@ -156,7 +217,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     let hot = tier_segments(input.segments, Tier::Hot);
     let (hot_floor, hot_target) =
         floor_and_target(input.hot.capacity_bytes, input.policy.hot_min_free.get())?;
-    let hot_total = sum_bytes(&hot)?;
+    let hot_total = sum_bytes(&hot, OverflowQuantity::HotTotal)?;
     let below = input.hot.free_bytes < hot_floor;
     let need = HotNeed {
         needed: if below {
@@ -164,11 +225,16 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         } else {
             0
         },
-        unsatisfiable: below && input.hot.free_bytes.saturating_add(hot_total) < hot_target,
+        unsatisfiable: input.hot.free_bytes.saturating_add(hot_total) < hot_floor,
     };
     let mut actions = Vec::new();
+    let mut below_floor = false;
     let moves = match archive {
-        Some(space) => plan_archive_side(input, space, &hot, &need, &mut actions)?,
+        Some(space) => {
+            let (moves, unreachable) = plan_archive_side(input, space, &hot, &need, &mut actions)?;
+            below_floor = unreachable;
+            moves
+        }
         None => Moves {
             count: 0,
             bytes: 0,
@@ -177,45 +243,75 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     };
     let rolling_buffer =
         plan_hot_deletes(input, &hot, &need, &moves, archive.is_some(), &mut actions);
+    let archive_status = match (input.archive, archive) {
+        (ArchiveState::Available(_), None) => ArchiveStatus::Unusable,
+        (_, None) => ArchiveStatus::Unavailable,
+        (_, Some(_)) if moves.archive_full => ArchiveStatus::Full,
+        (_, Some(_)) if below_floor => ArchiveStatus::BelowFloor,
+        (_, Some(_)) => ArchiveStatus::Available,
+    };
     Ok(Plan {
         actions,
-        archive: match archive {
-            None => ArchiveStatus::Unavailable,
-            Some(_) if moves.archive_full => ArchiveStatus::Full,
-            Some(_) => ArchiveStatus::Available,
+        archive: archive_status,
+        hot: match (need.unsatisfiable, rolling_buffer) {
+            (false, _) => HotState::Ok,
+            (true, false) => HotState::Unsatisfiable,
+            (true, true) => HotState::RollingBuffer,
         },
-        unsatisfiable: need.unsatisfiable,
-        rolling_buffer,
     })
 }
 
-/// Pushes archive evictions then the moves; returns what was moved.
+/// Pushes archive evictions then the moves; returns what was moved and whether the archive
+/// floor is unreachable even by evicting everything.
 fn plan_archive_side(
     input: &PlanInput<'_>,
     space: VolumeSpace,
     hot: &[&StoredSegment],
     need: &HotNeed,
     actions: &mut Vec<Action>,
-) -> Result<Moves, PlanError> {
+) -> Result<(Moves, bool), PlanError> {
     let archive_segments = tier_segments(input.segments, Tier::Archive);
-    let archive_total = sum_bytes(&archive_segments)?;
+    let archive_total = sum_bytes(&archive_segments, OverflowQuantity::ArchiveTotal)?;
     let (floor, target) =
         floor_and_target(space.capacity_bytes, input.policy.archive_min_free.get())?;
-    let moves = choose_moves(input, space, hot, need, archive_total, floor)?;
+    let facts = ArchiveFacts {
+        floor,
+        room: space
+            .free_bytes
+            .checked_add(archive_total)
+            .ok_or(PlanError::Overflow(OverflowQuantity::ArchiveRoom))?,
+    };
+    let moves = choose_moves(input, &facts, hot, need)?;
     let breach = space.free_bytes < floor
         || space
             .free_bytes
             .checked_sub(moves.bytes)
             .is_none_or(|left| left < floor);
     if breach {
-        let goal = moves.bytes.checked_add(target).ok_or(PlanError::Overflow)?;
-        let mut free = space.free_bytes;
-        for seg in &archive_segments {
-            if free >= goal {
-                break;
+        let eviction_goal = |extra: u64| {
+            moves
+                .bytes
+                .checked_add(extra)
+                .ok_or(PlanError::Overflow(OverflowQuantity::EvictionGoal))
+        };
+        let to_target = eviction_goal(target)?;
+        let to_floor = eviction_goal(floor)?;
+        let goal = if facts.room >= to_target {
+            Some(to_target)
+        } else if facts.room >= to_floor {
+            Some(to_floor)
+        } else {
+            None
+        };
+        if let Some(goal) = goal {
+            let mut free = space.free_bytes;
+            for seg in &archive_segments {
+                if free >= goal {
+                    break;
+                }
+                actions.push(Action::Delete(seg.id));
+                free = free.saturating_add(seg.bytes);
             }
-            actions.push(Action::Delete(seg.id));
-            free = free.saturating_add(seg.bytes);
         }
     }
     actions.extend(
@@ -223,21 +319,18 @@ fn plan_archive_side(
             .take(moves.count)
             .map(|s| Action::MoveToArchive(s.id)),
     );
-    Ok(moves)
+    Ok((moves, facts.room < floor))
 }
 
 /// Picks the oldest hot segments to move: those past `hot_max_age`, plus as many as the hot
-/// floor needs (all of them when it is unreachable), as far as the archive can absorb them.
+/// target needs (all of them when it is unreachable), as far as the archive can absorb them
+/// while keeping its floor.
 fn choose_moves(
     input: &PlanInput<'_>,
-    space: VolumeSpace,
+    facts: &ArchiveFacts,
     hot: &[&StoredSegment],
     need: &HotNeed,
-    archive_total: u64,
-    archive_floor: u64,
 ) -> Result<Moves, PlanError> {
-    // Most the archive can offer once everything it holds is evicted.
-    let room = space.free_bytes.saturating_add(archive_total);
     let mut moves = Moves {
         count: 0,
         bytes: 0,
@@ -245,15 +338,14 @@ fn choose_moves(
     };
     for seg in hot {
         let aged = input.now.saturating_duration_since(seg.ended_at) > input.policy.hot_max_age;
-        let pressure = need.unsatisfiable || moves.bytes < need.needed;
-        if !aged && !pressure {
+        if !aged && moves.bytes >= need.needed {
             break;
         }
         let after = moves
             .bytes
             .checked_add(seg.bytes)
-            .ok_or(PlanError::Overflow)?;
-        if room < after.saturating_add(archive_floor) {
+            .ok_or(PlanError::Overflow(OverflowQuantity::MoveBytes))?;
+        if facts.room < after.saturating_add(facts.floor) {
             moves.archive_full = true;
             break;
         }
@@ -277,7 +369,8 @@ fn plan_hot_deletes(
     if !archive_cannot_help || moves.bytes >= need.needed {
         return false;
     }
-    // Reachable: restore the floor plus headroom. Unreachable: only stop growth.
+    // Reachable floor: head for the target and stop when segments run out. Unreachable:
+    // only stop growth.
     let goal = if need.unsatisfiable {
         input.ingested_bytes
     } else {

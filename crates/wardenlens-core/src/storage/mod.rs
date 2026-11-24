@@ -20,7 +20,9 @@ mod proptests;
 )]
 mod tests;
 
-pub use plan::{Action, ArchiveStatus, Plan, PlanError, PlanInput, plan};
+pub use plan::{
+    Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,
+};
 pub use types::{
     ArchiveState, MinFreePercent, MinFreePercentError, Policy, SegmentId, StoredSegment, Tier,
     VolumeSpace,

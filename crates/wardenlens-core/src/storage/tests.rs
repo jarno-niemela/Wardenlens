@@ -3,8 +3,8 @@
 use crate::time::{DurationMs, Timestamp};
 
 use super::{
-    Action, ArchiveState, ArchiveStatus, MinFreePercent, Plan, PlanError, PlanInput, Policy,
-    SegmentId, StoredSegment, Tier, VolumeSpace, plan,
+    Action, ArchiveState, ArchiveStatus, HotState, MinFreePercent, OverflowQuantity, Plan,
+    PlanError, PlanInput, Policy, SegmentId, StoredSegment, Tier, VolumeSpace, plan,
 };
 
 /// Applies a plan to a simulated state: `(hot free, archive free, segments)`.
@@ -127,7 +127,7 @@ fn reproduces_the_worked_example_of_adr_0005_section_10() {
         Action::MoveToArchive(SegmentId::new(10_000))
     );
     assert_eq!(p.archive, ArchiveStatus::Available);
-    assert!(!p.unsatisfiable && !p.rolling_buffer);
+    assert_eq!(p.hot, HotState::Ok);
     let (hot_free, arch_free, _) =
         simulate(hot.free_bytes, Some(archive.free_bytes), &segments, &p);
     assert_eq!(hot_free, 242_390_072_770);
@@ -305,7 +305,7 @@ fn archive_unavailable_deletes_oldest_hot_to_the_target_and_leaves_archive_rows(
         ]
     );
     assert_eq!(p.archive, ArchiveStatus::Unavailable);
-    assert!(!p.unsatisfiable && !p.rolling_buffer);
+    assert_eq!(p.hot, HotState::Ok);
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn archive_unavailable_and_hot_above_floor_plans_nothing_even_for_aged_segments(
 }
 
 #[test]
-fn unusable_archive_counts_as_unavailable() {
+fn unusable_archive_is_reported_as_unusable_and_treated_as_unavailable() {
     let hot = VolumeSpace {
         capacity_bytes: 1000,
         free_bytes: 240,
@@ -333,7 +333,7 @@ fn unusable_archive_counts_as_unavailable() {
     };
     let segments = [seg(1, Tier::Hot, 30, 1)];
     let p = plan(&input(hot, ArchiveState::Available(arch), &segments, 0)).unwrap();
-    assert_eq!(p.archive, ArchiveStatus::Unavailable);
+    assert_eq!(p.archive, ArchiveStatus::Unusable);
     assert_eq!(ids(&p), vec![Action::Delete(SegmentId::new(1))]);
 }
 
@@ -373,8 +373,7 @@ fn unreachable_floor_with_archive_available_still_plans_every_move() {
         seg(3, Tier::Hot, 20, 3),
     ];
     let p = plan(&input(hot, ArchiveState::Available(arch), &segments, 20)).unwrap();
-    assert!(p.unsatisfiable);
-    assert!(!p.rolling_buffer);
+    assert_eq!(p.hot, HotState::Unsatisfiable);
     assert_eq!(p.archive, ArchiveStatus::Available);
     assert_eq!(
         ids(&p),
@@ -403,7 +402,7 @@ fn unreachable_floor_without_archive_keeps_hot_video_flat_and_alerts() {
             free_bytes: hot_free,
         };
         let p = plan(&input(space, ArchiveState::Unavailable, &segments, SEG)).unwrap();
-        assert!(p.unsatisfiable && p.rolling_buffer, "tick {tick}");
+        assert_eq!(p.hot, HotState::RollingBuffer, "tick {tick}");
         let (free, _, left) = simulate(hot_free, None, &segments, &p);
         hot_free = free;
         segments = left;
@@ -465,7 +464,7 @@ fn reports_overflow_instead_of_wrapping_on_huge_segment_sizes() {
     let segments = [seg(1, Tier::Hot, u64::MAX, 1), seg(2, Tier::Hot, 1, 2)];
     assert_eq!(
         plan(&input(hot, ArchiveState::Unavailable, &segments, 0)),
-        Err(PlanError::Overflow)
+        Err(PlanError::Overflow(OverflowQuantity::HotTotal))
     );
 }
 
@@ -493,4 +492,160 @@ fn zero_percent_floor_is_never_breached_at_zero_free() {
     );
     i.policy.hot_min_free = MinFreePercent::new(0).unwrap();
     assert_eq!(ids(&plan(&i).unwrap()), Vec::<Action>::new());
+}
+
+fn vol(capacity_bytes: u64, free_bytes: u64) -> VolumeSpace {
+    VolumeSpace {
+        capacity_bytes,
+        free_bytes,
+    }
+}
+
+fn has_delete_of(p: &Plan, tier: Tier, segments: &[StoredSegment]) -> bool {
+    p.actions.iter().any(|a| match a {
+        Action::Delete(id) => segments.iter().any(|s| s.id == *id && s.tier == tier),
+        _ => false,
+    })
+}
+
+/// Reviewer scenario: floor 250, free 100, only 100 B of video; unreachable.
+#[test]
+fn archive_floor_unreachable_deletes_nothing_and_reports_below_floor() {
+    let segments = [seg(1, Tier::Archive, 50, 1), seg(2, Tier::Archive, 50, 2)];
+    let p = plan(&input(
+        vol(1000, 900),
+        ArchiveState::Available(vol(1000, 100)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(ids(&p), Vec::<Action>::new());
+    assert_eq!(p.archive, ArchiveStatus::BelowFloor);
+}
+
+/// Auditor scenario: 800 B of foreign data, ten 10 B segments; 100 + 200... only 300 reachable.
+#[test]
+fn archive_filled_by_foreign_data_is_not_wiped() {
+    let segments: Vec<StoredSegment> = (0..10).map(|i| seg(i, Tier::Archive, 10, i)).collect();
+    let p = plan(&input(
+        vol(1000, 100),
+        ArchiveState::Available(vol(1000, 100)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    assert!(!has_delete_of(&p, Tier::Archive, &segments));
+    assert_eq!(p.archive, ArchiveStatus::BelowFloor);
+}
+
+/// Floor reachable, target not: evict only up to the floor.
+#[test]
+fn archive_floor_reachable_but_target_not_evicts_up_to_the_floor() {
+    // floor 250, target 260; free 200 + 5 x 10 = 250 reachable, 260 not.
+    let segments: Vec<StoredSegment> = (0..5).map(|i| seg(i, Tier::Archive, 10, i)).collect();
+    let p = plan(&input(
+        vol(1000, 900),
+        ArchiveState::Available(vol(1000, 200)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(p.actions.len(), 5);
+    let (_, arch, _) = simulate(900, Some(200), &segments, &p);
+    assert_eq!(arch, Some(250));
+    assert_eq!(p.archive, ArchiveStatus::Available);
+}
+
+/// Hot move needs eviction to a reachable floor but not the target.
+#[test]
+fn move_needing_eviction_to_floor_only_still_happens() {
+    // archive free 240, 20 B segment: goal floor 250 + 20 = 270 = 240 + 30 reachable; target 280 not.
+    let segments = [
+        seg(1, Tier::Hot, 20, 1),
+        seg(2, Tier::Archive, 15, 1),
+        seg(3, Tier::Archive, 15, 2),
+    ];
+    let p = plan(&input(
+        vol(1000, 240),
+        ArchiveState::Available(vol(1000, 240)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    let (hot_free, arch, _) = simulate(240, Some(240), &segments, &p);
+    assert_eq!(hot_free, 260);
+    assert_eq!(arch, Some(250));
+}
+
+/// No move that needs eviction is planned when the archive floor is unreachable.
+#[test]
+fn unreachable_archive_floor_plans_no_move_and_deletes_hot_instead() {
+    let segments = [seg(1, Tier::Hot, 30, 1), seg(2, Tier::Archive, 10, 1)];
+    let p = plan(&input(
+        vol(1000, 240),
+        ArchiveState::Available(vol(1000, 10)),
+        &segments,
+        0,
+    ))
+    .unwrap();
+    assert_eq!(ids(&p), vec![Action::Delete(SegmentId::new(1))]);
+    assert_eq!(p.archive, ArchiveStatus::Full);
+    assert_eq!(p.hot, HotState::Ok);
+}
+
+/// Floor 250 reachable (free 200 + 55 video) but target 260 not: not unsatisfiable.
+#[test]
+fn hot_floor_reachable_but_target_not_with_archive_moves_all_and_is_not_unsatisfiable() {
+    let segments = [seg(1, Tier::Hot, 25, 1), seg(2, Tier::Hot, 30, 2)];
+    let p = plan(&input(
+        vol(1000, 200),
+        ArchiveState::Available(vol(1000, 900)),
+        &segments,
+        999,
+    ))
+    .unwrap();
+    assert_eq!(p.hot, HotState::Ok);
+    assert_eq!(
+        ids(&p),
+        vec![
+            Action::MoveToArchive(SegmentId::new(1)),
+            Action::MoveToArchive(SegmentId::new(2))
+        ]
+    );
+}
+
+#[test]
+fn hot_floor_reachable_but_target_not_without_archive_deletes_all_and_no_rolling_buffer() {
+    let segments = [seg(1, Tier::Hot, 25, 1), seg(2, Tier::Hot, 30, 2)];
+    for state in [
+        ArchiveState::Unavailable,
+        ArchiveState::Available(vol(1000, 10)),
+    ] {
+        let p = plan(&input(vol(1000, 200), state, &segments, 999)).unwrap();
+        assert_eq!(p.hot, HotState::Ok);
+        assert_eq!(
+            ids(&p),
+            vec![
+                Action::Delete(SegmentId::new(1)),
+                Action::Delete(SegmentId::new(2))
+            ]
+        );
+    }
+}
+
+#[test]
+fn overflow_names_the_quantity() {
+    let segments = [
+        seg(1, Tier::Archive, u64::MAX, 1),
+        seg(2, Tier::Archive, 1, 2),
+    ];
+    assert_eq!(
+        plan(&input(
+            vol(1000, 900),
+            ArchiveState::Available(vol(1000, 900)),
+            &segments,
+            0
+        )),
+        Err(PlanError::Overflow(OverflowQuantity::ArchiveTotal))
+    );
 }
