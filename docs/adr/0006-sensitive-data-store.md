@@ -303,7 +303,8 @@ row above.
   transaction, re-open every entry with the old key and re-seal it with the new key and a fresh nonce, write a new
   `keycheck`, commit, then atomically rename `<key>.next` over the key file and fsync the directory. A crash between
   commit and rename leaves a `.next` file. **Recovery runs only in write commands, under the write lock** (the exclusive
-  SQLite write transaction, so two processes cannot race): if the vault does not open with the current key but opens
+  SQLite write transaction, so two processes cannot race; a write command that finds the lock taken waits up to about
+  0.5 s for it and then refuses, so a rival that finishes within that time does not make it fail): if the vault does not open with the current key but opens
   with `.next`, the rename is completed (**`<key>.next` must first pass the same `KeyFile::load` checks** as any key: regular
   file, owner, no group or world access, exactly 32 bytes, not a symlink, outside a work tree; otherwise it is neither
   used nor renamed); if it opens with the current key, a stale `.next` is deleted. Read commands
