@@ -93,17 +93,21 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   widely-used crates. Disable default features you do not use.
 - **SEC-9 Concurrency:** no `static mut`; prefer message passing; hold locks
   for the shortest scope and never across `.await`.
-- **SEC-10 One choke point, an allowlist, every entry point tested.** A rule
-  that must hold everywhere (a refusal, redaction, authentication, a rate or
-  concurrency cap, input classification) is enforced in the one function or
-  layer every path goes through, never in a helper that most paths happen to
-  call. It lets through what is known good (an allowlist, with no "everything
-  else is a file" fallthrough) instead of blocking what is known bad. Two
-  components that must agree on a set (a validator and a scanner, a needle
-  collapse and a view collapse) call one shared predicate, and a test fails if
-  they diverge. A test loops over every entry point (each subcommand, route,
-  error kind, input form), including one that matches nothing. Examples: #94,
-  #60, #75 r2-r3, #43 r3, #117 r5, #32 r1-r5 (`defect-patterns` P10).
+- **SEC-10 One choke point, a pass-list where the good set is known, every
+  entry point tested.** A rule that must hold everywhere (a refusal, redaction,
+  authentication, a rate or concurrency cap, input classification) is enforced
+  in the one function or layer every path goes through, never in a helper that
+  most paths happen to call. Where the good set can be listed (printable
+  characters, tree modes, echoable error kinds, routes), classify by a
+  **pass-list of known-good forms** and fail closed on anything unknown, with no
+  "everything else is a file" fallthrough. Where only the bad values are known
+  exactly (vault values, ADR 0006 §7), match them exactly over every rendering
+  (TEST-9). Never add a shape heuristic. Two components that must agree on a set
+  (a validator and a scanner, a needle collapse and a view collapse) call one
+  shared predicate, and a test fails if they diverge. A test loops over every
+  entry point (each subcommand, route, error kind, input form), including one
+  that matches nothing. Examples: #94, #60, #75 r1-r2, #43 r1-r3, #117 r1-r2
+  and r5, #32 r1-r5 (`defect-patterns` P10).
 
 ## 5. Testing (`TEST`)
 
@@ -136,8 +140,9 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   example. Any proof an optimisation relies on (for example "every ancestor of a
   new tree is new") is checked in both directions: a new path can sit on an old
   tree (#117 r4). Prefer "walk everything and dedupe" to "skip what looks
-  already handled". Examples: #117 r1-r5, #43 r2-r5, #32 rw1 (`defect-patterns`
-  P11).
+  already handled", but only within the SEC-2/SEC-3 bounds: #128's unbounded
+  `seen` set grew with the input. Examples: #117 r1-r5, #43 r2-r4, #32 rw1
+  (`defect-patterns` P11).
 
 ## 6. Style & documentation (`DOC`)
 
@@ -189,4 +194,4 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
 7. Are tests deterministic, behaviour-named, and covering edges?
 8. Any new dependency — justified and `cargo deny` clean?
 9. Is anything here speculative, dead, or duplicated?
-10. Is every cross-cutting policy at one choke point and an allowlist (SEC-10), and is every open-ended invariant backed by an enumerated table test (TEST-9)?
+10. Is every cross-cutting policy at one choke point, by a pass-list or exact match (SEC-10), and is every open-ended invariant backed by an enumerated table test (TEST-9)?

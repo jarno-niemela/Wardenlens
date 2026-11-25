@@ -46,6 +46,6 @@ For each finding, ask four questions:
 - **Locked files:** never edit `.claude/hooks/**`, `.claude/settings*.json`, `.githooks/**` or `.github/workflows/**`. If a lesson needs a hook or workflow change, stage the file in the scratchpad and hand it to the owner.
 
 ## 5. Measure
-Record in the PR body, per ticket: the rounds needed, and which pattern caused each extra round (a table of PR, rounds, round-by-round pattern). State whether last retro's patterns recurred (P10 did: in #75, #117, #43 and #32). The next retro checks whether these patterns recurred:
+Record in the PR body, per ticket: the rounds needed, and which pattern caused each extra round (a table of PR, rounds, round-by-round pattern). State, pattern by pattern, whether last retro's patterns recurred, with an escalation decision for each that did. The next retro checks whether these patterns recurred:
 - **Recurred** means the fix was not strong enough. Escalate: checklist → guideline → lint.
 - **Did not recur** means it worked. Leave it, and shrink it later.
