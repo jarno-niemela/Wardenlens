@@ -1,5 +1,6 @@
 //! Tests of the index. Helpers shared by the submodules.
 
+mod adv_145_guard;
 mod cursor_tests;
 mod guard_tests;
 mod hygiene;

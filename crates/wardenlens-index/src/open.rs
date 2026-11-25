@@ -28,11 +28,11 @@
 //! needs the same privileges as editing the index itself.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags};
 use wardenlens_fsutil::{
     FileLock, FsError, PrivateFile, check_parent, immutable_uri, open_private_file, open_sidecar,
     sidecar_len,
@@ -40,7 +40,7 @@ use wardenlens_fsutil::{
 
 use crate::error::IndexError;
 use crate::migrate::{self, Migration};
-use crate::sql;
+use crate::sql::{self, Db, ReadSql};
 
 /// `WLIX`, the `application_id` of an index file.
 pub(crate) const APPLICATION_ID: u32 = 0x574C_4958;
@@ -301,7 +301,7 @@ pub(crate) fn check_wal_header(
 /// its table, so a `-wal` from a diverged copy of this index is caught). The integrity check reads
 /// the whole file once at start-up; its cost grows linearly with the index, a few seconds per
 /// hundred megabytes.
-fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<InstanceId, IndexError> {
+fn judge_view(conn: &Db, migrations: &[Migration]) -> Result<InstanceId, IndexError> {
     let found = app_id(conn)?;
     if found != APPLICATION_ID {
         return Err(IndexError::WrongApplicationId { found });
@@ -325,7 +325,7 @@ fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<InstanceId,
 /// `-wal` to its main file: a `-wal` replayed onto another index's main file changes it.
 type InstanceId = Vec<u8>;
 
-fn instance_id(conn: &Connection) -> Result<InstanceId, IndexError> {
+pub(crate) fn instance_id(conn: &Db) -> Result<InstanceId, IndexError> {
     let id: Vec<u8> = sql::query_row(conn, sql::INSTANCE_ID, [], |r| r.get(0))
         .map_err(corruption_or("read instance id"))?;
     if id.len() == 16 {
@@ -340,13 +340,17 @@ fn instance_id(conn: &Connection) -> Result<InstanceId, IndexError> {
 pub(crate) fn corruption_or(op: &'static str) -> impl FnOnce(rusqlite::Error) -> IndexError {
     move |e| match (&e, e.sqlite_error_code()) {
         (_, Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
-        | (rusqlite::Error::InvalidColumnType(..), _) => IndexError::Damaged,
+        // A missing `index_meta` row (the one-row table of the instance id) is a damaged file.
+        | (
+            rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::QueryReturnedNoRows,
+            _,
+        ) => IndexError::Damaged,
         _ => IndexError::sqlite(op)(e),
     }
 }
 
 /// Opens the main file alone, read-only, ignoring any `-wal` and writing nothing: `immutable=1`.
-fn open_immutable(path: &Path, file: &PrivateFile) -> Result<Connection, IndexError> {
+fn open_immutable(path: &Path, file: &PrivateFile) -> Result<Db, IndexError> {
     let conn = Connection::open_with_flags(
         immutable_uri(path)?,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -356,7 +360,7 @@ fn open_immutable(path: &Path, file: &PrivateFile) -> Result<Connection, IndexEr
     )
     .map_err(corruption_or("open"))?;
     file.verify_path_unchanged(path)?;
-    Ok(conn)
+    Ok(Db::new(conn))
 }
 
 /// Read-only identification of a file with no usable `-wal`.
@@ -383,7 +387,7 @@ fn probe_immutable(
 ///
 /// (`SQLITE_READONLY` from a checkpoint is *not* a guard here: the `-wal` itself is opened
 /// read-write by SQLite.) The connection does create or update the `-shm`.
-pub(crate) fn open_wal_probe(path: &Path, file: &PrivateFile) -> Result<Connection, IndexError> {
+pub(crate) fn open_wal_probe(path: &Path, file: &PrivateFile) -> Result<Db, IndexError> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -399,7 +403,7 @@ pub(crate) fn open_wal_probe(path: &Path, file: &PrivateFile) -> Result<Connecti
     file.verify_path_unchanged(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(IndexError::sqlite("busy timeout"))?;
-    Ok(conn)
+    Ok(Db::new(conn))
 }
 
 /// Identification of a file with a valid non-empty `-wal`, with **no copy of the main file**:
@@ -486,13 +490,17 @@ fn wal_verdict(
 /// schema unreadable), as opposed to a real error (I/O, busy, permissions) that must be reported.
 /// A **pass-list**: only what is named here counts as unreadable, so a new error kind is reported,
 /// never silently treated as "the replayed view decides" (table-tested over every SQLite code).
-/// `code: None` is a failure that is not SQLite's: a missing `index_meta` row.
+/// `Unknown` is SQLite's `SQLITE_ERROR`, which is what a main file without the `index_meta`
+/// table (torn or foreign) reports ("no such table"); the error type keeps only the primary code,
+/// so it cannot be narrowed further, and every other primary code is a real error. A missing
+/// `index_meta` row is `Damaged` (see [`corruption_or`]), and a `Sqlite` error with no code is not
+/// passed.
 pub(crate) fn main_unreadable(e: &IndexError) -> bool {
     use rusqlite::ErrorCode::{DatabaseCorrupt, NotADatabase, Unknown};
     match e {
         IndexError::Damaged | IndexError::UnexpectedSchema => true,
         IndexError::Sqlite { code, .. } => {
-            matches!(code, None | Some(DatabaseCorrupt | NotADatabase | Unknown))
+            matches!(code, Some(DatabaseCorrupt | NotADatabase | Unknown))
         }
         _ => false,
     }
@@ -537,7 +545,7 @@ fn classify(path: &Path, file: &PrivateFile, migrations: &[Migration]) -> Result
     Ok(Kind::Ours)
 }
 
-fn app_id(conn: &Connection) -> Result<u32, IndexError> {
+fn app_id(conn: &Db) -> Result<u32, IndexError> {
     let raw: i64 = sql::query_row(conn, sql::GET_APP_ID, [], |r| r.get(0))
         .map_err(corruption_or("read application id"))?;
     // SQLite stores it as a signed 32-bit value; keep the bits.
@@ -548,31 +556,30 @@ fn app_id(conn: &Connection) -> Result<u32, IndexError> {
 
 /// Claims a file that was empty: under `BEGIN IMMEDIATE`, set the `application_id` if nothing
 /// else (another process, a file that grew) got there first.
-fn claim_new(conn: &mut Connection) -> Result<(), IndexError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(IndexError::sqlite("begin claim"))?;
-    let found = app_id(&tx)?;
-    if found == APPLICATION_ID {
-        return Ok(()); // another process of ours created it a moment ago
-    }
-    let objects: i64 = sql::query_row(&tx, sql::OBJECT_COUNT, [], |r| r.get(0))
-        .map_err(IndexError::sqlite("inspect schema"))?;
-    if found != 0 || objects != 0 || migrate::user_version(&tx)? != 0 {
-        return Err(IndexError::NotAnIndex);
-    }
-    sql::execute_unversioned(&tx, sql::BOOTSTRAP).map_err(IndexError::sqlite("bootstrap"))?;
-    tx.commit().map_err(IndexError::sqlite("commit claim"))
+fn claim_new(conn: &mut Db) -> Result<(), IndexError> {
+    sql::unversioned_tx(conn, "claim", |tx| {
+        let found = app_id(tx)?;
+        if found == APPLICATION_ID {
+            return Ok(None); // another process of ours created it a moment ago
+        }
+        let objects: i64 = sql::query_row(tx, sql::OBJECT_COUNT, [], |r| r.get(0))
+            .map_err(IndexError::sqlite("inspect schema"))?;
+        if found != 0 || objects != 0 || migrate::user_version(tx)? != 0 {
+            return Err(IndexError::NotAnIndex);
+        }
+        sql::execute_unversioned(tx, sql::BOOTSTRAP).map_err(IndexError::sqlite("bootstrap"))?;
+        Ok(Some(()))
+    })
+    .map(|_| ())
 }
 
-fn pragma_i64(conn: &Connection, stmt: &'static str, op: &'static str) -> Result<i64, IndexError> {
+fn pragma_i64(conn: &Db, stmt: ReadSql, op: &'static str) -> Result<i64, IndexError> {
     sql::query_row(conn, stmt, [], |r| r.get(0)).map_err(IndexError::sqlite(op))
 }
 
 /// Sets the connection pragmas and reads each back.
-fn apply_pragmas(conn: &Connection) -> Result<(), IndexError> {
-    conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(IndexError::sqlite("busy timeout"))?;
+/// The busy timeout is set on the raw connection before it is wrapped (see `open`).
+fn apply_pragmas(conn: &Db) -> Result<(), IndexError> {
     let mode: String = sql::query_row_unversioned(conn, sql::SET_WAL, |r| r.get(0))
         .map_err(IndexError::sqlite("journal mode"))?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -582,8 +589,9 @@ fn apply_pragmas(conn: &Connection) -> Result<(), IndexError> {
     }
     sql::execute_unversioned(conn, sql::SET_SYNC).map_err(IndexError::sqlite("synchronous"))?;
     sql::execute_unversioned(conn, sql::SET_FK).map_err(IndexError::sqlite("foreign keys"))?;
-    // `journal_size_limit` returns a row; SQLite reports it read-only (a connection setting).
-    let _: i64 = pragma_i64(conn, sql::SET_JOURNAL_LIMIT, "journal size limit")?;
+    // `journal_size_limit` returns a row; it is a setter, so it is not a read statement.
+    let _: i64 = sql::query_row_unversioned(conn, sql::SET_JOURNAL_LIMIT, |r| r.get(0))
+        .map_err(IndexError::sqlite("journal size limit"))?;
     let checks = [
         (sql::GET_SYNC, 2, "synchronous"),
         (sql::GET_FK, 1, "foreign_keys"),
@@ -626,7 +634,7 @@ fn lock_file(file: &PrivateFile, wait: Duration) -> Result<FileLock, IndexError>
 
 /// An open connection and the descriptor whose identity was checked.
 pub(crate) struct Opened {
-    pub(crate) conn: Connection,
+    pub(crate) conn: Db,
     /// Unlocked, but its descriptor stays open for the life of the connection.
     pub(crate) lock: FileLock,
     pub(crate) file: PrivateFile,
@@ -642,6 +650,19 @@ pub(crate) fn open(
 ) -> Result<Opened, IndexError> {
     check_parent(crate::parent_of(path))?;
     let file = open_private_file(path)?;
+    // Two names of one index file would each get their own `-wal` and `-shm`, so two processes
+    // would not see each other's SQLite locks and would overwrite each other's commits. Refused
+    // before anything is written (#145). `discard_if_created` cannot apply: a file we just made
+    // has one link.
+    if file
+        .file()
+        .metadata()
+        .map_err(IndexError::io("inspecting index file"))?
+        .nlink()
+        > 1
+    {
+        return Err(IndexError::HardLinkedIndex);
+    }
     // Excludes every other `Index::open` on this file from here to the end of this function: the
     // probes and the read-write open must not interleave with another opener's (a `-shm` one of
     // us created must not be attached to by another process, and two first creators must not
@@ -655,7 +676,7 @@ pub(crate) fn open(
         }
     };
     between();
-    let mut conn = Connection::open_with_flags(
+    let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -665,6 +686,7 @@ pub(crate) fn open(
     file.verify_path_unchanged(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(IndexError::sqlite("busy timeout"))?;
+    let mut conn = Db::new(conn);
     match kind {
         Kind::New => {
             if let Err(e) = claim_new(&mut conn) {

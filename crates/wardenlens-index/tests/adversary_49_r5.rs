@@ -429,8 +429,8 @@ fn a_hard_linked_shm_does_not_clobber_the_file_it_links_to() {
     assert!(after == precious, "the hard-linked file was rewritten");
 }
 
-/// The same for a `-wal` hard link: an own valid `-wal` linked from elsewhere is replayed and
-/// then checkpointed and deleted; the other name must at least still hold its bytes.
+/// The same for a `-wal` hard link: it is refused untouched (`InsecureSidecar`), and the other
+/// name still holds its bytes.
 #[test]
 fn a_hard_linked_wal_is_not_rewritten_through_the_other_name() {
     let dir = private_tempdir();

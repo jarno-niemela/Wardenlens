@@ -1,9 +1,9 @@
-//! Invariant 5: no SQL is built from data. The compiler enforces the shape of the wrappers in
-//! `sql.rs` (they take `&'static str`; the write methods need a `WriteTx`). It does **not** stop
-//! another file from calling `rusqlite` directly on a `Connection`: this text test does, over
-//! every production source file found on disk (not a hand-kept list), joining the lines of a
-//! wrapped call first. The read wrappers refuse a non-read-only statement at run time
-//! (`guard_tests`).
+//! Invariant 5: no SQL is built from data, and nothing but `sql.rs` runs SQL. The compiler
+//! enforces it: the connection is a `sql::Db` whose `rusqlite::Connection` is private to `sql.rs`,
+//! the read wrappers take a `ReadSql` token and the others a `&'static str`. These text tests are
+//! a **secondary** layer over every production source file found on disk (not a hand-kept list):
+//! no direct driver call outside `sql.rs`, no raw `Connection` held outside the three files that
+//! open one, and the setup wrappers used only by the open sequence and the reference schema.
 
 use std::path::{Path, PathBuf};
 
@@ -124,7 +124,7 @@ fn no_source_formats_or_concatenates_strings_into_sql() {
 fn the_wrappers_take_only_static_strings() {
     let sql = code(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sql.rs"));
     for f in [
-        "prepare<",
+        "prepare(",
         "execute_unversioned(",
         "query_row_unversioned<",
         "query_row<",
@@ -135,7 +135,11 @@ fn the_wrappers_take_only_static_strings() {
             .find(&format!("fn {f}"))
             .unwrap_or_else(|| panic!("{f}"));
         let sig: String = sql[at..].chars().take_while(|c| *c != '{').collect();
-        assert!(sig.contains("&'static str"), "{f}: {sig}");
+        // Reads take a `ReadSql` token (only `sql.rs` can make one), the rest a `&'static str`.
+        assert!(
+            sig.contains("&'static str") || sig.contains("ReadSql"),
+            "{f}: {sig}"
+        );
     }
 }
 
@@ -160,4 +164,19 @@ fn execute_unversioned_is_used_only_by_open_and_migrate() {
         }
     }
     assert!(seen >= 4, "the scan found {seen} uses");
+}
+
+/// Only `sql.rs` (the wrapper) and the two files that open a connection name the driver's
+/// `Connection`; a field or parameter of that type elsewhere would be a way round `sql::Db`.
+#[test]
+fn only_the_files_that_open_a_connection_name_the_raw_connection() {
+    for p in production_sources() {
+        let name = file_name(&p);
+        let text = code(&p);
+        let uses = text.contains("Connection");
+        if matches!(name.as_str(), "sql.rs" | "open.rs" | "migrate.rs") {
+            continue;
+        }
+        assert!(!uses, "{name} names the driver's Connection");
+    }
 }

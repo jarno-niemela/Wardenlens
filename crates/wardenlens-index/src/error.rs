@@ -64,6 +64,13 @@ pub enum IndexError {
         /// The sidecar suffix.
         suffix: &'static str,
     },
+    /// The index file itself has more than one hard link. Two names of one index get two
+    /// separate `-wal`/`-shm` pairs, so two processes would not see each other's locks and would
+    /// overwrite each other's committed rows. Nothing was modified.
+    #[error(
+        "index file has more than one hard link; nothing was modified; remove the extra name (keep one) and start again"
+    )]
+    HardLinkedIndex,
     /// A sidecar exists that cannot belong to this database in its state: any sidecar next to an
     /// empty file, a `-wal` or `-shm` next to a rollback-mode file, or an empty `-journal`.
     /// Nothing was modified. Move it out of the directory (and delete it later when you know

@@ -182,7 +182,9 @@ Rules:
   The read-only identity probe (which runs before any read-write open) honours this too: a non-empty `-journal` is
   polled for up to the same 5 seconds. If it is still there, `open` does not judge the torn main file: it writes a
   private copy of the vault file and the journal into a `.wardenlens-probe-*` directory (mode 0700, files 0600)
-  beside the vault and lets SQLite roll the copy back; the verdict is taken on the rolled-back copy. A wrong key
+  beside the vault and lets SQLite roll the copy back; the verdict is taken on the rolled-back copy. A copy left by a
+  crash is removed by the next `open`: `fsutil::Scratch::sweep_stale` removes a `.wardenlens-probe-<pid>-*` directory of ours
+  whose pid is not a live process (`kill(pid, 0)`; it assumes one pid namespace per data directory, #145). A wrong key
   gives `WrongKey`, a foreign database `NotInitialized`, an unknown schema `UnsupportedSchema`. `PendingJournal`
   is returned when the state could not be judged: for `create` that meets a vault with an unfinished transaction
   (a crashed `create` whose copy rolls back to a file with no vault is `NotEmpty`); for a copy that is still

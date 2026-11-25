@@ -35,8 +35,8 @@ pub fn check_parent(parent: &Path) -> Result<(), FsError> {
 /// then it must be a regular file owned by the effective user with no group or other permission
 /// bits and no setuid, setgid or sticky bit, and **exactly one hard link**: SQLite truncates and
 /// rewrites a `-shm` and a `-wal` in place, so a sidecar that is a second name of another file
-/// would clobber that file. (The main database file is not subject to the link rule: it is the
-/// file the index writes by design, and its identity is proven by its header.) Returns its
+/// would clobber that file. (The index refuses a main file with more than one link as well, in
+/// its own open: `IndexError::HardLinkedIndex`.) Returns its
 /// length, or `None` when it is absent.
 ///
 /// # Errors
@@ -110,7 +110,12 @@ impl Scratch {
     /// directory is removed only if it is a real directory (not a symlink) owned by the
     /// effective user, and the pid in its name is **not a live process** (`kill(pid, 0)` says
     /// no such process); the directories of live processes, including this one, are left alone.
-    /// Best effort (ERR-4): a failure to remove one is skipped. Returns how many were removed.
+    /// **Assumption: one pid namespace.** Liveness is `kill(pid, 0)` in this process's pid
+    /// namespace, so two containers that share the data directory but not the pid namespace
+    /// could remove each other's live scratch directories; the service runs one process per
+    /// data directory (a single container), and the probe that uses a scratch directory runs
+    /// under the vault's open, one at a time. Best effort (ERR-4): a failure to remove one is
+    /// skipped. Returns how many were removed.
     #[must_use]
     pub fn sweep_stale(parent: &Path) -> usize {
         let Ok(entries) = std::fs::read_dir(parent) else {

@@ -638,7 +638,8 @@ fn main_unreadable_passes_only_what_says_the_file_cannot_answer() {
     // Errors that are not SQLite codes.
     assert!(main_unreadable(&IndexError::Damaged));
     assert!(main_unreadable(&IndexError::UnexpectedSchema));
-    assert!(main_unreadable(&IndexError::Sqlite {
+    // No code at all (not a SQLite failure) is a real error, not "the file cannot say".
+    assert!(!main_unreadable(&IndexError::Sqlite {
         op: "t",
         code: None
     }));
@@ -657,4 +658,36 @@ fn main_unreadable_passes_only_what_says_the_file_cannot_answer() {
     ] {
         assert!(!main_unreadable(&real), "{real:?}");
     }
+}
+
+/// A main file whose `index_meta` has no row cannot say its instance id: `Damaged`, not a bare
+/// SQLite error, so the `-wal` probe lets the replayed view decide.
+#[test]
+fn a_missing_instance_id_row_is_damaged() {
+    let (_f, idx) = open_new();
+    idx.conn
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM index_meta;")
+        .unwrap();
+    let e = crate::open::instance_id(&idx.conn).unwrap_err();
+    assert!(matches!(e, IndexError::Damaged), "{e:?}");
+}
+
+/// A main file with a second name is refused for every state of the file and nothing changes
+/// (two names would get two `-wal`/`-shm` pairs and lose each other's commits).
+#[test]
+fn a_hard_linked_main_file_is_refused_untouched_whether_empty_or_in_use() {
+    // An empty file we adopt, and a live index with a `-wal`.
+    let empty = fixture();
+    std::fs::write(&empty.path, b"").unwrap();
+    chmod(&empty.path, 0o600);
+    let (live, idx) = open_new();
+    for f in [&empty, &live] {
+        let twin = f.dir.path().join("twin");
+        std::fs::hard_link(&f.path, &twin).unwrap();
+        let before = snapshot(f.dir.path());
+        let err = Index::open(&f.path).unwrap_err();
+        assert!(matches!(err, IndexError::HardLinkedIndex), "{err:?}");
+        assert_eq!(before, snapshot(f.dir.path()));
+    }
+    drop(idx);
 }

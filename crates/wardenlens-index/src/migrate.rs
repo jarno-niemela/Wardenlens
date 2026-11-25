@@ -2,7 +2,7 @@
 //! with `include_str!`. Each script ends with its own `PRAGMA user_version = <n>;`, so the version
 //! can never drift from the DDL, and the runner verifies that it did.
 
-use rusqlite::Connection;
+use crate::sql::Db;
 
 use crate::error::IndexError;
 use crate::sql;
@@ -28,7 +28,7 @@ pub(crate) fn latest(migrations: &[Migration]) -> i64 {
 }
 
 /// Reads `user_version`; a negative value is refused.
-pub(crate) fn user_version(conn: &Connection) -> Result<i64, IndexError> {
+pub(crate) fn user_version(conn: &Db) -> Result<i64, IndexError> {
     let v: i64 = sql::query_row(conn, sql::USER_VERSION, [], |r| r.get(0))
         .map_err(IndexError::sqlite("read schema version"))?;
     if v < 0 {
@@ -50,7 +50,7 @@ pub(crate) fn check_not_newer(found: i64, migrations: &[Migration]) -> Result<()
 /// script, the generation bump, `COMMIT`; see `sql::write_tx`) per script. The version is read
 /// again inside the transaction, so a competing process that migrated first is noticed. A failure
 /// rolls the failing step back and leaves earlier steps committed.
-pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), IndexError> {
+pub(crate) fn run(conn: &mut Db, migrations: &[Migration]) -> Result<(), IndexError> {
     for m in migrations {
         sql::write_tx_opt(conn, "migrate", |w| {
             let stored = user_version(w.read_conn())?;
@@ -75,7 +75,7 @@ pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(),
 pub(crate) type SchemaRow = (String, String, String, Option<String>);
 
 /// Reads every `sqlite_master` row of `conn`, sorted.
-pub(crate) fn schema_rows(conn: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
+pub(crate) fn schema_rows(conn: &Db) -> rusqlite::Result<Vec<SchemaRow>> {
     let mut stmt = sql::prepare(conn, sql::SCHEMA_ROWS)?;
     let mut rows: Vec<SchemaRow> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -91,7 +91,9 @@ pub(crate) fn reference_schema(
     migrations: &[Migration],
     version: i64,
 ) -> Result<Vec<SchemaRow>, IndexError> {
-    let conn = Connection::open_in_memory().map_err(IndexError::sqlite("reference schema"))?;
+    let conn = Db::new(
+        rusqlite::Connection::open_in_memory().map_err(IndexError::sqlite("reference schema"))?,
+    );
     sql::execute_unversioned(&conn, sql::BOOTSTRAP)
         .map_err(IndexError::sqlite("reference schema"))?;
     for m in migrations.iter().filter(|m| m.version <= version) {
