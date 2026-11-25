@@ -77,21 +77,36 @@ impl PrivateFile {
     }
 }
 
-/// An exclusive `flock` on a [`PrivateFile`], released when dropped.
+/// An exclusive `flock` on a [`PrivateFile`]. [`FileLock::unlock`] releases the lock; the guard
+/// keeps its descriptor until it is dropped.
 ///
 /// `flock` locks belong to the open file description, so two opens of one file exclude each other
 /// even inside one process. On Linux they are independent of the POSIX (`fcntl`) locks SQLite
 /// takes on the same file: holding this lock never blocks SQLite and SQLite never blocks it. It
 /// serialises only callers that also take it.
+///
+/// **Descriptor lifetime.** POSIX record locks belong to the process, and closing *any*
+/// descriptor of an inode drops every POSIX lock the process holds on it, including SQLite's WAL
+/// shared lock (fcntl(2)). So neither this guard's descriptor nor the [`PrivateFile`] may be
+/// closed while a SQLite connection to the file is live: unlock, but keep both open until the
+/// connection is closed.
 #[derive(Debug)]
 pub struct FileLock {
     file: File,
 }
 
+impl FileLock {
+    /// Releases the `flock` without closing the descriptor.
+    pub fn unlock(&self) {
+        // ERR-4: nothing useful to do if the unlock fails; dropping the guard closes the
+        // descriptor, which releases the lock.
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // ERR-4: nothing useful to do if the unlock fails; closing the descriptor releases it.
-        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        self.unlock();
     }
 }
 

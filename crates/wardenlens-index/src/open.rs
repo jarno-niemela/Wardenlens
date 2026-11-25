@@ -23,8 +23,8 @@
 //! 6. Only then is the file opened read-write (`SQLITE_OPEN_NOFOLLOW`) and the device and inode
 //!    compared again; pragmas are set and read back; migrations run.
 //!
-//! Residual trust: the `-wal` is judged by what its replay produces, so a `-wal` copied from
-//! another copy of *this* index (same uid, mode `0600`, private directory) is accepted. That
+//! Residual trust: the `-wal` is judged by what its replay produces and by its instance id, so a
+//! `-wal` copied from an older state of *this* index (same uid, mode `0600`, private directory) is accepted. That
 //! needs the same privileges as editing the index itself.
 
 use std::fs::File;
@@ -53,6 +53,8 @@ const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const HEADER_LEN: usize = 100;
 const SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 const WAL_MAGICS: [u32; 2] = [0x377f_0682, 0x377f_0683];
+/// Most bytes of a `-wal` read to prove it entirely zero.
+const MAX_ZERO_SCAN: u64 = wardenlens_fsutil::MAX_COPY_LEN;
 
 /// Presence and length of each sidecar (`None` = absent), in the order of [`SUFFIXES`].
 #[derive(Debug, Clone, Copy)]
@@ -157,46 +159,83 @@ fn check_sidecars(wal_mode: bool, sc: Sidecars) -> Result<(), IndexError> {
     Ok(())
 }
 
-/// What the first 32 bytes of a `-wal` say.
+/// What the start of a `-wal` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalHeader {
-    /// What a crash before the first frame leaves: an all-zero file, or a file shorter than a
-    /// header that is a prefix of a WAL magic. SQLite treats it as an empty WAL, and so do we.
+    /// What a crash before the first frame leaves: a file that is entirely zero, or a file
+    /// shorter than a header that is a prefix of a valid one. SQLite treats it as an empty WAL
+    /// (and rewrites it), and so do we.
     Torn,
     /// A WAL header with the page size of the main file.
     Valid,
 }
 
-/// Classifies the `-wal` header against the main file's page size. Only a file SQLite could have
-/// written is `Torn`; any other short or non-magic content is [`IndexError::InvalidWal`] and is
-/// never opened read-write, so it is never deleted or rewritten.
+/// The WAL format version SQLite writes, in bytes 4..8 of the header (3007000).
+const WAL_FORMAT_VERSION: u32 = 3_007_000;
+
+/// True if every byte of `wal` (`len` long) is zero. Reads at most [`MAX_ZERO_SCAN`] bytes; a
+/// longer file is never proven zero.
+fn all_zero(wal: &File, len: u64) -> Result<bool, IndexError> {
+    if len > MAX_ZERO_SCAN {
+        return Ok(false);
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut at = 0u64;
+    while at < len {
+        let want = usize::try_from(len.saturating_sub(at)).map_or(buf.len(), |r| r.min(buf.len()));
+        let window = buf.get_mut(..want).ok_or(IndexError::InvalidWal)?;
+        wal.read_exact_at(window, at)
+            .map_err(IndexError::io("reading wal"))?;
+        if window.iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        at = at.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
+    }
+    Ok(true)
+}
+
+/// Classifies the `-wal` against the main file's page size. Only a file SQLite could have
+/// written is `Torn`: **entirely** zero, or shorter than a header and a prefix of one (a WAL
+/// magic followed by the format version, then the page size if it is present). Anything else
+/// that is not a valid header is [`IndexError::InvalidWal`] and is never opened read-write, so it
+/// is never deleted or rewritten.
 fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHeader, IndexError> {
     let len = wal
         .metadata()
         .map_err(IndexError::io("inspecting wal"))?
         .len();
+    if all_zero(wal, len)? {
+        return Ok(WalHeader::Torn);
+    }
     let mut head = [0u8; 32];
     let want = usize::try_from(len.min(32)).unwrap_or(32);
     let got = head.get_mut(..want).ok_or(IndexError::InvalidWal)?;
     wal.read_exact_at(got, 0)
         .map_err(IndexError::io("reading wal header"))?;
-    let seen = head.get(..want).ok_or(IndexError::InvalidWal)?;
-    if seen.iter().all(|b| *b == 0) {
-        return Ok(WalHeader::Torn);
-    }
     let be = |b: &[u8], at: usize| {
         b.get(at..at.saturating_add(4))
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
             .map(u32::from_be_bytes)
     };
+    // The main file stores the page size as two bytes at 16, where 1 means 65536.
+    let main_page = main_header
+        .get(16..18)
+        .and_then(|s| <[u8; 2]>::try_from(s).ok())
+        .map(u16::from_be_bytes)
+        .map(|p| if p == 1 { 65_536_u32 } else { u32::from(p) });
     if want < 32 {
-        // A partial header write: the bytes present must be a prefix of a WAL magic.
-        let prefix_of_magic = WAL_MAGICS.iter().any(|m| {
-            let magic = m.to_be_bytes();
-            let n = want.min(4);
-            seen.get(..n) == magic.get(..n)
+        // A header write cut short: the bytes present must be a prefix of magic + version
+        // (+ page size). Magic alone, or any other bytes, is not.
+        let seen = head.get(..want).ok_or(IndexError::InvalidWal)?;
+        let prefix = WAL_MAGICS.iter().any(|m| {
+            let mut full = [0u8; 12];
+            full[..4].copy_from_slice(&m.to_be_bytes());
+            full[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+            full[8..12].copy_from_slice(&main_page.unwrap_or(0).to_be_bytes());
+            let n = want.min(12);
+            want >= 8 && seen.get(..n) == full.get(..n)
         });
-        return if prefix_of_magic {
+        return if prefix {
             Ok(WalHeader::Torn)
         } else {
             Err(IndexError::InvalidWal)
@@ -205,12 +244,6 @@ fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHea
     if !be(&head, 0).is_some_and(|m| WAL_MAGICS.contains(&m)) {
         return Err(IndexError::InvalidWal);
     }
-    // The main file stores the page size as two bytes at 16, where 1 means 65536.
-    let main_page = main_header
-        .get(16..18)
-        .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .map(u16::from_be_bytes)
-        .map(|p| if p == 1 { 65_536_u32 } else { u32::from(p) });
     if be(&head, 8) == main_page {
         Ok(WalHeader::Valid)
     } else {
@@ -261,7 +294,7 @@ fn instance_id(conn: &Connection) -> Result<InstanceId, IndexError> {
 
 /// A SQLite failure while reading a file we do not yet trust: corruption codes mean the file is
 /// damaged (or not a database), anything else is passed on.
-fn corruption_or(op: &'static str) -> impl FnOnce(rusqlite::Error) -> IndexError {
+pub(crate) fn corruption_or(op: &'static str) -> impl FnOnce(rusqlite::Error) -> IndexError {
     move |e| match (&e, e.sqlite_error_code()) {
         (_, Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
         | (rusqlite::Error::InvalidColumnType(..), _) => IndexError::Damaged,
@@ -331,7 +364,12 @@ pub(crate) fn open_wal_probe(path: &Path, file: &PrivateFile) -> Result<Connecti
 /// 2. the real files are opened with [`open_wal_probe`] so SQLite replays the `-wal` into its
 ///    in-memory view, and the view is judged like any index;
 /// 3. the view's instance id must equal the main file's: a `-wal` of another index (same
-///    application id, schema and a clean integrity check) is `ForeignWal`.
+///    application id, schema and a clean integrity check) is `ForeignWal`. This works because
+///    every commit of this crate rewrites the page that holds the id (`sql::write_tx`), so every
+///    non-empty `-wal` carries it. If the main file's id cannot be read (a page torn by a crash in
+///    the middle of a checkpoint) the replayed view decides; `ForeignWal` needs both ids readable
+///    and different. A torn main page plus a foreign `-wal` with our header cannot be told apart
+///    (it needs the privileges to edit the index).
 ///
 /// The probe never writes the main file or the `-wal` (guards on [`open_wal_probe`]). It does
 /// create or update the `-shm` (the wal-index every first connection rebuilds from the `-wal`).
@@ -362,21 +400,25 @@ fn wal_verdict(
     migrations: &[Migration],
 ) -> Result<(), IndexError> {
     let main_view = open_immutable(path, file)?;
-    let main_id = instance_id(&main_view).ok();
+    // The id of the main file alone. If the main file cannot answer because it is damaged or torn
+    // (a crash in the middle of a checkpoint leaves a page half new), it has no readable id and
+    // the replayed view decides; any other failure (I/O, busy) is the real error.
+    let main_id = match instance_id(&main_view) {
+        Ok(id) => Some(id),
+        Err(e) if main_unreadable(&e) => None,
+        Err(e) => return Err(e),
+    };
     let main_verdict = judge_view(&main_view, migrations);
-    // A main file that is torn by a crash in the middle of a checkpoint, or is simply behind its
-    // `-wal`, may fail the full judgement alone; the replayed view decides below. Keep the
-    // main file's own error to report if the view is not ours either.
     drop(main_view);
     let conn = open_wal_probe(path, file)?;
     match judge_view(&conn, migrations) {
-        Ok(view_id) => {
-            if main_id.as_ref() == Some(&view_id) {
-                Ok(())
-            } else {
-                Err(IndexError::ForeignWal)
-            }
-        }
+        // The replay is an index of ours: it must be this index's, unless the main file's id is
+        // unreadable. Residual: a torn main page plus a foreign `-wal` with our header cannot be
+        // told apart; that needs the privileges to edit the index.
+        Ok(view_id) => match main_id {
+            Some(id) if id != view_id => Err(IndexError::ForeignWal),
+            _ => Ok(()),
+        },
         Err(
             IndexError::WrongApplicationId { .. }
             | IndexError::UnexpectedSchema
@@ -388,6 +430,31 @@ fn wal_verdict(
             Ok(_) => Err(IndexError::ForeignWal),
         },
         Err(other) => Err(other),
+    }
+}
+
+/// True if a failed read of the main file alone means "this file cannot say" (damaged, torn,
+/// schema unreadable), as opposed to a real error (I/O, busy, permissions) that must be reported.
+fn main_unreadable(e: &IndexError) -> bool {
+    use rusqlite::ErrorCode::{
+        CannotOpen, DiskFull, NoLargeFileSupport, OutOfMemory, PermissionDenied, ReadOnly,
+        SystemIoFailure,
+    };
+    match e {
+        IndexError::Damaged | IndexError::UnexpectedSchema => true,
+        IndexError::Sqlite { code, .. } => !matches!(
+            code,
+            Some(
+                SystemIoFailure
+                    | CannotOpen
+                    | DiskFull
+                    | OutOfMemory
+                    | PermissionDenied
+                    | ReadOnly
+                    | NoLargeFileSupport
+            )
+        ),
+        _ => false,
     }
 }
 
@@ -454,7 +521,7 @@ fn claim_new(conn: &mut Connection) -> Result<(), IndexError> {
     if found != 0 || objects != 0 || migrate::user_version(&tx)? != 0 {
         return Err(IndexError::NotAnIndex);
     }
-    sql::execute_batch(&tx, sql::BOOTSTRAP).map_err(IndexError::sqlite("bootstrap"))?;
+    sql::execute_unversioned(&tx, sql::BOOTSTRAP).map_err(IndexError::sqlite("bootstrap"))?;
     tx.commit().map_err(IndexError::sqlite("commit claim"))
 }
 
@@ -473,8 +540,8 @@ fn apply_pragmas(conn: &Connection) -> Result<(), IndexError> {
             pragma: "journal_mode",
         });
     }
-    sql::execute_batch(conn, sql::SET_SYNC).map_err(IndexError::sqlite("synchronous"))?;
-    sql::execute_batch(conn, sql::SET_FK).map_err(IndexError::sqlite("foreign keys"))?;
+    sql::execute_unversioned(conn, sql::SET_SYNC).map_err(IndexError::sqlite("synchronous"))?;
+    sql::execute_unversioned(conn, sql::SET_FK).map_err(IndexError::sqlite("foreign keys"))?;
     // `journal_size_limit` returns a row, so it goes through `query_row`.
     let _: i64 = pragma_i64(conn, sql::SET_JOURNAL_LIMIT, "journal size limit")?;
     let checks = [
@@ -520,6 +587,8 @@ fn lock_file(file: &PrivateFile, wait: Duration) -> Result<FileLock, IndexError>
 /// An open connection and the descriptor whose identity was checked.
 pub(crate) struct Opened {
     pub(crate) conn: Connection,
+    /// Unlocked, but its descriptor stays open for the life of the connection.
+    pub(crate) lock: FileLock,
     pub(crate) file: PrivateFile,
 }
 
@@ -536,8 +605,8 @@ pub(crate) fn open(
     // Excludes every other `Index::open` on this file from here to the end of this function: the
     // probes and the read-write open must not interleave with another opener's (a `-shm` one of
     // us created must not be attached to by another process, and two first creators must not
-    // both claim the file). Released when `_lock` drops, after migrations.
-    let _lock = lock_file(&file, lock_wait)?;
+    // both claim the file). Unlocked after migrations; the descriptor then lives on in `Opened`.
+    let lock = lock_file(&file, lock_wait)?;
     let kind = match classify(path, &file, migrations) {
         Ok(kind) => kind,
         Err(e) => {
@@ -575,7 +644,8 @@ pub(crate) fn open(
     }
     apply_pragmas(&conn)?;
     migrate::run(&mut conn, migrations)?;
-    Ok(Opened { conn, file })
+    lock.unlock();
+    Ok(Opened { conn, lock, file })
 }
 
 /// Removes the empty file this call created when the open is refused before anything was

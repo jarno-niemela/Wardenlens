@@ -37,8 +37,10 @@ enum Side {
     Zeroed,
     /// 8 bytes that are not a WAL header.
     Short,
-    /// The first 4 bytes of a WAL magic and nothing else: a header write cut short.
+    /// The first 4 bytes of a WAL magic and nothing else: not a valid header prefix.
     TornMagic,
+    /// Magic and format version (8 bytes): a header write cut short.
+    TornHeader,
 }
 
 const MAINS: [Main; 5] = [
@@ -48,7 +50,7 @@ const MAINS: [Main; 5] = [
     Main::Foreign,
     Main::ForeignWal,
 ];
-const SIDES: [Side; 8] = [
+const SIDES: [Side; 9] = [
     Side::None,
     Side::Empty,
     Side::Ours,
@@ -57,6 +59,7 @@ const SIDES: [Side; 8] = [
     Side::Zeroed,
     Side::Short,
     Side::TornMagic,
+    Side::TornHeader,
 ];
 const SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
@@ -227,7 +230,9 @@ fn want(main: Main, suffix: &str, side: Side) -> Want {
         ("-wal", Side::Foreign) if main == Main::TooNew => Want::Refuse(is_too_new),
         ("-wal", Side::Foreign) => Want::Refuse(is_foreign_wal),
         // Not a WAL header and not a torn one: SQLite did not write it.
-        ("-wal", Side::Junk | Side::Short) => Want::Refuse(|e| matches!(e, IndexError::InvalidWal)),
+        ("-wal", Side::Junk | Side::Short | Side::TornMagic) => {
+            Want::Refuse(|e| matches!(e, IndexError::InvalidWal))
+        }
         // A torn header is an empty WAL, as SQLite treats it.
         // An empty or our own `-wal`, and any `-shm` (SQLite rebuilds it from the `-wal`; it is
         // never replayed).
@@ -255,6 +260,7 @@ fn setup_cell(main: Main, suffix: &str, side: Side) -> (Fixture, Option<Connecti
         (_, Side::Zeroed) => put(&sp, &[0u8; 700]),
         (_, Side::Short) => put(&sp, &[1u8; 8]),
         (_, Side::TornMagic) => put(&sp, &[0x37, 0x7f, 0x06, 0x82]),
+        (_, Side::TornHeader) => put(&sp, &[0x37, 0x7f, 0x06, 0x82, 0x00, 0x2d, 0xe2, 0x18]),
         _ => unreachable!(),
     }
     // The foreign WAL database brought its own `-wal`/`-shm` (mode of its creation): make them
@@ -297,7 +303,7 @@ fn the_matrix_has_every_main_state_and_every_sidecar_state() {
             assert!(cells.iter().any(|c| c.0 == main && c.1 == suffix));
         }
     }
-    assert_eq!(cells.len(), 95);
+    assert_eq!(cells.len(), 107);
 }
 
 #[test]

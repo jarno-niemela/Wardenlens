@@ -46,6 +46,17 @@ fn code(path: &Path) -> String {
         .map(|l| l.split("//").next().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n")
+        .split('\n')
+        .fold(String::new(), |mut acc, line| {
+            // Join a wrapped method call (`w\n    .execute(`) onto the receiver's line.
+            if line.trim_start().starts_with('.') {
+                acc.push_str(line.trim_start());
+            } else {
+                acc.push('\n');
+                acc.push_str(line);
+            }
+            acc
+        })
 }
 
 fn file_name(p: &Path) -> String {
@@ -76,7 +87,8 @@ fn only_sql_rs_calls_the_driver_with_sql_text() {
     for p in production_sources() {
         let text = code(&p);
         for call in SQL_CALLS {
-            let n = text.matches(call).count();
+            // `w.execute(..)` is `WriteTx`, whose methods exist only inside `sql::write_tx`.
+            let n = text.matches(call).count() - text.matches(&format!("w{call}")).count();
             if file_name(&p) == "sql.rs" {
                 calls_in_sql_rs += n;
             } else {
@@ -115,4 +127,25 @@ fn the_wrappers_take_only_static_strings() {
         let sig: String = sql[at..].chars().take_while(|c| *c != '{').collect();
         assert!(sig.contains("&'static str"), "{f}: {sig}");
     }
+}
+
+/// Statements that are not index data run through `sql::execute_unversioned`, which does not bump
+/// the generation: only the open sequence and the reference schema may use it, never a segment
+/// operation (those need a `WriteTx`, enforced by the types).
+#[test]
+fn execute_unversioned_is_used_only_by_open_and_migrate() {
+    let mut seen = 0;
+    for p in production_sources() {
+        let n = code(&p).matches("execute_unversioned(").count();
+        let name = file_name(&p);
+        if name == "sql.rs" {
+            continue;
+        }
+        if name == "open.rs" || name == "migrate.rs" {
+            seen += n;
+        } else {
+            assert_eq!(n, 0, "{name} runs an unversioned statement");
+        }
+    }
+    assert!(seen >= 3, "the scan found {seen} uses");
 }

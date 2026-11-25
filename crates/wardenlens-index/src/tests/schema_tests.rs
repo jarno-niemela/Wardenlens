@@ -251,27 +251,229 @@ fn every_index_gets_its_own_random_16_byte_instance_id() {
     assert_eq!(ids.len(), 8, "instance ids collide");
 }
 
-/// A `-wal` made from an index with the same schema and a clean integrity check, but another
-/// instance id, is refused and nothing is replayed (adversary r3, here with the exact variant).
-#[test]
-fn a_wal_of_another_index_is_foreign_even_when_it_is_a_clean_index() {
+/// The `-wal` of another, live index with `n` rows of `camera`, as an ordinary uncheckpointed
+/// `-wal` (no `VACUUM`): what a crashed process of another index leaves.
+fn live_wal_of_another_index(camera: &str, n: i64) -> Vec<u8> {
     let other = private_tempdir();
-    let op = base(other.path());
-    let oc = raw(&op);
-    oc.execute_batch("VACUUM").unwrap();
-    let wal = std::fs::read(format!("{}-wal", op.display())).unwrap();
-    drop(oc);
-    let dir = private_tempdir();
-    let path = base(dir.path());
+    let path = other.path().join("index.db");
+    let mut idx = Index::open(&path).unwrap();
+    for k in 0..n {
+        idx.insert(&rec(camera, BASE + k * 10_000, 1000, 10, 1), Tier::Hot)
+            .unwrap();
+    }
+    let wal = std::fs::read(format!("{}-wal", path.display())).unwrap();
+    assert!(wal.len() > 32);
+    drop(idx);
+    wal
+}
+
+fn place_wal(path: &std::path::Path, wal: &[u8]) {
     let w = format!("{}-wal", path.display());
-    std::fs::write(&w, &wal).unwrap();
+    std::fs::write(&w, wal).unwrap();
     chmod(std::path::Path::new(&w), 0o600);
+}
+
+fn rows_of(path: &std::path::Path) -> Vec<(String, i64)> {
+    // Only called on an index that opened.
+    let idx = Index::open(path).unwrap();
+    let mut s = idx
+        .conn
+        .prepare("SELECT camera_id, count(*) FROM segments GROUP BY 1")
+        .unwrap();
+    s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Reviewer case (a): a closed index with 5 rows next to another index's ordinary `-wal` with 2
+/// rows. Before the generation bump the foreign `-wal` carried no frame of the instance-id page,
+/// passed every check, and replaced this index's rows.
+#[test]
+fn a_closed_index_beside_another_indexs_ordinary_wal_is_refused_untouched() {
+    let dir = private_tempdir();
+    let path = dir.path().join("index.db");
+    let mut idx = Index::open(&path).unwrap();
+    for k in 0..5 {
+        idx.insert(&rec("mine", BASE + k * 10_000, 1000, 10, 1), Tier::Hot)
+            .unwrap();
+    }
+    drop(idx);
+    place_wal(&path, &live_wal_of_another_index("theirs", 2));
     let before = snapshot(dir.path());
     assert!(matches!(
         Index::open(&path).unwrap_err(),
         IndexError::ForeignWal
     ));
     assert_eq!(before, snapshot(dir.path()));
+}
+
+/// Reviewer case (b): the crash image before our first checkpoint (main file is the bootstrap,
+/// the `-wal` holds migration and rows) with the `-wal` replaced by another index's.
+#[test]
+fn a_crash_image_before_the_first_checkpoint_with_a_foreign_wal_is_refused_untouched() {
+    let live = private_tempdir();
+    let lp = live.path().join("index.db");
+    let mut idx = Index::open(&lp).unwrap();
+    idx.insert(&rec("mine", BASE, 1000, 10, 1), Tier::Hot)
+        .unwrap();
+    let crash = private_tempdir();
+    let cp = crash.path().join("index.db");
+    std::fs::copy(&lp, &cp).unwrap();
+    chmod(&cp, 0o600);
+    drop(idx);
+    place_wal(&cp, &live_wal_of_another_index("theirs", 2));
+    let before = snapshot(crash.path());
+    assert!(matches!(
+        Index::open(&cp).unwrap_err(),
+        IndexError::ForeignWal
+    ));
+    assert_eq!(before, snapshot(crash.path()));
+    // Control: the index's own `-wal` in the same position opens with its row.
+    let own = private_tempdir();
+    let op = own.path().join("index.db");
+    let mut idx = Index::open(&op).unwrap();
+    idx.insert(&rec("mine", BASE, 1000, 10, 1), Tier::Hot)
+        .unwrap();
+    let image = private_tempdir();
+    let ip = image.path().join("index.db");
+    for s in ["", "-wal"] {
+        let (a, b) = (
+            format!("{}{s}", op.display()),
+            format!("{}{s}", ip.display()),
+        );
+        std::fs::copy(&a, &b).unwrap();
+        chmod(std::path::Path::new(&b), 0o600);
+    }
+    drop(idx);
+    assert_eq!(rows_of(&ip), [("mine".to_owned(), 1)]);
+}
+
+/// The invariant behind both: every commit this crate makes puts a frame of the page that holds
+/// the instance id into the `-wal` (TEST-8: the parser reads the frames, not the code).
+fn wal_page_numbers(wal: &[u8], from: usize) -> Vec<u32> {
+    let page = usize::try_from(u32::from_be_bytes(wal[8..12].try_into().unwrap())).unwrap();
+    let mut out = Vec::new();
+    let mut at = 32 + (from.saturating_sub(32) / (24 + page)) * (24 + page);
+    while at + 24 + page <= wal.len() {
+        out.push(u32::from_be_bytes(wal[at..at + 4].try_into().unwrap()));
+        at += 24 + page;
+    }
+    out
+}
+
+fn wal_len(path: &std::path::Path) -> usize {
+    usize::try_from(
+        std::fs::metadata(format!("{}-wal", path.display()))
+            .unwrap()
+            .len(),
+    )
+    .unwrap()
+}
+
+fn instance_page(idx: &Index) -> u32 {
+    idx.conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'index_meta'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn generation(idx: &Index) -> i64 {
+    idx.conn
+        .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
+        .unwrap()
+}
+
+type Op = Box<dyn Fn(&mut Index)>;
+
+#[test]
+fn every_committing_operation_leaves_a_frame_of_the_instance_id_page() {
+    let f = fixture();
+    let mut idx = Index::open(&f.path).unwrap();
+    let page = instance_page(&idx);
+    assert_eq!(
+        page, 2,
+        "the instance id sits on the page the bootstrap creates first"
+    );
+    let ops: Vec<(&str, Op)> = vec![
+        (
+            "insert",
+            Box::new(|i| {
+                i.insert(&rec("cam1", BASE, 1000, 10, 1), Tier::Hot)
+                    .unwrap();
+            }),
+        ),
+        (
+            "insert 2",
+            Box::new(|i| {
+                i.insert(&rec("cam1", BASE + 10_000, 1000, 10, 1), Tier::Hot)
+                    .unwrap();
+            }),
+        ),
+        (
+            "set_tier",
+            Box::new(|i| {
+                i.set_tier(wardenlens_core::storage::SegmentId::new(1), Tier::Archive)
+                    .unwrap();
+            }),
+        ),
+        (
+            "delete",
+            Box::new(|i| {
+                i.delete(wardenlens_core::storage::SegmentId::new(2))
+                    .unwrap();
+            }),
+        ),
+    ];
+    // The open itself (bootstrap in main, migration in the -wal) is the first commit.
+    assert!(
+        wal_page_numbers(
+            &std::fs::read(format!("{}-wal", f.path.display())).unwrap(),
+            0
+        )
+        .contains(&page)
+    );
+    for (name, op) in ops {
+        let (len, gen_before) = (wal_len(&f.path), generation(&idx));
+        op(&mut idx);
+        let wal = std::fs::read(format!("{}-wal", f.path.display())).unwrap();
+        let new_pages = wal_page_numbers(&wal, len);
+        assert!(
+            new_pages.contains(&page),
+            "{name}: frames {new_pages:?} lack page {page}"
+        );
+        assert_eq!(generation(&idx), gen_before + 1, "{name}");
+    }
+    // A refused operation (no row) writes no frame and does not bump.
+    let (len, gen_before) = (wal_len(&f.path), generation(&idx));
+    assert!(
+        idx.delete(wardenlens_core::storage::SegmentId::new(99))
+            .is_err()
+    );
+    assert_eq!(wal_len(&f.path), len);
+    assert_eq!(generation(&idx), gen_before);
+}
+
+/// A migration step also bumps, so an index migrated by a newer build still carries the page.
+#[test]
+fn a_migration_step_leaves_a_frame_of_the_instance_id_page() {
+    let f = fixture();
+    drop(Index::open(&f.path).unwrap());
+    let v2 = crate::migrate::Migration {
+        version: 2,
+        sql: "CREATE TABLE extra (x INTEGER); PRAGMA user_version = 2;",
+    };
+    let idx = Index::open_with(&f.path, &[MIGRATIONS[0], v2], || {}).unwrap();
+    let wal = std::fs::read(format!("{}-wal", f.path.display())).unwrap();
+    assert!(wal_page_numbers(&wal, 0).contains(&instance_page(&idx)));
+    assert_eq!(
+        generation(&idx),
+        2,
+        "one bump for each of the two steps that ran"
+    );
 }
 
 /// Two openers exclude each other: a held lock makes the open wait, then report `Busy`; after
@@ -306,4 +508,22 @@ fn a_held_file_lock_makes_a_second_open_wait_then_report_busy() {
     let a = Index::open(&f.path).unwrap();
     let b = Index::open(&f.path).unwrap();
     drop((a, b));
+}
+
+/// A busy database is `Busy`, not `Damaged` or `ForeignWal`, on every probe connection.
+#[test]
+fn a_busy_probe_is_reported_as_busy() {
+    use rusqlite::ffi;
+    for code in [ffi::SQLITE_BUSY, ffi::SQLITE_LOCKED] {
+        let e = rusqlite::Error::SqliteFailure(ffi::Error::new(code), None);
+        assert!(matches!(
+            crate::open::corruption_or("probe")(e),
+            IndexError::Busy { op: "probe" }
+        ));
+    }
+    let corrupt = rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_CORRUPT), None);
+    assert!(matches!(
+        crate::open::corruption_or("probe")(corrupt),
+        IndexError::Damaged
+    ));
 }

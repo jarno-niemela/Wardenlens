@@ -46,14 +46,18 @@ pub enum IndexError {
         found: u32,
     },
     /// A `-wal`, `-shm` or `-journal` sidecar is a symlink or not a regular file.
-    #[error("sidecar {suffix} is not a regular file")]
+    #[error(
+        "sidecar {suffix} is not a regular file; nothing was modified; move it out of the directory and keep it"
+    )]
     BadSidecar {
         /// The sidecar suffix.
         suffix: &'static str,
     },
     /// A sidecar is owned by another user or grants group or other access. SQLite would replay
     /// or roll back whatever it holds into the index, so it is never trusted.
-    #[error("sidecar {suffix} is not owned by the current user or is accessible to others")]
+    #[error(
+        "sidecar {suffix} is not owned by the current user or is accessible to others; nothing was modified; move it out of the directory and keep it (or fix its owner and mode if it is yours)"
+    )]
     InsecureSidecar {
         /// The sidecar suffix.
         suffix: &'static str,
@@ -73,17 +77,18 @@ pub enum IndexError {
     /// journal, so this is either left by an interrupted creation (the file is in rollback mode
     /// only before the first row exists) or not ours. Nothing was modified and nothing was
     /// replayed. Decision (ADR 0005 section 5): no private-copy identification of a creation
-    /// window; deleting the `-journal` is safe, because an index holding recordings data never
-    /// has one, and the empty file that is left is adopted again.
+    /// window; moving the `-journal` out is lossless, because an index holding recordings data
+    /// never has one, and the empty file that is left is adopted again.
     #[error(
         "unfinished -journal next to the index; nothing was modified; move the -journal file out of the directory and keep it (an index with data never has one, so nothing is lost)"
     )]
     PendingJournal,
-    /// The `-wal` next to the index has no valid header and is not a torn one (an all-zero or
-    /// short file is treated as empty): SQLite did not write it. Nothing was modified. It holds
-    /// no committed data of this index, so deleting it loses nothing.
+    /// The `-wal` next to the index has no valid header and is not a torn one (only a file that
+    /// is entirely zero, or a short prefix of a valid header, is treated as empty): SQLite did not
+    /// write it. Nothing was modified. It holds no committed data of this index; move it out of
+    /// the directory and keep it.
     #[error(
-        "the -wal file has no valid header; it holds no data of this index and can be deleted; nothing was modified"
+        "the -wal file has no valid header; it holds no data of this index; nothing was modified; move it out of the directory and keep it"
     )]
     InvalidWal,
     /// The `-wal` next to the index is not this index's: a wrong header, another page size, or
@@ -105,7 +110,9 @@ pub enum IndexError {
     )]
     Damaged,
     /// The file was written by a newer build.
-    #[error("index schema version {found} is newer than the supported {supported}")]
+    #[error(
+        "index schema version {found} is newer than the supported {supported}; nothing was modified; run a newer build, or restore a backup of an older index; do not delete the file"
+    )]
     SchemaTooNew {
         /// The `user_version` found.
         found: i64,

@@ -6,7 +6,9 @@
 //! refuses a string built at run time. Values only ever travel as bound parameters. The
 //! `hygiene` test also greps every production source file for a direct call.
 
-use rusqlite::{Connection, Params, Result, Row, Statement};
+use rusqlite::{Connection, Params, Result, Row, Statement, Transaction, TransactionBehavior};
+
+use crate::error::IndexError;
 
 // The column list of a full row is repeated in `GET` and `LIST` on purpose, in the order
 // `rows::decode_segment` reads it: a `concat!` would be one more way to build SQL.
@@ -49,6 +51,11 @@ pub(crate) const OBJECT_COUNT: &str = "SELECT count(*) FROM sqlite_master";
 /// Creation bootstrap: sets the `application_id` (must equal `open::APPLICATION_ID`; a test
 /// checks) and creates `index_meta` with the random instance id, in one transaction.
 pub(crate) const BOOTSTRAP: &str = include_str!("../migrations/000_bootstrap.sql");
+/// Run by [`write_tx`] at the end of every write transaction: it rewrites the page that holds the
+/// instance id, so every non-empty `-wal` this crate writes carries that page and a replayed
+/// foreign `-wal` always shows the foreign id.
+pub(crate) const BUMP_GENERATION: &str =
+    "UPDATE index_meta SET generation = generation + 1 WHERE id = 1";
 pub(crate) const INSTANCE_ID: &str = "SELECT instance_id FROM index_meta WHERE id = 1";
 pub(crate) const SET_WAL: &str = "PRAGMA journal_mode = WAL";
 pub(crate) const SET_SYNC: &str = "PRAGMA synchronous = FULL";
@@ -68,11 +75,10 @@ pub(crate) fn prepare<'c>(conn: &'c Connection, sql: &'static str) -> Result<Sta
     conn.prepare(sql)
 }
 
-pub(crate) fn execute<P: Params>(conn: &Connection, sql: &'static str, params: P) -> Result<usize> {
-    conn.execute(sql, params)
-}
-
-pub(crate) fn execute_batch(conn: &Connection, sql: &'static str) -> Result<()> {
+/// Runs a statement that is not index data: connection setup pragmas, the creation bootstrap
+/// (rollback mode, before any WAL exists) and the in-memory reference schema. It does **not**
+/// bump the generation. Data writes cannot use it: they need a [`WriteTx`].
+pub(crate) fn execute_unversioned(conn: &Connection, sql: &'static str) -> Result<()> {
     conn.execute_batch(sql)
 }
 
@@ -83,4 +89,60 @@ pub(crate) fn query_row<T, P: Params>(
     f: impl FnOnce(&Row<'_>) -> Result<T>,
 ) -> Result<T> {
     conn.query_row(sql, params, f)
+}
+
+/// A write transaction opened by [`write_tx`]. It is the only way to run a data-changing
+/// statement (`execute`, `execute_batch`): they take a `&WriteTx`, which only [`write_tx`] can
+/// make, so a new write method cannot skip the generation bump (SEC-10: one choke point, enforced
+/// by the type).
+pub(crate) struct WriteTx<'a> {
+    tx: &'a Transaction<'a>,
+}
+
+impl WriteTx<'_> {
+    /// For reads inside the transaction.
+    pub(crate) fn conn(&self) -> &Connection {
+        self.tx
+    }
+
+    pub(crate) fn execute<P: Params>(&self, sql: &'static str, params: P) -> Result<usize> {
+        self.tx.execute(sql, params)
+    }
+
+    pub(crate) fn execute_batch(&self, sql: &'static str) -> Result<()> {
+        self.tx.execute_batch(sql)
+    }
+}
+
+/// The one way to change the database after creation: `BEGIN IMMEDIATE`, `f`, the generation
+/// bump, `COMMIT`. `f` returning `Ok(None)` or an error rolls everything back (no bump, no
+/// frame). Every segment write and every migration step goes through here.
+pub(crate) fn write_tx_opt<T>(
+    conn: &mut Connection,
+    op: &'static str,
+    f: impl FnOnce(&WriteTx<'_>) -> std::result::Result<Option<T>, IndexError>,
+) -> std::result::Result<Option<T>, IndexError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(IndexError::sqlite(op))?;
+    let out = {
+        let w = WriteTx { tx: &tx };
+        let Some(out) = f(&w)? else {
+            return Ok(None);
+        };
+        w.execute(BUMP_GENERATION, [])
+            .map_err(IndexError::sqlite(op))?;
+        out
+    };
+    tx.commit().map_err(IndexError::sqlite(op))?;
+    Ok(Some(out))
+}
+
+/// [`write_tx_opt`] for a closure that always produces a value.
+pub(crate) fn write_tx<T>(
+    conn: &mut Connection,
+    op: &'static str,
+    f: impl FnOnce(&WriteTx<'_>) -> std::result::Result<T, IndexError>,
+) -> std::result::Result<T, IndexError> {
+    write_tx_opt(conn, op, |w| f(w).map(Some))?.ok_or(IndexError::Sqlite { op, code: None })
 }

@@ -2,7 +2,7 @@
 //! with `include_str!`. Each script ends with its own `PRAGMA user_version = <n>;`, so the version
 //! can never drift from the DDL, and the runner verifies that it did.
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 
 use crate::error::IndexError;
 use crate::sql;
@@ -46,29 +46,26 @@ pub(crate) fn check_not_newer(found: i64, migrations: &[Migration]) -> Result<()
     Ok(())
 }
 
-/// Runs every script above the stored version, one transaction (`BEGIN IMMEDIATE`) per script.
-/// The version is read again inside the transaction, so a competing process that migrated first
-/// is noticed. A failure rolls the failing step back and leaves earlier steps committed.
+/// Runs every script above the stored version, one write transaction (`BEGIN IMMEDIATE`, the
+/// script, the generation bump, `COMMIT`; see `sql::write_tx`) per script. The version is read
+/// again inside the transaction, so a competing process that migrated first is noticed. A failure
+/// rolls the failing step back and leaves earlier steps committed.
 pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), IndexError> {
     for m in migrations {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(IndexError::sqlite("begin migration"))?;
-        let stored = user_version(&tx)?;
-        check_not_newer(stored, migrations)?;
-        if stored >= m.version {
-            continue;
-        }
-        sql::execute_batch(&tx, m.sql).map_err(|e| IndexError::Migration {
-            version: m.version,
-            code: e.sqlite_error_code(),
-        })?;
-        if user_version(&tx)? != m.version {
-            return Err(IndexError::MigrationDidNotAdvance { version: m.version });
-        }
-        tx.commit().map_err(|e| IndexError::Migration {
-            version: m.version,
-            code: e.sqlite_error_code(),
+        sql::write_tx_opt(conn, "migrate", |w| {
+            let stored = user_version(w.conn())?;
+            check_not_newer(stored, migrations)?;
+            if stored >= m.version {
+                return Ok(None);
+            }
+            w.execute_batch(m.sql).map_err(|e| IndexError::Migration {
+                version: m.version,
+                code: e.sqlite_error_code(),
+            })?;
+            if user_version(w.conn())? != m.version {
+                return Err(IndexError::MigrationDidNotAdvance { version: m.version });
+            }
+            Ok(Some(()))
         })?;
     }
     Ok(())
@@ -95,9 +92,10 @@ pub(crate) fn reference_schema(
     version: i64,
 ) -> Result<Vec<SchemaRow>, IndexError> {
     let conn = Connection::open_in_memory().map_err(IndexError::sqlite("reference schema"))?;
-    sql::execute_batch(&conn, sql::BOOTSTRAP).map_err(IndexError::sqlite("reference schema"))?;
+    sql::execute_unversioned(&conn, sql::BOOTSTRAP)
+        .map_err(IndexError::sqlite("reference schema"))?;
     for m in migrations.iter().filter(|m| m.version <= version) {
-        sql::execute_batch(&conn, m.sql).map_err(|e| IndexError::Migration {
+        sql::execute_unversioned(&conn, m.sql).map_err(|e| IndexError::Migration {
             version: m.version,
             code: e.sqlite_error_code(),
         })?;

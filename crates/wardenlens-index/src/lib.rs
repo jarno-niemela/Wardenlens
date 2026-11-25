@@ -26,7 +26,7 @@ use std::fmt;
 use std::path::Path;
 
 use rusqlite::Connection;
-use wardenlens_fsutil::PrivateFile;
+use wardenlens_fsutil::{FileLock, PrivateFile};
 
 pub use error::{CursorFault, IndexError};
 pub use open::BUSY_TIMEOUT;
@@ -34,7 +34,11 @@ pub use open::BUSY_TIMEOUT;
 /// An open index. Holds the connection and, until it is dropped, the descriptor whose identity
 /// was checked at open (so the inode cannot be recycled under the comparison).
 pub struct Index {
+    // Field order is the drop order: the connection closes first, then the descriptors. Closing
+    // any descriptor of the main file drops the process's POSIX locks on it, including SQLite's
+    // WAL shared lock, so none of them may close while the connection is live.
     conn: Connection,
+    _lock: FileLock,
     _file: PrivateFile,
 }
 
@@ -102,6 +106,7 @@ impl Index {
         let opened = open::open(path, migrations, between, lock_wait)?;
         Ok(Self {
             conn: opened.conn,
+            _lock: opened.lock,
             _file: opened.file,
         })
     }

@@ -67,27 +67,22 @@ impl SegmentIndex for Index {
             .ok()
             .filter(|f| *f > 0)
             .ok_or(invalid("frame_count"))?;
-        sql::execute(
-            &self.conn,
-            sql::INSERT,
-            params![
-                record.camera.as_str(),
-                started,
-                duration,
-                ended,
-                bytes,
-                frames,
-                tier_code(tier)?
-            ],
-        )
-        .map_err(map_insert)?;
-        let raw = self.conn.last_insert_rowid();
-        u64::try_from(raw)
-            .map(SegmentId::new)
-            .map_err(|_| IndexError::CorruptRow {
-                id: raw,
-                field: "id",
-            })
+        let code = tier_code(tier)?;
+        let camera = record.camera.as_str();
+        sql::write_tx(&mut self.conn, "insert", |w| {
+            w.execute(
+                sql::INSERT,
+                params![camera, started, duration, ended, bytes, frames, code],
+            )
+            .map_err(map_insert)?;
+            let raw = w.conn().last_insert_rowid();
+            u64::try_from(raw)
+                .map(SegmentId::new)
+                .map_err(|_| IndexError::CorruptRow {
+                    id: raw,
+                    field: "id",
+                })
+        })
     }
 
     fn get(&self, id: SegmentId) -> Result<Option<IndexedSegment>, IndexError> {
@@ -161,35 +156,39 @@ impl SegmentIndex for Index {
         let Some(raw) = raw_id(id) else {
             return Err(IndexError::NotFound(id.as_u64()));
         };
-        let changed = sql::execute(
-            &self.conn,
-            sql::SET_TIER,
-            params![raw, tier_code(tier)?, tier_code(other_tier(tier)?)?],
-        )
-        .map_err(IndexError::sqlite("set tier"))?;
-        if changed == 1 {
-            return Ok(());
-        }
-        let mut stmt =
-            sql::prepare(&self.conn, sql::TIER_OF).map_err(IndexError::sqlite("set tier"))?;
-        let mut rows = stmt.query([raw]).map_err(IndexError::sqlite("set tier"))?;
-        match rows.next().map_err(IndexError::sqlite("set tier"))? {
-            None => Err(IndexError::NotFound(id.as_u64())),
-            Some(_) => Err(IndexError::AlreadyOnTier(id.as_u64())),
-        }
+        let (new_code, old_code) = (tier_code(tier)?, tier_code(other_tier(tier)?)?);
+        sql::write_tx(&mut self.conn, "set tier", |w| {
+            let changed = w
+                .execute(sql::SET_TIER, params![raw, new_code, old_code])
+                .map_err(IndexError::sqlite("set tier"))?;
+            if changed == 1 {
+                return Ok(());
+            }
+            // Nothing changed: say why. The error rolls the transaction back (no bump).
+            let mut stmt =
+                sql::prepare(w.conn(), sql::TIER_OF).map_err(IndexError::sqlite("set tier"))?;
+            let mut rows = stmt.query([raw]).map_err(IndexError::sqlite("set tier"))?;
+            match rows.next().map_err(IndexError::sqlite("set tier"))? {
+                None => Err(IndexError::NotFound(id.as_u64())),
+                Some(_) => Err(IndexError::AlreadyOnTier(id.as_u64())),
+            }
+        })
     }
 
     fn delete(&mut self, id: SegmentId) -> Result<(), IndexError> {
         let Some(raw) = raw_id(id) else {
             return Err(IndexError::NotFound(id.as_u64()));
         };
-        let changed =
-            sql::execute(&self.conn, sql::DELETE, [raw]).map_err(IndexError::sqlite("delete"))?;
-        if changed == 1 {
-            Ok(())
-        } else {
-            Err(IndexError::NotFound(id.as_u64()))
-        }
+        sql::write_tx(&mut self.conn, "delete", |w| {
+            let changed = w
+                .execute(sql::DELETE, [raw])
+                .map_err(IndexError::sqlite("delete"))?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(IndexError::NotFound(id.as_u64()))
+            }
+        })
     }
 
     fn oldest(

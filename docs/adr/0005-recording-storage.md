@@ -296,28 +296,46 @@ identity and every sidecar are proven by means no sidecar can influence**:
   first connection rebuilds from the `-wal`). **A probe-created `-shm` is removed only when the probe refuses** (so the
   directory is byte-identical) and **never after success**, because the read-write open uses it; an `-shm` that existed
   before the probe is never removed. **Concurrent openers are excluded by an exclusive `flock` on the verified main-file
-  descriptor**, taken right after `open_private_file` and held until the read-write open, pragmas and migrations are
-  done (waiting up to the busy timeout, then `Busy`). `flock` belongs to the open file description and is independent of
-  SQLite's own POSIX locks on that file on Linux: it never blocks SQLite and SQLite never blocks it, so it serialises only
-  openers that take it. That is why removing a `-shm` we created is safe: no other `Index::open` can be attached to it, and a
-  live writer's `-shm` always pre-exists the probe. **Requirement (for #68):** every process opens the index through
+  descriptor**, taken right after `open_private_file` and held until the read-write open, pragmas and migrations are done
+  (waiting up to the busy timeout, then `Busy`); it is then unlocked, **but the lock descriptor and the verified descriptor
+  stay open for the whole life of the `Index` and are closed in `Drop` after the connection**. `flock` belongs to the open
+  file description and is independent of SQLite's own POSIX locks on that file on Linux: it never blocks SQLite and SQLite
+  never blocks it, so it serialises only openers that take it. The converse matters more: POSIX record locks belong to the
+  process, and closing *any* descriptor of an inode drops every POSIX lock the process holds on it, including SQLite's WAL
+  shared lock (fcntl(2)); closing one of our own descriptors while a connection is live would tell another process's closing
+  connection that it is the last one, so it would checkpoint and delete the `-wal` under us (round 4 found this).
+  Residual: a second `Index` on the same file **in the same process** closes its own descriptors when it is dropped, which
+  drops the first one's locks; use one `Index` per file per process (share it behind a lock), or open a second one only for
+  a file no other `Index` of the process has open (follow-up). That is why removing a `-shm` we created is safe: no other
+  `Index::open` can be attached to it, and a live writer's `-shm` always pre-exists the probe. **Requirement (for #68):** every process opens the index through
   `Index::open`, or holds the service's process lock (`wardenlens.lock`) across it; an `sqlite3` shell or another program
   opening the file concurrently is outside this guarantee. A reader open while a writer is live is a design item for #68, not
   handled here;
-- **the instance id** ties a `-wal` to its main file. At creation, in rollback mode and in one transaction before WAL is
-  switched on, a bootstrap script (not a numbered migration; `migrations/000_bootstrap.sql`) sets the `application_id` and
-  creates the single-row table `index_meta (id = 1, instance_id BLOB(16))` with `randomblob(16)`, which SQLite seeds from
-  the operating system; the id is for uniqueness, not a secret. The main file therefore holds the id from its first
-  page, so a deployment whose first checkpoint has not happened yet (the main file is a sound version-0 index and the `-wal`
-  holds the migration and every row) still opens. A `-wal` whose replay changes the id, or either side lacks it, is
-  `ForeignWal`: a `-wal` of another index with the same schema and a clean integrity check is refused. The reference schema
-  is the bootstrap plus the migrations up to the stored version, compared exactly;
+- **the instance id and the generation** tie a `-wal` to its main file. At creation, in rollback mode and in one
+  transaction before WAL is switched on, a bootstrap script (not a numbered migration; `migrations/000_bootstrap.sql`)
+  sets the `application_id` and creates the single-row table `index_meta (id = 1, instance_id BLOB(16), generation)` with
+  `randomblob(16)`, which SQLite seeds from the operating system; the id is for uniqueness, not a secret. The table is
+  created first, so it sits on page 2, which a commit would not otherwise touch again. **Invariant: every non-empty `-wal`
+  this crate writes carries a frame of that page.** It holds because every write transaction (each migration step,
+  `insert`, `set_tier`, `delete`, and any future write) goes through one choke point, `sql::write_tx`, which runs
+  `UPDATE index_meta SET generation = generation + 1` before `COMMIT`; the statements that change data take a `WriteTx`
+  that only `write_tx` can create, so a new write method cannot skip the bump (the compiler enforces it; a hygiene test
+  checks that unversioned statements are used only by the open sequence). A replayed view of a foreign index's `-wal`
+  therefore shows the foreign instance id, and is `ForeignWal`. The main file also holds the id from its first page, so a
+  deployment whose first checkpoint has not happened yet (the main file is a sound version-0 index and the `-wal` holds the
+  migration and every row) still opens. **A main file torn by a crash in the middle of a checkpoint** (a page half new) may
+  have no readable id; then the replayed view decides, and the main file's id is used only if it can be read. `ForeignWal` is
+  reported only when both ids are readable and differ; any other failure to read the main file (I/O, busy) is the real error.
+  Residual: a torn main page plus a foreign `-wal` that has our header cannot be told apart; and a `-wal` written by a
+  program that does not bump the generation (not this crate) is not covered. Both need the privileges to edit the index.
+  The reference schema is the bootstrap plus the migrations up to the stored version, compared exactly;
 - rules by sidecar: a `-journal` is refused in every state, because an index in WAL mode never writes one and a
   rollback-mode index exists only during creation, before any row (a non-empty one is `PendingJournal`, an empty one
   `StraySidecar`; the message says to move it out and keep it, and nothing is lost because an index with data never has one;
-  the creation window is not identified on a private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; only an all-zero `-wal`, or a short one that is a prefix of a WAL magic (what a crash before its
-  first frame leaves), is an empty WAL, as for SQLite; any other short or non-magic `-wal` is `InvalidWal` (holds nothing of
-  this index, never opened read-write, so never deleted or rewritten); a `-wal` with another page size, or one whose replay is not an index of ours
+  the creation window is not identified on a private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; only a `-wal` that is **entirely zero** (checked over the whole file, up to 256 MiB), or one shorter than a header that
+  is a prefix of magic + format version (+ page size), is an empty WAL, as for SQLite (what a crash before its first frame
+  leaves); any other short, non-magic or zero-header-with-a-body `-wal` is `InvalidWal` (holds nothing of this index, never
+  opened read-write, so never deleted or rewritten; the message says to move it out and keep it); a `-wal` with another page size, or one whose replay is not an index of ours
   (wrong `application_id`, schema or integrity), is `ForeignWal`. Every refusal message names a lossless remedy (move the
   file out of the directory and keep it). A `-wal` copied from this very index (same instance id) by the same user is accepted when
   it replays consistently; a stale `-wal` of an older state of this same index is indistinguishable and needs the
