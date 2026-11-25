@@ -75,6 +75,32 @@ fn create_makes_a_private_file_and_no_sidecars() {
     assert_eq!(names, ["k1", "vault.db"]);
 }
 
+/// SEC-2 (#145): a probe that crashed left a copy of the vault in a scratch directory; the next
+/// open removes it, but not a live process's directory.
+#[test]
+fn open_sweeps_the_scratch_directory_of_a_dead_process_only() {
+    let (d, v) = fresh();
+    drop(v);
+    let stale = d
+        .path()
+        .join(format!(".wardenlens-probe-{}-1-0", i32::MAX - 1));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("copy"), b"secret").unwrap();
+    let live = d
+        .path()
+        .join(format!(".wardenlens-probe-{}-1-0", std::process::id()));
+    std::fs::create_dir(&live).unwrap();
+    drop(Vault::open(&db(&d), same_key(d.path(), "k1")).unwrap());
+    assert!(
+        !stale.exists(),
+        "the dead process's scratch directory stayed"
+    );
+    assert!(
+        live.exists(),
+        "a live process's scratch directory was removed"
+    );
+}
+
 #[test]
 fn open_round_trips_entries() {
     let (d, mut v) = fresh();

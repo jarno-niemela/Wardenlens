@@ -99,7 +99,7 @@ pub enum IndexError {
     /// modified. Move it and its `-shm` out of the directory and keep them until you know whose they
     /// are; nothing is lost.
     #[error(
-        "the -wal file does not belong to this index; nothing was modified; move it and its -shm out of the directory and keep them until you know whose they are"
+        "the -wal file does not belong to this index, or replaying it gives a damaged database; nothing was modified; move it and its -shm out of the directory and keep them until you know whose they are"
     )]
     ForeignWal,
     /// The schema (every `sqlite_master` row) is not the one of its `user_version`.

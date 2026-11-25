@@ -377,7 +377,9 @@ fn probe_immutable(
 /// - **a read-only pager** (`SQLITE_OPEN_READ_ONLY`): no write transaction can begin, so no frame
 ///   is appended to the `-wal` and no page is written to the main file;
 /// - our own main-file descriptor is `O_RDONLY` (checked by fsutil's tests), and the connection
-///   opens the main file read-only.
+///   opens the main file read-only;
+/// - **no explicit checkpoint**: the probe only runs the read statements of [`judge_view`], which
+///   the read wrappers of `sql.rs` refuse to widen to a write.
 ///
 /// (`SQLITE_READONLY` from a checkpoint is *not* a guard here: the `-wal` itself is opened
 /// read-write by SQLite.) The connection does create or update the `-shm`.
@@ -462,6 +464,10 @@ fn wal_verdict(
             Some(id) if id != view_id => Err(IndexError::ForeignWal),
             _ => Ok(()),
         },
+        // `Damaged` stays here on purpose (#145 asked to map it to `Damaged`; two committed
+        // tests pin `ForeignWal` for a replay that fails its integrity check: a foreign `-wal`
+        // with stale frames replays into a corrupt database, and `DamagedBtree` in
+        // `schema_tests`; a decision for the controller). The `ForeignWal` message says so.
         Err(
             IndexError::WrongApplicationId { .. }
             | IndexError::UnexpectedSchema
@@ -478,25 +484,16 @@ fn wal_verdict(
 
 /// True if a failed read of the main file alone means "this file cannot say" (damaged, torn,
 /// schema unreadable), as opposed to a real error (I/O, busy, permissions) that must be reported.
-fn main_unreadable(e: &IndexError) -> bool {
-    use rusqlite::ErrorCode::{
-        CannotOpen, DiskFull, NoLargeFileSupport, OutOfMemory, PermissionDenied, ReadOnly,
-        SystemIoFailure,
-    };
+/// A **pass-list**: only what is named here counts as unreadable, so a new error kind is reported,
+/// never silently treated as "the replayed view decides" (table-tested over every SQLite code).
+/// `code: None` is a failure that is not SQLite's: a missing `index_meta` row.
+pub(crate) fn main_unreadable(e: &IndexError) -> bool {
+    use rusqlite::ErrorCode::{DatabaseCorrupt, NotADatabase, Unknown};
     match e {
         IndexError::Damaged | IndexError::UnexpectedSchema => true,
-        IndexError::Sqlite { code, .. } => !matches!(
-            code,
-            Some(
-                SystemIoFailure
-                    | CannotOpen
-                    | DiskFull
-                    | OutOfMemory
-                    | PermissionDenied
-                    | ReadOnly
-                    | NoLargeFileSupport
-            )
-        ),
+        IndexError::Sqlite { code, .. } => {
+            matches!(code, None | Some(DatabaseCorrupt | NotADatabase | Unknown))
+        }
         _ => false,
     }
 }

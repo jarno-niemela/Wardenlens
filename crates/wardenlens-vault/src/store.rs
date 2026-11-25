@@ -181,6 +181,9 @@ fn connect(
     let parent = parent_of(path)?;
     refuse_work_tree(parent)?;
     check_parent(parent)?;
+    // SEC-2: a probe that crashed left a copy of the vault in a scratch directory; remove the
+    // ones of dead processes (best effort).
+    let _ = Scratch::sweep_stale(parent);
     if must_exist {
         match path.symlink_metadata() {
             Ok(_) => {}

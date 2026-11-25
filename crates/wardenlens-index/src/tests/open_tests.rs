@@ -590,3 +590,71 @@ mod wal_header {
         assert!(matches!(judge(&wal), Err(IndexError::ForeignWal)));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// main_unreadable is a pass-list (#145)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn main_unreadable_passes_only_what_says_the_file_cannot_answer() {
+    use crate::open::main_unreadable;
+    use rusqlite::ErrorCode::{self, *};
+    // Every SQLite code, with the expected answer; a code that is not listed here is a real
+    // error (`ErrorCode` is non-exhaustive, so the list is checked by hand against rusqlite).
+    let all: [ErrorCode; 24] = [
+        InternalMalfunction,
+        PermissionDenied,
+        OperationAborted,
+        DatabaseBusy,
+        DatabaseLocked,
+        OutOfMemory,
+        ReadOnly,
+        OperationInterrupted,
+        SystemIoFailure,
+        DatabaseCorrupt,
+        NotFound,
+        DiskFull,
+        CannotOpen,
+        FileLockingProtocolFailed,
+        SchemaChanged,
+        TooBig,
+        ConstraintViolation,
+        TypeMismatch,
+        ApiMisuse,
+        NoLargeFileSupport,
+        AuthorizationForStatementDenied,
+        ParameterOutOfRange,
+        NotADatabase,
+        Unknown,
+    ];
+    for code in all {
+        let want = matches!(code, DatabaseCorrupt | NotADatabase | Unknown);
+        let e = IndexError::Sqlite {
+            op: "t",
+            code: Some(code),
+        };
+        assert_eq!(main_unreadable(&e), want, "{code:?}");
+    }
+    // Errors that are not SQLite codes.
+    assert!(main_unreadable(&IndexError::Damaged));
+    assert!(main_unreadable(&IndexError::UnexpectedSchema));
+    assert!(main_unreadable(&IndexError::Sqlite {
+        op: "t",
+        code: None
+    }));
+    for real in [
+        IndexError::Busy { op: "t" },
+        IndexError::Io {
+            op: "t",
+            kind: std::io::ErrorKind::Other,
+        },
+        IndexError::ForeignWal,
+        IndexError::InvalidWal,
+        IndexError::NotAnIndex,
+        IndexError::PendingJournal,
+        IndexError::NotReadOnly { op: "t" },
+        IndexError::Constraint { op: "t" },
+    ] {
+        assert!(!main_unreadable(&real), "{real:?}");
+    }
+}
