@@ -72,6 +72,8 @@ pub struct VolumeStat {
     pub block_size: u64,
     /// Total blocks.
     pub blocks: u64,
+    /// Free blocks, including those reserved for root (`f_bfree`).
+    pub blocks_free: u64,
     /// Blocks available to unprivileged users.
     pub blocks_available: u64,
     /// The volume is mounted read-only (`ST_RDONLY`).
@@ -85,6 +87,16 @@ pub struct ReadFile {
     pub file: File,
     /// Its length in bytes.
     pub len: u64,
+}
+
+/// One entry of a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DirEntry {
+    /// The entry name (a single component; names that are not UTF-8 are skipped by [`RootDir::list`]).
+    pub name: String,
+    /// The kind reported by the directory entry (`Other` when the filesystem does not say).
+    pub kind: FileKind,
 }
 
 /// An owned directory descriptor. Children are opened with `openat2`
@@ -234,6 +246,66 @@ impl RootDir {
         })
     }
 
+    /// Create the regular file `name` (mode `0600`) in this directory with `O_CREAT | O_EXCL |
+    /// O_NOFOLLOW`, for writing. An existing entry of any kind (a symlink included) is `EEXIST`.
+    ///
+    /// # Errors
+    /// Invalid component, or the `openat` failure.
+    pub fn create_new(&self, name: &str) -> Result<File, FsError> {
+        let fd = openat(
+            &self.fd,
+            component(name)?,
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NOCTTY
+                | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(FsError::io("create file"))?;
+        Ok(File::from(fd))
+    }
+
+    /// List this directory: at most `max` entries (`.` and `..` excluded); names that are not
+    /// UTF-8 or not a valid single component are skipped.
+    ///
+    /// # Errors
+    /// The directory cannot be read, or it holds more than `max` entries ([`FsError::TooManyEntries`]).
+    pub fn list(&self, max: usize) -> Result<Vec<DirEntry>, FsError> {
+        let mut dir = rustix::fs::Dir::read_from(&self.fd).map_err(FsError::io("read dir"))?;
+        let mut out = Vec::new();
+        let mut seen: usize = 0;
+        while let Some(entry) = dir.read() {
+            let entry = entry.map_err(FsError::io("read dir"))?;
+            let raw = entry.file_name().to_bytes();
+            if raw == b"." || raw == b".." {
+                continue;
+            }
+            seen = seen.saturating_add(1);
+            if seen > max {
+                return Err(FsError::TooManyEntries);
+            }
+            let Ok(name) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            if component(name).is_err() {
+                continue;
+            }
+            let kind = match entry.file_type() {
+                FileType::RegularFile => FileKind::Regular,
+                FileType::Directory => FileKind::Directory,
+                FileType::Symlink => FileKind::Symlink,
+                _ => FileKind::Other,
+            };
+            out.push(DirEntry {
+                name: name.to_owned(),
+                kind,
+            });
+        }
+        Ok(out)
+    }
+
     /// Check that the entry named by `comps` is a regular file, without opening it for reading:
     /// an `O_PATH` descriptor needs no read permission, does not update `atime` and does not
     /// run a device's open routine. Symlinks anywhere are refused by the kernel.
@@ -317,6 +389,7 @@ impl RootDir {
         Ok(VolumeStat {
             block_size: v.f_frsize,
             blocks: v.f_blocks,
+            blocks_free: v.f_bfree,
             blocks_available: v.f_bavail,
             read_only: v.f_flag.contains(StatVfsMountFlags::RDONLY),
         })
@@ -550,5 +623,64 @@ mod tests {
             root.ensure_regular(&["dir"]),
             Err(FsError::NotRegular)
         ));
+    }
+
+    #[test]
+    fn create_new_is_exclusive_private_and_refuses_symlinks() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let (d, root) = setup();
+        let mut f = root.create_new("f.part").unwrap();
+        f.write_all(b"x").unwrap();
+        let mode = std::fs::metadata(d.path().join("f.part"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "never group or other access, whatever the umask"
+        );
+        assert_eq!(
+            root.create_new("f.part").unwrap_err().errno(),
+            Some(rustix::io::Errno::EXIST)
+        );
+        symlink(d.path().join("elsewhere"), d.path().join("dangling")).unwrap();
+        assert_eq!(
+            root.create_new("dangling").unwrap_err().errno(),
+            Some(rustix::io::Errno::EXIST),
+            "O_EXCL refuses a dangling symlink and does not create its target"
+        );
+        assert!(!d.path().join("elsewhere").exists());
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(matches!(
+                root.create_new(bad),
+                Err(FsError::InvalidComponent)
+            ));
+        }
+    }
+
+    #[test]
+    fn list_reports_names_and_kinds_and_enforces_the_bound() {
+        let (d, root) = setup();
+        std::fs::write(d.path().join("a"), b"x").unwrap();
+        std::fs::create_dir(d.path().join("b")).unwrap();
+        symlink(d.path().join("a"), d.path().join("c")).unwrap();
+        let mut got = root.list(10).unwrap();
+        got.sort_by(|x, y| x.name.cmp(&y.name));
+        let kinds: Vec<_> = got.iter().map(|e| (e.name.as_str(), e.kind)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("a", FileKind::Regular),
+                ("b", FileKind::Directory),
+                ("c", FileKind::Symlink)
+            ]
+        );
+        assert_eq!(
+            root.list(2).unwrap_err().to_string(),
+            FsError::TooManyEntries.to_string()
+        );
+        assert_eq!(root.list(3).unwrap().len(), 3);
     }
 }
