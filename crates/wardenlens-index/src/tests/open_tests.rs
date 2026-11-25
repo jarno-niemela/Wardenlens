@@ -33,9 +33,9 @@ fn fresh_open_sets_and_verifies_every_pragma() {
     assert_eq!(pragma_i64(c, "busy_timeout"), 5000);
     assert_eq!(pragma_i64(c, "journal_size_limit"), 67_108_864);
     // The pragma statements in sql.rs carry these literal values.
-    assert_eq!(
-        crate::sql::SET_APP_ID,
-        format!("PRAGMA application_id = {APPLICATION_ID}")
+    assert!(
+        crate::sql::BOOTSTRAP.contains(&format!("PRAGMA application_id = {APPLICATION_ID};")),
+        "the bootstrap sets the application id of open.rs"
     );
     assert_eq!(
         crate::sql::SET_JOURNAL_LIMIT,
@@ -438,4 +438,37 @@ fn empty_regular_file_owned_by_us_is_adopted() {
     let f = fixture();
     write_private(&f.path, b"");
     let _ = Index::open(&f.path).unwrap();
+}
+
+/// A crash before the first checkpoint: the main file holds only the creation bootstrap (version
+/// 0) and the `-wal` holds the migration and every row. This is what a new deployment looks like
+/// for hours, so it must open with every row.
+#[test]
+fn a_crash_before_the_first_checkpoint_opens_with_every_row() {
+    let live = private_tempdir();
+    let lp = live.path().join("index.db");
+    let mut idx = Index::open(&lp).unwrap();
+    for k in 0..5 {
+        idx.insert(&rec("cam1", BASE + k * 10_000, 1000, 10, 1), Tier::Hot)
+            .unwrap();
+    }
+    let crash = private_tempdir();
+    let cp = crash.path().join("index.db");
+    for s in ["", "-wal"] {
+        let (mut a, mut b) = (lp.as_os_str().to_owned(), cp.as_os_str().to_owned());
+        a.push(s);
+        b.push(s);
+        std::fs::copy(&a, &b).unwrap();
+        chmod(std::path::Path::new(&b), 0o600);
+    }
+    drop(idx);
+    // Sanity of the setup: the crash image has a non-empty -wal and a main file of one page set.
+    assert!(
+        std::fs::metadata(format!("{}-wal", cp.display()))
+            .unwrap()
+            .len()
+            > 32
+    );
+    let idx = Index::open(&cp).unwrap();
+    assert_eq!(idx.bytes_by_tier().unwrap().hot.segments, 5);
 }

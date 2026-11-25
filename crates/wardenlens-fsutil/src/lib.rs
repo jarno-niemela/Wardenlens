@@ -17,7 +17,7 @@ mod quarantine;
 mod root;
 
 pub use error::FsError;
-pub use private_file::{FileIdentity, PrivateFile, open_private_file, path_identity};
+pub use private_file::{FileIdentity, FileLock, PrivateFile, open_private_file, path_identity};
 pub use probe::{
     MAX_COPY_LEN, Scratch, check_parent, copy_bounded, immutable_uri, open_sidecar, sidecar_len,
 };

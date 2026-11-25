@@ -280,26 +280,48 @@ identity and every sidecar are proven by means no sidecar can influence**:
   memory by running the compiled-in migrations up to that version (so it cannot drift from them, and it applies at version 0
   too), then `PRAGMA integrity_check` (not `quick_check`: only it compares each index with its table, which catches a `-wal`
   from a diverged copy of the same index). It reads the whole file once at start-up, a few seconds per hundred megabytes;
-- with no usable `-wal` that read is an `immutable=1` open. **With a valid non-empty `-wal` it is a `SQLITE_OPEN_READ_ONLY`
-  (not immutable) connection on the real files, with `NO_CKPT_ON_CLOSE`: no copy of the main file.** Decision record,
-  options in the order evaluated: (a) the read-only connection, chosen; (b) validating the `-wal` frames in Rust and (c)
-  copying the `-wal` plus selected main pages were not needed. Round 2 copied the main file into a scratch directory, capped
-  at 256 MiB, so an index above about 2.7 million rows could never recover from a crash and `serve` (#68) refused to start.
-  A read-only SQLite connection never writes the main file or the `-wal` (a read-only pager has no write transaction; a
-  checkpoint on a read-only WAL connection returns `SQLITE_READONLY`), which `the_wal_probe_writes_neither_main_nor_wal_nor_a_new_shm`
-  and every byte-identical refusal row check. It does create or update the `-shm` (the wal-index, rebuilt from the `-wal` by
-  every first connection after a crash): a `-shm` that did not exist is removed again after the probe, and an existing one
-  may be rewritten, so the refusal guarantee covers the main file and the `-wal`. A reader open while a writer is live
-  (another process holding the `-shm`) is a design item for #68, not handled here;
+- with no usable `-wal` that read is an `immutable=1` open. **With a valid non-empty `-wal`**: (1) the main file alone
+  (`immutable=1`, `-wal` ignored) is judged as above and its instance id read, so a damaged or foreign main file is reported
+  as itself and never blamed on the `-wal`; (2) the real files are opened with `SQLITE_OPEN_READ_ONLY` and
+  `NO_CKPT_ON_CLOSE`, so SQLite replays the `-wal` into its in-memory view, which is judged the same way; (3) **the view's
+  instance id must equal the main file's** (see below), else `ForeignWal`. No copy of the main file is made. Decision
+  record, options in the order evaluated: (a) the read-only connection, chosen; (b) validating the `-wal` frames in Rust and
+  (c) copying the `-wal` plus selected main pages were not needed. Round 2 copied the main file into a scratch directory,
+  capped at 256 MiB, so an index above about 2.7 million rows could never recover from a crash and `serve` (#68) refused to
+  start. The probe cannot write the main file or the `-wal` because of three guards, each pinned by a test
+  (`probe_connection_is_read_only_and_never_checkpoints`): `NO_CKPT_ON_CLOSE` (no checkpoint, which is the only thing that
+  writes the main file from the `-wal`, and no `-wal` delete on close), the read-only pager (`is_readonly(MAIN_DB)`; no write
+  transaction can begin, so no frame is appended) and our `O_RDONLY` main descriptor. (`SQLITE_READONLY` from a checkpoint is
+  not a guard: SQLite opens the `-wal` itself read-write.) The probe does create or update the `-shm` (the wal-index every
+  first connection rebuilds from the `-wal`). **A probe-created `-shm` is removed only when the probe refuses** (so the
+  directory is byte-identical) and **never after success**, because the read-write open uses it; an `-shm` that existed
+  before the probe is never removed. **Concurrent openers are excluded by an exclusive `flock` on the verified main-file
+  descriptor**, taken right after `open_private_file` and held until the read-write open, pragmas and migrations are
+  done (waiting up to the busy timeout, then `Busy`). `flock` belongs to the open file description and is independent of
+  SQLite's own POSIX locks on that file on Linux: it never blocks SQLite and SQLite never blocks it, so it serialises only
+  openers that take it. That is why removing a `-shm` we created is safe: no other `Index::open` can be attached to it, and a
+  live writer's `-shm` always pre-exists the probe. **Requirement (for #68):** every process opens the index through
+  `Index::open`, or holds the service's process lock (`wardenlens.lock`) across it; an `sqlite3` shell or another program
+  opening the file concurrently is outside this guarantee. A reader open while a writer is live is a design item for #68, not
+  handled here;
+- **the instance id** ties a `-wal` to its main file. At creation, in rollback mode and in one transaction before WAL is
+  switched on, a bootstrap script (not a numbered migration; `migrations/000_bootstrap.sql`) sets the `application_id` and
+  creates the single-row table `index_meta (id = 1, instance_id BLOB(16))` with `randomblob(16)`, which SQLite seeds from
+  the operating system; the id is for uniqueness, not a secret. The main file therefore holds the id from its first
+  page, so a deployment whose first checkpoint has not happened yet (the main file is a sound version-0 index and the `-wal`
+  holds the migration and every row) still opens. A `-wal` whose replay changes the id, or either side lacks it, is
+  `ForeignWal`: a `-wal` of another index with the same schema and a clean integrity check is refused. The reference schema
+  is the bootstrap plus the migrations up to the stored version, compared exactly;
 - rules by sidecar: a `-journal` is refused in every state, because an index in WAL mode never writes one and a
   rollback-mode index exists only during creation, before any row (a non-empty one is `PendingJournal`, an empty one
-  `StraySidecar`; deleting it is safe and the index is recreated or adopted again; the creation window is not identified on a
-  private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; a `-wal` shorter than a header or all
-  zeros (what a crash before its first frame leaves) is an empty WAL, as for SQLite; a `-wal` without a WAL magic is
-  `InvalidWal` (holds nothing of this index); a `-wal` with another page size, or one whose replay is not an index of ours
+  `StraySidecar`; the message says to move it out and keep it, and nothing is lost because an index with data never has one;
+  the creation window is not identified on a private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; only an all-zero `-wal`, or a short one that is a prefix of a WAL magic (what a crash before its
+  first frame leaves), is an empty WAL, as for SQLite; any other short or non-magic `-wal` is `InvalidWal` (holds nothing of
+  this index, never opened read-write, so never deleted or rewritten); a `-wal` with another page size, or one whose replay is not an index of ours
   (wrong `application_id`, schema or integrity), is `ForeignWal`. Every refusal message names a lossless remedy (move the
-  file out of the directory and keep it). A `-wal` copied from another copy of this index by the same user is accepted when
-  it replays consistently: that needs the privileges to edit the index itself.
+  file out of the directory and keep it). A `-wal` copied from this very index (same instance id) by the same user is accepted when
+  it replays consistently; a stale `-wal` of an older state of this same index is indistinguishable and needs the
+  privileges to edit the index itself.
 
 **Migration scheme: `PRAGMA user_version`, migrations written in-house** as an ordered array of SQL scripts compiled in
 with `include_str!`. `Index::open` runs, under `BEGIN IMMEDIATE`, every script with a number above the stored

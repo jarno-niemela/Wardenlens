@@ -56,18 +56,31 @@ impl Index {
     /// Opens the index at `path`, creating it (mode `0600`) when the file is missing or empty,
     /// and migrates it to the schema of this build.
     ///
+    /// Concurrent openers are serialised by an exclusive `flock` on the verified file descriptor
+    /// (waiting up to [`BUSY_TIMEOUT`]); every process must open through this function, or hold the
+    /// service's process lock around it (ADR 0005 section 5, #68).
+    ///
     /// # Errors
-    /// - [`IndexError::Fs`]: a symlink, a directory, a FIFO, a wrong owner or mode, a missing
-    ///   parent directory, or a path that changed while it was opened.
-    /// - [`IndexError::NotAnIndex`], [`IndexError::WrongApplicationId`],
-    ///   [`IndexError::BadSidecar`], [`IndexError::StraySidecar`], [`IndexError::PendingJournal`]:
-    ///   the file is not an index of ours; it was not modified.
-    /// - [`IndexError::SchemaTooNew`] and [`IndexError::InvalidSchemaVersion`]: the stored
-    ///   version; the file was not modified.
+    /// Every variant of [`IndexError`] that `open` can return:
+    /// - [`IndexError::Fs`]: a symlink, a directory, a FIFO, a wrong owner or mode, a parent
+    ///   directory that is not ours or is group- or world-writable, a missing parent, or a path
+    ///   that changed while it was opened.
+    /// - [`IndexError::Io`]: a file-system call on the file or a sidecar failed.
+    /// - [`IndexError::NotAnIndex`], [`IndexError::WrongApplicationId`]: the file is not an index.
+    /// - [`IndexError::BadSidecar`], [`IndexError::InsecureSidecar`], [`IndexError::StraySidecar`],
+    ///   [`IndexError::PendingJournal`], [`IndexError::InvalidWal`], [`IndexError::ForeignWal`]:
+    ///   a sidecar does not belong to the file.
+    /// - [`IndexError::UnexpectedSchema`], [`IndexError::Damaged`]: the schema differs from its
+    ///   version, or the integrity check failed.
+    /// - [`IndexError::SchemaTooNew`], [`IndexError::InvalidSchemaVersion`]: the stored version.
     /// - [`IndexError::Migration`], [`IndexError::MigrationDidNotAdvance`]: a step failed and was
-    ///   rolled back; earlier steps stay committed and the file keeps working at that version.
-    /// - [`IndexError::PragmaRefused`], [`IndexError::Busy`], [`IndexError::Sqlite`],
-    ///   [`IndexError::Io`].
+    ///   rolled back; earlier steps stay committed.
+    /// - [`IndexError::PragmaRefused`]: a pragma did not take its value.
+    /// - [`IndexError::Busy`]: another opener or writer held the file past the timeout.
+    /// - [`IndexError::Sqlite`]: any other SQLite failure.
+    ///
+    /// Every refusal in the first six groups leaves the main file and the `-wal` unmodified (a
+    /// `-shm` that did not exist is not left behind); each message names a lossless remedy.
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         Self::open_with(path, migrate::MIGRATIONS, || {})
     }
@@ -77,7 +90,16 @@ impl Index {
         migrations: &[migrate::Migration],
         between: impl FnOnce(),
     ) -> Result<Self, IndexError> {
-        let opened = open::open(path, migrations, between)?;
+        Self::open_with_lock_wait(path, migrations, between, BUSY_TIMEOUT)
+    }
+
+    pub(crate) fn open_with_lock_wait(
+        path: &Path,
+        migrations: &[migrate::Migration],
+        between: impl FnOnce(),
+        lock_wait: std::time::Duration,
+    ) -> Result<Self, IndexError> {
+        let opened = open::open(path, migrations, between, lock_wait)?;
         Ok(Self {
             conn: opened.conn,
             _file: opened.file,

@@ -46,8 +46,10 @@ pub(crate) const LATEST_START: &str =
 pub(crate) const GET_APP_ID: &str = "PRAGMA application_id";
 pub(crate) const USER_VERSION: &str = "PRAGMA user_version";
 pub(crate) const OBJECT_COUNT: &str = "SELECT count(*) FROM sqlite_master";
-/// Must equal `open::APPLICATION_ID` (a test checks).
-pub(crate) const SET_APP_ID: &str = "PRAGMA application_id = 1464617304";
+/// Creation bootstrap: sets the `application_id` (must equal `open::APPLICATION_ID`; a test
+/// checks) and creates `index_meta` with the random instance id, in one transaction.
+pub(crate) const BOOTSTRAP: &str = include_str!("../migrations/000_bootstrap.sql");
+pub(crate) const INSTANCE_ID: &str = "SELECT instance_id FROM index_meta WHERE id = 1";
 pub(crate) const SET_WAL: &str = "PRAGMA journal_mode = WAL";
 pub(crate) const SET_SYNC: &str = "PRAGMA synchronous = FULL";
 pub(crate) const SET_FK: &str = "PRAGMA foreign_keys = ON";

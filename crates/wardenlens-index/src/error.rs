@@ -33,10 +33,14 @@ pub enum IndexError {
         kind: std::io::ErrorKind,
     },
     /// The file is not empty and is not an SQLite database.
-    #[error("file is not an sqlite database")]
+    #[error(
+        "file is not an sqlite database; nothing was modified; move it out of the way and keep it until you know what it is"
+    )]
     NotAnIndex,
     /// An SQLite database that is not an index (its `application_id` differs). Never modified.
-    #[error("database is not a wardenlens index (application id {found:#x})")]
+    #[error(
+        "database is not a wardenlens index (application id {found:#x}); nothing was modified; move it out of the way and keep it until you know whose it is"
+    )]
     WrongApplicationId {
         /// The `application_id` found.
         found: u32,
@@ -72,7 +76,7 @@ pub enum IndexError {
     /// window; deleting the `-journal` is safe, because an index holding recordings data never
     /// has one, and the empty file that is left is adopted again.
     #[error(
-        "unfinished -journal next to the index; nothing was modified; delete the -journal file (an index with data never has one)"
+        "unfinished -journal next to the index; nothing was modified; move the -journal file out of the directory and keep it (an index with data never has one, so nothing is lost)"
     )]
     PendingJournal,
     /// The `-wal` next to the index has no valid header and is not a torn one (an all-zero or
@@ -91,10 +95,14 @@ pub enum IndexError {
     )]
     ForeignWal,
     /// The schema (every `sqlite_master` row) is not the one of its `user_version`.
-    #[error("index schema differs from its version")]
+    #[error(
+        "index schema differs from its version; nothing was modified; keep the file and restore a backup, or move it aside (the index can be rebuilt from the recordings)"
+    )]
     UnexpectedSchema,
     /// The database failed an integrity check or SQLite reports it corrupt. Nothing was modified.
-    #[error("index file is damaged")]
+    #[error(
+        "index file is damaged; nothing was modified; keep the file and restore a backup, or move it aside (the index can be rebuilt from the recordings)"
+    )]
     Damaged,
     /// The file was written by a newer build.
     #[error("index schema version {found} is newer than the supported {supported}")]

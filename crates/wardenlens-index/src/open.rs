@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use wardenlens_fsutil::{
-    FsError, PrivateFile, check_parent, immutable_uri, open_private_file, open_sidecar, sidecar_len,
+    FileLock, FsError, PrivateFile, check_parent, immutable_uri, open_private_file, open_sidecar,
+    sidecar_len,
 };
 
 use crate::error::IndexError;
@@ -159,22 +160,28 @@ fn check_sidecars(wal_mode: bool, sc: Sidecars) -> Result<(), IndexError> {
 /// What the first 32 bytes of a `-wal` say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalHeader {
-    /// Shorter than a header, or all zeros: what a crash before the first frame leaves. SQLite
-    /// treats it as an empty WAL, and so does this crate.
+    /// What a crash before the first frame leaves: an all-zero file, or a file shorter than a
+    /// header that is a prefix of a WAL magic. SQLite treats it as an empty WAL, and so do we.
     Torn,
     /// A WAL header with the page size of the main file.
     Valid,
 }
 
-/// Classifies the `-wal` header against the main file's page size.
+/// Classifies the `-wal` header against the main file's page size. Only a file SQLite could have
+/// written is `Torn`; any other short or non-magic content is [`IndexError::InvalidWal`] and is
+/// never opened read-write, so it is never deleted or rewritten.
 fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHeader, IndexError> {
+    let len = wal
+        .metadata()
+        .map_err(IndexError::io("inspecting wal"))?
+        .len();
     let mut head = [0u8; 32];
-    match wal.read_exact_at(&mut head, 0) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(WalHeader::Torn),
-        Err(e) => return Err(IndexError::io("reading wal header")(e)),
-    }
-    if head.iter().all(|b| *b == 0) {
+    let want = usize::try_from(len.min(32)).unwrap_or(32);
+    let got = head.get_mut(..want).ok_or(IndexError::InvalidWal)?;
+    wal.read_exact_at(got, 0)
+        .map_err(IndexError::io("reading wal header"))?;
+    let seen = head.get(..want).ok_or(IndexError::InvalidWal)?;
+    if seen.iter().all(|b| *b == 0) {
         return Ok(WalHeader::Torn);
     }
     let be = |b: &[u8], at: usize| {
@@ -182,8 +189,20 @@ fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHea
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
             .map(u32::from_be_bytes)
     };
+    if want < 32 {
+        // A partial header write: the bytes present must be a prefix of a WAL magic.
+        let prefix_of_magic = WAL_MAGICS.iter().any(|m| {
+            let magic = m.to_be_bytes();
+            let n = want.min(4);
+            seen.get(..n) == magic.get(..n)
+        });
+        return if prefix_of_magic {
+            Ok(WalHeader::Torn)
+        } else {
+            Err(IndexError::InvalidWal)
+        };
+    }
     if !be(&head, 0).is_some_and(|m| WAL_MAGICS.contains(&m)) {
-        // Neither a WAL header nor a torn one: not a file SQLite wrote for any database.
         return Err(IndexError::InvalidWal);
     }
     // The main file stores the page size as two bytes at 16, where 1 means 65536.
@@ -206,7 +225,7 @@ fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHea
 /// its table, so a `-wal` from a diverged copy of this index is caught). The integrity check reads
 /// the whole file once at start-up; its cost grows linearly with the index, a few seconds per
 /// hundred megabytes.
-fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<(), IndexError> {
+fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<InstanceId, IndexError> {
     let found = app_id(conn)?;
     if found != APPLICATION_ID {
         return Err(IndexError::WrongApplicationId { found });
@@ -223,7 +242,21 @@ fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<(), IndexEr
     if verdict != "ok" {
         return Err(IndexError::Damaged);
     }
-    Ok(())
+    instance_id(conn)
+}
+
+/// The random per-index id created with the file (`index_meta`, ADR 0005 section 5). It ties a
+/// `-wal` to its main file: a `-wal` replayed onto another index's main file changes it.
+type InstanceId = Vec<u8>;
+
+fn instance_id(conn: &Connection) -> Result<InstanceId, IndexError> {
+    let id: Vec<u8> = sql::query_row(conn, sql::INSTANCE_ID, [], |r| r.get(0))
+        .map_err(corruption_or("read instance id"))?;
+    if id.len() == 16 {
+        Ok(id)
+    } else {
+        Err(IndexError::Damaged)
+    }
 }
 
 /// A SQLite failure while reading a file we do not yet trust: corruption codes mean the file is
@@ -236,13 +269,8 @@ fn corruption_or(op: &'static str) -> impl FnOnce(rusqlite::Error) -> IndexError
     }
 }
 
-/// Read-only identification of a file with no usable `-wal`: `immutable=1` never writes a
-/// journal, `-wal` or `-shm` and ignores any present.
-fn probe_immutable(
-    path: &Path,
-    file: &PrivateFile,
-    migrations: &[Migration],
-) -> Result<(), IndexError> {
+/// Opens the main file alone, read-only, ignoring any `-wal` and writing nothing: `immutable=1`.
+fn open_immutable(path: &Path, file: &PrivateFile) -> Result<Connection, IndexError> {
     let conn = Connection::open_with_flags(
         immutable_uri(path)?,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -252,20 +280,67 @@ fn probe_immutable(
     )
     .map_err(corruption_or("open"))?;
     file.verify_path_unchanged(path)?;
-    judge_view(&conn, migrations)
+    Ok(conn)
 }
 
-/// Identification of a file with a valid non-empty `-wal`, with **no copy of the main file**: a
-/// `SQLITE_OPEN_READ_ONLY` (not immutable) connection on the real files, so SQLite replays the
-/// `-wal` into its in-memory view and the view is judged.
+/// Read-only identification of a file with no usable `-wal`.
+fn probe_immutable(
+    path: &Path,
+    file: &PrivateFile,
+    migrations: &[Migration],
+) -> Result<(), IndexError> {
+    judge_view(&open_immutable(path, file)?, migrations).map(|_| ())
+}
+
+/// The connection of the `-wal` probe: `SQLITE_OPEN_READ_ONLY` on the real files with
+/// `NO_CKPT_ON_CLOSE`. These are the guards that keep the probe from writing the main file or the
+/// `-wal` (pinned by `probe_connection_is_read_only_and_never_checkpoints`):
+/// - **no checkpoint and no `-wal` delete on close** (`NO_CKPT_ON_CLOSE`): a checkpoint is the
+///   only thing that writes the main file from the `-wal`, and the last-connection close would
+///   otherwise run one and unlink the `-wal`;
+/// - **a read-only pager** (`SQLITE_OPEN_READ_ONLY`): no write transaction can begin, so no frame
+///   is appended to the `-wal` and no page is written to the main file;
+/// - our own main-file descriptor is `O_RDONLY` (checked by fsutil's tests), and the connection
+///   opens the main file read-only.
 ///
-/// What such a connection writes, by SQLite's documented behaviour and by the tests: never the
-/// main file and never the `-wal` (a read-only pager has no write transaction, and a checkpoint
-/// on a read-only WAL connection returns `SQLITE_READONLY`; `NO_CKPT_ON_CLOSE` is also set).
-/// It does create or update the `-shm` (the wal-index, rebuilt from the `-wal` by every first
-/// connection, never trusted across a crash). A `-shm` that did not exist is removed again after
-/// the probe, so a refusal leaves the directory byte-identical; an existing `-shm` may be
-/// rewritten, and the refusal guarantee covers the main file and the `-wal`.
+/// (`SQLITE_READONLY` from a checkpoint is *not* a guard here: the `-wal` itself is opened
+/// read-write by SQLite.) The connection does create or update the `-shm`.
+pub(crate) fn open_wal_probe(path: &Path, file: &PrivateFile) -> Result<Connection, IndexError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(corruption_or("open"))?;
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .map_err(IndexError::sqlite("db config"))?;
+    file.verify_path_unchanged(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(IndexError::sqlite("busy timeout"))?;
+    Ok(conn)
+}
+
+/// Identification of a file with a valid non-empty `-wal`, with **no copy of the main file**:
+/// 1. the main file alone (`immutable=1`, `-wal` ignored) must be a sound index of ours: this is
+///    the verdict for a damaged or foreign main file, so such a file is never blamed on the
+///    `-wal`; its instance id is read;
+/// 2. the real files are opened with [`open_wal_probe`] so SQLite replays the `-wal` into its
+///    in-memory view, and the view is judged like any index;
+/// 3. the view's instance id must equal the main file's: a `-wal` of another index (same
+///    application id, schema and a clean integrity check) is `ForeignWal`.
+///
+/// The probe never writes the main file or the `-wal` (guards on [`open_wal_probe`]). It does
+/// create or update the `-shm` (the wal-index every first connection rebuilds from the `-wal`).
+/// **On refusal** a `-shm` that did not exist is removed again so the directory is byte-identical;
+/// **after success it is never removed**, because the read-write open uses it. Both are safe
+/// because `Index::open` holds an exclusive `flock` on the verified main descriptor from
+/// `classify` until the read-write open is established, so no other `Index::open` can be
+/// attached to a `-shm` we created, and a `-shm` that existed before the probe is never touched
+/// by removal.
 pub(crate) fn probe_wal_readonly(
     path: &Path,
     file: &PrivateFile,
@@ -273,37 +348,46 @@ pub(crate) fn probe_wal_readonly(
 ) -> Result<(), IndexError> {
     let shm = std::path::PathBuf::from(sidecar_path(path, "-shm"));
     let shm_existed = sidecar_len(&shm)?.is_some();
-    let verdict = (|| {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(corruption_or("open"))?;
-        conn.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        )
-        .map_err(IndexError::sqlite("db config"))?;
-        file.verify_path_unchanged(path)?;
-        conn.busy_timeout(BUSY_TIMEOUT)
-            .map_err(IndexError::sqlite("busy timeout"))?;
-        judge_view(&conn, migrations)
-    })();
-    if !shm_existed {
-        // ERR-4: best effort. No `-shm` existed, so no connection was live; the one we made is
-        // derived state and the next open rebuilds it.
+    let verdict = wal_verdict(path, file, migrations);
+    if verdict.is_err() && !shm_existed {
+        // ERR-4: best effort; the `-shm` is derived state and the next open rebuilds it.
         let _ = std::fs::remove_file(&shm);
     }
-    match verdict {
-        // The replay gave something that is not our index: the `-wal` is not ours.
+    verdict
+}
+
+fn wal_verdict(
+    path: &Path,
+    file: &PrivateFile,
+    migrations: &[Migration],
+) -> Result<(), IndexError> {
+    let main_view = open_immutable(path, file)?;
+    let main_id = instance_id(&main_view).ok();
+    let main_verdict = judge_view(&main_view, migrations);
+    // A main file that is torn by a crash in the middle of a checkpoint, or is simply behind its
+    // `-wal`, may fail the full judgement alone; the replayed view decides below. Keep the
+    // main file's own error to report if the view is not ours either.
+    drop(main_view);
+    let conn = open_wal_probe(path, file)?;
+    match judge_view(&conn, migrations) {
+        Ok(view_id) => {
+            if main_id.as_ref() == Some(&view_id) {
+                Ok(())
+            } else {
+                Err(IndexError::ForeignWal)
+            }
+        }
         Err(
             IndexError::WrongApplicationId { .. }
             | IndexError::UnexpectedSchema
             | IndexError::Damaged,
-        ) => Err(IndexError::ForeignWal),
-        other => other,
+        ) => match main_verdict {
+            // The main file is itself not a sound index of ours: that is the cause.
+            Err(own) => Err(own),
+            // The main file is sound and the replay is not ours: the `-wal` is.
+            Ok(_) => Err(IndexError::ForeignWal),
+        },
+        Err(other) => Err(other),
     }
 }
 
@@ -370,7 +454,7 @@ fn claim_new(conn: &mut Connection) -> Result<(), IndexError> {
     if found != 0 || objects != 0 || migrate::user_version(&tx)? != 0 {
         return Err(IndexError::NotAnIndex);
     }
-    sql::execute_batch(&tx, sql::SET_APP_ID).map_err(IndexError::sqlite("set application id"))?;
+    sql::execute_batch(&tx, sql::BOOTSTRAP).map_err(IndexError::sqlite("bootstrap"))?;
     tx.commit().map_err(IndexError::sqlite("commit claim"))
 }
 
@@ -415,6 +499,24 @@ fn apply_pragmas(conn: &Connection) -> Result<(), IndexError> {
     Ok(())
 }
 
+/// Takes the exclusive `flock` on the verified descriptor, waiting at most `wait`. `flock` is
+/// independent of SQLite's own POSIX locks on the file: it never blocks SQLite and SQLite never
+/// blocks it, so it serialises only openers of this crate.
+fn lock_file(file: &PrivateFile, wait: Duration) -> Result<FileLock, IndexError> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(lock) = file.try_lock_exclusive()? {
+            return Ok(lock);
+        }
+        if start.elapsed() >= wait {
+            return Err(IndexError::Busy {
+                op: "lock index file",
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// An open connection and the descriptor whose identity was checked.
 pub(crate) struct Opened {
     pub(crate) conn: Connection,
@@ -427,9 +529,15 @@ pub(crate) fn open(
     path: &Path,
     migrations: &[Migration],
     between: impl FnOnce(),
+    lock_wait: Duration,
 ) -> Result<Opened, IndexError> {
     check_parent(crate::parent_of(path))?;
     let file = open_private_file(path)?;
+    // Excludes every other `Index::open` on this file from here to the end of this function: the
+    // probes and the read-write open must not interleave with another opener's (a `-shm` one of
+    // us created must not be attached to by another process, and two first creators must not
+    // both claim the file). Released when `_lock` drops, after migrations.
+    let _lock = lock_file(&file, lock_wait)?;
     let kind = match classify(path, &file, migrations) {
         Ok(kind) => kind,
         Err(e) => {

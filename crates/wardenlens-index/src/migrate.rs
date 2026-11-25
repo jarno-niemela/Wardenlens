@@ -87,14 +87,15 @@ pub(crate) fn schema_rows(conn: &Connection) -> rusqlite::Result<Vec<SchemaRow>>
     Ok(rows)
 }
 
-/// The schema a database at `version` must have, built by running the compiled-in scripts up to
-/// `version` on an empty in-memory database. Nothing about it is hand-listed, so it cannot drift
+/// The schema a database at `version` must have, built by running the creation bootstrap and then
+/// the compiled-in scripts up to `version` on an empty in-memory database. Nothing about it is hand-listed, so it cannot drift
 /// from the migrations.
 pub(crate) fn reference_schema(
     migrations: &[Migration],
     version: i64,
 ) -> Result<Vec<SchemaRow>, IndexError> {
     let conn = Connection::open_in_memory().map_err(IndexError::sqlite("reference schema"))?;
+    sql::execute_batch(&conn, sql::BOOTSTRAP).map_err(IndexError::sqlite("reference schema"))?;
     for m in migrations.iter().filter(|m| m.version <= version) {
         sql::execute_batch(&conn, m.sql).map_err(|e| IndexError::Migration {
             version: m.version,

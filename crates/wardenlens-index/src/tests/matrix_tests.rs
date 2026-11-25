@@ -8,7 +8,6 @@ use wardenlens_core::storage::{SegmentIndex, Tier};
 
 use super::*;
 use crate::error::IndexError;
-use crate::open::APPLICATION_ID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Main {
@@ -36,8 +35,10 @@ enum Side {
     Junk,
     /// 700 zero bytes: what a crash before a `-wal` header was written leaves.
     Zeroed,
-    /// 8 bytes: a header that was never completed.
+    /// 8 bytes that are not a WAL header.
     Short,
+    /// The first 4 bytes of a WAL magic and nothing else: a header write cut short.
+    TornMagic,
 }
 
 const MAINS: [Main; 5] = [
@@ -47,7 +48,7 @@ const MAINS: [Main; 5] = [
     Main::Foreign,
     Main::ForeignWal,
 ];
-const SIDES: [Side; 7] = [
+const SIDES: [Side; 8] = [
     Side::None,
     Side::Empty,
     Side::Ours,
@@ -55,6 +56,7 @@ const SIDES: [Side; 7] = [
     Side::Junk,
     Side::Zeroed,
     Side::Short,
+    Side::TornMagic,
 ];
 const SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
@@ -120,8 +122,7 @@ fn build_main(f: &Fixture, main: Main) -> (Option<Connection>, WalPair) {
     match main {
         Main::Rollback => {
             let c = raw(&f.path);
-            c.execute_batch(&format!("PRAGMA application_id = {APPLICATION_ID};"))
-                .unwrap();
+            c.execute_batch(crate::sql::BOOTSTRAP).unwrap();
             drop(c);
             chmod(&f.path, 0o600);
             (None, None)
@@ -222,9 +223,11 @@ fn want(main: Main, suffix: &str, side: Side) -> Want {
         ("-journal", _) => Want::Refuse(is_pending),
         ("-wal", _) if main == Main::Rollback => Want::Refuse(|e| stray("-wal")(e)),
         ("-shm", _) if main == Main::Rollback => Want::Refuse(|e| stray("-shm")(e)),
+        // The main file is judged first: a too-new main is reported as that, not as a bad `-wal`.
+        ("-wal", Side::Foreign) if main == Main::TooNew => Want::Refuse(is_too_new),
         ("-wal", Side::Foreign) => Want::Refuse(is_foreign_wal),
         // Not a WAL header and not a torn one: SQLite did not write it.
-        ("-wal", Side::Junk) => Want::Refuse(|e| matches!(e, IndexError::InvalidWal)),
+        ("-wal", Side::Junk | Side::Short) => Want::Refuse(|e| matches!(e, IndexError::InvalidWal)),
         // A torn header is an empty WAL, as SQLite treats it.
         // An empty or our own `-wal`, and any `-shm` (SQLite rebuilds it from the `-wal`; it is
         // never replayed).
@@ -251,6 +254,7 @@ fn setup_cell(main: Main, suffix: &str, side: Side) -> (Fixture, Option<Connecti
         (_, Side::Junk) => put(&sp, &[0xd9u8; 700]),
         (_, Side::Zeroed) => put(&sp, &[0u8; 700]),
         (_, Side::Short) => put(&sp, &[1u8; 8]),
+        (_, Side::TornMagic) => put(&sp, &[0x37, 0x7f, 0x06, 0x82]),
         _ => unreachable!(),
     }
     // The foreign WAL database brought its own `-wal`/`-shm` (mode of its creation): make them
@@ -293,7 +297,7 @@ fn the_matrix_has_every_main_state_and_every_sidecar_state() {
             assert!(cells.iter().any(|c| c.0 == main && c.1 == suffix));
         }
     }
-    assert_eq!(cells.len(), 83);
+    assert_eq!(cells.len(), 95);
 }
 
 #[test]
