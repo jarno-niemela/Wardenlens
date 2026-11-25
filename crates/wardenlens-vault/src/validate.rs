@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use secrecy::zeroize::Zeroizing;
 use wardenlens_core::camera::{CameraError, DisplayName, Host};
 use wardenlens_core::entry::EntryKind;
-use wardenlens_core::text::is_invisible;
+use wardenlens_core::text::is_dropped_invisible;
 
 use crate::error::VaultError;
 use crate::store::MAX_VALUE_LEN;
@@ -101,7 +101,7 @@ fn host_rule(e: CameraError) -> &'static str {
 }
 
 /// The display name as the vault stores it: every `char::is_whitespace` character becomes
-/// U+0020, a run of them is one space, invisible characters (`is_invisible`) are dropped and the
+/// U+0020, a run of them is one space, invisible characters (`is_dropped_invisible`, the scanner's squeeze predicate) are dropped and the
 /// ends are trimmed. A hand-written name with an NBSP or a narrow NBSP therefore stays usable
 /// and is stored in the one plain-space form the scanner looks for.
 pub(crate) fn display_name_text(raw: &str) -> Zeroizing<String> {
@@ -110,7 +110,7 @@ pub(crate) fn display_name_text(raw: &str) -> Zeroizing<String> {
     for c in raw.chars() {
         if c.is_whitespace() {
             pending_space = true;
-        } else if !is_invisible(c) {
+        } else if !is_dropped_invisible(c) {
             if pending_space && !out.is_empty() {
                 out.push(' ');
             }

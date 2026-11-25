@@ -8,7 +8,7 @@
 //! | control chars (NUL, tab, newline, DEL, C1) | `NameCharset` |
 //! | whitespace other than U+0020 (NBSP, U+2003, U+3000, U+2028) | `NameCharset` |
 //! | any Unicode `Cf` char, bidi control (incl. U+061C), soft hyphen, variation selector or invisible filler (`crate::text::is_invisible`, the vault scanner's predicate) | `NameCharset` |
-//! | no alphanumeric character, a leading combining mark, a private-use or noncharacter code point, U+2800 or U+FFFC (renders blank or as a box) | `NameCharset` |
+//! | no alphanumeric character, a leading combining mark (in the blocks `is_combining_mark` lists, not every Unicode combining mark), no alphanumeric character other than combining marks, a private-use or noncharacter code point, U+2800 or U+FFFC (renders blank or as a box) | `NameCharset` |
 //!
 //! This is the one display-name validator: the vault normalises whitespace and invisible
 //! characters and then calls [`DisplayName::new`] for its `display_name` entries, so a name set
@@ -39,24 +39,110 @@ fn is_blank_glyph(c: char) -> bool {
         || (n & 0xFFFE) == 0xFFFE
 }
 
-/// Combining marks (`Mn`, `Mc`, `Me`), by the main blocks: a name may not start with one.
+/// Combining marks (`Mn`, `Mc`, `Me`) in the blocks listed here: Combining Diacritical Marks,
+/// Cyrillic, Hebrew, Arabic, Syriac, Thaana, `NKo`, Devanagari and the Indic blocks, Thai, Lao,
+/// Tibetan, Myanmar, Khmer, the extended and supplement diacritics, symbols, CJK and half marks.
+/// Not every Unicode combining mark is covered, only the marks in these blocks.
+const COMBINING_RANGES: [(u32, u32); 92] = [
+    (0x0300, 0x036F),
+    (0x0483, 0x0489),
+    (0x0591, 0x05BD),
+    (0x05BF, 0x05BF),
+    (0x05C1, 0x05C2),
+    (0x05C4, 0x05C5),
+    (0x05C7, 0x05C7),
+    (0x0610, 0x061A),
+    (0x064B, 0x065F),
+    (0x0670, 0x0670),
+    (0x06D6, 0x06DC),
+    (0x06DF, 0x06E4),
+    (0x06E7, 0x06E8),
+    (0x06EA, 0x06ED),
+    (0x0711, 0x0711),
+    (0x0730, 0x074A),
+    (0x07A6, 0x07B0),
+    (0x07EB, 0x07F3),
+    (0x0816, 0x082D),
+    (0x0859, 0x085B),
+    (0x08D3, 0x08E1),
+    (0x08E3, 0x0903),
+    (0x093A, 0x094F),
+    (0x0951, 0x0957),
+    (0x0962, 0x0963),
+    (0x0981, 0x0983),
+    (0x09BC, 0x09CD),
+    (0x09D7, 0x09D7),
+    (0x09E2, 0x09E3),
+    (0x0A01, 0x0A03),
+    (0x0A3C, 0x0A51),
+    (0x0A70, 0x0A71),
+    (0x0A75, 0x0A75),
+    (0x0A81, 0x0A83),
+    (0x0ABC, 0x0ACD),
+    (0x0AE2, 0x0AE3),
+    (0x0B01, 0x0B03),
+    (0x0B3C, 0x0B57),
+    (0x0B62, 0x0B63),
+    (0x0B82, 0x0B82),
+    (0x0BBE, 0x0BCD),
+    (0x0BD7, 0x0BD7),
+    (0x0C00, 0x0C04),
+    (0x0C3E, 0x0C56),
+    (0x0C62, 0x0C63),
+    (0x0C81, 0x0C83),
+    (0x0CBC, 0x0CBC),
+    (0x0CBE, 0x0CD6),
+    (0x0CE2, 0x0CE3),
+    (0x0D00, 0x0D03),
+    (0x0D3B, 0x0D3C),
+    (0x0D3E, 0x0D4D),
+    (0x0D57, 0x0D57),
+    (0x0D62, 0x0D63),
+    (0x0D81, 0x0D83),
+    (0x0DCA, 0x0DDF),
+    (0x0DF2, 0x0DF3),
+    (0x0E31, 0x0E31),
+    (0x0E34, 0x0E3A),
+    (0x0E47, 0x0E4E),
+    (0x0EB1, 0x0EB1),
+    (0x0EB4, 0x0EBC),
+    (0x0EC8, 0x0ECE),
+    (0x0F18, 0x0F19),
+    (0x0F35, 0x0F35),
+    (0x0F37, 0x0F37),
+    (0x0F39, 0x0F39),
+    (0x0F3E, 0x0F3F),
+    (0x0F71, 0x0F84),
+    (0x0F86, 0x0F87),
+    (0x0F8D, 0x0FBC),
+    (0x102B, 0x103E),
+    (0x1056, 0x1059),
+    (0x105E, 0x1060),
+    (0x1062, 0x1064),
+    (0x1067, 0x106D),
+    (0x1071, 0x1074),
+    (0x1082, 0x108D),
+    (0x108F, 0x108F),
+    (0x109A, 0x109D),
+    (0x135D, 0x135F),
+    (0x1712, 0x1715),
+    (0x17B6, 0x17D3),
+    (0x17DD, 0x17DD),
+    (0x180B, 0x180D),
+    (0x1AB0, 0x1AFF),
+    (0x1DC0, 0x1DFF),
+    (0x20D0, 0x20FF),
+    (0x302A, 0x302F),
+    (0x3099, 0x309A),
+    (0xFB1E, 0xFB1E),
+    (0xFE20, 0xFE2F),
+];
+
 fn is_combining_mark(c: char) -> bool {
-    matches!(
-        u32::from(c),
-        0x0300..=0x036F
-            | 0x0483..=0x0489
-            | 0x0591..=0x05BD
-            | 0x0610..=0x061A
-            | 0x064B..=0x065F
-            | 0x0900..=0x0903
-            | 0x093A..=0x094F
-            | 0x1AB0..=0x1AFF
-            | 0x1DC0..=0x1DFF
-            | 0x20D0..=0x20FF
-            | 0x302A..=0x302F
-            | 0x3099..=0x309A
-            | 0xFE20..=0xFE2F
-    )
+    let n = u32::from(c);
+    COMBINING_RANGES
+        .iter()
+        .any(|&(lo, hi)| (lo..=hi).contains(&n))
 }
 
 impl DisplayName {
@@ -77,7 +163,9 @@ impl DisplayName {
         let leading_mark = text.chars().next().is_some_and(is_combining_mark);
         if bad
             || leading_mark
-            || !text.chars().any(char::is_alphanumeric)
+            || !text
+                .chars()
+                .any(|c| c.is_alphanumeric() && !is_combining_mark(c))
             || text.starts_with(' ')
             || text.ends_with(' ')
         {
@@ -152,6 +240,20 @@ mod tests {
         for n in ["a\u{301}", "1", "\u{4e2d}", "Cam #1", "\u{e9}-"] {
             assert!(DisplayName::new(n).is_ok(), "{n:?}");
         }
+    }
+
+    #[test]
+    fn combining_marks_in_the_listed_blocks_are_not_alphanumeric_content() {
+        for n in [
+            "\u{0E31}",
+            "\u{05C1}",
+            "\u{0670}",
+            "\u{0E31} \u{0981}",
+            "\u{0F71}abc",
+        ] {
+            assert_eq!(DisplayName::new(n), Err(CameraError::NameCharset), "{n:?}");
+        }
+        assert!(DisplayName::new("\u{0E01}\u{0E31}").is_ok());
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
-use wardenlens_vault::legacy::{LegacyImport as Mapped, MAX_REPORTED_KEYS, map_legacy};
+use wardenlens_vault::legacy::{
+    LegacyImport as Mapped, MAX_REPORTED_KEYS, map_legacy, stored_display_name,
+};
 use wardenlens_vault::{Scan, Scannability};
 use zeroize::Zeroizing;
 
@@ -51,6 +53,7 @@ fn read_file(path: &Path, explicit: bool) -> Result<Option<Zeroizing<String>>, C
 /// Camera display name to inventory id, from the inventory's `name` (or `display_name`).
 fn names_to_ids(table: &toml::Table) -> Result<BTreeMap<String, String>, CliError> {
     let mut map = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
     let Some(cameras) = table.get("cameras").and_then(toml::Value::as_table) else {
         return Ok(map);
     };
@@ -59,12 +62,16 @@ fn names_to_ids(table: &toml::Table) -> Result<BTreeMap<String, String>, CliErro
             .as_table()
             .and_then(|c| c.get("name").or_else(|| c.get("display_name")))
             .and_then(toml::Value::as_str);
-        if let Some(name) = name
-            && map.insert(name.to_owned(), id.clone()).is_some()
-        {
-            return Err(CliError::Refused(
-                "two inventory cameras share a display name; the secret file cannot be mapped",
-            ));
+        // Compared in the vault's stored form, so names that differ only in white space or
+        // invisible characters are one name (the library refuses them too).
+        if let Some(name) = name {
+            let stored = stored_display_name(name);
+            if !stored.is_empty() && !seen.insert(stored) {
+                return Err(CliError::Refused(
+                    "two inventory cameras share a display name; the secret file cannot be mapped",
+                ));
+            }
+            map.insert(name.to_owned(), id.clone());
         }
     }
     Ok(map)

@@ -1,5 +1,6 @@
-//! Adversary tests for #43 round 2: the vault's display-name rule is now core's `DisplayName`
-//! (no whitespace other than U+0020). Synthetic values only.
+//! Adversary tests for #43 round 2: the vault normalises a display name (whitespace to U+0020,
+//! invisible characters dropped) and then applies core's `DisplayName`; the stored form is found
+//! in every spelling a file can use. Synthetic values only.
 
 #![expect(
     clippy::unwrap_used,
@@ -57,10 +58,9 @@ fn misses(v: &Vault) -> Vec<&'static str> {
         .collect()
 }
 
-/// Since #43 the vault stores `Porte\u{202F}Nord Est` as the plain-space `Porte Nord Est`, the
-/// only spelling it keeps. Every spelling of the same name in a file must
-/// still be found; before #43 storing the verbatim spelling found the JSON- and URL-escaped
-/// forms through the unsqueezed needles (ADR 0006 section 7).
+/// The vault normalises `Porte\u{202F}Nord Est` to the plain-space `Porte Nord Est`, the only
+/// spelling it keeps. Every spelling of the same name in a file must still be found, though the
+/// verbatim spelling is no longer stored for the unsqueezed needles to match (ADR 0006 section 7).
 #[test]
 fn a_plain_space_display_name_is_found_in_every_no_break_space_spelling() {
     let (_d, mut v) = fresh();
@@ -82,8 +82,8 @@ fn a_plain_space_display_name_is_found_in_every_no_break_space_spelling() {
     assert!(missed.is_empty(), "display name missed in: {missed:?}");
 }
 
-/// Control: the pre-#43 behaviour, kept for the `other` kind, finds the escaped forms of the
-/// character that is stored. Shows the miss above comes from the spelling the store forces.
+/// Control: an `other` value keeps the no-break space it is stored with, and its escaped
+/// spellings are found through the unsqueezed needles.
 #[test]
 fn an_other_value_stored_with_the_no_break_space_is_found_in_its_escaped_spellings() {
     let (_d, mut v) = fresh();

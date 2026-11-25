@@ -1,15 +1,18 @@
-//! The ADR 0006 section 7 squeeze table and the fold (full lowercase mapping).
+//! The ADR 0006 section 7 squeeze and the fold (full lowercase mapping). What the squeeze deletes
+//! is `wardenlens_core::text::is_dropped_invisible`, the predicate the vault's display-name
+//! normalisation uses too (one definition).
 //!
 //! Line breaks are never touched, so line numbers stay valid.
 
 use std::borrow::Cow;
 
-/// Appends `c` to `out` after the squeeze table: invisible characters are deleted, the
+/// Appends `c` to `out` after the squeeze: invisible characters are deleted, the
 /// fullwidth ASCII block and the listed lookalikes of `.`, `-` and space are mapped.
 fn squeeze_char(c: char, out: &mut String) {
+    if is_dropped_invisible(c) {
+        return;
+    }
     match u32::from(c) {
-        0x00AD | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF => {
-        }
         // U+FF01..=U+FF5E is U+0021..=U+007E plus 0xFEE0.
         n @ 0xFF01..=0xFF5E => out.extend(char::from_u32(n.saturating_sub(0xFEE0))),
         0x3002 | 0xFF61 | 0x2024 => out.push('.'),
@@ -19,6 +22,7 @@ fn squeeze_char(c: char, out: &mut String) {
     }
 }
 
+use wardenlens_core::text::is_dropped_invisible;
 pub use wardenlens_core::text::is_invisible;
 
 /// True for a character that the joined view and the needle collapse both turn into a space
@@ -84,10 +88,14 @@ mod tests {
             ('\u{202F}', true),
             ('\u{2060}', false),
             ('\u{2064}', false),
-            ('\u{2065}', true),
+            ('\u{2065}', false),
             ('\u{2066}', false),
             ('\u{2069}', false),
-            ('\u{206A}', true),
+            ('\u{206A}', false),
+            ('\u{2070}', true),
+            // Not deleted: white space collapses instead.
+            ('\u{2028}', true),
+            ('\u{2029}', true),
         ] {
             let squeezed = squeeze(&c.to_string());
             assert_eq!(squeezed == c.to_string(), kept, "U+{:04X}", u32::from(c));
@@ -96,6 +104,28 @@ mod tests {
         assert_eq!(squeeze("\u{FF5E}"), "~");
         assert_eq!(squeeze("\u{FF00}"), "\u{FF00}");
         assert_eq!(squeeze("\u{FF5F}"), "\u{FF5F}");
+    }
+
+    #[test]
+    fn squeeze_deletes_exactly_the_dropped_invisible_characters() {
+        for n in 0..=0x0010_FFFF_u32 {
+            let Some(c) = char::from_u32(n) else { continue };
+            assert_eq!(
+                squeeze(&c.to_string()).is_empty(),
+                is_dropped_invisible(c),
+                "U+{n:04X}"
+            );
+        }
+        for c in [
+            '\u{FE0F}',
+            '\u{034F}',
+            '\u{180E}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{E0100}',
+        ] {
+            assert_eq!(squeeze(&format!("a{c}b")), "ab", "U+{:04X}", u32::from(c));
+        }
     }
 
     #[test]

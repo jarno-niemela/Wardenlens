@@ -40,9 +40,33 @@ pub fn is_invisible(c: char) -> bool {
     )
 }
 
+/// True for a character that normalisation deletes outright: [`is_invisible`] except the
+/// characters that are white space (U+2028 and U+2029), which collapse to a space instead so a
+/// name wrapped on them is still one name. This is the one definition of "deleted": the vault's
+/// display-name normalisation and the scanner's squeeze both call it, so a name as stored and the
+/// same name in a file reduce to the same text.
+#[must_use]
+pub fn is_dropped_invisible(c: char) -> bool {
+    is_invisible(c) && !c.is_whitespace()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_invisible;
+    use super::{is_dropped_invisible, is_invisible};
+
+    #[test]
+    fn dropped_invisible_is_invisible_without_white_space() {
+        for n in 0..=0x0010_FFFF_u32 {
+            let Some(c) = char::from_u32(n) else { continue };
+            assert_eq!(
+                is_dropped_invisible(c),
+                is_invisible(c) && !c.is_whitespace(),
+                "U+{n:04X}"
+            );
+        }
+        assert!(!is_dropped_invisible('\u{2028}'));
+        assert!(is_dropped_invisible('\u{FE0F}'));
+    }
 
     /// Every `Cf` (format) range of Unicode 16, from `DerivedGeneralCategory.txt`.
     const CF_RANGES: [(u32, u32); 21] = [

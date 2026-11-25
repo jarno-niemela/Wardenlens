@@ -121,10 +121,14 @@ impl Matcher {
         Ok(())
     }
 
-    /// A decoded text: squeezed again (decoding can produce characters the table maps), then
-    /// matched as a text view and as a joined view.
+    /// A decoded text, searched as it is (a value glued behind a decoded invisible character
+    /// keeps its boundary) and squeezed again (decoding can produce characters the squeeze
+    /// maps), the squeezed form also as a joined view. Neither form loses a hit the other finds.
     fn decoded(&self, text: &str, bit: u8, found: &mut Found) -> Result<(), ScanError> {
         let squeezed = squeeze(text);
+        if squeezed != text {
+            self.text_view(text.as_bytes(), bit, found)?;
+        }
         self.text_view(squeezed.as_bytes(), bit, found)?;
         self.joined(&squeezed, found)
     }

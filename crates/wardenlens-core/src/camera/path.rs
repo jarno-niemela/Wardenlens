@@ -25,8 +25,9 @@
 //! lies in the query). A name is compared case-insensitively with this list: `pass`, `passw`,
 //! `passwd`, `password`, `passcode`, `pw`, `pwd`, `p`, `user`, `usr`, `u`, `username`,
 //! `user_name`, `user-name`, `userid`, `user_id`, `login`, `loginuse`, `loginpas`, `token`,
-//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`, `pword`, `account`. Also, for every `=`, the maximal run of ASCII
-//! alphanumerics right before it is compared with the list, so `_password=`, `0_user=`,
+//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`, `pword`, `account`. Also, for every `=`, the run of ASCII
+//! alphanumerics, `_` and `-` right before it is split on `_` and `-` and every trailing join of
+//! its pieces is compared with the list (separators removed), so `x_user_name=`, `+user_id=`, `_password=`, `0_user=`,
 //! `+password=`, `(password=` and `:password=` are refused. This covers the
 //! Xiongmai/XMEye form `/user=admin&password=x&channel=1&stream=0.sdp`, `;` path parameters and
 //! a second `?`. The list can never be complete, so the second layer is that `Debug` and
@@ -80,15 +81,32 @@ fn is_denied(name: &str) -> bool {
     DENIED_PARAMS.iter().any(|d| name.eq_ignore_ascii_case(d))
 }
 
-/// True when the maximal run of ASCII alphanumerics at the end of `before_eq` (the text in front
-/// of one `=`) is on the list, so `_password=`, `0_user=`, `+password=` and `(password=` are
-/// all caught whatever separator precedes the name.
+/// A list name or a candidate with `_` and `-` removed, lowercased, for the multi-word compare.
+fn squashed(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// True when the run of `[A-Za-z0-9_-]` at the end of `before_eq` (the text in front of one `=`),
+/// split on `_` and `-`, has a trailing join of pieces on the list (separators removed on both
+/// sides): `name`, `user_name` and `x_user_name` are all tried. So `_password=`, `0_user=`,
+/// `+user_id=`, `x_user_name=` and `(password=` are caught whatever precedes the name, while a
+/// name that merely ends in a listed word inside one piece (`monkey=`, `accounting=`) is not.
 fn tail_denied(before_eq: &str) -> bool {
     let start = before_eq
         .bytes()
-        .rposition(|b| !b.is_ascii_alphanumeric())
+        .rposition(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
         .map_or(0, |i| i.saturating_add(1));
-    before_eq.get(start..).is_some_and(is_denied)
+    let run = before_eq.get(start..).unwrap_or_default();
+    let pieces: Vec<&str> = run.split(['_', '-']).collect();
+    (0..pieces.len()).any(|from| {
+        let joined: String = pieces.get(from..).unwrap_or_default().concat();
+        DENIED_PARAMS
+            .iter()
+            .any(|d| squashed(d) == squashed(&joined))
+    })
 }
 
 /// RFC 3986 `pchar` plus `/` and `?`, without `@` and `%`.
@@ -215,6 +233,32 @@ mod tests {
             "/a?accounting=1",
             "/a?monkey=1",
             "/a?apikeys=1",
+        ] {
+            assert!(RtspPath::new(p).is_ok(), "{p}");
+        }
+    }
+
+    #[test]
+    fn multi_word_credential_names_are_refused_behind_any_prefix_but_not_inside_a_word() {
+        for p in [
+            "/a?x_user_name=1",
+            "/a?0_user-name=1",
+            "/a?+user_id=1",
+            "/a?(user_name=1",
+            "/a?x-api_key=1",
+        ] {
+            assert_eq!(
+                RtspPath::new(p),
+                Err(CameraError::PathCredentialParam),
+                "{p}"
+            );
+        }
+        for p in [
+            "/a?monkey=1",
+            "/a?accounting=1",
+            "/a?apikeys=1",
+            "/a?my_users=1",
+            "/a?x_name=1",
         ] {
             assert!(RtspPath::new(p).is_ok(), "{p}");
         }
