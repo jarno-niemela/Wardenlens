@@ -1,0 +1,22 @@
+[package]
+name = "wardenlens-storage"
+description = "Storage executor: volume probe, archive state, the crash-safe tier move, delete and the bounded storage loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustix = { workspace = true }
+thiserror = { workspace = true }
+wardenlens-core = { workspace = true }
+wardenlens-fsutil = { path = "../wardenlens-fsutil" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Tests run the loop against the real SQLite index; it is not a runtime edge (ADR 0005 section 11).
+wardenlens-index = { path = "../wardenlens-index" }
+
+[lints]
+workspace = true
