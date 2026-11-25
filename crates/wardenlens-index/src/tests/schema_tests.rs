@@ -243,7 +243,7 @@ fn every_index_gets_its_own_random_16_byte_instance_id() {
         let (_f, idx) = open_new();
         let id: Vec<u8> = idx
             .conn
-            .query_row(crate::sql::INSTANCE_ID, [], |r| r.get(0))
+            .query_row(crate::sql::INSTANCE_ID.text(), [], |r| r.get(0))
             .unwrap();
         assert_eq!(id.len(), 16);
         ids.insert(id);

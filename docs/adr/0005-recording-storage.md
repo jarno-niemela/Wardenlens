@@ -273,7 +273,12 @@ first read and checkpoints when the last connection closes, so **no read-write c
 identity and every sidecar are proven by means no sidecar can influence**:
 
 - the parent directory is ours and not group- or world-writable (`fsutil::check_parent`, shared with the vault); each `-wal`,
-  `-shm` and `-journal` is `lstat`ed and must be a regular file owned by the service user with no group or other bit; the
+  `-shm` and `-journal` is `lstat`ed and must be a regular file owned by the service user with no group or other bit and
+  **exactly one hard link** (SQLite rewrites a `-shm` and a `-wal` in place, so a sidecar that is a second name of another file
+  would clobber it; `InsecureSidecar`, nothing modified). **The main file must have exactly one link too**
+  (`HardLinkedIndex`, nothing modified): two names of one index file get two separate `-wal`/`-shm` pairs, so two processes
+  do not see each other's SQLite locks and overwrite each other's committed rows. (Holding the `flock` for the life of the
+  handle is #148.) The `-shm`/`-wal`/`-journal` rule is in `fsutil::sidecar_len`, the main-file rule in the index's open (#145); the
   100-byte header is read through our own descriptor (magic, `application_id`, journal mode);
 - the settled state is judged read-only: `application_id`, `user_version` (too new is refused here, so the file stays
   byte-identical), then **every `sqlite_master` row** (`type, name, tbl_name, sql`) compared with a reference built in
@@ -318,9 +323,21 @@ identity and every sidecar are proven by means no sidecar can influence**:
   created first, so it sits on page 2, which a commit would not otherwise touch again. **Invariant: every non-empty `-wal`
   this crate writes carries a frame of that page.** It holds because every write transaction (each migration step,
   `insert`, `set_tier`, `delete`, and any future write) goes through one choke point, `sql::write_tx`, which runs
-  `UPDATE index_meta SET generation = generation + 1` before `COMMIT`; the statements that change data take a `WriteTx`
-  that only `write_tx` can create, so a new write method cannot skip the bump (the compiler enforces it; a hygiene test
-  checks that unversioned statements are used only by the open sequence). A replayed view of a foreign index's `-wal`
+  `UPDATE index_meta SET generation = generation + 1` before `COMMIT`; what enforces it, exactly: (1) **the compiler**: the connection is a `sql::Db` whose
+  `rusqlite::Connection` is private to `sql.rs`, so no other file can call `.execute`, `.query_row`, `.pragma_update`,
+  `.prepare_with_flags` or `.transaction` on it; the only ways to run SQL are the functions of `sql.rs`, which take a
+  `&'static str` or a `ReadSql`; (2) **the compiler**: the data writes (`WriteTx::write`, `WriteTx::write_batch`) need a
+  `&WriteTx`, which only `write_tx` makes, and `write_tx` runs the bump before `COMMIT`; (3) **the compiler**: the read
+  wrappers `sql::prepare` and `sql::query_row` take a `ReadSql` token, a newtype whose constructor is private to `sql.rs`
+  and which exists only for the reviewed `SELECT`s and getter pragmas (a pass-list, not a shape check: `sqlite3_stmt_readonly`
+  is true for `COMMIT`, `ATTACH`, `PRAGMA locking_mode = ...` and others, so it cannot be the test). A test checks that every
+  token is read-only, returns a column and is not transaction control, `ATTACH`, or a setter pragma. As defence in depth
+  `prepare` also refuses, at run time, a statement that is not `readonly()` or has no column (`IndexError::NotReadOnly`);
+  (4) **by convention, checked by test**: the setup statements that write without a bump (`journal_mode`,
+  `journal_size_limit`, the creation transaction, the reference schema) use `execute_unversioned`, `query_row_unversioned`
+  and `unversioned_tx`, which a hygiene test limits to `open.rs` and `migrate.rs`. That limit, and a second grep for direct
+  driver calls, are text checks, not the compiler. `WriteTx::write` keeps `&'static str` (not a token): a `WriteTx` is
+  already the proof that the bump follows, and the migration scripts are whole files. A replayed view of a foreign index's `-wal`
   therefore shows the foreign instance id, and is `ForeignWal`. The main file also holds the id from its first page, so a
   deployment whose first checkpoint has not happened yet (the main file is a sound version-0 index and the `-wal` holds the
   migration and every row) still opens. **A main file torn by a crash in the middle of a checkpoint** (a page half new) may
@@ -334,7 +351,7 @@ identity and every sidecar are proven by means no sidecar can influence**:
   `StraySidecar`; the message says to move it out and keep it, and nothing is lost because an index with data never has one;
   the creation window is not identified on a private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; only a `-wal` that is **entirely zero** (checked over the whole file, up to 256 MiB), or one shorter than a header that
   is a prefix of magic + format version (+ page size), is an empty WAL, as for SQLite (what a crash before its first frame
-  leaves); any other short, non-magic or zero-header-with-a-body `-wal` is `InvalidWal` (holds nothing of this index, never
+  leaves); any other short, non-magic, **bad-header-checksum** (SQLite ignores every frame of such a file and then rewrites and deletes it, so it must never be opened read-write; the salts are covered by that checksum) or zero-header-with-a-body `-wal` is `InvalidWal` (holds nothing of this index, never
   opened read-write, so never deleted or rewritten; the message says to move it out and keep it); a `-wal` with another page size, or one whose replay is not an index of ours
   (wrong `application_id`, schema or integrity), is `ForeignWal`. Every refusal message names a lossless remedy (move the
   file out of the directory and keep it). A `-wal` copied from this very index (same instance id) by the same user is accepted when

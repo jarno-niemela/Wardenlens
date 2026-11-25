@@ -53,15 +53,24 @@ pub enum IndexError {
         /// The sidecar suffix.
         suffix: &'static str,
     },
-    /// A sidecar is owned by another user or grants group or other access. SQLite would replay
-    /// or roll back whatever it holds into the index, so it is never trusted.
+    /// A sidecar is owned by another user, grants group or other access, or has more than one
+    /// hard link (SQLite rewrites a `-shm` and a `-wal` in place, which would clobber the file
+    /// that has the other name). SQLite would replay or roll back whatever it holds into the
+    /// index, so it is never trusted. Nothing was modified.
     #[error(
-        "sidecar {suffix} is not owned by the current user or is accessible to others; nothing was modified; move it out of the directory and keep it (or fix its owner and mode if it is yours)"
+        "sidecar {suffix} is not owned by the current user, is accessible to others or has more than one hard link; nothing was modified; move it out of the directory and keep it (or fix its owner, mode or links if it is yours)"
     )]
     InsecureSidecar {
         /// The sidecar suffix.
         suffix: &'static str,
     },
+    /// The index file itself has more than one hard link. Two names of one index get two
+    /// separate `-wal`/`-shm` pairs, so two processes would not see each other's locks and would
+    /// overwrite each other's committed rows. Nothing was modified.
+    #[error(
+        "index file has more than one hard link; nothing was modified; remove the extra name (keep one) and start again"
+    )]
+    HardLinkedIndex,
     /// A sidecar exists that cannot belong to this database in its state: any sidecar next to an
     /// empty file, a `-wal` or `-shm` next to a rollback-mode file, or an empty `-journal`.
     /// Nothing was modified. Move it out of the directory (and delete it later when you know
@@ -83,7 +92,8 @@ pub enum IndexError {
         "unfinished -journal next to the index; nothing was modified; move the -journal file out of the directory and keep it (an index with data never has one, so nothing is lost)"
     )]
     PendingJournal,
-    /// The `-wal` next to the index has no valid header and is not a torn one (only a file that
+    /// The `-wal` next to the index has no valid header (wrong magic or header checksum) and is
+    /// not a torn one (only a file that
     /// is entirely zero, or a short prefix of a valid header, is treated as empty): SQLite did not
     /// write it. Nothing was modified. It holds no committed data of this index; move it out of
     /// the directory and keep it.
@@ -96,7 +106,7 @@ pub enum IndexError {
     /// modified. Move it and its `-shm` out of the directory and keep them until you know whose they
     /// are; nothing is lost.
     #[error(
-        "the -wal file does not belong to this index; nothing was modified; move it and its -shm out of the directory and keep them until you know whose they are"
+        "the -wal file does not belong to this index, or replaying it gives a damaged database; nothing was modified; move it and its -shm out of the directory and keep them until you know whose they are"
     )]
     ForeignWal,
     /// The schema (every `sqlite_master` row) is not the one of its `user_version`.
@@ -159,6 +169,13 @@ pub enum IndexError {
         /// The SQLite result code, if any.
         code: Option<ErrorCode>,
     },
+    /// A read path was given a statement that is not read-only (a programming error, never
+    /// caused by data): the read wrappers refuse it so it cannot skip the generation bump.
+    #[error("{op}: refused a statement that is not read-only")]
+    NotReadOnly {
+        /// What was being done.
+        op: &'static str,
+    },
     /// A segment with the same camera and start time exists.
     #[error("a segment with this camera and start time already exists")]
     Duplicate,
@@ -205,6 +222,7 @@ impl IndexError {
     /// Maps a failed SQLite call, keeping only the result code (the message can name files).
     pub(crate) fn sqlite(op: &'static str) -> impl FnOnce(rusqlite::Error) -> Self {
         move |e| match e.sqlite_error_code() {
+            _ if matches!(e, rusqlite::Error::InvalidQuery) => Self::NotReadOnly { op },
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy { op },
             code => Self::Sqlite { op, code },
         }

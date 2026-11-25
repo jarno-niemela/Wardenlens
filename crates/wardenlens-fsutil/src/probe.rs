@@ -33,15 +33,22 @@ pub fn check_parent(parent: &Path) -> Result<(), FsError> {
 
 /// Checks a sidecar of a database file (`-wal`, `-shm`, `-journal`) without opening it: `lstat`,
 /// then it must be a regular file owned by the effective user with no group or other permission
-/// bits and no setuid, setgid or sticky bit. Returns its length, or `None` when it is absent.
+/// bits and no setuid, setgid or sticky bit, and **exactly one hard link**: SQLite truncates and
+/// rewrites a `-shm` and a `-wal` in place, so a sidecar that is a second name of another file
+/// would clobber that file. (The index refuses a main file with more than one link as well, in
+/// its own open: `IndexError::HardLinkedIndex`.) Returns its
+/// length, or `None` when it is absent.
 ///
 /// # Errors
 /// [`FsError::NotRegular`] (a symlink is not regular), [`FsError::WrongOwner`],
-/// [`FsError::InsecureMode`] or a failed `lstat`.
+/// [`FsError::InsecureMode`], [`FsError::HardLinked`] or a failed `lstat`.
 pub fn sidecar_len(path: &Path) -> Result<Option<u64>, FsError> {
     match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => {
             check_stat(&st)?;
+            if st.st_nlink > 1 {
+                return Err(FsError::HardLinked { links: st.st_nlink });
+            }
             Ok(Some(u64::try_from(st.st_size).unwrap_or(u64::MAX)))
         }
         Err(Errno::NOENT) => Ok(None),
@@ -97,6 +104,72 @@ impl Scratch {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Removes the scratch directories (`.wardenlens-probe-<pid>-...`) that a process which has
+    /// since died left in `parent` after a crash (SEC-2: they hold a copy of the database). A
+    /// directory is removed only if it is a real directory (not a symlink) owned by the
+    /// effective user, and the pid in its name is **not a live process** (`kill(pid, 0)` says
+    /// no such process); the directories of live processes, including this one, are left alone.
+    /// **Assumption: one pid namespace.** Liveness is `kill(pid, 0)` in this process's pid
+    /// namespace, so two containers that share the data directory but not the pid namespace
+    /// could remove each other's live scratch directories; the service runs one process per
+    /// data directory (a single container), and the probe that uses a scratch directory runs
+    /// under the vault's open, one at a time. Best effort (ERR-4): a failure to remove one is
+    /// skipped. Returns how many were removed.
+    #[must_use]
+    pub fn sweep_stale(parent: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return 0;
+        };
+        let me = rustix::process::geteuid().as_raw();
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = stale_candidate_pid(&name) else {
+                continue;
+            };
+            if pid_is_alive(pid) {
+                continue;
+            }
+            // `symlink_metadata`: a symlink named like a scratch directory is not followed and
+            // not removed through.
+            let ours = entry
+                .path()
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_dir() && m.uid() == me);
+            if ours && std::fs::remove_dir_all(entry.path()).is_ok() {
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+}
+
+/// The pid of a `.wardenlens-probe-<pid>-<nanos>-<n>` name, or `None` for any other name.
+fn stale_candidate_pid(name: &OsStr) -> Option<i32> {
+    let rest = name.as_bytes().strip_prefix(b".wardenlens-probe-")?;
+    let mut parts = rest.split(|b| *b == b'-');
+    let (pid, nanos, n) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let digits = |b: &[u8]| !b.is_empty() && b.iter().all(u8::is_ascii_digit);
+    if !(digits(pid) && digits(nanos) && digits(n)) {
+        return None;
+    }
+    std::str::from_utf8(pid).ok()?.parse::<i32>().ok()
+}
+
+/// True unless `kill(pid, 0)` reports that no such process exists. A pid that is not a valid
+/// process id is not alive.
+fn pid_is_alive(pid: i32) -> bool {
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return false;
+    };
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
 }
 
 impl Drop for Scratch {
@@ -106,7 +179,9 @@ impl Drop for Scratch {
     }
 }
 
-/// Most bytes [`copy_bounded`] copies.
+/// Most bytes [`copy_bounded`] copies. The vault probe copies its file under this cap. The index
+/// does **not** copy (it probes a `-wal` read-only on the real files), so its size is not capped by
+/// it; the index uses the value only as the longest `-wal` it reads to prove it all zero.
 pub const MAX_COPY_LEN: u64 = 256 * 1024 * 1024;
 
 /// Copies `src` (at most [`MAX_COPY_LEN`] bytes) through the descriptor to a new `0600` file
@@ -236,6 +311,19 @@ mod tests {
         }
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert_eq!(sidecar_len(&p).unwrap(), Some(3));
+        // A second name makes it a hard-linked sidecar: refused, and the file is untouched.
+        let twin = d.path().join("twin");
+        std::fs::hard_link(&p, &twin).unwrap();
+        assert!(matches!(
+            sidecar_len(&p),
+            Err(FsError::HardLinked { links: 2 })
+        ));
+        assert!(matches!(
+            sidecar_len(&twin),
+            Err(FsError::HardLinked { links: 2 })
+        ));
+        std::fs::remove_file(&twin).unwrap();
+        assert_eq!(sidecar_len(&p).unwrap(), Some(3));
         // A symlink, a directory and a FIFO are not regular files.
         let link = d.path().join("link");
         symlink(&p, &link).unwrap();
@@ -264,6 +352,64 @@ mod tests {
         .unwrap();
         assert!(!open_sidecar(&fifo).unwrap().metadata().unwrap().is_file());
         assert!(open_sidecar(&real).unwrap().metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_directories_of_ours() {
+        let d = private_dir();
+        let dead = i32::MAX - 1; // above any pid_max: no such process
+        let stale = d.path().join(format!(".wardenlens-probe-{dead}-123-0"));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("copy.db"), b"x").unwrap();
+        // The directory of a live process (this one) stays.
+        let live = Scratch::new(d.path()).unwrap();
+        // Names that merely look similar stay: wrong shape, not a directory, a symlink.
+        let decoys = [
+            format!(".wardenlens-probe-{dead}-123"),
+            format!(".wardenlens-probe-{dead}-123-0-9"),
+            ".wardenlens-probe-abc-123-0".to_string(),
+            ".wardenlens-probe--1-123-0".to_string(),
+            format!("wardenlens-probe-{dead}-123-0"),
+        ];
+        for n in &decoys {
+            std::fs::create_dir(d.path().join(n)).unwrap();
+        }
+        let file = d.path().join(format!(".wardenlens-probe-{dead}-5-1"));
+        std::fs::write(&file, b"keep").unwrap();
+        let target = d.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("precious"), b"keep").unwrap();
+        let link = d.path().join(format!(".wardenlens-probe-{dead}-6-2"));
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(Scratch::sweep_stale(d.path()), 1);
+        assert!(!stale.exists());
+        assert!(live.path().exists());
+        for n in &decoys {
+            assert!(d.path().join(n).exists(), "{n}");
+        }
+        assert!(file.exists());
+        assert!(link.symlink_metadata().is_ok());
+        assert!(
+            target.join("precious").exists(),
+            "removed through a symlink"
+        );
+        // Idempotent, and a missing parent is not an error.
+        assert_eq!(Scratch::sweep_stale(d.path()), 0);
+        assert_eq!(Scratch::sweep_stale(&d.path().join("missing")), 0);
+    }
+
+    #[test]
+    fn stale_candidate_pid_table() {
+        let t = |s: &str| stale_candidate_pid(OsStr::new(s));
+        assert_eq!(t(".wardenlens-probe-42-1-2"), Some(42));
+        assert_eq!(t(".wardenlens-probe-42-1"), None);
+        assert_eq!(t(".wardenlens-probe-42-1-2-3"), None);
+        assert_eq!(t(".wardenlens-probe-x-1-2"), None);
+        assert_eq!(t(".wardenlens-probe-99999999999-1-2"), None);
+        assert_eq!(t(".wardenlens-probe-0-1-2"), Some(0));
+        assert!(!pid_is_alive(0), "pid 0 is not a process id");
+        assert!(pid_is_alive(i32::try_from(std::process::id()).unwrap()));
     }
 
     #[test]

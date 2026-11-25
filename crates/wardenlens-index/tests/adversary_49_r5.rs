@@ -411,7 +411,6 @@ fn failed_writes_leave_no_frame_and_each_success_adds_page_two() {
 /// rewrites it. A `-shm` that is a hard link to another file (here: a file of ours that holds
 /// data) is not derived state: it must be refused, or at least the linked file left intact.
 #[test]
-#[ignore = "follow-up #145"]
 fn a_hard_linked_shm_does_not_clobber_the_file_it_links_to() {
     let (dir, path) = closed_index_with("c", 3);
     let keep = dir.path().join("keep.bin");
@@ -430,8 +429,8 @@ fn a_hard_linked_shm_does_not_clobber_the_file_it_links_to() {
     assert!(after == precious, "the hard-linked file was rewritten");
 }
 
-/// The same for a `-wal` hard link: an own valid `-wal` linked from elsewhere is replayed and
-/// then checkpointed and deleted; the other name must at least still hold its bytes.
+/// The same for a `-wal` hard link: it is refused untouched (`InsecureSidecar`), and the other
+/// name still holds its bytes.
 #[test]
 fn a_hard_linked_wal_is_not_rewritten_through_the_other_name() {
     let dir = private_tempdir();
@@ -447,10 +446,16 @@ fn a_hard_linked_wal_is_not_rewritten_through_the_other_name() {
     let other_name = image.path().join("backup-of-wal");
     std::fs::hard_link(sidecar(&ip, "-wal"), &other_name).unwrap();
     let saved = std::fs::read(&other_name).unwrap();
-    {
-        let mut idx = Index::open(&ip).unwrap();
-        idx.insert(&rec("c", BASE + 10_000), Tier::Hot).unwrap();
-    }
+    // #145: a `-wal` with a second name is refused (SQLite rewrites a `-wal` in place), so the
+    // open fails and nothing is written through either name. The expectation that the other
+    // name still holds its bytes is unchanged and now holds exactly.
+    let before = snapshot(image.path());
+    let err = Index::open(&ip).unwrap_err();
+    assert!(
+        matches!(err, IndexError::InsecureSidecar { suffix: "-wal" }),
+        "{err:?}"
+    );
+    assert!(before == snapshot(image.path()), "the refusal wrote");
     let after = std::fs::read(&other_name).unwrap();
     assert!(
         after.len() >= saved.len() && after[..32] == saved[..32],
@@ -485,7 +490,6 @@ fn round_five_errors_carry_no_path() {
 /// committed rows it holds (recoverable by fixing 8 bytes). The documented rule says such a file
 /// is `InvalidWal` and kept byte-identical.
 #[test]
-#[ignore = "follow-up #145"]
 fn a_wal_with_a_bad_header_checksum_is_refused_and_kept() {
     let dir = private_tempdir();
     let path = dir.path().join("index.db");
@@ -506,7 +510,8 @@ fn a_wal_with_a_bad_header_checksum_is_refused_and_kept() {
     drop(r);
     let after = snapshot(dir.path());
     let kept = before.get("index.db-wal") == after.get("index.db-wal");
-    let rows_now = rows(&Index::open(&path).unwrap(), "c").len();
+    // Diagnostic only (#145): a refused file is refused again, so a failed open is "no rows".
+    let rows_now = Index::open(&path).map_or(0, |i| rows(&i, "c").len());
     assert!(
         kept,
         "opened={opened}: the -wal holding a committed row was {} (rows now {rows_now} of 4)",

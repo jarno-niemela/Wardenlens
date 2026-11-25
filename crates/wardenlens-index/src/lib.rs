@@ -25,7 +25,7 @@ mod sql;
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::Connection;
+use crate::sql::Db;
 use wardenlens_fsutil::{FileLock, PrivateFile};
 
 pub use error::{CursorFault, IndexError};
@@ -37,7 +37,7 @@ pub struct Index {
     // Field order is the drop order: the connection closes first, then the descriptors. Closing
     // any descriptor of the main file drops the process's POSIX locks on it, including SQLite's
     // WAL shared lock, so none of them may close while the connection is live.
-    conn: Connection,
+    conn: Db,
     _lock: FileLock,
     _file: PrivateFile,
 }

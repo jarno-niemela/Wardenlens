@@ -33,6 +33,14 @@ pub enum FsError {
         /// The effective uid.
         expected: u32,
     },
+    /// A sidecar has more than one hard link, so SQLite would truncate or rewrite a file that
+    /// also has another name. Only sidecars are checked: they are derived state SQLite rewrites
+    /// and deletes, never data to keep under another name.
+    #[error("file has {links} hard links")]
+    HardLinked {
+        /// The link count found.
+        links: u64,
+    },
     /// The directory is not owned by the effective user.
     #[error("directory is not owned by the current user")]
     ParentWrongOwner,

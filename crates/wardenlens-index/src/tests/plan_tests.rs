@@ -26,10 +26,14 @@ fn populated() -> (Fixture, Index) {
     (f, idx)
 }
 
-fn plan(idx: &Index, stmt: &str, args: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+fn plan(
+    idx: &Index,
+    stmt: impl Into<crate::sql::ReadSql>,
+    args: &[&dyn rusqlite::ToSql],
+) -> Vec<String> {
     let mut s = idx
         .conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {stmt}"))
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", stmt.into().text()))
         .unwrap();
     s.query_map(args, |r| r.get::<_, String>(3))
         .unwrap()
@@ -110,8 +114,8 @@ fn latest_start_searches_the_camera_index() {
 fn by_id_statements_use_the_primary_key() {
     let (_f, idx) = populated();
     for (name, stmt, args) in [
-        ("get", sql::GET, vec![&1_i64 as &dyn rusqlite::ToSql]),
-        ("tier_of", sql::TIER_OF, vec![&1_i64]),
+        ("get", sql::GET.text(), vec![&1_i64 as &dyn rusqlite::ToSql]),
+        ("tier_of", sql::TIER_OF.text(), vec![&1_i64]),
         ("delete", sql::DELETE, vec![&1_i64]),
         ("set_tier", sql::SET_TIER, vec![&1_i64, &1_i64, &0_i64]),
     ] {
