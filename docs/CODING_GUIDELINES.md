@@ -93,6 +93,21 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   widely-used crates. Disable default features you do not use.
 - **SEC-9 Concurrency:** no `static mut`; prefer message passing; hold locks
   for the shortest scope and never across `.await`.
+- **SEC-10 One choke point, a pass-list where the good set is known, every
+  entry point tested.** A rule that must hold everywhere (a refusal, redaction,
+  authentication, a rate or concurrency cap, input classification) is enforced
+  in the one function or layer every path goes through, never in a helper that
+  most paths happen to call. Where the good set can be listed (printable
+  characters, tree modes, echoable error kinds, routes), classify by a
+  **pass-list of known-good forms** and fail closed on anything unknown, with no
+  "everything else is a file" fallthrough. Where only the bad values are known
+  exactly (vault values, ADR 0006 §7), match them exactly over every rendering
+  (TEST-9). A shape heuristic is never the enforcement: it may exist only as a secondary layer behind the choke point (an advisory soft lint, ADR 0006 §7, or defence in depth behind unconditional redaction, such as the `RtspPath` name check). Never answer a finding by growing the heuristic instead of fixing the choke point. Two components that must agree on a set
+  (a validator and a scanner, a needle collapse and a view collapse) call one
+  shared predicate, and a test fails if they diverge. A test loops over every
+  entry point (each subcommand, route, error kind, input form), including one
+  that matches nothing. Examples: #94, #60, #75 r1-r2, #43 r1-r3, #117 r1-r2
+  and r5, #32 r1-r5 (`defect-patterns` P10).
 
 ## 5. Testing (`TEST`)
 
@@ -117,6 +132,17 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   an ordering or a redaction must fail when that guard is removed or reordered:
   mutation-check it once by hand and say so in the PR. A test that passes only
   because of scheduler timing is not deterministic (TEST-5).
+- **TEST-9 Enumerate the whole surface before fixing.** For an invariant over an
+  open-ended input space (every path a push publishes, every spelling a scanner
+  must find, every input form of a parse type), write the full enumeration and a
+  table-driven test, one row per element, **before** the fix, and show that it
+  fails first. A brief or ticket states the invariant, not the reported
+  example. Any proof an optimisation relies on (for example "every ancestor of a
+  new tree is new") is checked in both directions: a new path can sit on an old
+  tree (#117 r4). Prefer "walk everything and dedupe" to "skip what looks
+  already handled", but only within the SEC-2/SEC-3 bounds: #128's unbounded
+  `seen` set grew with the input. Examples: #117 r1-r5, #43 r2-r4, #32 rw1
+  (`defect-patterns` P11).
 
 ## 6. Style & documentation (`DOC`)
 
@@ -168,3 +194,4 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
 7. Are tests deterministic, behaviour-named, and covering edges?
 8. Any new dependency — justified and `cargo deny` clean?
 9. Is anything here speculative, dead, or duplicated?
+10. Is every cross-cutting policy at one choke point, by a pass-list or exact match (SEC-10), and is every open-ended invariant backed by an enumerated table test (TEST-9)?

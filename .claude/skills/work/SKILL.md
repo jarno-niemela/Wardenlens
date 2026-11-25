@@ -29,6 +29,7 @@ For every subagent: write its exact prompt to a file in the scratchpad, run `scr
 - **Split before implementing** when the ticket spans a library and its CLI or git/workflow integration, or carries several rounds of amendments. Keep the pure library in N, file the rest as a new ticket blocked by N, and record the split as an amendment comment on N. Strike the moved criteria in N's body, with a pointer to the new ticket, so merge rule 3 does not still require them. The unsplit #74 vault and #32 catalogue hit the 5-round cap; the split #94 CLI took 3 rounds.
 - **Amending a ticket:** if the rule comes from an ADR, change the ADR first and mirror it into the ticket. Never add new rules to a ticket while its ADR is still under verification. In PR #77, ticket bullets drifted from the ADR, which wins, and that cost a major.
 - **Real devices and site data:** spike tickets are read-only towards cameras. A write needs the owner's approval for that one change: read and record the old value first, change nothing else, and revert when done. Code, docs and briefs name cameras by inventory id only; LAN addresses, credentials, serials and display names never enter the repo or a brief.
+- Scratch git experiments, by you or in a brief, use `git -C <absolute temp path>` only; a failed `cd` once let `git reset --hard` run in the main checkout (#117 r1). Say so in every implementer brief.
 - `scripts/ticket claim N`
 - Branch `<type>/<N>-<slug>` (type from conventional title: feat/fix/refactor/chore/docs/test).
 ```bash
@@ -44,12 +45,13 @@ Dispatch the `implementer` subagent with: ticket number, full ticket body, workt
 The `Ticket audit report` issue is never a work item: do not claim it, route it to `/ticket-audit`.
 
 ## 3. Open the PR
+Every push below is chained: `scripts/gate && <CI's shellcheck line> && git push`. CI's command is the `run: shellcheck …` line in `.github/workflows/ci.yml` (no `-x`; the gate's has `-x`), run from the worktree.
 ```bash
-git -C .claude/worktrees/N push -u origin <branch>
+(cd /abs/.claude/worktrees/N && scripts/gate && <CI shellcheck line> ) && git -C .claude/worktrees/N push -u origin <branch>
 gh pr create --head <branch> --title "<conventional title> (#N)" --body-file <filled .github/pull_request_template.md with Closes #N>
 gh pr edit <pr> --add-label agent:sonnet
 ```
-**Bring the branch up to date before every verification round.** If `origin/main` moved, run `git merge origin/main` in the worktree. Resolve a `Cargo.lock` conflict with `git checkout --theirs Cargo.lock` and a cargo re-resolve, and resolve `lib.rs` module lists by union. Then run the gate and push, in that order and chained with `&&`. Updating first means the verified head is the one that merges; updating after verification changes the head and needs re-verification.
+**Bring the branch up to date before every verification round.** If `origin/main` moved, run `git merge origin/main` in the worktree. Rework commits stay separate from the merge of main (#32). Resolve a `Cargo.lock` conflict with `git checkout --theirs Cargo.lock` and a cargo re-resolve, and resolve `lib.rs` module lists by union. Then run the gate, CI's exact shellcheck and the push, chained with `&&` as above. Updating first means the verified head is the one that merges; updating after verification changes the head and needs re-verification.
 
 **Pipeline:** while one PR verifies, start the next ticket's implementer in its own worktree. Never verify two branches that conflict (5b).
 
@@ -62,7 +64,7 @@ The gate result comes from your own `scripts/gate` run (step 2); pass it to the 
 
 Launch **in one message** `reviewer`, `security-auditor`, `adversary`. Do not pass the implementer's reasoning; verifiers judge the code, not the story.
 
-Record each verdict (only from a complete report, never a partial or interrupted one) against the exact commit, one call per dimension:
+Record each verdict (only from a complete report, never a partial or interrupted one) against the exact commit, one call per dimension. **Record each one as soon as it arrives, all three, before any `verify carry`** (#117 and #43 once carried with a verdict unrecorded); if `carry` reports fewer than 3, re-run it once or twice, because the status API can lag. If it still reports fewer than 3, run `scripts/verify check`, and mark the missing verdict on the verified SHA (`verify mark`, only from a complete verifier report), then re-run `scripts/verify carry <pr> <SHA>`, before merging:
 ```bash
 scripts/verify mark <pr> quality|security|adversarial pass|fail $SHA
 ```
@@ -75,7 +77,9 @@ Collect verdicts:
 
 ## 5. Fix loop (max 5 rounds)
 **Writing a design ruling into a fix brief.** Most extra rounds came from rulings that fixed one case and broke another. Before sending a ruling:
-- **Ask for the class, not the instance.** When a finding is one case of a rule (one subcommand skipping a refusal, one error kind echoing input), the brief asks for the rule at its choke point, as an allowlist, with a test over every case (P10).
+- **Ask for the class, not the instance.** When a finding is one case of a rule (one subcommand skipping a refusal, one error kind echoing input), the brief asks for the rule at its choke point, as a pass-list or exact match, with a test over every case (P10, SEC-10).
+- **Name the invariant and the surface (TEST-9).** For an open-ended input space, the brief states the invariant ("every full path a push publishes is scanned"), asks for the written enumeration and a table test before the fix, and has the implementer check any "skip what is already handled" proof in both directions. #117 took six rounds, one instance each (replace refs, empty directories, names across `/`, old subtrees under renamed paths, mode `40755`); #43 took four more for scanner spellings (P11).
+- **Keep fix rounds in scope.** A ticket that pulls in another crate's behaviour (#43 changed the vault and the scanner) is split into its own ticket at r1, not widened by a brief.
 - **State the invariant** the fix must keep, quoting the ticket's "never …" sentences and the ADR principle.
 - **Apply it symmetrically.** If it holds for the archive tier, it must hold for the hot tier, and the same goes for `create` versus `open`.
 - **Check it against the committed adversary tests.** For stateful logic, simulate several ticks by hand.
@@ -86,7 +90,7 @@ Collect verdicts:
 
 1. `scripts/ticket status N changes-requested`; post the consolidated findings as a PR comment (`gh pr comment`).
 2. Re-dispatch the `implementer` with the findings verbatim and the adversary's failing tests (tell it to commit those tests: they are now regression tests).
-3. You run the gate, push, set `SHA` to the new head, and go back to step 4 with **all three** verifiers from scratch. `scripts/ticket status N in-review`. Statuses on the old SHA do not count for the new head.
+3. You run, chained with `&&`, the gate, then CI's exact shellcheck (the `run: shellcheck …` line in `.github/workflows/ci.yml`, no `-x`), then push, and set `SHA` to the new head. Go back to step 4 with **all three** verifiers from scratch. `scripts/ticket status N in-review`. Statuses on the old SHA do not count for the new head.
 4. After round 5 still failing: stop. Comment a summary, label issue and PR `agent:human`, leave it `changes-requested`, report to user, continue with the next ticket if `--loop`.
 
 **At the cap** (as with #74 / PR #97; the binding rule is "Owner override at the cap" in `docs/WORKFLOW.md`):
@@ -99,10 +103,10 @@ Collect verdicts:
   - Only then set the `verify/*` statuses to success. They record the override, not an independent pass.
 
 ## 5b. Running verification in parallel
-Two PRs can be verified at once only if a trial merge of both onto `origin/main` is clean. Use a scratch clone (`/tmp/claude-1000/mt`) with a throwaway identity (`git -c user.name=t -c user.email=t@example.invalid merge …`) for the trial only. **Never push from the scratch clone**: it has no `core.hooksPath`, so `.githooks/pre-push` would not run. Almost every core PR adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`, so two such PRs conflict. Verify those one after another, and merge whichever is closer to passing first. Resolve the real conflict in the PR's own hooked worktree (`git merge origin/main`, the union of both module lists, sorted), then run the gate and push. The new head needs all three verifiers again. That re-verification is not a fix round and does not count toward the cap; name its briefs `<ticket>-<role>-rN-reverify.md` so `/retro` does not count them. It costs as much as a round, so prefer merging the closer PR first over verifying both.
+Two PRs can be verified at once only if a trial merge of both onto `origin/main` is clean. Use a scratch clone (`/tmp/claude-1000/mt`) with a throwaway identity (`git -c user.name=t -c user.email=t@example.invalid merge …`) for the trial only. **Never push from the scratch clone**: it has no `core.hooksPath`, so `.githooks/pre-push` would not run. Almost every core PR adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`, so two such PRs conflict. Verify those one after another, and merge whichever is closer to passing first. Resolve the real conflict in the PR's own hooked worktree (`git merge origin/main`, the union of both module lists, sorted), then run the gate, CI's exact shellcheck and the push, chained with `&&`. The new head needs all three verifiers again. That re-verification is not a fix round and does not count toward the cap; name its briefs `<ticket>-<role>-rN-reverify.md` so `/retro` does not count them. It costs as much as a round, so prefer merging the closer PR first over verifying both.
 
 ## 6. Keep adversary tests and merge
-Passing adversary tests listed under WORTH KEEPING: first read them for sleeps, racing threads or wall-clock bounds (a timing-dependent test goes to a follow-up ticket, never to main), and check their location: only files under `crates/*/tests/**` or `scripts/tests/**` can be carried; tests in a `src/` test module are saved outside the repo and go to the follow-up. Copy the rest from the adversary worktree into the PR branch, commit them (test-only), run the gate, push, then:
+Passing adversary tests listed under WORTH KEEPING: first read them for sleeps, racing threads or wall-clock bounds (a timing-dependent test goes to a follow-up ticket, never to main), and check their location: only files under `crates/*/tests/**` or `scripts/tests/**` can be carried; tests in a `src/` test module are saved outside the repo and go to the follow-up. Copy the rest from the adversary worktree into the PR branch, commit them (test-only), run the gate, CI's exact shellcheck and the push, chained with `&&`, then:
 ```bash
 scripts/verify carry <pr> $SHA        # refuses unless the diff since $SHA touches only crates/*/tests/** or scripts/tests/**
 ```
