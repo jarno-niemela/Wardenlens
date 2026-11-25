@@ -69,6 +69,42 @@ pub(crate) const BYTES_BY_TIER: ReadSql = ReadSql(
 pub(crate) const LATEST_START: ReadSql =
     ReadSql("SELECT MAX(started_at_ms) FROM segments WHERE camera_id = ?1");
 
+// The camera registry (ticket #50). The column list is repeated in `GET_CAMERA` and `LIST_CAMERAS`
+// on purpose, in the order `cameras::decode` reads it.
+
+/// ?1 id, ?2 model, ?3 port, ?4 main path, ?5 sub path or NULL, ?6 now. A new row gets `?6` as
+/// both timestamps; an existing row keeps `created_at_ms`.
+pub(crate) const UPSERT_CAMERA: &str = "INSERT INTO cameras \
+    (id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+    ON CONFLICT (id) DO UPDATE SET model = excluded.model, rtsp_port = excluded.rtsp_port, \
+    main_path = excluded.main_path, sub_path = excluded.sub_path, \
+    updated_at_ms = excluded.updated_at_ms";
+
+pub(crate) const GET_CAMERA: ReadSql = ReadSql(
+    "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms \
+    FROM cameras WHERE id = ?1",
+);
+
+/// ?1 the row count to fetch.
+pub(crate) const LIST_CAMERAS: ReadSql = ReadSql(
+    "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms \
+    FROM cameras ORDER BY id LIMIT ?1",
+);
+
+pub(crate) const CAMERA_EXISTS: ReadSql = ReadSql("SELECT count(*) FROM cameras WHERE id = ?1");
+
+pub(crate) const CAMERA_COUNT: ReadSql = ReadSql("SELECT count(*) FROM cameras");
+
+/// Removes the registry row only: segments carry no foreign key and stay (ADR 0005 section 5).
+pub(crate) const DELETE_CAMERA: &str = "DELETE FROM cameras WHERE id = ?1";
+
+/// The camera ids that have segments but no registry row, ?1 the row count to fetch.
+pub(crate) const ORPHAN_CAMERAS: ReadSql = ReadSql(
+    "SELECT DISTINCT s.camera_id FROM segments s LEFT JOIN cameras c ON c.id = s.camera_id \
+    WHERE c.id IS NULL ORDER BY s.camera_id LIMIT ?1",
+);
+
 // Open and migration statements.
 pub(crate) const GET_APP_ID: ReadSql = ReadSql("PRAGMA application_id");
 pub(crate) const USER_VERSION: ReadSql = ReadSql("PRAGMA user_version");

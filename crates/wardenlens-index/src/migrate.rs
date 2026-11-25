@@ -17,10 +17,16 @@ pub(crate) struct Migration {
 }
 
 /// All migrations of this build. Append-only.
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/001_segments.sql"),
-}];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/001_segments.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/002_cameras.sql"),
+    },
+];
 
 /// The newest version `migrations` reaches.
 pub(crate) fn latest(migrations: &[Migration]) -> i64 {

@@ -14,6 +14,7 @@
 //! Every SQL statement is a `&'static str` in `sql`; values travel only as bound parameters.
 //! Errors carry no path and no row data (SEC-6).
 
+mod cameras;
 mod cursor;
 mod error;
 mod migrate;
@@ -28,6 +29,7 @@ use std::path::Path;
 use crate::sql::Db;
 use wardenlens_fsutil::{FileLock, PrivateFile};
 
+pub use cameras::{CameraRecord, MAX_CAMERAS, StoredCamera};
 pub use error::{CursorFault, IndexError};
 pub use open::BUSY_TIMEOUT;
 
