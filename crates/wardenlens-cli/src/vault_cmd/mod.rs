@@ -44,7 +44,11 @@ pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Re
         VaultCommand::Key(crate::args::KeyCommand::Export) => keys::export(&env.paths()?, term),
         VaultCommand::Key(crate::args::KeyCommand::Import) => keys::import(env, term),
         VaultCommand::ImportLegacy(a) => legacy::import(&a, env, term),
-        VaultCommand::Scan(a) => scan::run(&a, &env.paths().map_err(could_not_scan)?, term),
+        VaultCommand::Scan(a) => {
+            let fixed = a.default_paths.then(|| env.without_overrides());
+            let paths = fixed.as_ref().unwrap_or(env).paths();
+            scan::run(&a, &paths.map_err(could_not_scan)?, term)
+        }
     }
 }
 

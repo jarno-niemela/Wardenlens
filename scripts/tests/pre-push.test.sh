@@ -6,6 +6,8 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 hooks=${HOOKS:-$root/.githooks}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# Hermetic: no vault, no installed scanner, whatever this machine has (the hook under test may scan pushes).
+export HOME="$tmp/home"; mkdir -p "$HOME"; unset WARDENLENS_VAULT WARDENLENS_REQUIRE_VAULT
 # Only pre-push is under test: a hooks dir holding just it keeps the repo's pre-commit (cargo fmt) out
 # of commits made inside the throwaway clones.
 hooks_src=$hooks; hooks=$tmp/hooks; mkdir -p "$hooks"; ln -s "$hooks_src/pre-push" "$hooks/pre-push"

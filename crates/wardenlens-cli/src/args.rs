@@ -58,7 +58,7 @@ pub(crate) enum VaultCommand {
     Key(KeyCommand),
     /// Import the legacy `AgentDVR` secret file and camera inventory.
     ImportLegacy(LegacyArgs),
-    /// Scan files and directories for any vault value. Exits 1 on a hit, 2 if the scan could not run.
+    /// Scan files, directories, the staged changes or a pushed range for any vault value. Exits 1 on a hit, 2 if the scan could not run.
     ///
     /// A hit is printed as `entry-id kind path:line`; the value, the matching text and the line
     /// are never printed, and a path that contains a hit is replaced by `<redacted-path:N>`.
@@ -67,12 +67,36 @@ pub(crate) enum VaultCommand {
     Scan(ScanArgs),
 }
 
-/// Arguments of `scan`.
-#[derive(Debug, Args)]
+/// Arguments of `scan`: files and directories, or one git source.
+#[derive(Debug, Default, Args)]
 pub(crate) struct ScanArgs {
     /// Files and directories to scan; a directory is walked, symlinks inside it are skipped.
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(
+        value_name = "PATH",
+        required_unless_present_any = ["staged", "range"],
+        conflicts_with_all = ["staged", "range"]
+    )]
     pub(crate) paths: Vec<PathBuf>,
+    /// Scan what the next commit would hold: the staged blobs (read from the index, not the
+    /// working tree), their paths included. Binary blobs are scanned too.
+    #[arg(long, conflicts_with = "range")]
+    pub(crate) staged: bool,
+    /// Scan what pushing `B` over `A` would publish: the blobs and commits that are new, every
+    /// path of the new commits and the raw commit and tag objects. `A` may be empty or all zeros
+    /// (a new branch).
+    #[arg(long, value_name = "A..B")]
+    pub(crate) range: Option<String>,
+    /// With `--range`: also treat what this remote's tracking refs hold as already published.
+    #[arg(long, value_name = "REMOTE", requires = "range", conflicts_with_all = ["staged", "paths"])]
+    pub(crate) remote: Option<String>,
+    /// With `--range`: a ref name that the push publishes; the name is scanned and reported
+    /// as `ref:<index>` (its position among the `--ref` options). May be repeated.
+    #[arg(long = "ref", value_name = "NAME", requires = "range", conflicts_with_all = ["staged", "paths"])]
+    pub(crate) refs: Vec<String>,
+    /// Use the fixed default vault and key paths and ignore `WARDENLENS_VAULT` and
+    /// `WARDENLENS_VAULT_KEY_FILE` (the git hooks pass this).
+    #[arg(long)]
+    pub(crate) default_paths: bool,
 }
 
 /// `wardenlens vault key ...`
