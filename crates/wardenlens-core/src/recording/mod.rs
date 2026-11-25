@@ -8,8 +8,9 @@ mod clock;
 mod path;
 mod segmenter;
 
+pub use crate::camera::CameraId;
 pub use clock::MediaClock;
-pub use path::{CameraId, RecordingError, RelPath};
+pub use path::{RecordingError, RelPath};
 pub use segmenter::{
     Decision, FrameMeta, MAX_FRAGMENT_BYTES, MAX_FRAME_BYTES, PushError, Pushed, SegmentConfig,
     SegmentRecord, Segmenter,

@@ -63,11 +63,30 @@ is deliberately weaker (case-insensitive, whitespace-collapsed) because PII pros
 stable on disk and are bound into the ciphertext (section 3); a new kind takes a new code, never a reused one.
 
 **Limits (SEC-2).** A value is at most 4096 bytes of UTF-8, an id at most 128 bytes, a store at most 10,000 entries; all
-are checked on `set` and on `open`. Values are validated per kind on `set` (an IPv4 host must parse with std's strict
-`Ipv4Addr`, a MAC must reduce to 12 hex digits; a hostname is validated **per label**: 1 to 63 bytes of `a-z`, `0-9`,
-`-` and `_` (the underscore is allowed because service and DNS-SD names use it), no label starting or ending with a
-hyphen, the whole name at most 253 bytes, lower-cased at `set`, trailing dot removed; IDN hostnames are entered in
-their `xn--` form).
+are checked on `set` and on `open`. Values are validated per kind on `set`; a MAC must reduce to 12 hex digits.
+
+**One validator for hosts and display names (amended by #43).** The `host` and `display-name` rules are those of the
+pure core types `camera::Host` and `camera::DisplayName`; the vault calls `Host::new` and `DisplayName::new` and stores
+the canonical text they return, so a value set by this version always builds a camera and the rules cannot drift. A
+value stored by an older version may not: the future camera loader must report such a value by its id when it builds a
+camera (it is not built here). The vault adds only the normalisation in front of them (lower-case, one trailing dot
+removed, bracketed IPv6 refused so a stored address has one spelling). For a display name the normalisation is: every
+`char::is_whitespace` character becomes U+0020, a run is one space, invisible characters (`text::is_dropped_invisible`: `is_invisible` minus white space) are
+dropped and the ends are trimmed, so a hand-written name with an NBSP or narrow NBSP stays usable and is stored in the
+one plain-space form; legacy import maps names in that stored form too. Core then refuses a name over 128 bytes, a
+control character, or a name that renders blank (no alphanumeric, a leading combining mark, private use,
+noncharacters, U+2800, U+FFFC); the import report names a refused `.name` key.
+
+- *Host:* 1 to 253 bytes of ASCII. An IPv4 address must parse with std's strict `Ipv4Addr`; an IPv6 address with std's
+  `Ipv6Addr`, stored canonical, with no zone id and not IPv4-mapped (`::ffff:a.b.c.d`) so each address has one
+  spelling. Otherwise a DNS name validated **per label**: 1 to 63 bytes of `a-z`, `0-9`, `-` and `_` (the underscore is
+  allowed because service and DNS-SD names use it), no label starting or ending with a hyphen, lower-cased. The last
+  label must not be all digits or `0x` plus hex digits (that would be a spelling of an IPv4 address). Userinfo, port,
+  path, whitespace, controls and non-ASCII are refused; IDN hostnames are entered in their `xn--` form.
+- *Display name:* 1 to 128 bytes; no control character, no whitespace other than U+0020, no leading or trailing space,
+  and no invisible character: every Unicode `Cf` character plus the invisible fillers and variation selectors, as
+  decided by the one predicate `wardenlens_core::text::is_invisible` (re-exported by the vault scanner); the vault's
+  normalisation and the scanner's squeeze delete the same set, `wardenlens_core::text::is_dropped_invisible`.
 
 **What stays out of the store.** Anything that is not about the site: vendor, model, firmware family, stream codec,
 resolution, ONVIF profile numbers, RTSP path templates, default ports, inventory ids (`reolink-1`). These are public
@@ -313,32 +332,56 @@ address-shaped or password-shaped string that is not in the vault passes (no fal
 shape heuristics of `scripts/agents check` and the catalogue guard are demoted to an optional soft lint (warnings only,
 section 9).
 
-**Views of the text.** Every input is matched in four views, and a hit in any of them counts (reported once per
-entry and line):
+**Views of the text.** One input is matched in the views below, and a hit in any of them counts (reported once per
+entry and line). The views are built from three texts: the **raw** text (UTF-8, invalid bytes become U+FFFD), its
+**squeezed** form, and each **decoded** text (below). Each of these texts is searched in the same set of forms by one
+helper (so the raw text and a decoded text cannot drift).
 
-1. **raw**: the bytes as they are;
-2. **squeezed**: decode UTF-8 (invalid bytes become U+FFFD), then delete the invisible characters U+00AD, U+200B to
-   U+200F, U+202A to U+202E, U+2060 to U+2064, U+2066 to U+2069 and U+FEFF; map the fullwidth ASCII block U+FF01 to
-   U+FF5E onto U+0021 to U+007E; map U+3002, U+FF61 and U+2024 to `.`; map U+2010 to U+2015 and U+2212 to `-`; map
-   U+00A0, U+2000 to U+200A and U+3000 to a space. Line breaks are never touched, so line numbers stay valid;
-3. **decoded**: the squeezed view with `%XX` sequences percent-decoded once (invalid sequences left as they are); the
-   decoded **byte string is re-decoded as UTF-8, lossy** (invalid sequences become U+FFFD), so `%E2%80%93` becomes the
-   en dash U+2013.
-   `%0A` and `%0D` (any case) are **not** decoded, so a decoded view never gains a line break and line numbers stay valid;
-4. **JSON-unescaped**: the squeezed view with JSON string escapes decoded once: `\uXXXX` (a surrogate pair such as
-   `\uD83D\uDE00` becomes one character), `\"`, `\\` and `\/`. **Never decoded**, so the view never gains a line break:
-   `\n`, `\r`, `\t`, `\u000a`, `\u000d`, `\u0085`, `\u2028` and `\u2029` (any case of the hex digits). A lone surrogate
-   (`\uD83D` without its partner) is left as it is. This is what matches a password in a JSON log, including the
-   `\u0026` and `\u0027` forms for `&` and `'` that .NET and Go writers produce. The needle list therefore has no
-   JSON-escaped form (a JSON-escaped needle would miss any escape style it did not anticipate).
+The **squeeze** is: delete the characters `wardenlens_core::text::is_dropped_invisible` returns true for (that is
+`is_invisible` minus white space; U+2028 and U+2029 are white space, so they are collapsed in the joined view, not
+deleted); map the fullwidth ASCII block U+FF01 to U+FF5E onto U+0021 to U+007E; map U+3002, U+FF61 and U+2024 to `.`;
+map U+2010 to U+2015 and U+2212 to `-`; map U+00A0, U+2000 to U+200A and U+3000 to a space. Line breaks are never
+touched, so line numbers stay valid. The vault's display-name normalisation deletes the same set, so a name as stored
+and the same name in a file reduce to the same text.
 
-**Which view is built from which.** The squeezed view is built from the raw text; the decoded, the JSON-unescaped and the
-joined view (below) are each built from the **squeezed** text, independently of each other (the decoded view is not
-JSON-unescaped and the other way round). The decoding steps do not squeeze again, so a character of the squeeze table that
-appears only after decoding is not mapped by the squeeze; the decoded and JSON-unescaped views are therefore also matched
-against the unsqueezed needles (next paragraph), which finds the encoded forms of a character *inside a stored value*.
-What stays a gap (section 8) is an invisible character **inserted** as an escape into text (`%E2%80%8B`, `\u200b`) in the
-middle of a value that does not contain it.
+1. **raw**: the bytes as they are (unsqueezed needles);
+2. **squeezed**: the squeeze of the raw text (invisible characters deleted: finds a value with an invisible character
+   inside it);
+3. **boundary**: the squeeze with each dropped invisible character replaced by one space instead of deleted. It exists
+   only to give a value glued to a letter by an invisible character (`x<ZWSP>Porte Nord Est`) its non-alphanumeric
+   boundary, which the deleting view removes; it is built only when the text holds such a character;
+4. **joined** (display names and `other` only): the squeezed text and the boundary text, each with every run of
+   `char::is_whitespace` characters turned into one space and lowercased, so a name wrapped across lines, indented or
+   written with a tab, NBSP, narrow NBSP, U+3000 or a double space is found; a hit is reported at the line where it
+   starts;
+5. **percent-decoded**: `%XX` sequences decoded once (invalid sequences left as they are); the decoded **byte string
+   is re-decoded as UTF-8, lossy** (invalid sequences become U+FFFD), so `%E2%80%93` becomes the en dash U+2013.
+   Never decoded, so a decoded view never gains a line break and line numbers stay valid: `%0A` and `%0D` (any case)
+   and the escapes of U+0085, U+2028 and U+2029;
+6. **JSON-unescaped**: JSON string escapes decoded once: `\uXXXX` (a surrogate pair such as `\uD83D\uDE00` becomes one
+   character), `\"`, `\\`, `\/`, `\t`, `\f` and `\b` (none can add a line break). Never decoded, so the view never
+   gains a line break: `\n`, `\r`, `\u000a`, `\u000d`, `\u0085`, `\u2028` and `\u2029` (any case of the hex digits). A
+   lone surrogate (`\uD83D` without its partner) is left as it is. This is what matches a password in a JSON log,
+   including the `\u0026` and `\u0027` forms for `&` and `'` that .NET and Go writers produce. The needle list
+   therefore has no JSON-escaped form (a JSON-escaped needle would miss any escape style it did not anticipate).
+
+**Which view is built from which.** The percent-decoded and the JSON-unescaped views are each built from the **raw**
+text **and** from the **squeezed** text, independently of each other (the percent-decoded view is not JSON-unescaped
+and the other way round). Decoding the raw text keeps a literal invisible character that stands before an encoded value
+(`x<ZWSP>Porte%20Nord%20Est`), so the boundary check still sees it; decoding the squeezed text finds an escape that an
+invisible character split. Each decoded text is then searched as it is (unsqueezed), squeezed, in the boundary form
+and joined (the joined view of the squeezed and of the boundary form), like the raw text (one code path, amended by
+#43). So a plain-space display name is found in `Porte%E2%80%AFNord%20Est` or `Porte\u202fNord Est`, and an invisible
+character inserted as an escape (`%E2%80%8B`, `\u200b`) is deleted like a raw one. The decoded and JSON-unescaped
+views are still also matched against the unsqueezed needles (next paragraph). What stays a gap (section 8) is chained
+encoding (percent-encoding of a JSON escape and the other way round) and the line-break escapes.
+
+**The spelling matrix.** A stored display name `Porte Nord Est` is found in every combination of: the encoding of
+the name (literal, a `\uXXXX` escape for every character, the JSON short escapes, `%XX` for every byte, `%20` for
+the spaces); the separator between its words (space, tab, form feed, NBSP, narrow NBSP, U+3000, a double space, a line
+break); and an invisible character (none, inside a word, glued before the name to a preceding letter, glued after it),
+the invisible written literally or encoded. The only cells that stay missing are listed in section 8, and the test
+`scan::tests::matrix` pins both: every other cell is found, and those cells are missing.
 
 **Needles are squeezed with the same table.** Every literal needle (the raw value, its slugs, its joined-view form, its
 compact serial form, its XML and percent forms) is built from the stored value and then passed through the **same squeeze
@@ -363,7 +406,7 @@ Matching is done on these views for every kind; the per-kind rules below only ad
 the full lowercase mapping, `char::to_lowercase`, applied to the needles too; this is not Unicode case folding
 and a string can change length) and, for two kinds, a **joined** view.
 
-Tables, not heuristics: the same four views are applied to every file the same way, and the mapping is part of the
+Tables, not heuristics: the same views are applied to every file the same way, and the mapping is part of the
 tested contract. A character not in the tables (for example a Cyrillic lookalike) is not mapped; see "what the scan
 cannot catch".
 
@@ -458,7 +501,7 @@ The username of a `credential` is **not scanned** (usernames such as `admin` are
 sensitive username belongs in an `other` entry).
 
 *`display-name`* and *`other`* (matched in the fold; the value is whitespace-collapsed: any run of Unicode whitespace
-becomes one space). They are matched in a **joined** view of each text, in addition to the four views: every line
+becomes one space). They are matched in a **joined** view of each text, in addition to the other views: every line
 break (`\n`, `\r\n` or a lone `\r`) and the spaces and tabs that follow it become one space, and any run of Unicode `White_Space` characters (the set the needle collapse uses, one shared definition; none of them adds a line break, lines are counted on `\n`) becomes one space, so
 a name wrapped across lines or indented is found; the stored value itself, folded but not collapsed, is also a needle of the other views, so it is found byte for byte; a hit is reported at the line where it starts. Boundary: not `A`. Minimum
 7 bytes. `display-name` additionally gets the **slug** needles with each space replaced by `-`, by `_`, and removed.
@@ -504,6 +547,13 @@ the redaction rule of section 8, a path; it is also item 5 of the gap list). A t
 **What the scan cannot catch** (residual risk; **the list below is illustrative, not exhaustive**: anything that
 is not a listed rendering of a vault value is outside the guarantee):
 
+0. **Documented gaps of the spelling matrix (section 7).** A line break between the words of a display name that is
+   written as an escape: the JSON escapes `\n`, `\r`, `\u000a`, `\u000d`, `\u0085`, `\u2028`, `\u2029` and the percent
+   escapes `%0A`, `%0D`, `%C2%85`, `%E2%80%A8`, `%E2%80%A9`. Reason: decoding them would put a line break into a
+   decoded view and move the line numbers a hit is reported at (SEC-6 reports only id, kind and line, and that line
+   must be the one in the file). A literal line break between the words is found (joined view). The matrix test
+   asserts these cells as missing.
+
 1. **A value that is not in the vault.** The central gap. An address the owner never entered, a camera added through
    the camera's own web page, a value typed straight into a file. Mitigation: the vault is the only sanctioned way in
    (`import-legacy`, the import command, `vault set`), and the optional shape lint flags candidates for the owner to
@@ -516,8 +566,7 @@ is not a listed rendering of a vault value is outside the guarantee):
    inside the blob), regrouped phone numbers (`555 0100` against `5550100`), **spaced hex dumps** (`63 6f 72 ...`), a display name encoded
    with `+` for spaces (`Back+Door+North`), **defanged hostnames** (`nvr-1[.]example[.]invalid`), and **IDN (Unicode) forms of `xn--` hostnames**, **an IPv6 address with a trailing word glued on** (`2001:db8::1:<hex word>`), **a hex word or a dotted prefix glued on in
    front** (`cafe2001:db8::1`, `1.2001:db8::1`), **IPv4-compatible, NAT64 and translated forms** of an address, the
-   **unbracketed port form** `2001:db8::1:554`, **invisible characters inserted as escapes** into the middle of a value (`%E2%80%8B`, `\u200b`: the decoding steps run after the
-   squeeze step and do not squeeze again), **Rust renderings** of a value such as `Ipv4Addr::new(192, 0, 2, 10)` and `[192, 0, 2, 10]`, and **byte-array MACs**
+   **unbracketed port form** `2001:db8::1:554`, **Rust renderings** of a value such as `Ipv4Addr::new(192, 0, 2, 10)` and `[192, 0, 2, 10]`, and **byte-array MACs**
    (`[0x02, 0x00, 0x5e, 0x00, 0x53, 0xaf]`).
 4. Lookalike characters: Cyrillic or other homoglyphs, NFD vs NFC forms, transliteration (`ä` to `a`) of display names
    and `other` text.

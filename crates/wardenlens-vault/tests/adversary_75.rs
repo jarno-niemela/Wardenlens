@@ -183,10 +183,10 @@ fn ipv4_shapes_that_are_not_the_value_are_not_found() {
     }
 }
 
-/// The display name with U+202F is accepted by the store, so the verbatim miss is reachable
-/// through `vault set` and `Matcher::from_vault`.
+/// A stored value with U+202F is found verbatim through `vault set` and `Matcher::from_vault`.
+/// Since #43 a display name is core's `DisplayName`, which refuses U+202F, so this uses `Other`.
 #[test]
-fn a_stored_display_name_with_a_narrow_no_break_space_is_found_verbatim_through_the_vault() {
+fn a_stored_value_with_a_narrow_no_break_space_is_found_verbatim_through_the_vault() {
     use std::os::unix::fs::PermissionsExt;
     use wardenlens_secrets::KeyFile;
     use wardenlens_vault::{Scan, Value, Vault};
@@ -198,7 +198,7 @@ fn a_stored_display_name_with_a_narrow_no_break_space_is_found_verbatim_through_
     let stored = "Porte\u{202F}Nord Est";
     v.set(
         &EntryId::new("cam:a:name").unwrap(),
-        EntryKind::DisplayName,
+        EntryKind::Other,
         &Value::Text(SecretString::from(stored.to_owned())),
         Scan::Normal,
     )

@@ -30,6 +30,7 @@ mod guard;
 mod matrix;
 mod validate;
 
+pub(crate) use entry::is_slug;
 pub use entry::{
     CatalogueEntry, Codec, ConfigFeature, Event, EventKind, EventSource, EventStatus, Evidence,
     FirmwareFamily, Protocol, ProtocolKind, Stream, StreamRole, SupportLevel,

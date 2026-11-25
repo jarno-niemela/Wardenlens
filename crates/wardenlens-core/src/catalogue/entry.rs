@@ -104,7 +104,7 @@ impl Codec {
 }
 
 /// Which stream of the camera is described.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StreamRole {
@@ -363,6 +363,13 @@ impl CatalogueEntry {
     pub fn model_slug(&self) -> String {
         slug(&self.model)
     }
+}
+
+/// True when `text` is exactly what [`slug`] would produce from itself: non-empty, ASCII
+/// lowercase alphanumerics separated by single `-`. The camera model reference uses this, so
+/// the catalogue and the camera agree on what a slug is.
+pub(crate) fn is_slug(text: &str) -> bool {
+    !text.is_empty() && slug(text) == text
 }
 
 /// Lowercases, maps every run of non-alphanumeric characters to one `-`, trims `-` at the ends.

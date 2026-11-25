@@ -126,6 +126,10 @@ fn decode_escape(b: &[u8], at: usize) -> Option<(char, usize)> {
         b'"' => Some(('"', 2)),
         b'\\' => Some(('\\', 2)),
         b'/' => Some(('/', 2)),
+        // White space and a control character: none adds a line break.
+        b't' => Some(('\t', 2)),
+        b'f' => Some(('\u{000C}', 2)),
+        b'b' => Some(('\u{0008}', 2)),
         b'u' => {
             let code = unicode_escape(b, at)?;
             if is_line_break(code) {
@@ -148,7 +152,8 @@ fn decode_escape(b: &[u8], at: usize) -> Option<(char, usize)> {
     }
 }
 
-/// JSON string escapes decoded once: `\uXXXX` (with surrogate pairs), `\"`, `\\` and `\/`.
+/// JSON string escapes decoded once: `\uXXXX` (with surrogate pairs), `\"`, `\\`, `\/`, `\t`, `\f` and `\b`. `\n` and `\r`
+/// stay as text, like the other line-break escapes (they would move line numbers).
 pub(super) fn json_unescaped(squeezed: &str) -> String {
     let b = squeezed.as_bytes();
     let mut out = String::with_capacity(b.len());
@@ -251,10 +256,10 @@ mod tests {
             esc!("2029"),
             "\\n",
             "\\r",
-            "\\t",
         ] {
             assert_eq!(json_unescaped(kept), kept);
         }
+        assert_eq!(json_unescaped(r"a\tb\fc\bd"), "a\tb\u{C}c\u{8}d");
         assert_eq!(
             json_unescaped(concat!("\\", esc!("0041"))),
             concat!("\\", "u0041")

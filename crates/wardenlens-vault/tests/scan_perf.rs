@@ -110,6 +110,16 @@ fn worst_cases(len: usize) -> Vec<(&'static str, Vec<u8>)> {
             "backslashes",
             b"\\u00\\".iter().copied().cycle().take(len).collect(),
         ),
+        (
+            "invisibles, percent and backslashes",
+            "x\u{200B}%20\\t\u{FE0F}Back Door\n"
+                .as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(len)
+                .collect(),
+        ),
         ("newlines", vec![b'\n'; len]),
         ("invalid utf-8", vec![0xFF; len]),
         (

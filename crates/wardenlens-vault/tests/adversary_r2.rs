@@ -128,11 +128,12 @@ fn credential_at_both_field_limits_round_trips() {
 #[test]
 fn display_name_that_grows_under_the_fold_at_the_limit_is_stored() {
     let (_d, _p, mut v) = fresh();
-    // 2048 x U+0130 = 4096 bytes; lowercased 6144 bytes (only used for the flag).
+    // 64 x U+0130 = 128 bytes (core's `DisplayName` cap since #43; it was 2048 x U+0130 = 4096
+    // bytes under the old vault-only cap); lowercased 192 bytes (only used for the flag).
     let r = v.set(
         &id("cam:a:name"),
         EntryKind::DisplayName,
-        &text(&"\u{130}".repeat(2048)),
+        &text(&"\u{130}".repeat(64)),
         Scan::Normal,
     );
     assert_eq!(r.unwrap(), Scannability::Scannable);

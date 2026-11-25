@@ -9,7 +9,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
-use wardenlens_vault::legacy::{LegacyImport as Mapped, MAX_REPORTED_KEYS, map_legacy};
+use wardenlens_vault::legacy::{
+    LegacyError, LegacyImport as Mapped, MAX_REPORTED_KEYS, map_legacy,
+};
 use wardenlens_vault::{Scan, Scannability};
 use zeroize::Zeroizing;
 
@@ -48,6 +50,10 @@ fn read_file(path: &Path, explicit: bool) -> Result<Option<Zeroizing<String>>, C
     Ok(Some(text))
 }
 
+/// Shown when two cameras share a display name, whichever check finds it.
+const DUPLICATE_NAME: CliError =
+    CliError::Refused("two cameras share a display name; the secret file cannot be mapped");
+
 /// Camera display name to inventory id, from the inventory's `name` (or `display_name`).
 fn names_to_ids(table: &toml::Table) -> Result<BTreeMap<String, String>, CliError> {
     let mut map = BTreeMap::new();
@@ -59,12 +65,13 @@ fn names_to_ids(table: &toml::Table) -> Result<BTreeMap<String, String>, CliErro
             .as_table()
             .and_then(|c| c.get("name").or_else(|| c.get("display_name")))
             .and_then(toml::Value::as_str);
+        // Only the exact spelling is checked here, because the map is keyed by it and a second
+        // camera would replace the first. Names that differ only in white space or invisible
+        // characters are refused by `map_legacy` (one check: the vault's stored form).
         if let Some(name) = name
             && map.insert(name.to_owned(), id.clone()).is_some()
         {
-            return Err(CliError::Refused(
-                "two inventory cameras share a display name; the secret file cannot be mapped",
-            ));
+            return Err(DUPLICATE_NAME);
         }
     }
     Ok(map)
@@ -107,7 +114,10 @@ pub(super) fn import<T: Terminal>(
         .map(names_to_ids)
         .transpose()?
         .unwrap_or_default();
-    let mapped = map_legacy(json.as_ref(), &names, table.as_ref())?;
+    let mapped = map_legacy(json.as_ref(), &names, table.as_ref()).map_err(|e| match e {
+        LegacyError::DuplicateName => DUPLICATE_NAME,
+        other => CliError::from(other),
+    })?;
 
     let mut session = open_write(&paths, term)?;
     let mut unscannable = Vec::new();

@@ -22,7 +22,7 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_secrets::Credentials;
 
 use crate::store::Value;
-use crate::validate::{check_credential, normalize_text};
+use crate::validate::{check_credential, display_name_text, normalize_text};
 
 /// Most cameras accepted from one legacy file (SEC-2).
 pub const MAX_LEGACY_CAMERAS: usize = 256;
@@ -229,6 +229,28 @@ fn text(s: &str) -> Value {
     Value::Text(SecretString::from(s.to_owned()))
 }
 
+/// The inventory names in their stored form (whitespace normalised, invisible characters
+/// dropped), to inventory ids.
+///
+/// Invariant (I1): two inventory names that normalise to the same text are an error, never a
+/// silent first-wins: a credential must not land on a camera other than the one whose name
+/// matches.
+fn by_stored_name(
+    names_to_ids: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, LegacyError> {
+    let mut map = BTreeMap::new();
+    for (n, id) in names_to_ids {
+        let stored = display_name_text(n);
+        if stored.is_empty() {
+            continue;
+        }
+        if map.insert((*stored).clone(), id.clone()).is_some() {
+            return Err(LegacyError::DuplicateName);
+        }
+    }
+    Ok(map)
+}
+
 /// Maps the `AgentDVR` secret file (a JSON array of camera objects).
 ///
 /// Mapped: `name` (display name), `login` or `username`, and `password` (a credential entry).
@@ -247,26 +269,38 @@ pub fn map_secret_json(
     if cameras.len() > MAX_LEGACY_CAMERAS {
         return Err(LegacyError::TooMany);
     }
+    let by_stored_name = by_stored_name(names_to_ids)?;
     let mut out = LegacyImport::default();
     let mut seen = BTreeSet::new();
     let mut taken = BTreeSet::new();
     for (ordinal, camera) in cameras.iter().enumerate() {
         let obj = camera.as_object().ok_or(LegacyError::NotAnObject)?;
         let mut skipped: Vec<&str> = Vec::new();
-        let name = string_field(obj.get("name"))?;
-        let name = name.filter(|n| {
-            let ok = storable(EntryKind::DisplayName, n);
-            if !ok {
-                skipped.push("name");
-            }
-            ok
-        });
-        if let Some(n) = name
+        // Names are compared in their stored form (whitespace normalised, invisible characters
+        // dropped), so an NBSP in either file still finds the inventory camera. The inventory
+        // lookup happens whether or not the vault would store the name (an emoji-only name is
+        // refused as a stored name but still identifies its camera); only storing is skipped.
+        let norm = string_field(obj.get("name"))?.map(display_name_text);
+        let storable_name = norm
+            .as_deref()
+            .is_some_and(|n| storable(EntryKind::DisplayName, n));
+        if norm.is_some() && !storable_name {
+            skipped.push("name");
+        }
+        let looked_up = norm.as_deref().map(String::as_str);
+        // Only storable names can collide as stored names; two cameras sharing an unstorable name
+        // that maps to one inventory camera collide on its entry id (`DuplicateId`).
+        if let Some(n) = looked_up
+            && storable_name
             && !seen.insert(n.to_owned())
         {
             return Err(LegacyError::DuplicateName);
         }
-        let mapped = name.and_then(|n| names_to_ids.get(n)).map(String::as_str);
+        let name = looked_up.filter(|_| storable_name);
+        let mapped = looked_up
+            .filter(|n| !n.is_empty())
+            .and_then(|n| by_stored_name.get(n))
+            .map(String::as_str);
         let (inv, renamed) = inventory_id(mapped, "json", ordinal);
         if renamed && let Some(m) = mapped {
             out.report(Some("cameras"), m);
@@ -560,6 +594,63 @@ mod tests {
     }
 
     #[test]
+    fn inventory_names_equal_after_normalisation_are_a_duplicate() {
+        for (a, b) in [
+            ("Porte Nord", "Porte\u{a0}Nord"),
+            ("Porte Nord", "Porte  Nord"),
+            ("PorteNord", "Porte\u{200b}Nord"),
+            ("Porte Nord", "Porte Nord\u{fe0f}"),
+        ] {
+            let m = BTreeMap::from([
+                (a.to_owned(), "x".to_owned()),
+                (b.to_owned(), "y".to_owned()),
+            ]);
+            assert_eq!(
+                map_secret_json(&json(r#"[{"name":"Porte Nord"}]"#), &m).unwrap_err(),
+                LegacyError::DuplicateName,
+                "{a:?} {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_names_equal_after_normalisation_are_a_duplicate() {
+        for second in [
+            "Porte  Nord",
+            "Porte\u{00a0}Nord",
+            "Porte\u{200b} Nord ",
+            " Porte Nord",
+        ] {
+            let doc = serde_json::json!([{"name": "Porte Nord"}, {"name": second}]);
+            assert_eq!(
+                map_secret_json(&doc, &BTreeMap::new()).unwrap_err(),
+                LegacyError::DuplicateName,
+                "{second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_name_still_finds_its_inventory_camera() {
+        for name in ["\u{1F3E0}", "---", "\u{2605} \u{2605}"] {
+            let m = BTreeMap::from([(name.to_owned(), "garage".to_owned())]);
+            let doc = serde_json::json!([{"name": name, "login": "u1", "password": "Tr0ub4dor-1"}]);
+            let i = map_secret_json(&doc, &m).unwrap();
+            assert!(
+                i.entries
+                    .iter()
+                    .any(|e| e.id.as_str() == "cam:garage:credential"),
+                "{name:?}"
+            );
+            assert!(i.entries.iter().all(|e| e.kind != EntryKind::DisplayName));
+            assert!(
+                i.unknown_keys.iter().any(|k| k.ends_with("name")),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
     fn json_camera_count_is_bounded() {
         let many = serde_json::Value::Array(vec![serde_json::json!({}); MAX_LEGACY_CAMERAS + 1]);
         assert_eq!(
@@ -659,6 +750,35 @@ mod tests {
         let i = map_secret_json(&v, &m).unwrap();
         assert_eq!(i.unknown_keys, ["cameras.Front\\tGate"]);
         assert_eq!(entry_ids(&i)[0], "cam:import-json-1:name");
+    }
+
+    /// A hand-written name with a no-break or narrow no-break space still maps to its inventory
+    /// camera, and the stored name is the plain-space form (#43 round 3).
+    #[test]
+    fn names_with_no_break_spaces_map_to_their_inventory_ids() {
+        let names = BTreeMap::from([
+            ("Porte\u{a0}Nord".to_owned(), "porte-a".to_owned()),
+            ("Porte Sud".to_owned(), "porte-b".to_owned()),
+        ]);
+        let doc = json(
+            r#"[{"name":"Porte Nord","login":"u1","password":"Tr0ub4dor-1"},
+                {"name":"Porte\u202fSud","login":"u2","password":"Tr0ub4dor-2"},
+                {"name":"Cour\u00a0Est","login":"u3","password":"Tr0ub4dor-3"}]"#,
+        );
+        let imp = map_secret_json(&doc, &names).unwrap();
+        assert_eq!(
+            entry_ids(&imp),
+            [
+                "cam:porte-a:credential",
+                "cam:porte-b:credential",
+                "cam:import-json-3:name",
+                "cam:import-json-3:credential"
+            ]
+        );
+        let Value::Text(t) = &find(&imp, "cam:import-json-3:name").value else {
+            panic!("shape")
+        };
+        assert_eq!(t.expose_secret(), "Cour Est");
     }
 
     #[test]

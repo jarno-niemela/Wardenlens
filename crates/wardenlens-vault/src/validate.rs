@@ -1,9 +1,11 @@
 //! Per-kind validation and normalisation (ADR 0006 section 1) and the `unscannable` rule.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use secrecy::zeroize::Zeroizing;
+use wardenlens_core::camera::{CameraError, DisplayName, Host};
 use wardenlens_core::entry::EntryKind;
+use wardenlens_core::text::is_dropped_invisible;
 
 use crate::error::VaultError;
 use crate::store::MAX_VALUE_LEN;
@@ -12,8 +14,6 @@ use crate::store::MAX_VALUE_LEN;
 pub const MIN_SCANNABLE_LEN: usize = 7;
 /// Single-label hosts below this length are `unscannable`.
 const MIN_SINGLE_LABEL_HOST_LEN: usize = 8;
-const MAX_HOSTNAME_LEN: usize = 253;
-const MAX_LABEL_LEN: usize = 63;
 
 fn invalid(kind: EntryKind, rule: &'static str) -> VaultError {
     VaultError::InvalidValue { kind, rule }
@@ -51,7 +51,8 @@ pub(crate) fn normalize_text(kind: EntryKind, raw: &str) -> Result<Zeroizing<Str
         EntryKind::Host => normalize_host(raw),
         EntryKind::Mac => normalize_mac(raw),
         EntryKind::Secret => non_empty(kind, raw).map(|t| Zeroizing::new(t.to_owned())),
-        EntryKind::Serial | EntryKind::DisplayName => {
+        EntryKind::DisplayName => normalize_display_name(raw),
+        EntryKind::Serial => {
             let t = non_empty(kind, raw.trim())?;
             if t.chars().any(char::is_control) {
                 return Err(invalid(kind, "contains a control character"));
@@ -72,6 +73,10 @@ fn non_empty(kind: EntryKind, text: &str) -> Result<&str, VaultError> {
     }
 }
 
+/// The host rule for a stored value. The vault only lower-cases, drops one trailing dot and
+/// refuses brackets (so a stored IPv6 has one spelling); the validation itself is core's
+/// [`Host::new`], the one source of truth (ADR 0006 section 1), so every stored host builds a
+/// camera. The stored text is the canonical form core returns.
 fn normalize_host(raw: &str) -> Result<Zeroizing<String>, VaultError> {
     let kind = EntryKind::Host;
     let lower = Zeroizing::new(raw.to_ascii_lowercase());
@@ -79,35 +84,60 @@ fn normalize_host(raw: &str) -> Result<Zeroizing<String>, VaultError> {
     if name.is_empty() {
         return Err(invalid(kind, "host is empty"));
     }
-    if name.contains(':') {
-        return name
-            .parse::<Ipv6Addr>()
-            .map(|a| Zeroizing::new(a.to_string()))
-            .map_err(|_| invalid(kind, "not a valid IPv6 address"));
+    if name.contains(['[', ']']) {
+        return Err(invalid(kind, "host must not be bracketed"));
     }
-    if name.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-        return name
-            .parse::<Ipv4Addr>()
-            .map(|a| Zeroizing::new(a.to_string()))
-            .map_err(|_| invalid(kind, "not a valid IPv4 address"));
+    let host = Host::new(name).map_err(|e| invalid(kind, host_rule(e)))?;
+    Ok(Zeroizing::new(host.expose()))
+}
+
+fn host_rule(e: CameraError) -> &'static str {
+    match e {
+        CameraError::HostEmpty => "host is empty",
+        CameraError::HostTooLong => "hostname is longer than 253 bytes",
+        CameraError::HostLabel => "hostname label is invalid",
+        _ => "not a valid IP address or hostname",
     }
-    if name.len() > MAX_HOSTNAME_LEN {
-        return Err(invalid(kind, "hostname is longer than 253 bytes"));
-    }
-    for label in name.split('.') {
-        let ok_chars = label
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'));
-        if label.is_empty()
-            || label.len() > MAX_LABEL_LEN
-            || !ok_chars
-            || label.starts_with('-')
-            || label.ends_with('-')
-        {
-            return Err(invalid(kind, "hostname label is invalid"));
+}
+
+/// The display name as the vault stores it: every `char::is_whitespace` character becomes
+/// U+0020, a run of them is one space, invisible characters (`is_dropped_invisible`, the scanner's squeeze predicate) are dropped and the
+/// ends are trimmed. A hand-written name with an NBSP or a narrow NBSP therefore stays usable
+/// and is stored in the one plain-space form the scanner looks for.
+pub(crate) fn display_name_text(raw: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(raw.len()));
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+        } else if !is_dropped_invisible(c) {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(c);
         }
     }
-    Ok(Zeroizing::new(name.to_owned()))
+    out
+}
+
+/// The display-name rule: whitespace and invisible characters are normalised
+/// ([`display_name_text`]), the rest is core's [`DisplayName::new`] (1 to 128 bytes, no control
+/// character, at least one alphanumeric one).
+fn normalize_display_name(raw: &str) -> Result<Zeroizing<String>, VaultError> {
+    let kind = EntryKind::DisplayName;
+    let t = display_name_text(raw);
+    let t = non_empty(kind, &t)?;
+    let name = DisplayName::new(t).map_err(|e| {
+        invalid(
+            kind,
+            match e {
+                CameraError::NameLength => "display name must be 1 to 128 bytes",
+                _ => "display name has a disallowed character",
+            },
+        )
+    })?;
+    Ok(Zeroizing::new(name.expose().to_owned()))
 }
 
 /// Reduces any separator layout to 12 hex digits and re-renders them as `aa:bb:cc:dd:ee:ff`
@@ -257,6 +287,84 @@ mod tests {
         assert!(n(EntryKind::Host, &ok253).is_ok());
     }
 
+    /// Every host the vault stores builds a camera host, and the stored text is core's canonical
+    /// form (ADR 0006 section 1: core's `Host` is the one validator).
+    #[test]
+    fn stored_hosts_go_through_core_host() {
+        for raw in [
+            "192.0.2.10",
+            "2001:DB8:0:0:0:0:0:1",
+            "NVR-1.Example.INVALID.",
+            "_sip._tcp.example.invalid",
+            "a_b",
+            &"a".repeat(63),
+        ] {
+            let stored = n(EntryKind::Host, raw).unwrap();
+            assert_eq!(Host::new(&stored).unwrap().expose(), stored, "{raw}");
+        }
+        for bad in [
+            "",
+            ".",
+            "a..b",
+            "-a.example",
+            "a b",
+            "a/b",
+            "a@b",
+            "[2001:db8::1]",
+            "fe80::1%eth0",
+            "::ffff:192.0.2.1",
+            "host.123",
+            "example.0x7f",
+            "caf\u{e9}.example",
+        ] {
+            assert!(n(EntryKind::Host, bad).is_err(), "{bad:?}");
+            assert!(
+                Host::new(bad.strip_suffix('.').unwrap_or(bad)).is_err() || bad.contains('['),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Every stored display name builds a camera name; names core refuses are refused here.
+    /// Whitespace of any kind becomes one plain space and invisible characters are dropped before
+    /// core sees the name; more than 128 bytes and the remaining controls are refused.
+    #[test]
+    fn stored_display_names_go_through_core_display_name() {
+        for raw in [
+            "Back Door North",
+            "  padded  ",
+            "caf\u{e9}",
+            &"a".repeat(128),
+        ] {
+            let stored = n(EntryKind::DisplayName, raw).unwrap();
+            assert_eq!(DisplayName::new(&stored).unwrap().expose(), stored);
+        }
+        for (raw, want) in [
+            ("a\u{a0}b", "a b"),
+            ("Porte\u{202f}Nord Est", "Porte Nord Est"),
+            ("a\u{2003}\u{a0} b", "a b"),
+            ("a\tb", "a b"),
+            ("a\nb", "a b"),
+            ("a\u{200b}b", "ab"),
+            ("a\u{202e}b", "ab"),
+            ("a\u{61c}b", "ab"),
+            ("a\u{feff}b", "ab"),
+            ("\u{a0}\u{3000}Porte Nord\u{2003}", "Porte Nord"),
+        ] {
+            assert_eq!(n(EntryKind::DisplayName, raw).unwrap(), want, "{raw:?}");
+        }
+        for bad in [
+            &"a".repeat(129),
+            "a\x7fb",
+            "a\u{85}\u{1}b",
+            "\u{2800}",
+            "\u{200b}",
+            "   ",
+        ] {
+            assert!(n(EntryKind::DisplayName, bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn mac_reduces_to_colon_form() {
         for s in [
@@ -288,7 +396,11 @@ mod tests {
         ] {
             assert!(n(kind, "").is_err());
             assert!(n(kind, "ab\0cd").is_err());
-            assert!(n(kind, &"x".repeat(4096)).is_ok());
+            // Display names are capped at 128 bytes by core's `DisplayName`.
+            assert_eq!(
+                n(kind, &"x".repeat(4096)).is_ok(),
+                kind != EntryKind::DisplayName
+            );
             assert!(matches!(
                 n(kind, &"x".repeat(4097)),
                 Err(VaultError::ValueTooLarge { .. })
@@ -300,7 +412,7 @@ mod tests {
     #[test]
     fn serial_and_display_name_refuse_control_characters() {
         assert!(n(EntryKind::Serial, "SN\n1").is_err());
-        assert!(n(EntryKind::DisplayName, "a\tb").is_err());
+        assert!(n(EntryKind::DisplayName, "a\x01b").is_err());
         assert!(n(EntryKind::Other, "a\nb").is_ok());
     }
 
