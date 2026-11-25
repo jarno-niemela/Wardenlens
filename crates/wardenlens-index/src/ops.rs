@@ -202,11 +202,9 @@ impl SegmentIndex for Index {
         // The key of the row to continue after; `(MIN, 0)` is before every row.
         let (after_end, after_id) = match after {
             None => (i64::MIN, 0),
-            // An id above i64::MAX names no row: everything sorts before it.
-            Some((ended, id)) => match raw_id(id) {
-                Some(raw) => (ended.as_unix_millis(), raw),
-                None => return Ok(Vec::new()),
-            },
+            // An id above i64::MAX names no row, so it sorts after every row that ends at `ended`:
+            // clamping it to i64::MAX gives the same keyset.
+            Some((ended, id)) => (ended.as_unix_millis(), raw_id(id).unwrap_or(i64::MAX)),
         };
         let mut stmt =
             sql::prepare(&self.conn, sql::OLDEST).map_err(IndexError::sqlite("oldest"))?;

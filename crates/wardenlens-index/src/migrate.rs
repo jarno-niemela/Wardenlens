@@ -14,20 +14,12 @@ pub(crate) struct Migration {
     pub(crate) version: i64,
     /// The script, ending with `PRAGMA user_version = <version>;`.
     pub(crate) sql: &'static str,
-    /// The `(type, name)` of the tables and indexes the script creates (`sqlite_sequence` is implied once
-    /// any migration ran). The identity probe requires the schema to be exactly these.
-    pub(crate) objects: &'static [(&'static str, &'static str)],
 }
 
 /// All migrations of this build. Append-only.
 pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     sql: include_str!("../migrations/001_segments.sql"),
-    objects: &[
-        ("table", "segments"),
-        ("index", "segments_camera_start"),
-        ("index", "segments_tier_end"),
-    ],
 }];
 
 /// The newest version `migrations` reaches.
@@ -80,4 +72,34 @@ pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(),
         })?;
     }
     Ok(())
+}
+
+/// One `sqlite_master` row: `(type, name, tbl_name, sql)`.
+pub(crate) type SchemaRow = (String, String, String, Option<String>);
+
+/// Reads every `sqlite_master` row of `conn`, sorted.
+pub(crate) fn schema_rows(conn: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
+    let mut stmt = sql::prepare(conn, sql::SCHEMA_ROWS)?;
+    let mut rows: Vec<SchemaRow> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.sort();
+    Ok(rows)
+}
+
+/// The schema a database at `version` must have, built by running the compiled-in scripts up to
+/// `version` on an empty in-memory database. Nothing about it is hand-listed, so it cannot drift
+/// from the migrations.
+pub(crate) fn reference_schema(
+    migrations: &[Migration],
+    version: i64,
+) -> Result<Vec<SchemaRow>, IndexError> {
+    let conn = Connection::open_in_memory().map_err(IndexError::sqlite("reference schema"))?;
+    for m in migrations.iter().filter(|m| m.version <= version) {
+        sql::execute_batch(&conn, m.sql).map_err(|e| IndexError::Migration {
+            version: m.version,
+            code: e.sqlite_error_code(),
+        })?;
+    }
+    schema_rows(&conn).map_err(IndexError::sqlite("reference schema"))
 }

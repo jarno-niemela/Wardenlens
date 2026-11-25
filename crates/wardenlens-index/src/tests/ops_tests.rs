@@ -672,10 +672,27 @@ fn oldest_pages_by_keyset_exactly_once() {
         .oldest(Tier::Hot, Some((ts(BASE + 10_000), a)), 10)
         .unwrap();
     assert_eq!(after_a.iter().map(|s| s.id).collect::<Vec<_>>(), [b]);
-    // A key above any id names no row and sorts before nothing.
+    // An id above any row id sorts after every row that ends at the same time, and before every
+    // row that ends later: the key `(T, u64::MAX)` skips exactly the rows ending at or before T.
+    let everything = idx.oldest(Tier::Hot, None, 100).unwrap();
     assert_eq!(
-        idx.oldest(Tier::Hot, Some((ts(0), SegmentId::new(u64::MAX))), 10)
+        idx.oldest(Tier::Hot, Some((ts(0), SegmentId::new(u64::MAX))), 100)
             .unwrap(),
-        []
+        everything
+    );
+    let skipped = idx
+        .oldest(
+            Tier::Hot,
+            Some((ts(BASE + 10_000), SegmentId::new(u64::MAX))),
+            100,
+        )
+        .unwrap();
+    assert!(skipped.iter().all(|s| s.ended_at > ts(BASE + 10_000)));
+    assert_eq!(
+        skipped.len(),
+        everything
+            .iter()
+            .filter(|s| s.ended_at > ts(BASE + 10_000))
+            .count()
     );
 }

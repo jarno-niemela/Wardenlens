@@ -11,12 +11,10 @@ const V2: Migration = Migration {
     version: 2,
     sql: "ALTER TABLE segments ADD COLUMN note TEXT; CREATE TABLE extra (x INTEGER); \
           INSERT INTO extra VALUES (1); PRAGMA user_version = 2;",
-    objects: &[("table", "extra")],
 };
 const V3: Migration = Migration {
     version: 3,
     sql: "CREATE TABLE third (y INTEGER); PRAGMA user_version = 3;",
-    objects: &[("table", "third")],
 };
 
 fn version(c: &Connection) -> i64 {
@@ -87,7 +85,6 @@ fn a_failing_step_rolls_back_alone_and_the_older_version_stays_usable() {
     let bad = Migration {
         version: 2,
         sql: "CREATE TABLE half (x); SELECT * FROM nope; PRAGMA user_version = 2;",
-        objects: &[],
     };
     let err = Index::open_with(&f.path, &[MIGRATIONS[0], bad], || {}).unwrap_err();
     assert!(
@@ -107,7 +104,6 @@ fn step_one_commits_even_when_step_two_fails() {
     let bad = Migration {
         version: 2,
         sql: "SELECT * FROM nope;",
-        objects: &[],
     };
     let err = Index::open_with(&f.path, &[MIGRATIONS[0], bad], || {}).unwrap_err();
     assert!(matches!(err, IndexError::Migration { version: 2, .. }));
@@ -121,7 +117,6 @@ fn a_script_that_forgets_its_version_is_rolled_back() {
     let lazy = Migration {
         version: 2,
         sql: "CREATE TABLE lazy (x);",
-        objects: &[],
     };
     let err = Index::open_with(&f.path, &[MIGRATIONS[0], lazy], || {}).unwrap_err();
     assert!(
@@ -254,7 +249,6 @@ fn a_failure_after_any_statement_rolls_back_to_the_exact_old_schema() {
             migs.push(Migration {
                 version: step.version,
                 sql: leaked,
-                objects: &[],
             });
             let err = Index::open_with(&f.path, &migs, || {}).unwrap_err();
             assert!(matches!(err, IndexError::Migration { .. }), "k={k} {err:?}");

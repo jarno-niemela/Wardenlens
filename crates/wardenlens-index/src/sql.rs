@@ -57,9 +57,8 @@ pub(crate) const GET_SYNC: &str = "PRAGMA synchronous";
 pub(crate) const GET_FK: &str = "PRAGMA foreign_keys";
 pub(crate) const GET_JOURNAL_LIMIT: &str = "PRAGMA journal_size_limit";
 pub(crate) const GET_BUSY: &str = "PRAGMA busy_timeout";
-pub(crate) const SCHEMA_OBJECTS: &str = "SELECT type, name FROM sqlite_master \
-    WHERE substr(name, 1, 17) != 'sqlite_autoindex_'";
-pub(crate) const QUICK_CHECK: &str = "PRAGMA quick_check(1)";
+pub(crate) const SCHEMA_ROWS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master";
+pub(crate) const INTEGRITY_CHECK: &str = "PRAGMA integrity_check(1)";
 
 // The only places SQL text reaches `rusqlite`. Each takes `&'static str`.
 

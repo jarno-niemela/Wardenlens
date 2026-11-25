@@ -75,7 +75,10 @@ fn oldest_searches_the_tier_end_index_without_a_sort() {
     let p = plan(&idx, sql::OLDEST, &[&0_i64, &1_i64, &2_i64, &10_i64]);
     assert_eq!(p.len(), 1, "{p:?}");
     assert!(p[0].starts_with("SEARCH segments USING"), "{p:?}");
-    assert!(p[0].contains("INDEX segments_tier_end (tier=?"), "{p:?}");
+    assert!(
+        p[0].contains("INDEX segments_tier_end (tier=? AND ended_at_ms>?)"),
+        "{p:?}"
+    );
     no_scan_or_sort(&p);
 }
 

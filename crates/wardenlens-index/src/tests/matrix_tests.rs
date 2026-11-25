@@ -34,6 +34,10 @@ enum Side {
     Foreign,
     /// Bytes that are not any SQLite file.
     Junk,
+    /// 700 zero bytes: what a crash before a `-wal` header was written leaves.
+    Zeroed,
+    /// 8 bytes: a header that was never completed.
+    Short,
 }
 
 const MAINS: [Main; 5] = [
@@ -43,12 +47,14 @@ const MAINS: [Main; 5] = [
     Main::Foreign,
     Main::ForeignWal,
 ];
-const SIDES: [Side; 5] = [
+const SIDES: [Side; 7] = [
     Side::None,
     Side::Empty,
     Side::Ours,
     Side::Foreign,
     Side::Junk,
+    Side::Zeroed,
+    Side::Short,
 ];
 const SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
@@ -216,7 +222,10 @@ fn want(main: Main, suffix: &str, side: Side) -> Want {
         ("-journal", _) => Want::Refuse(is_pending),
         ("-wal", _) if main == Main::Rollback => Want::Refuse(|e| stray("-wal")(e)),
         ("-shm", _) if main == Main::Rollback => Want::Refuse(|e| stray("-shm")(e)),
-        ("-wal", Side::Foreign | Side::Junk) => Want::Refuse(is_foreign_wal),
+        ("-wal", Side::Foreign) => Want::Refuse(is_foreign_wal),
+        // Not a WAL header and not a torn one: SQLite did not write it.
+        ("-wal", Side::Junk) => Want::Refuse(|e| matches!(e, IndexError::InvalidWal)),
+        // A torn header is an empty WAL, as SQLite treats it.
         // An empty or our own `-wal`, and any `-shm` (SQLite rebuilds it from the `-wal`; it is
         // never replayed).
         ("-wal" | "-shm", _) => accepted,
@@ -240,6 +249,8 @@ fn setup_cell(main: Main, suffix: &str, side: Side) -> (Fixture, Option<Connecti
         ("-shm", Side::Foreign) => put(&sp, &foreign_wal().1),
         ("-journal", Side::Ours | Side::Foreign) => put(&sp, &foreign_journal()),
         (_, Side::Junk) => put(&sp, &[0xd9u8; 700]),
+        (_, Side::Zeroed) => put(&sp, &[0u8; 700]),
+        (_, Side::Short) => put(&sp, &[1u8; 8]),
         _ => unreachable!(),
     }
     // The foreign WAL database brought its own `-wal`/`-shm` (mode of its creation): make them
@@ -282,7 +293,7 @@ fn the_matrix_has_every_main_state_and_every_sidecar_state() {
             assert!(cells.iter().any(|c| c.0 == main && c.1 == suffix));
         }
     }
-    assert_eq!(cells.len(), 59);
+    assert_eq!(cells.len(), 83);
 }
 
 #[test]

@@ -330,8 +330,9 @@ fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
 /// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks
 /// (judged after rolling back a hot journal, on the copy); [`VaultError::PendingJournal`] if the
 /// copy stays corrupt after the rollback, the retry cap is exhausted, a timed-out raced read
-/// finds the file corrupt, or `create` meets a vault; [`VaultError::Io`] and non-corruption
-/// [`VaultError::Sqlite`] errors are passed on.
+/// finds the file corrupt, or `create` meets a vault; [`VaultError::Io`] (reading the header or
+/// the sidecars), [`VaultError::Fs`] (the scratch directory and the bounded copy, which are
+/// `wardenlens-fsutil` helpers) and non-corruption [`VaultError::Sqlite`] errors are passed on.
 fn probe_existing(
     path: &Path,
     file: &PrivateFile,

@@ -268,22 +268,38 @@ the device and inode compared; a symlink or a wrong owner is refused. Pragmas on
 checked on open, so a foreign SQLite file is refused. One writer and the rest readers (WAL): the cli keeps one write
 connection and a small number of read connections.
 
-**Sidecars and identity (#49 round 2, defect pattern P3).** SQLite replays a hot `-journal` and a `-wal` on the first
-read and checkpoints when the last connection closes, so **no read-write connection is opened on `index.db` until its
-identity and every sidecar are proven by means no sidecar can influence**: the parent directory is ours and not group- or
-world-writable (`fsutil::check_parent`, shared with the vault); each `-wal`, `-shm` and `-journal` is `lstat`ed and must
-be a regular file owned by the service user with no group or other bit; the 100-byte header is read through our own
-descriptor (magic, `application_id`, journal mode); the settled state (`application_id`, `user_version`, exactly the
-`sqlite_master` objects of that version, `quick_check`) is judged read-only, by an `immutable=1` open when there is no
-`-wal`, and otherwise on a **private copy** of the main file and the `-wal` in a `0700` scratch directory (the vault's
-rolled-back-copy technique, helpers in `fsutil`). Rules by sidecar: a `-journal` is refused in every state, because an
-index in WAL mode never writes one and a rollback-mode index exists only during creation, before any row (a non-empty one
-is `PendingJournal`, an empty one `StraySidecar`; **deleting it is safe**, and the index is recreated or adopted again);
-a `-wal` or `-shm` next to a rollback-mode or empty file is refused; a `-wal` must have a WAL header of the main file's page
-size and must replay, on the copy, to a database that is still ours (`ForeignWal` otherwise). A `-wal` copied from another
-copy of this index by the same user is accepted: that needs the privileges to edit the index itself. A too-new
-`user_version` is refused from the same read-only view, so the file and its sidecars stay byte-identical. The creation-window
-`-journal` is **not** identified on a private copy: refusing it with a remedy that loses nothing is simpler and safe.
+**Sidecars and identity (#49 rounds 2 and 3, defect pattern P3).** SQLite replays a hot `-journal` and a `-wal` on the
+first read and checkpoints when the last connection closes, so **no read-write connection is opened on `index.db` until its
+identity and every sidecar are proven by means no sidecar can influence**:
+
+- the parent directory is ours and not group- or world-writable (`fsutil::check_parent`, shared with the vault); each `-wal`,
+  `-shm` and `-journal` is `lstat`ed and must be a regular file owned by the service user with no group or other bit; the
+  100-byte header is read through our own descriptor (magic, `application_id`, journal mode);
+- the settled state is judged read-only: `application_id`, `user_version` (too new is refused here, so the file stays
+  byte-identical), then **every `sqlite_master` row** (`type, name, tbl_name, sql`) compared with a reference built in
+  memory by running the compiled-in migrations up to that version (so it cannot drift from them, and it applies at version 0
+  too), then `PRAGMA integrity_check` (not `quick_check`: only it compares each index with its table, which catches a `-wal`
+  from a diverged copy of the same index). It reads the whole file once at start-up, a few seconds per hundred megabytes;
+- with no usable `-wal` that read is an `immutable=1` open. **With a valid non-empty `-wal` it is a `SQLITE_OPEN_READ_ONLY`
+  (not immutable) connection on the real files, with `NO_CKPT_ON_CLOSE`: no copy of the main file.** Decision record,
+  options in the order evaluated: (a) the read-only connection, chosen; (b) validating the `-wal` frames in Rust and (c)
+  copying the `-wal` plus selected main pages were not needed. Round 2 copied the main file into a scratch directory, capped
+  at 256 MiB, so an index above about 2.7 million rows could never recover from a crash and `serve` (#68) refused to start.
+  A read-only SQLite connection never writes the main file or the `-wal` (a read-only pager has no write transaction; a
+  checkpoint on a read-only WAL connection returns `SQLITE_READONLY`), which `the_wal_probe_writes_neither_main_nor_wal_nor_a_new_shm`
+  and every byte-identical refusal row check. It does create or update the `-shm` (the wal-index, rebuilt from the `-wal` by
+  every first connection after a crash): a `-shm` that did not exist is removed again after the probe, and an existing one
+  may be rewritten, so the refusal guarantee covers the main file and the `-wal`. A reader open while a writer is live
+  (another process holding the `-shm`) is a design item for #68, not handled here;
+- rules by sidecar: a `-journal` is refused in every state, because an index in WAL mode never writes one and a
+  rollback-mode index exists only during creation, before any row (a non-empty one is `PendingJournal`, an empty one
+  `StraySidecar`; deleting it is safe and the index is recreated or adopted again; the creation window is not identified on a
+  private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; a `-wal` shorter than a header or all
+  zeros (what a crash before its first frame leaves) is an empty WAL, as for SQLite; a `-wal` without a WAL magic is
+  `InvalidWal` (holds nothing of this index); a `-wal` with another page size, or one whose replay is not an index of ours
+  (wrong `application_id`, schema or integrity), is `ForeignWal`. Every refusal message names a lossless remedy (move the
+  file out of the directory and keep it). A `-wal` copied from another copy of this index by the same user is accepted when
+  it replays consistently: that needs the privileges to edit the index itself.
 
 **Migration scheme: `PRAGMA user_version`, migrations written in-house** as an ordered array of SQL scripts compiled in
 with `include_str!`. `Index::open` runs, under `BEGIN IMMEDIATE`, every script with a number above the stored

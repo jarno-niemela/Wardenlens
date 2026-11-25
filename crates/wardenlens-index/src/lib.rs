@@ -3,7 +3,7 @@
 //! [`Index`] is one SQLite file in WAL mode with `synchronous = FULL`, opened only through the
 //! checked sequence in `open`: a private parent directory, our own `O_NOFOLLOW` descriptor, every
 //! sidecar checked for kind, owner and mode, and the identity of the file and of its `-wal` proven
-//! read-only (header, an immutable open or a private copy) before any read-write connection exists,
+//! read-only (header, an immutable open, or a read-only connection when a `-wal` is present) before any read-write connection exists,
 //! then `SQLITE_OPEN_NOFOLLOW` and a device and inode comparison. The schema is versioned with
 //! `PRAGMA user_version`; an older file is migrated step by step, a newer one is refused and left
 //! untouched. [`Index`] implements the core port [`wardenlens_core::storage::SegmentIndex`].

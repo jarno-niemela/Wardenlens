@@ -56,10 +56,10 @@ pub enum IndexError {
     },
     /// A sidecar exists that cannot belong to this database in its state: any sidecar next to an
     /// empty file, a `-wal` or `-shm` next to a rollback-mode file, or an empty `-journal`.
-    /// Nothing was modified. If it is not another program's, remove it: an index holds no
-    /// unrecoverable data in a sidecar that does not match its mode.
+    /// Nothing was modified. Move it out of the directory (and delete it later when you know
+    /// it is not another program's).
     #[error(
-        "sidecar {suffix} does not belong to this database; nothing was modified (remove it if it is not another program's)"
+        "sidecar {suffix} does not belong to this database; nothing was modified; move it out of the directory (keep it until you know whose it is)"
     )]
     StraySidecar {
         /// The sidecar suffix.
@@ -75,10 +75,20 @@ pub enum IndexError {
         "unfinished -journal next to the index; nothing was modified; delete the -journal file (an index with data never has one)"
     )]
     PendingJournal,
+    /// The `-wal` next to the index has no valid header and is not a torn one (an all-zero or
+    /// short file is treated as empty): SQLite did not write it. Nothing was modified. It holds
+    /// no committed data of this index, so deleting it loses nothing.
+    #[error(
+        "the -wal file has no valid header; it holds no data of this index and can be deleted; nothing was modified"
+    )]
+    InvalidWal,
     /// The `-wal` next to the index is not this index's: a wrong header, another page size, or
     /// replaying it onto the index gives a database that is not an index of ours. Nothing was
-    /// modified. If it is not another program's, remove it (frames not yet checkpointed are lost).
-    #[error("the -wal file does not belong to this index; nothing was modified")]
+    /// modified. Move it and its `-shm` out of the directory and keep them until you know whose they
+    /// are; nothing is lost.
+    #[error(
+        "the -wal file does not belong to this index; nothing was modified; move it and its -shm out of the directory and keep them until you know whose they are"
+    )]
     ForeignWal,
     /// The schema (every `sqlite_master` row) is not the one of its `user_version`.
     #[error("index schema differs from its version")]
@@ -86,9 +96,6 @@ pub enum IndexError {
     /// The database failed an integrity check or SQLite reports it corrupt. Nothing was modified.
     #[error("index file is damaged")]
     Damaged,
-    /// The file or its `-wal` is larger than the identification copy allows.
-    #[error("index file is too large to verify")]
-    TooLargeToProbe,
     /// The file was written by a newer build.
     #[error("index schema version {found} is newer than the supported {supported}")]
     SchemaTooNew {

@@ -15,10 +15,11 @@
 //!    With the sidecar state it selects the row of the table in `classify` (the matrix tested in
 //!    `open_tests`); a sidecar that cannot belong to the file in that state is refused.
 //! 5. The identity of the *settled* state is judged read-only: `application_id`, `user_version`
-//!    (too new is refused here), exactly the schema objects of that version, and `quick_check`.
-//!    Without a `-wal` this is an `immutable=1` read-only open of the file. With a non-empty
-//!    `-wal` it is a read-write open of a **private copy** of the main file and the `-wal` in a
-//!    `0700` scratch directory, so SQLite replays the copy, never the original.
+//!    (too new is refused here), every `sqlite_master` row against a reference built from the
+//!    migrations, and `integrity_check`. Without a usable `-wal` this is an `immutable=1`
+//!    read-only open. With a valid non-empty `-wal` it is a `SQLITE_OPEN_READ_ONLY` connection on
+//!    the real files (no copy of the main file, so no size limit); see `probe_wal_readonly` for
+//!    what that does and does not write, and ADR 0005 section 5 for the decision.
 //! 6. Only then is the file opened read-write (`SQLITE_OPEN_NOFOLLOW`) and the device and inode
 //!    compared again; pragmas are set and read back; migrations run.
 //!
@@ -27,14 +28,13 @@
 //! needs the same privileges as editing the index itself.
 
 use std::fs::File;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use wardenlens_fsutil::{
-    FsError, PrivateFile, Scratch, check_parent, copy_bounded, immutable_uri, open_private_file,
-    open_sidecar, sidecar_len,
+    FsError, PrivateFile, check_parent, immutable_uri, open_private_file, open_sidecar, sidecar_len,
 };
 
 use crate::error::IndexError;
@@ -51,8 +51,6 @@ pub(crate) const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const HEADER_LEN: usize = 100;
 const SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
-/// How often a copy that raced a writer is repeated before the open reports `Busy`.
-const PROBE_ATTEMPTS: u32 = 4;
 const WAL_MAGICS: [u32; 2] = [0x377f_0682, 0x377f_0683];
 
 /// Presence and length of each sidecar (`None` = absent), in the order of [`SUFFIXES`].
@@ -158,38 +156,56 @@ fn check_sidecars(wal_mode: bool, sc: Sidecars) -> Result<(), IndexError> {
     Ok(())
 }
 
-/// The `-wal` header must be a WAL header of the page size of the main file.
-fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<(), IndexError> {
+/// What the first 32 bytes of a `-wal` say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalHeader {
+    /// Shorter than a header, or all zeros: what a crash before the first frame leaves. SQLite
+    /// treats it as an empty WAL, and so does this crate.
+    Torn,
+    /// A WAL header with the page size of the main file.
+    Valid,
+}
+
+/// Classifies the `-wal` header against the main file's page size.
+fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHeader, IndexError> {
     let mut head = [0u8; 32];
     match wal.read_exact_at(&mut head, 0) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(IndexError::ForeignWal);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(WalHeader::Torn),
         Err(e) => return Err(IndexError::io("reading wal header")(e)),
+    }
+    if head.iter().all(|b| *b == 0) {
+        return Ok(WalHeader::Torn);
     }
     let be = |b: &[u8], at: usize| {
         b.get(at..at.saturating_add(4))
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
             .map(u32::from_be_bytes)
     };
+    if !be(&head, 0).is_some_and(|m| WAL_MAGICS.contains(&m)) {
+        // Neither a WAL header nor a torn one: not a file SQLite wrote for any database.
+        return Err(IndexError::InvalidWal);
+    }
     // The main file stores the page size as two bytes at 16, where 1 means 65536.
     let main_page = main_header
         .get(16..18)
         .and_then(|s| <[u8; 2]>::try_from(s).ok())
         .map(u16::from_be_bytes)
         .map(|p| if p == 1 { 65_536_u32 } else { u32::from(p) });
-    match (be(&head, 0), be(&head, 8)) {
-        (Some(magic), Some(page)) if WAL_MAGICS.contains(&magic) && Some(page) == main_page => {
-            Ok(())
-        }
-        _ => Err(IndexError::ForeignWal),
+    if be(&head, 8) == main_page {
+        Ok(WalHeader::Valid)
+    } else {
+        Err(IndexError::ForeignWal)
     }
 }
 
 /// What the read-only probes check, on the settled view `conn`: `application_id`, then
-/// `user_version` (too new or negative is refused), then exactly the schema objects of that
-/// version, then `quick_check`.
+/// `user_version` (too new or negative is refused), then **every `sqlite_master` row**
+/// (`type, name, tbl_name, sql`) against a reference built from the compiled-in migrations up to
+/// that version, then `integrity_check` (which, unlike `quick_check`, compares every index with
+/// its table, so a `-wal` from a diverged copy of this index is caught). The integrity check reads
+/// the whole file once at start-up; its cost grows linearly with the index, a few seconds per
+/// hundred megabytes.
 fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<(), IndexError> {
     let found = app_id(conn)?;
     if found != APPLICATION_ID {
@@ -197,37 +213,12 @@ fn judge_view(conn: &Connection, migrations: &[Migration]) -> Result<(), IndexEr
     }
     let version = migrate::user_version(conn)?;
     migrate::check_not_newer(version, migrations)?;
-    let mut stmt =
-        sql::prepare(conn, sql::SCHEMA_OBJECTS).map_err(corruption_or("inspect schema"))?;
-    let mut rows = stmt.query([]).map_err(corruption_or("inspect schema"))?;
-    let mut seen: Vec<(String, String)> = Vec::new();
-    while let Some(row) = rows.next().map_err(corruption_or("inspect schema"))? {
-        let pair = (
-            row.get::<_, String>(0)
-                .map_err(corruption_or("inspect schema"))?,
-            row.get::<_, String>(1)
-                .map_err(corruption_or("inspect schema"))?,
-        );
-        seen.push(pair);
-        if seen.len() > 64 {
-            return Err(IndexError::UnexpectedSchema);
-        }
-    }
-    let mut want: Vec<(String, String)> = Vec::new();
-    for m in migrations.iter().filter(|m| m.version <= version) {
-        for (kind, name) in m.objects {
-            want.push(((*kind).to_owned(), (*name).to_owned()));
-        }
-    }
-    if version > 0 {
-        want.push(("table".to_owned(), "sqlite_sequence".to_owned()));
-    }
-    seen.sort();
-    want.sort();
+    let seen = migrate::schema_rows(conn).map_err(corruption_or("inspect schema"))?;
+    let want = migrate::reference_schema(migrations, version)?;
     if seen != want {
         return Err(IndexError::UnexpectedSchema);
     }
-    let verdict: String = sql::query_row(conn, sql::QUICK_CHECK, [], |r| r.get(0))
+    let verdict: String = sql::query_row(conn, sql::INTEGRITY_CHECK, [], |r| r.get(0))
         .map_err(corruption_or("integrity check"))?;
     if verdict != "ok" {
         return Err(IndexError::Damaged);
@@ -245,8 +236,8 @@ fn corruption_or(op: &'static str) -> impl FnOnce(rusqlite::Error) -> IndexError
     }
 }
 
-/// Read-only identification of a file with no `-wal`: `immutable=1` never writes a journal,
-/// `-wal` or `-shm` and ignores any present.
+/// Read-only identification of a file with no usable `-wal`: `immutable=1` never writes a
+/// journal, `-wal` or `-shm` and ignores any present.
 fn probe_immutable(
     path: &Path,
     file: &PrivateFile,
@@ -264,80 +255,56 @@ fn probe_immutable(
     judge_view(&conn, migrations)
 }
 
-type Stamp = (u64, i64, i64, u64);
-
-fn stamp(m: &std::fs::Metadata) -> Stamp {
-    (m.ino(), m.mtime(), m.mtime_nsec(), m.len())
-}
-
-/// Identification of a file with a non-empty `-wal`: the main file and the `-wal` are copied
-/// (through verified descriptors, bounded) into a private scratch directory and the **copy** is
-/// opened read-write, so SQLite replays the copy and the originals are only read. A copy that
-/// raced a writer (the stamps of the originals moved) is repeated.
-fn probe_wal_copy(
+/// Identification of a file with a valid non-empty `-wal`, with **no copy of the main file**: a
+/// `SQLITE_OPEN_READ_ONLY` (not immutable) connection on the real files, so SQLite replays the
+/// `-wal` into its in-memory view and the view is judged.
+///
+/// What such a connection writes, by SQLite's documented behaviour and by the tests: never the
+/// main file and never the `-wal` (a read-only pager has no write transaction, and a checkpoint
+/// on a read-only WAL connection returns `SQLITE_READONLY`; `NO_CKPT_ON_CLOSE` is also set).
+/// It does create or update the `-shm` (the wal-index, rebuilt from the `-wal` by every first
+/// connection, never trusted across a crash). A `-shm` that did not exist is removed again after
+/// the probe, so a refusal leaves the directory byte-identical; an existing `-shm` may be
+/// rewritten, and the refusal guarantee covers the main file and the `-wal`.
+pub(crate) fn probe_wal_readonly(
     path: &Path,
     file: &PrivateFile,
-    head: &[u8; HEADER_LEN],
     migrations: &[Migration],
 ) -> Result<(), IndexError> {
-    let parent = crate::parent_of(path);
-    let wal_path = sidecar_path(path, "-wal");
-    for _ in 0..PROBE_ATTEMPTS {
-        // O_NONBLOCK: a FIFO in place of the `-wal` must not block (it was refused by `lstat`
-        // already; this covers a swap).
-        let wal = open_sidecar(Path::new(&wal_path))?;
-        let wal_meta = wal.metadata().map_err(IndexError::io("inspecting wal"))?;
-        if !wal_meta.is_file() {
-            return Err(IndexError::BadSidecar { suffix: "-wal" });
-        }
-        check_wal_header(&wal, head)?;
-        let main_before = stamp(
-            &file
-                .file()
-                .metadata()
-                .map_err(IndexError::io("inspecting index"))?,
-        );
-        let wal_before = stamp(&wal_meta);
-        let scratch = Scratch::new(parent)?;
-        let copy = scratch.path().join("index.db");
-        let copy_wal = scratch.path().join("index.db-wal");
-        let copied = copy_bounded(file.file(), &copy)? && copy_bounded(&wal, &copy_wal)?;
-        if !copied {
-            return Err(IndexError::TooLargeToProbe);
-        }
-        let main_after = stamp(
-            &file
-                .file()
-                .metadata()
-                .map_err(IndexError::io("inspecting index"))?,
-        );
-        let wal_after = std::fs::symlink_metadata(&wal_path)
-            .map(|m| stamp(&m))
-            .map_err(IndexError::io("inspecting wal"))?;
-        if main_after != main_before || wal_after != wal_before {
-            continue; // a writer was active: the copy may be torn
-        }
-        file.verify_path_unchanged(path)?;
+    let shm = std::path::PathBuf::from(sidecar_path(path, "-shm"));
+    let shm_existed = sidecar_len(&shm)?.is_some();
+    let verdict = (|| {
         let conn = Connection::open_with_flags(
-            &copy,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
-        .map_err(corruption_or("open copy"))?;
-        return match judge_view(&conn, migrations) {
-            // The replay gave something that is not our index: the `-wal` is not ours.
-            Err(
-                IndexError::WrongApplicationId { .. }
-                | IndexError::UnexpectedSchema
-                | IndexError::Damaged,
-            ) => Err(IndexError::ForeignWal),
-            other => other,
-        };
+        .map_err(corruption_or("open"))?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .map_err(IndexError::sqlite("db config"))?;
+        file.verify_path_unchanged(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(IndexError::sqlite("busy timeout"))?;
+        judge_view(&conn, migrations)
+    })();
+    if !shm_existed {
+        // ERR-4: best effort. No `-shm` existed, so no connection was live; the one we made is
+        // derived state and the next open rebuilds it.
+        let _ = std::fs::remove_file(&shm);
     }
-    Err(IndexError::Busy {
-        op: "identify index",
-    })
+    match verdict {
+        // The replay gave something that is not our index: the `-wal` is not ours.
+        Err(
+            IndexError::WrongApplicationId { .. }
+            | IndexError::UnexpectedSchema
+            | IndexError::Damaged,
+        ) => Err(IndexError::ForeignWal),
+        other => other,
+    }
 }
 
 /// Judges the file without any read-write connection.
@@ -357,8 +324,22 @@ fn classify(path: &Path, file: &PrivateFile, migrations: &[Migration]) -> Result
     }
     let (head, wal_mode) = read_header(file.file())?;
     check_sidecars(wal_mode, sc)?;
-    if sc.wal.is_some_and(|n| n > 0) {
-        probe_wal_copy(path, file, &head, migrations)?;
+    let usable_wal = match sc.wal {
+        Some(n) if n > 0 => {
+            let wal = open_sidecar(Path::new(&sidecar_path(path, "-wal")))?;
+            if !wal
+                .metadata()
+                .map_err(IndexError::io("inspecting wal"))?
+                .is_file()
+            {
+                return Err(IndexError::BadSidecar { suffix: "-wal" });
+            }
+            check_wal_header(&wal, &head)? == WalHeader::Valid
+        }
+        _ => false,
+    };
+    if usable_wal {
+        probe_wal_readonly(path, file, migrations)?;
     } else {
         probe_immutable(path, file, migrations)?;
     }
