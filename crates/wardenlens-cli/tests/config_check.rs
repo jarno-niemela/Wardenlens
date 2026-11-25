@@ -45,10 +45,14 @@ fn base() -> Command {
 }
 
 /// Runs with a watchdog: a hang (a FIFO opened blocking) fails the test instead of the suite.
-fn run(mut c: Command) -> Output {
+fn run(c: Command) -> Output {
+    run_to(c, Stdio::piped())
+}
+
+fn run_to(mut c: Command, stdout: Stdio) -> Output {
     let mut child = c
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -128,6 +132,22 @@ fn key_file_contents_are_never_read_or_printed() {
     assert_no_sentinel(&out);
 }
 
+/// The error-line substring each path-kind row must produce.
+fn expected_reason(name: &str) -> &'static str {
+    match name {
+        "missing" => "not found",
+        "directory" | "fifo" | "char device" => "not a regular file",
+        "symlink to file" | "dangling symlink" | "symlink to directory" => "symbolic link",
+        "mode 000" => "cannot be opened",
+        "world-writable" => "writable by everyone",
+        "64 KiB + 1" | "64 MiB" => "larger than",
+        "invalid utf-8" => "not valid UTF-8",
+        "empty" => "missing required key",
+        "invalid listen" => "api.listen",
+        other => panic!("no expected reason for {other}"),
+    }
+}
+
 /// TEST-9: every kind of thing the config path can name, with its exit code. The file contents
 /// (where there are any) hold a sentinel that must not come back.
 #[test]
@@ -203,6 +223,9 @@ fn every_path_kind_has_a_defined_exit_code_and_leaks_nothing() {
         assert_eq!(out.status.code(), Some(code), "{name}: {out:?}");
         assert_no_sentinel(&out);
         if code != 0 {
+            // The reason is the real one: swapping two error kinds fails here.
+            let reason = expected_reason(name);
+            assert!(text(&out.stderr).contains(reason), "{name}: {out:?}");
             assert_eq!(text(&out.stdout), "", "{name}");
             assert!(text(&out.stderr).starts_with("error: "), "{name}: {out:?}");
         }
@@ -480,4 +503,111 @@ fn log_format_is_validated() {
     let mut c = base();
     c.args(["--log-format", "yaml", "config", "check"]);
     assert_eq!(run(c).status.code(), Some(2));
+}
+
+#[test]
+fn a_symlink_loop_in_a_parent_is_not_called_a_symlink_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    symlink(&b, &a).unwrap();
+    symlink(&a, &b).unwrap();
+    let out = check(&a.join("w.toml"));
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("cannot be opened"), "{err}");
+    assert!(err.contains("symbolic links"), "{err}");
+    assert!(!err.contains("give its real path"), "{err}");
+}
+
+#[test]
+fn a_stdout_failure_exits_two_not_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(&dir, "w.toml", VALID.as_bytes());
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    for (name, stdout) in [
+        ("/dev/full", Stdio::from(full)),
+        ("closed pipe", Stdio::from(writer)),
+    ] {
+        let mut c = base();
+        c.args(["config", "check", "--config"]).arg(&p);
+        let out = run_to(c, stdout);
+        assert_eq!(out.status.code(), Some(2), "{name}: {out:?}");
+        assert!(
+            text(&out.stderr).contains("cannot write to stdout"),
+            "{name}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn vault_gets_no_logging_and_refuses_log_format() {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = base();
+    c.env("HOME", home.path())
+        .args(["--log-format", "text", "vault", "list"]);
+    let out = run(c);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(text(&out.stdout), "");
+    let mut c = base();
+    c.env("HOME", home.path())
+        .args(["--log-format", "json", "vault", "list"]);
+    let out = run(c);
+    assert_eq!(out.status.code(), Some(2));
+    assert_all_json(&out.stderr);
+}
+
+#[test]
+fn config_flag_without_a_subcommand_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = write(&dir, "good.toml", VALID.as_bytes());
+    let mut c = base();
+    c.arg("--config").arg(&good);
+    let out = run(c);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(text(&out.stdout), "");
+    assert!(text(&out.stderr).contains("needs a subcommand"), "{out:?}");
+}
+
+#[test]
+fn usage_errors_are_json_when_json_was_asked_for_exactly() {
+    for args in [
+        &["--log-format", "json", "config", "check", "--bogus"][..],
+        &["--log-format=json", "config", "check", "--bogus"][..],
+        &["--log-format", "json", "config"][..],
+    ] {
+        let mut c = base();
+        c.args(args);
+        let out = run(c);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&out.stderr).lines().count(), 1, "{args:?}");
+        assert_all_json(&out.stderr);
+    }
+    // Not an exact match: plain text.
+    let mut c = base();
+    c.args(["--log-format", "jsonx", "config", "check"]);
+    let out = run(c);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).starts_with("error: "));
+}
+
+#[test]
+fn printed_paths_never_hold_invisible_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, ch) in [
+        '\u{202e}', '\u{2066}', '\u{2028}', '\u{2029}', '\u{200b}', '\u{feff}',
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cfg = VALID.replace("/srv/wl/hot", &format!("/srv/wl/h{ch}ot"));
+        let out = check(&write(&dir, &format!("i{i}.toml"), cfg.as_bytes()));
+        assert_eq!(out.status.code(), Some(1), "U+{:04X}", u32::from(ch));
+        assert_eq!(text(&out.stdout), "");
+        assert!(!text(&out.stderr).contains(ch));
+    }
 }

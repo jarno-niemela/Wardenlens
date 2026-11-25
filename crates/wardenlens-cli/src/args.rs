@@ -16,9 +16,9 @@ pub(crate) struct Cli {
     /// empty), then `/etc/wardenlens/wardenlens.toml`. Not used by `vault`.
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) config: Option<PathBuf>,
-    /// Log format on stderr. The level comes from `RUST_LOG` (default `info`).
-    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
-    pub(crate) log_format: LogFormat,
+    /// Log format on stderr, `text` by default. The level comes from `RUST_LOG` (default `info`). Not used by `vault`.
+    #[arg(long, global = true, value_enum)]
+    pub(crate) log_format: Option<LogFormat>,
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
@@ -47,7 +47,7 @@ pub(crate) enum Command {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
     /// Read and validate the config file, then print what it sets (paths and floors, never the
-    /// contents of the key file). Exits 0 if valid, 1 if invalid, 2 if the file cannot be read.
+    /// contents of the key file). Exits 0 if valid, 1 if the config is invalid, 2 if the file cannot be read, stdout cannot be written or the arguments are wrong.
     Check,
 }
 

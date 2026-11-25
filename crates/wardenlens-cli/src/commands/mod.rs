@@ -37,7 +37,8 @@ pub(crate) fn error_chain(e: &dyn Error) -> String {
 }
 
 /// Writes the failure to stderr regardless of `RUST_LOG`: `error: <chain>` as text, or one JSON
-/// object per line in the shape of the subscriber's output under `--log-format json`.
+/// object per line under `--log-format json` (`level`, `fields.message`, `target`; unlike the
+/// subscriber's lines it has no timestamp).
 pub(crate) fn report_error(e: &dyn Error, format: LogFormat) {
     let chain = error_chain(e);
     let line = match format {
@@ -51,4 +52,13 @@ pub(crate) fn report_error(e: &dyn Error, format: LogFormat) {
     };
     // If stderr is gone there is nowhere left to report; the exit code carries the signal.
     let _ = writeln!(io::stderr(), "{line}");
+}
+
+/// A refused combination of arguments: reported like any error, exit 2.
+pub(crate) fn usage_failure(message: &'static str, format: LogFormat) -> std::process::ExitCode {
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct Usage(&'static str);
+    report_error(&Usage(message), format);
+    std::process::ExitCode::from(2)
 }

@@ -22,7 +22,8 @@ pub enum PathProblem {
     NotAbsolute,
     /// Empty or longer than 4096 bytes.
     BadLength,
-    /// Contains a control character (including NUL).
+    /// Contains a control character (including NUL) or an invisible one (a Unicode format
+    /// character such as a bidi override, a line or paragraph separator, a zero-width character).
     ControlChar,
     /// Contains a `.` or `..` component.
     DotComponent,
@@ -104,7 +105,7 @@ pub enum ConfigError {
     #[error("key {key} rejected: {}", match reason {
         PathProblem::NotAbsolute => "path is not absolute",
         PathProblem::BadLength => "path is empty or too long",
-        PathProblem::ControlChar => "path contains a control character",
+        PathProblem::ControlChar => "path contains a control or invisible character",
         PathProblem::DotComponent => "path contains a . or .. component",
         PathProblem::NotCanonical => "path has an empty component or a trailing slash",
         PathProblem::Root => "path is the filesystem root",

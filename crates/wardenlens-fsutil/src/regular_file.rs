@@ -12,7 +12,8 @@ use crate::root::FileStat;
 /// Open `path` read-only and return the descriptor with its `fstat`.
 ///
 /// The last path component is opened with `O_NOFOLLOW`: a symlink, dangling or not, is refused
-/// with `ELOOP` (a symlink in a parent directory is followed; the caller names the whole path).
+/// with [`FsError::Symlink`] (a symlink in a parent directory is followed; a loop there is a
+/// plain `ELOOP` I/O error).
 /// `O_NONBLOCK` keeps a planted FIFO from blocking the open, `O_NOCTTY` keeps a terminal device
 /// from becoming the controlling terminal; the descriptor is then `fstat`ed and anything but a
 /// regular file (directory, FIFO, device, socket) is refused with [`FsError::NotRegular`].
@@ -27,7 +28,15 @@ pub fn open_regular_nofollow(path: &Path) -> Result<(File, FileStat), FsError> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(FsError::io("open"))?;
+    .map_err(|e| {
+        // ELOOP also comes from a loop in a parent directory; only a symlink as the last
+        // component is a symlink refusal.
+        if e == Errno::LOOP && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+            FsError::Symlink
+        } else {
+            FsError::io("open")(e)
+        }
+    })?;
     let st = fstat(&fd).map_err(FsError::io("fstat"))?;
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
         return Err(FsError::NotRegular);
@@ -35,10 +44,10 @@ pub fn open_regular_nofollow(path: &Path) -> Result<(File, FileStat), FsError> {
     Ok((File::from(fd), FileStat::from_stat(&st)))
 }
 
-/// True if `e` is the `ELOOP` of a refused symlink.
+/// True if `e` says the last path component is a symlink (not merely an `ELOOP` from a parent).
 #[must_use]
 pub fn is_symlink_refusal(e: &FsError) -> bool {
-    e.errno() == Some(Errno::LOOP)
+    matches!(e, FsError::Symlink)
 }
 
 #[cfg(test)]

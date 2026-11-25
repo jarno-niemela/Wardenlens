@@ -23,8 +23,9 @@
 //!   reason, never file contents.
 //!
 //! # Exit codes
-//! 1 for a config that was read but is invalid (and for stdout failing); 2 for a config that
-//! could not be read, or for a usage error (as for the vault commands, 2 means the resource the
+//! 1 only for a config that was read but is invalid; 2 for everything else that stops the command
+//! doing its job: a config that could not be read, stdout that could not be written (a closed
+//! pipe, a full disk) and a usage error (as for the vault commands, 2 means the resource the
 //! command needs cannot be used).
 
 use std::io::Read;
@@ -87,7 +88,7 @@ pub(crate) enum ConfigFileError {
 impl ConfigFileError {
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
-            Self::Invalid(_) | Self::Output(_) => 1,
+            Self::Invalid(_) => 1,
             _ => 2,
         }
     }
@@ -233,7 +234,7 @@ mod tests {
         );
         assert_eq!(
             ConfigFileError::Output(std::io::Error::other("x")).exit_code(),
-            1
+            2
         );
     }
 }

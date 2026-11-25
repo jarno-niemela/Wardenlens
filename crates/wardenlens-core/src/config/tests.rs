@@ -179,6 +179,15 @@ fn path_table_for_every_path_key() {
         ("/srv/x\\u0000y", Err(ControlChar)),
         ("/srv/x\\ny", Err(ControlChar)),
         ("/srv/x\\u007fy", Err(ControlChar)),
+        // Invisible characters (`text::is_invisible`: Cf, separators), not only Cc.
+        ("/srv/x\\u202ey", Err(ControlChar)),
+        ("/srv/x\\u2066y", Err(ControlChar)),
+        ("/srv/x\\u2028y", Err(ControlChar)),
+        ("/srv/x\\u2029y", Err(ControlChar)),
+        ("/srv/x\\u200by", Err(ControlChar)),
+        ("/srv/x\\ufeffy", Err(ControlChar)),
+        ("/srv/x\\u00ady", Err(ControlChar)),
+        ("/srv/x\\u180ey", Err(ControlChar)),
     ];
     let keys = [
         ("storage.hot_root", "hot_root = \"/srv/wardenlens/hot\""),
