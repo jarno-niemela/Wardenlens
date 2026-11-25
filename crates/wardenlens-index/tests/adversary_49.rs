@@ -18,6 +18,14 @@ use wardenlens_index::{Index, IndexError};
 
 const BASE: i64 = 1_700_000_000_000;
 
+/// A temporary directory nobody else can write: tempfile follows the umask, and the index
+/// refuses a group-writable parent (fixture only: the tests do not depend on the runner's umask).
+fn private_tempdir() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    chmod(d.path(), 0o700);
+    d
+}
+
 fn cam(s: &str) -> CameraId {
     CameraId::new(s).unwrap()
 }
@@ -63,7 +71,7 @@ fn new_index(dir: &Path) -> PathBuf {
 /// not delete or replay it: either refuse it, or leave it byte-identical.
 #[test]
 fn a_stray_journal_next_to_a_wal_index_is_not_deleted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = new_index(dir.path());
     let j = sidecar(&path, "-journal");
     std::fs::write(&j, [0xd9u8; 512]).unwrap();
@@ -105,7 +113,7 @@ fn hot_journal_of_foreign_db(dir: &Path) -> Vec<u8> {
 /// overwrite index pages with foreign pages.
 #[test]
 fn a_foreign_hot_journal_next_to_a_wal_index_is_never_replayed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = new_index(dir.path());
     let journal = hot_journal_of_foreign_db(dir.path());
     assert!(journal.len() > 4096, "journal was not written");
@@ -133,11 +141,11 @@ fn a_foreign_hot_journal_next_to_a_wal_index_is_never_replayed() {
 /// included: refusing must not checkpoint it.
 #[test]
 fn a_newer_index_with_a_leftover_wal_is_left_byte_identical() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = new_index(dir.path());
     // Make it "newer" and leave a -wal behind as a crash would: copy the files while a
     // connection holds the WAL open.
-    let crash = tempfile::tempdir().unwrap();
+    let crash = private_tempdir();
     let c = rusqlite::Connection::open(&path).unwrap();
     c.execute_batch("PRAGMA user_version = 99; CREATE TABLE future(x);")
         .unwrap();
@@ -163,7 +171,7 @@ fn a_newer_index_with_a_leftover_wal_is_left_byte_identical() {
 /// SQLite then replays). The index opens one without complaint.
 #[test]
 fn an_index_in_a_world_writable_directory_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let shared = dir.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     chmod(&shared, 0o777);
@@ -175,10 +183,10 @@ fn an_index_in_a_world_writable_directory_is_refused() {
 /// by someone else; its frames must not be replayed into the index.
 #[test]
 fn a_planted_world_writable_wal_is_not_replayed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = new_index(dir.path());
     // Forge a -wal: a byte copy of our index, written through SQLite, WAL captured mid-life.
-    let forge_dir = tempfile::tempdir().unwrap();
+    let forge_dir = private_tempdir();
     let forge = forge_dir.path().join("index.db");
     std::fs::copy(&path, &forge).unwrap();
     let c = rusqlite::Connection::open(&forge).unwrap();
@@ -214,7 +222,7 @@ fn a_planted_world_writable_wal_is_not_replayed() {
 /// Two segments the insert accepts must not make `bytes_by_tier` fail for ever after.
 #[test]
 fn accepted_inserts_never_make_bytes_by_tier_fail() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let mut idx = Index::open(&dir.path().join("index.db")).unwrap();
     let big = u64::try_from(i64::MAX).unwrap();
     let a = idx.insert(&rec("cam1", BASE, 1000, big), Tier::Hot);
@@ -232,7 +240,7 @@ fn accepted_inserts_never_make_bytes_by_tier_fail() {
 /// removed) is a `CorruptRow`, like every other bad stored value.
 #[test]
 fn latest_started_at_with_a_text_start_is_a_corrupt_row() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = new_index(dir.path());
     let idx = Index::open(&path).unwrap();
     {

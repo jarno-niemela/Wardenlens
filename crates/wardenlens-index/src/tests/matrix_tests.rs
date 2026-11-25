@@ -65,7 +65,7 @@ fn side_path(f: &Fixture, suffix: &str) -> std::path::PathBuf {
 
 /// A real hot rollback journal of a foreign database (the adversary's recipe).
 fn foreign_journal() -> Vec<u8> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let other = dir.path().join("foreign.db");
     let c = Connection::open(&other).unwrap();
     c.execute_batch(
@@ -92,7 +92,7 @@ fn side_path_of(p: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 
 /// Real `-wal` and `-shm` bytes of a foreign WAL database (taken while it is open).
 fn foreign_wal() -> (Vec<u8>, Vec<u8>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let other = dir.path().join("foreign.db");
     let c = Connection::open(&other).unwrap();
     c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
