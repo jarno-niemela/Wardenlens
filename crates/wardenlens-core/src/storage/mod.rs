@@ -4,6 +4,7 @@
 //! The planner performs no I/O. The storage adapter probes the volumes, calls
 //! [`plan`], and executes the returned actions.
 
+mod files;
 mod plan;
 mod types;
 
@@ -20,6 +21,9 @@ mod proptests;
 )]
 mod tests;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use files::{MemoryHandle, MemorySegmentFiles};
+pub use files::{OpenedSegment, SegmentFiles, SegmentOpenError};
 pub use plan::{
     Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,
 };
