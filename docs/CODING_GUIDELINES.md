@@ -102,7 +102,7 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   **pass-list of known-good forms** and fail closed on anything unknown, with no
   "everything else is a file" fallthrough. Where only the bad values are known
   exactly (vault values, ADR 0006 §7), match them exactly over every rendering
-  (TEST-9). Never add a shape heuristic. Two components that must agree on a set
+  (TEST-9). A shape heuristic is never the enforcement: it may exist only as a secondary layer behind the choke point (an advisory soft lint, ADR 0006 §7, or defence in depth behind unconditional redaction, such as the `RtspPath` name check). Never answer a finding by growing the heuristic instead of fixing the choke point. Two components that must agree on a set
   (a validator and a scanner, a needle collapse and a view collapse) call one
   shared predicate, and a test fails if they diverge. A test loops over every
   entry point (each subcommand, route, error kind, input form), including one

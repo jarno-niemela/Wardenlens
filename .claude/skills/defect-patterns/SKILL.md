@@ -28,7 +28,7 @@ Keep it current with `/retro` (the `retro` skill).
   - `name` and `display_name` overwrote each other;
   - over-long ids dropped fields;
   - an empty `login` produced a credential that `set` refused.
-  - #43 (PR #127): r1 a duplicate `CameraId` was never unified; r2 legacy names with NBSP were dropped; r3 names that normalise equal merged silently (first wins), and a JSON name that `DisplayName` refuses lost its inventory mapping.
+  - #43 (PR #127): r2 legacy names with NBSP were dropped; r3 names that normalise equal merged silently (first wins), and a JSON name that `DisplayName` refuses lost its inventory mapping.
 - **Self-test.**
   - A test that enumerates every key of a hostile fixture and asserts each is imported or reported.
   - A cross-source collision test, including a real id that looks like a generated one.
@@ -61,7 +61,7 @@ Keep it current with `/retro` (the `retro` skill).
 ## P3. Touching what is not yours (foreign files, sidecars, recovery)
 No major recurred in #75, #117, #32, #43, so this is compact. P3 minors did recur: #75 r1-r2 added open flags (`O_NOFOLLOW`, `NOCTTY`) on discovered files, and #124 asks for a directory-fd walk.
 - **Rule.** Before any write-capable operation (a read-write open, a pragma, `CREATE`, SQLite hot-journal or WAL recovery), prove identity **read-only**: exact schema (every `sqlite_master` row, not just tables), version and a keycheck under the supplied key, by an immutable probe. Cover **every entry point** (`open`, `create`, `rekey`, the empty-file path) and every sidecar (`-wal`, `-journal`).
-- **Rule.** With a hot `-journal` the main file may be torn (a crash mid-rekey leaves the new keycheck page), so identify a **private rolled-back copy** (#104 r3). It is safe only with: copying through the verified descriptor, a 0700 scratch directory with `create_new` 0600 files, a size cap, removal on every return path, an `O_NOFOLLOW | O_NONBLOCK` journal open, and refusing a journal whose tail holds a super-journal pointer (PR #106, #119).
+- **Rule.** With a hot `-journal` the main file may be torn (a crash mid-rekey leaves the new keycheck page), so identify a **private rolled-back copy of main file + journal** (#104 r3). It is safe only with: copying through the verified descriptor, a 0700 scratch directory with `create_new` 0600 files, a size cap, removal on every return path, an `O_NOFOLLOW | O_NONBLOCK` journal open, and refusing a journal whose tail holds a super-journal pointer (PR #106, #119).
 - **Rule.** Every open of a path the program discovered (sidecar, walk entry, path named inside a file) uses `O_NOFOLLOW | O_NONBLOCK`, rejects a non-regular `symlink_metadata` first, and re-checks `is_file` on the descriptor. Keep libraries from opening such paths themselves (#104 r3-r4 FIFO hangs). A path the owner names still opens with `O_NONBLOCK`.
 - **Rule.** Separate "foreign" from "mine, mid-write or crashed": wait for a live writer up to the busy timeout, let a proven own file recover, else return a distinct typed error. Never return an error whose obvious fix destroys data (`NotInitialized` invites deleting the journal).
 - **Example.** #74 r3-r5 (PR #97): `create`, then `open`, ran `journal_mode` on a foreign WAL database before refusing it. #104 r1 (PR #106): refusing the vault's own `-journal` broke crash recovery. #104 r2-r4: an immutable probe of a torn main file locked out the old key.
@@ -163,18 +163,18 @@ No major recurred in #75, #117, #32, #43, so this is compact. P3 minors did recu
 - **Merge conflicts:** almost every branch adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`. Before verifying two PRs in parallel, trial-merge them; resolve conflicts by taking the union of both module lists (PR #97, #101, #102). Resolving a conflict changes the head, so all three verifiers must run again.
 
 ## P10. A rule that must hold everywhere, enforced in only some places (promoted to SEC-10)
-- **Rule.** SEC-10 is the rule: one choke point, a pass-list of known-good forms where the good set can be listed (exact match over every rendering where only the bad values are known, as in the vault scan), every entry point tested, one shared predicate for two components that must agree. Never add a shape heuristic. Know how the framework applies a layer: axum's `Router::layer` wraps each route separately, so wrap the finished router as one service.
+- **Rule.** SEC-10 is the rule: one choke point, a pass-list of known-good forms where the good set can be listed (exact match over every rendering where only the bad values are known, as in the vault scan), every entry point tested, one shared predicate for two components that must agree. A shape heuristic is never the enforcement. It may exist only as a secondary layer behind the choke point: a soft lint (ADR 0006 §7), or defence in depth behind unconditional redaction (the `RtspPath` name check). Never answer a finding by growing the heuristic instead of fixing the choke point. Know how the framework applies a layer: axum's `Router::layer` wraps each route separately, so wrap the finished router as one service.
 - **Example.**
   - #94 (PR #109) r1-r3: `check-key <path>` skipped a refusal that lived only in `Env::paths()`; clap's echo was fixed per error kind until it became a pass-list. #60 (PR #115) r1: `Router::layer` gave every route its own pool of 64.
   - #75 (PR #122) r1-r2: printed paths were not neutralised (r1), then the printable check was a denylist that missed `Cf` characters and redaction scanned the id and kind prefix, hiding clean locations (r2).
   - #117 (PR #125) r1-r2 and r5: hooks printed raw ref names before the scan; an unknown tree mode fell through to "file".
   - #43 (PR #127) r1-r3: credentials in the `RtspPath` path part (the Xiongmai `/user=…&password=…` form, `;` parameters, a second `?`) were printed by `Camera`'s `Debug`; the name denylist was re-found in r2 and r3 and is still open (#129), while redacting `Debug` and `Display` was the choke point that held.
-  - #43 (PR #127) r1, r3: core and vault validators disagreed; the vault's deletions and the scanner's squeeze were two predicates.
+  - #43 (PR #127) r1, r3: a duplicate `CameraId` type was never unified (r1); core and vault validators disagreed; the vault's deletions and the scanner's squeeze were two predicates.
   - #32 (PR #71) r1-r5: a heuristic denylist guard was re-found each round (comments, query strings, quotes, XML, camelCase, CDATA); it became a soft lint over the exact-match scan.
 - **Self-test.**
   - Loop over **every** entry point (each subcommand, route, method, error kind, input form, including one that matches nothing) and assert the policy holds.
   - For two components, assert `shared_set(a) == shared_set(b)`, or feed one generated input through both.
-  - Loop over every type holding a URL or path and assert `Debug` and `Display` are redacted when the value contains `user=`, `password=` or `@`.
+  - Loop over every type holding a camera URL, RTSP path or credential and assert the raw value never appears in `Debug` or `Display` output, whatever it contains (unconditional redaction). Not for filesystem paths.
 
 ## P11. An open-ended input space fixed one instance per round (promoted to TEST-9)
 - **Rule.** TEST-9 is the rule: write the full enumeration and a table-driven test before fixing, and check any "skip what is already handled" proof in both directions (within the SEC-2/SEC-3 bounds).

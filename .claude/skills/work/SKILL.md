@@ -64,7 +64,7 @@ The gate result comes from your own `scripts/gate` run (step 2); pass it to the 
 
 Launch **in one message** `reviewer`, `security-auditor`, `adversary`. Do not pass the implementer's reasoning; verifiers judge the code, not the story.
 
-Record each verdict (only from a complete report, never a partial or interrupted one) against the exact commit, one call per dimension. **Record each one as soon as it arrives, all three, before any `verify carry`** (#117 and #43 once carried with a verdict unrecorded); if `carry` reports fewer than 3, re-run it once or twice, because the status API can lag. If it still reports fewer than 3, run `scripts/verify check`, and mark the missing verdict on the verified SHA (`verify mark`) before merging:
+Record each verdict (only from a complete report, never a partial or interrupted one) against the exact commit, one call per dimension. **Record each one as soon as it arrives, all three, before any `verify carry`** (#117 and #43 once carried with a verdict unrecorded); if `carry` reports fewer than 3, re-run it once or twice, because the status API can lag. If it still reports fewer than 3, run `scripts/verify check`, and mark the missing verdict on the verified SHA (`verify mark`, only from a complete verifier report), then re-run `scripts/verify carry <pr> <SHA>`, before merging:
 ```bash
 scripts/verify mark <pr> quality|security|adversarial pass|fail $SHA
 ```
