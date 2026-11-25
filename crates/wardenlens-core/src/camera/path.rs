@@ -183,6 +183,13 @@ impl RtspPath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The query string: the text after the first `?`, `None` when there is no `?`. `/a?` has
+    /// the empty query `Some("")`, which is a query string like any other.
+    #[must_use]
+    pub fn query(&self) -> Option<&str> {
+        self.0.split_once('?').map(|(_, q)| q)
+    }
 }
 
 impl fmt::Debug for RtspPath {
@@ -207,6 +214,19 @@ impl FromStr for RtspPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_is_the_text_after_the_first_question_mark() {
+        for (p, q) in [
+            ("/a", None),
+            ("/a?", Some("")),
+            ("/a?b=1", Some("b=1")),
+            ("/a?b?c", Some("b?c")),
+            ("/?x=1", Some("x=1")),
+        ] {
+            assert_eq!(RtspPath::new(p).unwrap().query(), q, "{p}");
+        }
+    }
 
     #[test]
     fn credential_names_behind_any_separator_are_refused() {

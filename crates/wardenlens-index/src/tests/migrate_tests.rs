@@ -7,14 +7,15 @@ use super::*;
 use crate::error::IndexError;
 use crate::migrate::{MIGRATIONS, Migration};
 
-const V2: Migration = Migration {
-    version: 2,
-    sql: "ALTER TABLE segments ADD COLUMN note TEXT; CREATE TABLE extra (x INTEGER); \
-          INSERT INTO extra VALUES (1); PRAGMA user_version = 2;",
-};
-const V3: Migration = Migration {
+/// Synthetic steps on top of the real migrations 1 and 2.
+const S3: Migration = Migration {
     version: 3,
-    sql: "CREATE TABLE third (y INTEGER); PRAGMA user_version = 3;",
+    sql: "ALTER TABLE segments ADD COLUMN note TEXT; CREATE TABLE extra (x INTEGER); \
+          INSERT INTO extra VALUES (1); PRAGMA user_version = 3;",
+};
+const S4: Migration = Migration {
+    version: 4,
+    sql: "CREATE TABLE fourth (y INTEGER); PRAGMA user_version = 4;",
 };
 
 fn version(c: &Connection) -> i64 {
@@ -46,14 +47,19 @@ fn migrations_are_numbered_1_to_n_and_each_script_sets_its_own_version() {
 #[test]
 fn empty_database_migrates_from_zero() {
     let (f, idx) = open_new();
-    assert_eq!(version(&idx.conn), 1);
+    assert_eq!(version(&idx.conn), 2);
     let names: Vec<_> = schema(&idx.conn).into_iter().map(|(_, n)| n).collect();
-    for want in ["segments", "segments_camera_start", "segments_tier_end"] {
+    for want in [
+        "segments",
+        "segments_camera_start",
+        "segments_tier_end",
+        "cameras",
+    ] {
         assert!(names.iter().any(|n| n == want), "{want}");
     }
     assert!(!names.iter().any(|n| n == "schema_version"));
     drop(idx);
-    assert_eq!(version(&raw(&f.path)), 1);
+    assert_eq!(version(&raw(&f.path)), 2);
 }
 
 #[test]
@@ -63,9 +69,9 @@ fn older_database_migrates_step_by_step_keeping_its_rows() {
     idx.insert(&rec("cam1", BASE, 1000, 5, 1), Tier::Hot)
         .unwrap();
     drop(idx);
-    let v3 = [MIGRATIONS[0], V2, V3];
-    let idx = Index::open_with(&f.path, &v3, || {}).unwrap();
-    assert_eq!(version(&idx.conn), 3);
+    let v4 = [MIGRATIONS[0], MIGRATIONS[1], S3, S4];
+    let idx = Index::open_with(&f.path, &v4, || {}).unwrap();
+    assert_eq!(version(&idx.conn), 4);
     let rows: i64 = idx
         .conn
         .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
@@ -83,16 +89,16 @@ fn a_failing_step_rolls_back_alone_and_the_older_version_stays_usable() {
     let f = fixture();
     drop(Index::open(&f.path).unwrap());
     let bad = Migration {
-        version: 2,
-        sql: "CREATE TABLE half (x); SELECT * FROM nope; PRAGMA user_version = 2;",
+        version: 3,
+        sql: "CREATE TABLE half (x); SELECT * FROM nope; PRAGMA user_version = 3;",
     };
-    let err = Index::open_with(&f.path, &[MIGRATIONS[0], bad], || {}).unwrap_err();
+    let err = Index::open_with(&f.path, &[MIGRATIONS[0], MIGRATIONS[1], bad], || {}).unwrap_err();
     assert!(
-        matches!(err, IndexError::Migration { version: 2, .. }),
+        matches!(err, IndexError::Migration { version: 3, .. }),
         "{err:?}"
     );
     let mut idx = Index::open(&f.path).unwrap();
-    assert_eq!(version(&idx.conn), 1);
+    assert_eq!(version(&idx.conn), 2);
     assert!(!schema(&idx.conn).iter().any(|(_, n)| n == "half"));
     idx.insert(&rec("cam1", BASE, 1000, 5, 1), Tier::Hot)
         .unwrap();
@@ -115,22 +121,22 @@ fn a_script_that_forgets_its_version_is_rolled_back() {
     let f = fixture();
     drop(Index::open(&f.path).unwrap());
     let lazy = Migration {
-        version: 2,
+        version: 3,
         sql: "CREATE TABLE lazy (x);",
     };
-    let err = Index::open_with(&f.path, &[MIGRATIONS[0], lazy], || {}).unwrap_err();
+    let err = Index::open_with(&f.path, &[MIGRATIONS[0], MIGRATIONS[1], lazy], || {}).unwrap_err();
     assert!(
-        matches!(err, IndexError::MigrationDidNotAdvance { version: 2 }),
+        matches!(err, IndexError::MigrationDidNotAdvance { version: 3 }),
         "{err:?}"
     );
     let c = raw(&f.path);
-    assert_eq!(version(&c), 1);
+    assert_eq!(version(&c), 2);
     assert!(!schema(&c).iter().any(|(_, n)| n == "lazy"));
 }
 
 #[test]
 fn newer_version_is_a_typed_error_and_the_file_is_untouched() {
-    for newer in [2_i64, 3, 1_000_000, i64::from(i32::MAX)] {
+    for newer in [3_i64, 4, 1_000_000, i64::from(i32::MAX)] {
         let f = fixture();
         drop(Index::open(&f.path).unwrap());
         raw(&f.path)
@@ -139,7 +145,7 @@ fn newer_version_is_a_typed_error_and_the_file_is_untouched() {
         let before = snapshot(f.dir.path());
         let err = Index::open(&f.path).unwrap_err();
         assert!(
-            matches!(err, IndexError::SchemaTooNew { found, supported: 1 } if found == newer),
+            matches!(err, IndexError::SchemaTooNew { found, supported: 2 } if found == newer),
             "{err:?}"
         );
         assert_eq!(before, snapshot(f.dir.path()), "version {newer}");
@@ -178,23 +184,22 @@ fn statements(sql: &str) -> Vec<String> {
 /// The copy is what a power cut would leave; it must open at the old version, usable.
 #[test]
 fn a_crash_after_any_statement_of_a_migration_leaves_the_old_version_usable() {
-    // Migration 1 is checked from empty, migration 2 on top of version 1, with a real row.
-    for (label, base, step) in [("m1", None, MIGRATIONS[0]), ("m2", Some(MIGRATIONS[0]), V2)] {
+    // Migration 1 from empty; migrations 2 and 3 (synthetic) on top, with a real row.
+    let m = [MIGRATIONS[0], MIGRATIONS[1], S3];
+    for step in m {
+        let base = &m[..usize::try_from(step.version - 1).unwrap()];
+        let label = step.version;
         let stmts = statements(step.sql);
-        assert!(stmts.len() >= 3, "{label}");
+        assert!(stmts.len() >= 2, "{label}");
         for k in 0..=stmts.len() {
             let src = fixture();
-            let old_version = i64::from(base.is_some());
-            if base.is_some() {
-                let mut idx = Index::open(&src.path).unwrap();
+            let old_version = i64::try_from(base.len()).unwrap();
+            let mut idx = Index::open_with(&src.path, base, || {}).unwrap();
+            if !base.is_empty() {
                 idx.insert(&rec("cam1", BASE, 1000, 5, 1), Tier::Hot)
                     .unwrap();
-                drop(idx);
-            } else {
-                // An index-shaped empty database: application id set, nothing else.
-                let idx = Index::open_with(&src.path, &[], || {}).unwrap();
-                drop(idx);
             }
+            drop(idx);
             let mut c = raw(&src.path);
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -218,10 +223,10 @@ fn a_crash_after_any_statement_of_a_migration_leaves_the_old_version_usable() {
             drop(c);
             let probe = Connection::open(&dst.path).unwrap();
             // Opened as the crashed process would restart: old version, intact schema.
-            assert_eq!(version(&probe), old_version, "{label} k={k}");
+            assert_eq!(version(&probe), old_version, "m{label} k={k}");
             drop(probe);
-            let mut idx = Index::open_with(&dst.path, &[MIGRATIONS[0], V2], || {}).unwrap();
-            assert_eq!(version(&idx.conn), 2, "{label} k={k}");
+            let mut idx = Index::open_with(&dst.path, &m[..=base.len()], || {}).unwrap();
+            assert_eq!(version(&idx.conn), step.version, "m{label} k={k}");
             idx.insert(&rec("cam1", BASE + 60_000, 1000, 5, 1), Tier::Hot)
                 .unwrap();
         }
@@ -231,13 +236,10 @@ fn a_crash_after_any_statement_of_a_migration_leaves_the_old_version_usable() {
 /// A failure injected after `k` statements: the transaction rolls back to the exact old schema.
 #[test]
 fn a_failure_after_any_statement_rolls_back_to_the_exact_old_schema() {
-    for step in [MIGRATIONS[0], V2] {
+    let all = [MIGRATIONS[0], MIGRATIONS[1], S3];
+    for step in all {
         let stmts = statements(step.sql);
-        let base: Vec<Migration> = if step.version == 1 {
-            vec![]
-        } else {
-            vec![MIGRATIONS[0]]
-        };
+        let base: Vec<Migration> = all[..usize::try_from(step.version - 1).unwrap()].to_vec();
         for k in 0..stmts.len() {
             let f = fixture();
             drop(Index::open_with(&f.path, &base, || {}).unwrap());

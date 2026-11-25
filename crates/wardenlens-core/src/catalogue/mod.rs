@@ -28,6 +28,7 @@ mod entry;
 mod error;
 mod guard;
 mod matrix;
+mod query;
 mod validate;
 
 pub(crate) use entry::is_slug;
@@ -38,4 +39,5 @@ pub use entry::{
 pub use error::{CatalogueError, SiteDataKind};
 pub use guard::{LintWarning, check_source, lint_source};
 pub use matrix::render_matrix;
+pub use query::query_allowed;
 pub use validate::{lint, validate};

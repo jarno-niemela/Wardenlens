@@ -2,6 +2,7 @@
 //! other row data; segment ids and schema versions are the only values that appear.
 
 use rusqlite::ErrorCode;
+use wardenlens_core::camera::CameraError;
 use wardenlens_fsutil::FsError;
 
 /// Why a cursor was refused.
@@ -190,6 +191,34 @@ pub enum IndexError {
     InvalidRecord {
         /// The field name.
         field: &'static str,
+    },
+    /// A camera path (or its query) was refused by the path rules: it has an `@`, a credential
+    /// parameter, a bad character or a bad shape. Nothing was written; on a read, the row is bad.
+    #[error("camera {field} refused: {source}")]
+    CameraPathInvalid {
+        /// `main_path` or `sub_path`.
+        field: &'static str,
+        /// The rule that failed (never the text).
+        source: CameraError,
+    },
+    /// A camera path has a query string the catalogue does not allow for the camera's model.
+    #[error("camera {field} has a query string the catalogue does not allow for this model")]
+    CameraQueryNotAllowed {
+        /// `main_path` or `sub_path`.
+        field: &'static str,
+    },
+    /// A stored camera row violates the schema's bounds (a file edited outside SQLite). It names
+    /// the column only, never the camera (SEC-6).
+    #[error("stored camera row is invalid: {field}")]
+    CorruptCameraRow {
+        /// The offending column.
+        field: &'static str,
+    },
+    /// The registry holds the most cameras it accepts.
+    #[error("the camera registry is full ({max} cameras)")]
+    TooManyCameras {
+        /// The limit.
+        max: usize,
     },
     /// No segment with this id.
     #[error("segment {0} not found")]

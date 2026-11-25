@@ -162,7 +162,7 @@ fn the_reference_schema_is_built_from_the_migrations() {
     assert_eq!(v0[0].1, "index_meta");
     let (_f, idx) = open_new();
     assert_eq!(
-        reference_schema(MIGRATIONS, 1).unwrap(),
+        reference_schema(MIGRATIONS, 2).unwrap(),
         schema_rows(&idx.conn).unwrap()
     );
 }
@@ -461,7 +461,7 @@ fn every_committing_operation_leaves_a_frame_of_the_instance_id_page() {
 #[test]
 fn a_migration_step_leaves_a_frame_of_the_instance_id_page() {
     let f = fixture();
-    drop(Index::open(&f.path).unwrap());
+    drop(Index::open_with(&f.path, &MIGRATIONS[..1], || {}).unwrap());
     let v2 = crate::migrate::Migration {
         version: 2,
         sql: "CREATE TABLE extra (x INTEGER); PRAGMA user_version = 2;",
