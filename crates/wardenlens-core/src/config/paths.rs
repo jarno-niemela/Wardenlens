@@ -10,7 +10,10 @@ pub(super) fn validate(text: &str) -> Result<(), PathProblem> {
     if text.is_empty() || text.len() > MAX_PATH_BYTES {
         return Err(PathProblem::BadLength);
     }
-    if text.chars().any(char::is_control) {
+    if text
+        .chars()
+        .any(|c| c.is_control() || crate::text::is_invisible(c))
+    {
         return Err(PathProblem::ControlChar);
     }
     let Some(rest) = text.strip_prefix('/') else {
