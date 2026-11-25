@@ -1,17 +1,19 @@
 //! Matching one input in every view (ADR 0006 section 7).
 //!
-//! Views: raw (unsqueezed needles), squeezed (squeezed needles), decoded and JSON-unescaped
-//! (both, each squeezed again), joined (squeezed needles; display names and `other` only; built
-//! from the squeezed, the decoded and the JSON-unescaped text alike). Needles of folded kinds
-//! are matched in lowercased copies of the views. A view that would equal the squeezed view
-//! (no `%`, no backslash) is not built: it cannot match anything the squeezed view does not.
+//! Views: raw (unsqueezed needles); squeezed (invisible characters deleted); the boundary form
+//! (each dropped invisible character a space, so a value glued to a letter by one keeps a
+//! non-alphanumeric neighbour); joined (display names and `other` only; built from the squeezed
+//! and from the boundary form). The raw and the squeezed text are each decoded (percent and
+//! JSON) and every decoded text is searched as it is and in its squeezed, boundary and joined
+//! forms. Needles of folded kinds are matched in lowercased copies of the views. A decode that
+//! cannot change the text (no `%`, no backslash) is not built.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 
 use super::matcher::{Automaton, Matcher};
 use super::needles::{Boundary, view};
-use super::squeeze::{fold, lossy, squeeze, squeeze_lossy};
+use super::squeeze::{fold, lossy, squeeze, squeeze_boundary};
 use super::views::{View, joined_folded, json_unescaped, percent_decoded};
 use super::{Hit, MAX_HITS, MAX_INPUT_LEN, ScanError, ScanReport, net};
 
@@ -121,16 +123,49 @@ impl Matcher {
         Ok(())
     }
 
-    /// A decoded text, searched as it is (a value glued behind a decoded invisible character
-    /// keeps its boundary) and squeezed again (decoding can produce characters the squeeze
-    /// maps), the squeezed form also as a joined view. Neither form loses a hit the other finds.
-    fn decoded(&self, text: &str, bit: u8, found: &mut Found) -> Result<(), ScanError> {
+    /// The squeezed forms of `text`: the squeezed view (invisible characters deleted, for a
+    /// value with one inside it) and its joined view, and, if `text` holds a dropped invisible
+    /// character, the boundary form (each one a space) and its joined view, for a value glued to
+    /// a letter by an invisible character. `bit` is the view bit of the squeezed needles.
+    fn squeezed_forms(&self, text: &str, bit: u8, found: &mut Found) -> Result<(), ScanError> {
         let squeezed = squeeze(text);
-        if squeezed != text {
-            self.text_view(text.as_bytes(), bit, found)?;
-        }
         self.text_view(squeezed.as_bytes(), bit, found)?;
-        self.joined(&squeezed, found)
+        self.joined(&squeezed, found)?;
+        if let Some(spaced) = squeeze_boundary(text) {
+            self.text_view(spaced.as_bytes(), bit, found)?;
+            self.joined(&spaced, found)?;
+        }
+        Ok(())
+    }
+
+    /// A decoded text, searched as it is (a value glued behind a decoded invisible character
+    /// keeps its boundary) and in its squeezed forms (decoding can produce characters the
+    /// squeeze maps or drops). Neither form loses a hit the other finds.
+    fn decoded(&self, text: &str, bit: u8, found: &mut Found) -> Result<(), ScanError> {
+        self.text_view(text.as_bytes(), bit, found)?;
+        self.squeezed_forms(text, bit, found)
+    }
+
+    /// Decodes `text` (and its squeezed form: a squeeze can join the halves of an escape
+    /// that an invisible character split) and searches each result with `decoded`. The raw text
+    /// is decoded too, so a literal invisible character before an encoded value is still there
+    /// when the boundary is checked.
+    fn decode_with(
+        &self,
+        text: &str,
+        squeezed: &str,
+        marker: char,
+        decode: fn(&str) -> String,
+        bit: u8,
+        found: &mut Found,
+    ) -> Result<(), ScanError> {
+        if text.contains(marker) {
+            self.decoded(&decode(text), bit, found)?;
+        }
+        if squeezed != text && squeezed.contains(marker) {
+            self.decoded(&decode(squeezed), bit, found)?;
+        }
+        Ok(())
     }
 
     pub(super) fn scan(&self, input: &[u8]) -> Result<ScanReport, ScanError> {
@@ -139,17 +174,27 @@ impl Matcher {
         }
         let mut found = Found::default();
         self.text_view(input, view::RAW, &mut found)?;
-        let squeezed = squeeze_lossy(input);
-        self.text_view(squeezed.as_bytes(), view::SQUEEZED, &mut found)?;
-        self.joined(&squeezed, &mut found)?;
+        let text = lossy(input);
+        self.squeezed_forms(&text, view::SQUEEZED, &mut found)?;
         // Decoded views go through the same squeeze and join as the raw text (one place), so a
         // name written with an escaped no-break space still matches its plain-space needle.
-        if squeezed.contains('%') {
-            self.decoded(&percent_decoded(&squeezed), view::DECODED, &mut found)?;
-        }
-        if squeezed.contains('\\') {
-            self.decoded(&json_unescaped(&squeezed), view::JSON, &mut found)?;
-        }
+        let squeezed = squeeze(&text);
+        self.decode_with(
+            &text,
+            &squeezed,
+            '%',
+            percent_decoded,
+            view::DECODED,
+            &mut found,
+        )?;
+        self.decode_with(
+            &text,
+            &squeezed,
+            '\\',
+            json_unescaped,
+            view::JSON,
+            &mut found,
+        )?;
         Ok(self.report(found))
     }
 

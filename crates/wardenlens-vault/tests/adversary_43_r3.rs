@@ -64,7 +64,8 @@ fn legacy_credential_is_never_attached_to_a_different_camera_after_name_normalis
             serde_json::to_string(exact).unwrap()
         ));
         match map_legacy(Some(&doc), &names, None) {
-            Err(_) => {}
+            Err(LegacyError::DuplicateName) => {}
+            Err(e) => panic!("{exact:?} vs {other:?}: {e:?}"),
             Ok(out) => assert_eq!(
                 credential_ids(&out),
                 ["cam:cam-exact:credential"],

@@ -10,6 +10,7 @@
 )]
 
 mod edges;
+mod matrix;
 mod props;
 mod table;
 

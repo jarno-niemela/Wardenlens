@@ -229,13 +229,6 @@ fn text(s: &str) -> Value {
     Value::Text(SecretString::from(s.to_owned()))
 }
 
-/// A display name in the form the vault stores and the legacy mapper compares: white space
-/// normalised, invisible characters dropped. The CLI uses it for its own duplicate check.
-#[must_use]
-pub fn stored_display_name(raw: &str) -> String {
-    (*display_name_text(raw)).clone()
-}
-
 /// The inventory names in their stored form (whitespace normalised, invisible characters
 /// dropped), to inventory ids.
 ///

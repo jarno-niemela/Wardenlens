@@ -1101,6 +1101,28 @@ fn import_legacy_refuses_two_inventory_cameras_with_one_name() {
 }
 
 #[test]
+fn import_legacy_refuses_inventory_names_equal_after_normalisation() {
+    let h = Home::new();
+    h.init();
+    // The second name holds a no-break space: the same name once stored.
+    let toml = "[cameras.a]\nname = \"Porte Nord\"\n[cameras.b]\nname = \"Porte\u{A0}Nord\"\n";
+    let json = r#"[{"name":"Porte Nord","login":"u","password":"pw-synthetic-7"}]"#;
+    let l = legacy_files(&h, json, toml);
+    let (j, i) = (l.json.to_str().unwrap(), l.toml.to_str().unwrap());
+    let err = cmd(
+        &h.env(),
+        &["import-legacy", "--secret-json", j, "--inventory", i],
+        &mut Fake::pipe(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CliError::Refused(msg) if msg.contains("share a display name")),
+        "{err:?}"
+    );
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), "");
+}
+
+#[test]
 fn import_legacy_refuses_an_oversized_file() {
     let h = Home::new();
     h.init();

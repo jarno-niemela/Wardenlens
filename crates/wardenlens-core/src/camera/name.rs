@@ -40,10 +40,13 @@ fn is_blank_glyph(c: char) -> bool {
 }
 
 /// Combining marks (`Mn`, `Mc`, `Me`) in the blocks listed here: Combining Diacritical Marks,
-/// Cyrillic, Hebrew, Arabic, Syriac, Thaana, `NKo`, Devanagari and the Indic blocks, Thai, Lao,
-/// Tibetan, Myanmar, Khmer, the extended and supplement diacritics, symbols, CJK and half marks.
-/// Not every Unicode combining mark is covered, only the marks in these blocks.
-const COMBINING_RANGES: [(u32, u32); 92] = [
+/// Cyrillic, Hebrew, Arabic, Syriac, Thaana, `NKo`, Samaritan, Mandaic, Devanagari and the Indic
+/// blocks, Thai, Lao, Tibetan, Myanmar, Khmer, the extended and supplement diacritics, symbols,
+/// CJK and half marks. Not every Unicode combining mark is covered, only the marks in these
+/// blocks. The ranges leave out the letters (`Lm`, `Lo`) that sit between marks in those blocks
+/// (U+081A, U+0824, U+0828, U+093D, U+09BD, U+0ABD, U+0B3D), so such a letter is an ordinary
+/// character. A code point inside a range that Unicode 16 has not assigned is treated as a mark.
+const COMBINING_RANGES: [(u32, u32); 99] = [
     (0x0300, 0x036F),
     (0x0483, 0x0489),
     (0x0591, 0x05BD),
@@ -62,15 +65,20 @@ const COMBINING_RANGES: [(u32, u32); 92] = [
     (0x0730, 0x074A),
     (0x07A6, 0x07B0),
     (0x07EB, 0x07F3),
-    (0x0816, 0x082D),
+    (0x0816, 0x0819),
+    (0x081B, 0x0823),
+    (0x0825, 0x0827),
+    (0x0829, 0x082D),
     (0x0859, 0x085B),
     (0x08D3, 0x08E1),
     (0x08E3, 0x0903),
-    (0x093A, 0x094F),
+    (0x093A, 0x093C),
+    (0x093E, 0x094F),
     (0x0951, 0x0957),
     (0x0962, 0x0963),
     (0x0981, 0x0983),
-    (0x09BC, 0x09CD),
+    (0x09BC, 0x09BC),
+    (0x09BE, 0x09CD),
     (0x09D7, 0x09D7),
     (0x09E2, 0x09E3),
     (0x0A01, 0x0A03),
@@ -78,10 +86,12 @@ const COMBINING_RANGES: [(u32, u32); 92] = [
     (0x0A70, 0x0A71),
     (0x0A75, 0x0A75),
     (0x0A81, 0x0A83),
-    (0x0ABC, 0x0ACD),
+    (0x0ABC, 0x0ABC),
+    (0x0ABE, 0x0ACD),
     (0x0AE2, 0x0AE3),
     (0x0B01, 0x0B03),
-    (0x0B3C, 0x0B57),
+    (0x0B3C, 0x0B3C),
+    (0x0B3E, 0x0B57),
     (0x0B62, 0x0B63),
     (0x0B82, 0x0B82),
     (0x0BBE, 0x0BCD),
@@ -239,6 +249,33 @@ mod tests {
         }
         for n in ["a\u{301}", "1", "\u{4e2d}", "Cam #1", "\u{e9}-"] {
             assert!(DisplayName::new(n).is_ok(), "{n:?}");
+        }
+    }
+
+    /// The letters (`Lm`, `Lo`) that sit between marks in the listed blocks are accepted, alone,
+    /// first and as the only content; their neighbouring marks still are not.
+    #[test]
+    fn letters_between_marks_are_ordinary_characters() {
+        for c in [
+            '\u{081A}', '\u{0824}', '\u{0828}', '\u{093D}', '\u{09BD}', '\u{0ABD}', '\u{0B3D}',
+        ] {
+            assert!(c.is_alphanumeric(), "U+{:04X}", u32::from(c));
+            assert!(!is_combining_mark(c), "U+{:04X}", u32::from(c));
+            assert!(
+                DisplayName::new(&c.to_string()).is_ok(),
+                "U+{:04X}",
+                u32::from(c)
+            );
+            assert!(
+                DisplayName::new(&format!("{c}x")).is_ok(),
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        for c in [
+            '\u{0819}', '\u{081B}', '\u{093C}', '\u{093E}', '\u{09BC}', '\u{09BE}',
+        ] {
+            assert!(is_combining_mark(c), "U+{:04X}", u32::from(c));
         }
     }
 

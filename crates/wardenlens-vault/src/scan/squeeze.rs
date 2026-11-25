@@ -6,10 +6,14 @@
 
 use std::borrow::Cow;
 
-/// Appends `c` to `out` after the squeeze: invisible characters are deleted, the
-/// fullwidth ASCII block and the listed lookalikes of `.`, `-` and space are mapped.
-fn squeeze_char(c: char, out: &mut String) {
+/// Appends `c` to `out` after the squeeze: invisible characters are deleted (or, with
+/// `boundary`, become one space each, see [`squeeze_boundary`]), the fullwidth ASCII block and
+/// the listed lookalikes of `.`, `-` and space are mapped.
+fn squeeze_char(c: char, boundary: bool, out: &mut String) {
     if is_dropped_invisible(c) {
+        if boundary {
+            out.push(' ');
+        }
         return;
     }
     match u32::from(c) {
@@ -37,14 +41,24 @@ pub(super) fn is_collapsible(c: char) -> bool {
 pub(super) fn squeeze(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        squeeze_char(c, &mut out);
+        squeeze_char(c, false, &mut out);
     }
     out
 }
 
-/// Decodes `bytes` as UTF-8 (each invalid sequence becomes U+FFFD), then squeezes. Never slices.
-pub(super) fn squeeze_lossy(bytes: &[u8]) -> String {
-    squeeze(&String::from_utf8_lossy(bytes))
+/// The boundary form of `text`: the squeeze, except that each dropped invisible character
+/// becomes a space instead of being deleted, so a value glued to a letter by an invisible
+/// character (`x<ZWSP>value`) still has a non-alphanumeric neighbour. `None` if `text` holds
+/// no such character (the form would equal the squeezed one).
+pub(super) fn squeeze_boundary(text: &str) -> Option<String> {
+    if !text.chars().any(is_dropped_invisible) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        squeeze_char(c, true, &mut out);
+    }
+    Some(out)
 }
 
 /// The view lowercased with the full lowercase mapping (`char::to_lowercase`; a string can
@@ -139,9 +153,23 @@ mod tests {
     }
 
     #[test]
+    fn boundary_form_turns_each_dropped_invisible_into_a_space() {
+        assert_eq!(
+            squeeze_boundary("x\u{200B}Porte").as_deref(),
+            Some("x Porte")
+        );
+        assert_eq!(
+            squeeze_boundary("a\u{FE0F}\u{00AD}b").as_deref(),
+            Some("a  b")
+        );
+        assert_eq!(squeeze_boundary("a\u{00A0}b"), None);
+        assert_eq!(squeeze_boundary("plain"), None);
+    }
+
+    #[test]
     fn lossy_never_slices_invalid_bytes() {
-        assert_eq!(squeeze_lossy(b"a\xFFb"), "a\u{FFFD}b");
-        assert_eq!(squeeze_lossy(b"\xE2\x80"), "\u{FFFD}");
+        assert_eq!(squeeze(&lossy(b"a\xFFb")), "a\u{FFFD}b");
+        assert_eq!(squeeze(&lossy(b"\xE2\x80")), "\u{FFFD}");
     }
 
     #[test]
