@@ -167,11 +167,11 @@ fn crash_mid_rekey_then_new_key_is_wrong_key_and_old_key_recovers() {
 }
 
 /// An open racing a committed write must succeed (ADR 0006 section 3: a scan during a write
-/// waits). Each round has the writer hold a transaction with its `-journal` on disk, then commit
-/// as the open starts, so the open sees the hot journal or the committed file depending on the
-/// scheduler; both outcomes must be `Ok`. The channels (no sleeps, no clocks: TEST-5) keep
+/// waits). Each round has the writer hold an open transaction (its `-journal` on disk), then
+/// commit as the open starts, so the open sees the journal or the committed file depending on
+/// the scheduler; both outcomes must be `Ok`. The channels (no sleeps, no clocks: TEST-5) keep
 /// exactly one write in flight per open. An unbounded writer loop is not a valid race: a writer
-/// that holds the lock almost continuously starves any reader, SQLite's own included, for longer
+/// that is almost always committing starves any reader, SQLite's own included, for longer
 /// than `BUSY_TIMEOUT` (#134), which is a refusal by design.
 #[test]
 fn opens_racing_committed_writes_never_fail() {
@@ -199,9 +199,10 @@ fn opens_racing_committed_writes_never_fail() {
     };
     let mut failures = Vec::new();
     for _ in 0..ROUNDS {
+        let key = KeyFile::load(&tmp.path().join("k")).unwrap();
         hot_rx.recv().unwrap();
         go_tx.send(()).unwrap();
-        match Vault::open(&db, KeyFile::load(&tmp.path().join("k")).unwrap()) {
+        match Vault::open(&db, key) {
             Ok(v) => drop(v),
             Err(e) => failures.push(format!("{e:?}")),
         }

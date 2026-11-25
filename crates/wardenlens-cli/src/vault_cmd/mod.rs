@@ -178,3 +178,26 @@ fn rm<T: Terminal>(id: &str, p: &Paths, term: &mut T) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests;
+
+/// Test-only. A child created by `fork` holds a copy of every open descriptor until it reaches
+/// `exec`, so a `git` spawn on one test thread can keep another test's [`session::DirLock`]
+/// held for a moment after that test dropped it (#134). Tests that spawn processes take the
+/// read side, tests that assert on the lock's outcome take the write side.
+#[cfg(test)]
+pub(crate) static SPAWN_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Read side of [`SPAWN_GUARD`]: held by whoever spawns a child process.
+#[cfg(test)]
+pub(crate) fn spawning() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPAWN_GUARD
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write side of [`SPAWN_GUARD`]: held by a test while it relies on a `DirLock` being free.
+#[cfg(test)]
+pub(crate) fn lock_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    SPAWN_GUARD
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

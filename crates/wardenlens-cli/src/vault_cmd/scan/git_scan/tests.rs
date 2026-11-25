@@ -105,7 +105,10 @@ impl Repo {
         for (k, v) in env {
             c.env(k, v);
         }
-        let out = c.output().unwrap();
+        let out = {
+            let _g = crate::vault_cmd::spawning();
+            c.output().unwrap()
+        };
         assert!(out.status.success(), "git {args:?} failed");
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
@@ -176,6 +179,7 @@ mergetag object {side_sha}\n type commit\n tag side-tag\n tagger {who}\n \n {V_M
     fn git_in(&self, args: &[&str], stdin: &[u8]) -> String {
         use std::io::Write as _;
         use std::process::Stdio;
+        let guard = crate::vault_cmd::spawning();
         let mut child = Command::new("git")
             .current_dir(self.path())
             .env_clear()
@@ -186,6 +190,7 @@ mergetag object {side_sha}\n type commit\n tag side-tag\n tagger {who}\n \n {V_M
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        drop(guard);
         child.stdin.take().unwrap().write_all(stdin).unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
@@ -664,6 +669,7 @@ fn the_scan_does_not_write_to_the_repository() {
     r.write("staged.txt", b"s\n");
     r.git(&[], &["add", "staged.txt"]);
     let snapshot = |dir: &Path| {
+        let _g = crate::vault_cmd::spawning();
         let out = Command::new("find")
             .arg(dir.join(".git"))
             .args(["-type", "f", "-printf", "%p %s %T@\\n"])

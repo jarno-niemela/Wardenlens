@@ -140,6 +140,13 @@ impl Git {
         }
     }
 
+    /// Spawns `cmd`. In tests the spawn is held under [`crate::vault_cmd::spawning`].
+    fn spawn(cmd: &mut Command) -> Result<Child, GitError> {
+        #[cfg(test)]
+        let _guard = crate::vault_cmd::spawning();
+        cmd.spawn().map_err(|_| GitError::Spawn)
+    }
+
     fn command(&self, args: &[&OsStr]) -> Command {
         let mut c = Command::new(&self.exe);
         if let Some(d) = &self.dir {
@@ -177,7 +184,7 @@ impl Git {
     /// Runs git and returns its standard output, at most `limit` bytes; `stdin` is fed from a
     /// second thread so a large input cannot deadlock against the output.
     fn capture(&self, args: &[&OsStr], stdin: &[u8], limit: usize) -> Result<Vec<u8>, GitError> {
-        let mut child = self.command(args).spawn().map_err(|_| GitError::Spawn)?;
+        let mut child = Self::spawn(&mut self.command(args))?;
         let (Some(mut input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             kill(&mut child);
             return Err(GitError::Spawn);
@@ -288,10 +295,7 @@ impl Git {
 
     /// Starts a `cat-file --batch` process that answers one request at a time.
     pub(super) fn object_reader(&self) -> Result<ObjectReader, GitError> {
-        let mut child = self
-            .command(&args(&["cat-file", "--batch"]))
-            .spawn()
-            .map_err(|_| GitError::Spawn)?;
+        let mut child = Self::spawn(&mut self.command(&args(&["cat-file", "--batch"])))?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             kill(&mut child);
             let _ = child.wait();
@@ -313,10 +317,7 @@ impl Git {
         if shas.is_empty() {
             return Ok(());
         }
-        let mut child = self
-            .command(&args(&["cat-file", "--batch"]))
-            .spawn()
-            .map_err(|_| GitError::Spawn)?;
+        let mut child = Self::spawn(&mut self.command(&args(&["cat-file", "--batch"])))?;
         let (Some(mut input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             kill(&mut child);
             return Err(GitError::Spawn);

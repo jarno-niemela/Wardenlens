@@ -26,10 +26,11 @@ pub(super) struct DirLock {
 }
 
 /// Tries made to take the key-directory lock before refusing, and the pause between two tries.
-/// A lock whose holder has just released it can still be held for a moment by a child that a
-/// concurrent `fork` (a `git` spawn from another thread) copied the descriptor into and that has
-/// not yet reached `exec`, which closes it (`O_CLOEXEC`). A brief grace rides that out; a real
-/// second writer still gets the refusal, half a second later (#134, #128).
+/// A write command waits up to about 0.5 s for the lock and then refuses; a writer whose rival
+/// finishes within that time now succeeds. The wait also rides out a lock that its holder has
+/// just released but that a child still holds: a concurrent `fork` (a `git` spawn from another
+/// thread) copies the descriptor, and the child keeps the lock until `exec` closes it
+/// (`O_CLOEXEC`) (#134, #128).
 const LOCK_ATTEMPTS: u32 = 50;
 const LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 

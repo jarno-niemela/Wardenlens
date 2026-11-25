@@ -915,6 +915,7 @@ fn a_held_lock_refuses_recovery_and_leaves_next_in_place() {
     h.init();
     set_text(&h, "cam:a:host", "host", "192.0.2.77");
     crash_after_commit(&h);
+    let _x = super::lock_exclusive();
     let held = super::session::DirLock::acquire(h.paths().key.parent().unwrap()).unwrap();
     let err = cmd(&h.env(), &["rm", "cam:a:host"], &mut Fake::pipe()).unwrap_err();
     assert!(err.to_string().contains("another vault write"), "{err}");
@@ -927,6 +928,7 @@ fn a_held_lock_refuses_recovery_and_leaves_next_in_place() {
 /// child copied the descriptor across a concurrent `fork` and held the lock until `exec`).
 #[test]
 fn a_lock_released_during_the_grace_period_is_acquired() {
+    let _x = super::lock_exclusive();
     let h = Home::new();
     h.init();
     let dir = h.paths().key.parent().unwrap().to_owned();
@@ -945,6 +947,7 @@ fn a_lock_released_during_the_grace_period_is_acquired() {
 /// A lock that stays held is still refused, after exactly `attempts - 1` pauses.
 #[test]
 fn a_lock_held_throughout_the_grace_period_is_refused() {
+    let _x = super::lock_exclusive();
     let h = Home::new();
     h.init();
     let dir = h.paths().key.parent().unwrap().to_owned();
@@ -1299,6 +1302,7 @@ fn adv_rekey_with_the_lock_busy_changes_nothing() {
     h.init();
     set_text(&h, "cam:a:host", "host", "192.0.2.77");
     let before = std::fs::read(h.paths().key).unwrap();
+    let _x = super::lock_exclusive();
     let held = super::session::DirLock::acquire(h.paths().key.parent().unwrap()).unwrap();
     let mut t = Fake::tty();
     assert!(cmd(&h.env(), &["rekey"], &mut t).is_err());
