@@ -1,0 +1,33 @@
+[package]
+name = "wardenlens-onvif"
+description = "ONVIF device client: WS-Security digest, device information, profiles and stream URIs over plain HTTP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# Versions and features follow ADR 0004 section 7 and section 10.
+[dependencies]
+wardenlens-core.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+quick-xml = { version = "0.42", default-features = false }
+# `client` and `http1` only: one connection per request, driven by hand (no pool, no redirects).
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+bytes = "1.12.2"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"] }
+# SHA-1 only answers the WS-Security digest challenge (ADR 0004 section 7). `zeroize` wipes the
+# hasher state, which holds password bytes, on drop.
+sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "time", "net", "io-util", "test-util"] }
+
+[lints]
+workspace = true
