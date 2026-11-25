@@ -6,6 +6,7 @@
 
 pub mod camera;
 pub mod catalogue;
+pub mod config;
 pub mod connection;
 pub mod entry;
 pub mod mp4box;

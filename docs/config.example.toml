@@ -1,0 +1,39 @@
+# Example wardenlens.toml. Synthetic values only: replace the paths for your site.
+# Unknown keys are rejected. Durations are whole seconds.
+
+[api]
+# LAN-only: loopback, private (10/8, 172.16/12, 192.168/16), fc00::/7 or link-local.
+# Use an explicit "ip:port"; a hostname, a missing port and port 0 are refused.
+listen = "127.0.0.1:8080"
+# Docker bridge network only: the process must listen on all container interfaces.
+# Set listen = "0.0.0.0:8080" together with allow_unspecified_bind = true, and publish the
+# port to a single host LAN address in the compose file.
+allow_unspecified_bind = false
+# 100.64.0.0/10 (VPN overlays such as Tailscale). ISP carrier-grade NAT shares this range with
+# other subscribers, so it is refused unless you opt in.
+allow_cgnat_bind = false
+
+[storage]
+# Absolute, canonical paths (no "..", no "//", no trailing slash). The two roots must not be
+# equal or nested.
+hot_root = "/srv/wardenlens/hot"
+archive_root = "/srv/wardenlens/archive"
+# Minimum free space per volume, percent, 0-90.
+hot_min_free_percent = 25
+archive_min_free_percent = 25
+# Hot video older than this is moved to the archive even without pressure. Seconds, 60-604800.
+hot_max_age = 43200
+# Upper bound of storage actions per tick, 1-1024.
+max_actions_per_tick = 64
+
+[recording]
+# Target segment length in seconds, 10-290.
+segment_target_secs = 60
+
+[database]
+# Must not lie inside either storage root.
+path = "/srv/wardenlens/state/index.db"
+
+[secrets]
+# Must not lie inside either storage root.
+key_file = "/srv/wardenlens/state/secrets.key"
