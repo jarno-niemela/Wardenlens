@@ -140,7 +140,7 @@ impl Git {
         }
     }
 
-    /// Spawns `cmd`. In tests the spawn is held under [`crate::vault_cmd::spawning`].
+    /// Spawns `cmd`. In tests the spawn is held under `crate::vault_cmd::spawning`.
     fn spawn(cmd: &mut Command) -> Result<Child, GitError> {
         #[cfg(test)]
         let _guard = crate::vault_cmd::spawning();
