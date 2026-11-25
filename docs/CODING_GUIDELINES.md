@@ -93,6 +93,17 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   widely-used crates. Disable default features you do not use.
 - **SEC-9 Concurrency:** no `static mut`; prefer message passing; hold locks
   for the shortest scope and never across `.await`.
+- **SEC-10 One choke point, an allowlist, every entry point tested.** A rule
+  that must hold everywhere (a refusal, redaction, authentication, a rate or
+  concurrency cap, input classification) is enforced in the one function or
+  layer every path goes through, never in a helper that most paths happen to
+  call. It lets through what is known good (an allowlist, with no "everything
+  else is a file" fallthrough) instead of blocking what is known bad. Two
+  components that must agree on a set (a validator and a scanner, a needle
+  collapse and a view collapse) call one shared predicate, and a test fails if
+  they diverge. A test loops over every entry point (each subcommand, route,
+  error kind, input form), including one that matches nothing. Examples: #94,
+  #60, #75 r2-r3, #43 r3, #117 r5, #32 r1-r5 (`defect-patterns` P10).
 
 ## 5. Testing (`TEST`)
 
@@ -117,6 +128,16 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   an ordering or a redaction must fail when that guard is removed or reordered:
   mutation-check it once by hand and say so in the PR. A test that passes only
   because of scheduler timing is not deterministic (TEST-5).
+- **TEST-9 Enumerate the whole surface before fixing.** For an invariant over an
+  open-ended input space (every path a push publishes, every spelling a scanner
+  must find, every input form of a parse type), write the full enumeration and a
+  table-driven test, one row per element, **before** the fix, and show that it
+  fails first. A brief or ticket states the invariant, not the reported
+  example. Any proof an optimisation relies on (for example "every ancestor of a
+  new tree is new") is checked in both directions: a new path can sit on an old
+  tree (#117 r4). Prefer "walk everything and dedupe" to "skip what looks
+  already handled". Examples: #117 r1-r5, #43 r2-r5, #32 rw1 (`defect-patterns`
+  P11).
 
 ## 6. Style & documentation (`DOC`)
 
@@ -168,3 +189,4 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
 7. Are tests deterministic, behaviour-named, and covering edges?
 8. Any new dependency — justified and `cargo deny` clean?
 9. Is anything here speculative, dead, or duplicated?
+10. Is every cross-cutting policy at one choke point and an allowlist (SEC-10), and is every open-ended invariant backed by an enumerated table test (TEST-9)?

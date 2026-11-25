@@ -27,6 +27,7 @@ Keep it current with `/retro` (the `retro` skill).
   - `name` and `display_name` overwrote each other;
   - over-long ids dropped fields;
   - an empty `login` produced a credential that `set` refused.
+  - #43 (PR #127) r1-r3: a duplicate `CameraId` was never unified; legacy names with NBSP were dropped; names that normalise equal merged silently (first wins).
 - **Self-test.**
   - A test that enumerates every key of a hostile fixture and asserts each is imported or reported.
   - A cross-source collision test, including a real id that looks like a generated one.
@@ -57,33 +58,13 @@ Keep it current with `/retro` (the `retro` skill).
   - A **multi-tick** simulation (50-100 ticks) with mixed segment sizes and foreign growth.
 
 ## P3. Touching what is not yours (foreign files, sidecars, recovery)
-- **Rule.** Before any write-capable operation, prove identity **read-only**:
-  - write-capable means a read-write open, a pragma, `CREATE`, or SQLite's hot-journal or WAL recovery;
-  - identity means exact schema, version and a keycheck under the supplied key, checked by an immutable probe;
-  - with a hot `-journal`, the main file may be torn (for example a crash mid-rekey leaves the new
-    keycheck page), so identify a **private rolled-back copy** of main file + journal instead (#104 r3).
-  - Enumerate **every entry point** (`open`, `create`, `rekey`, the empty-file path) and every sidecar (`-wal`, `-journal`).
-  - The rolled-back copy is safe only with all of: copying through the already-verified descriptor, a 0700 scratch directory with `create_new` 0600 files, a size cap, removal on every return path, an `O_NOFOLLOW | O_NONBLOCK` journal open, and refusing a journal whose tail holds a super-journal pointer (PR #106, PR #119).
-- **Rule.** Every open of a path the program discovered (a sidecar, a directory-walk entry, a path named inside a file), as opposed to one the owner named explicitly, uses `O_NOFOLLOW | O_NONBLOCK`, rejects a non-regular `symlink_metadata` first, and re-checks `is_file` on the descriptor. When a library would open such a path itself, keep it from doing so: SQLite follows a super-journal name stored inside a journal, so the probe refuses that journal first (#104 r3 FIFO `-journal` hang; r4 FIFO super-journal hang, fixed in PR #119). A path the owner names (for example `import-legacy` input) still opens with `O_NONBLOCK`.
-- **Rule.** Separate "foreign" from "mine, mid-write or crashed":
-  - wait for a live writer up to the busy timeout;
-  - let a proven own file recover;
-  - otherwise return a distinct typed error.
-  - Never return an error whose obvious fix destroys data. For example, `NotInitialized` invites deleting the journal.
-- **Rule.** "Exact schema" means every `sqlite_master` row (tables, indexes, triggers and
-  views), not just tables. A table name like `meta` is not identity.
-- **Example.**
-  - #74 r3-r5 (PR #97): `create`, and then `open`, ran `journal_mode` on a foreign WAL database before refusing it; the probe trusted any `meta` table.
-  - #104 r1 (PR #106): the fix refused the vault's own `-journal`, which broke crash recovery and concurrent readers.
-  - #104 r2-r4 (PR #106): an immutable probe of a torn main file locked out the old key; the copy's new journal open hung on a FIFO.
-- **Self-test.** For each entry point:
-  - a foreign WAL database, a database with a `meta` table, a leftover `-wal` and a hot `-journal`, each asserting the main file, the sidecar and the directory listing are **byte-identical**;
-  - an own vault opened during a concurrent write, and after a crash mid-write and mid-rekey.
-    For mid-rekey, the crash must leave the **new keycheck page in the main file** with the
-    old pages in the journal, as found in #104 r2. A crash that touches only `entries` does
-    not test it.
-  - **Timing (TEST-5):** coordinate the concurrent writer with a channel or barrier, not a
-    `sleep`. The only real-time element allowed is the code's own bounded `BUSY_TIMEOUT`.
+No recurrence in #75, #117, #32, #43; kept compact.
+- **Rule.** Before any write-capable operation (a read-write open, a pragma, `CREATE`, SQLite hot-journal or WAL recovery), prove identity **read-only**: exact schema (every `sqlite_master` row, not just tables), version and a keycheck under the supplied key, by an immutable probe. Cover **every entry point** (`open`, `create`, `rekey`, the empty-file path) and every sidecar (`-wal`, `-journal`).
+- **Rule.** With a hot `-journal` the main file may be torn (a crash mid-rekey leaves the new keycheck page), so identify a **private rolled-back copy** (#104 r3). It is safe only with: copying through the verified descriptor, a 0700 scratch directory with `create_new` 0600 files, a size cap, removal on every return path, an `O_NOFOLLOW | O_NONBLOCK` journal open, and refusing a journal whose tail holds a super-journal pointer (PR #106, #119).
+- **Rule.** Every open of a path the program discovered (sidecar, walk entry, path named inside a file) uses `O_NOFOLLOW | O_NONBLOCK`, rejects a non-regular `symlink_metadata` first, and re-checks `is_file` on the descriptor. Keep libraries from opening such paths themselves (#104 r3-r4 FIFO hangs). A path the owner names still opens with `O_NONBLOCK`.
+- **Rule.** Separate "foreign" from "mine, mid-write or crashed": wait for a live writer up to the busy timeout, let a proven own file recover, else return a distinct typed error. Never return an error whose obvious fix destroys data (`NotInitialized` invites deleting the journal).
+- **Example.** #74 r3-r5 (PR #97): `create`, then `open`, ran `journal_mode` on a foreign WAL database before refusing it. #104 r1 (PR #106): refusing the vault's own `-journal` broke crash recovery. #104 r2-r4: an immutable probe of a torn main file locked out the old key.
+- **Self-test.** Per entry point: a foreign WAL database, a database with a `meta` table, a leftover `-wal` and a hot `-journal`, each asserting main file, sidecar and directory listing are **byte-identical**; an own vault during a concurrent write and after a crash mid-write and mid-rekey (the crash must leave the new keycheck page in the main file, #104 r2). **TEST-5:** coordinate the writer with a channel or barrier, never `sleep`.
 
 ## P4. Panics and blow-ups on untrusted bytes
 - **Rule.** A byte-length check followed by `str` slicing (`split_at`, `[a..b]`) panics
@@ -132,6 +113,7 @@ Keep it current with `/retro` (the `retro` skill).
   - #44 (PR #101) r1: the `unsatisfiable` / `rolling_buffer` bools.
   - #45 (PR #102) r2: `Decision` with `Option<PushError>` (#105).
   - #60 (PR #115) r1: store failures shared the auth-failure sampling counter and were logged as "authentication failed". Keep one counter and one message per failure kind.
+  - #75 (PR #122) r2: exit 1 must mean only "hit found"; walk-limit and output errors had to exit 2. #117 (PR #125) r2: a `git ls-files` failure inside a process substitution failed open.
 - **Self-test.** One test per error variant that the new code can return. `grep` each
   variant in the tests; an untested variant is a finding.
 
@@ -143,6 +125,7 @@ Keep it current with `/retro` (the `retro` skill).
   - #46 (PR #95) r3 and #44 (PR #101) r5: stale adversary-test doc comments.
   - #60 (PR #115) r2: the slot-wait test passed with the layers swapped, because the permit is taken in `poll_ready`.
   - #104 (PR #106) r4: a kept adversary test relied on a writer thread winning a race, and flaked the gate on main (#116).
+  - #32 (PR #71) rw1: the encoding test covered only `quirks[0]`, so a mutation dropping other fields survived. #117 (PR #125) r3: no deletion test.
 - **Self-test.**
   - For each assertion, ask: "would this fail if the function returned a constant or its own input?"
   - For each proptest, count with a temporary counter how often the target branch is hit, and require more than 0.
@@ -157,33 +140,47 @@ Keep it current with `/retro` (the `retro` skill).
   NOTES FOR VERIFIERS with the reason. Verifiers accept a justified deviation; they
   block a silent one.
 - **Rule.** When a fix round changes the design, update the ADR paragraph and the public rustdoc in the **same** round. A process or gate change goes into `docs/WORKFLOW.md`, the binding text, not only into a skill.
-- **Example.** #74 (PR #97) r3: the `unknown_keys` rustdoc missed two categories. #110 r1: a ticket criterion (cap escalation) was left out. #104 (PR #106) r3: the ADR still described round-2 behaviour. #107 (PR #110) r2: the override existed in a skill but contradicted WORKFLOW.md.
+- **Example.** #74 (PR #97) r3: the `unknown_keys` rustdoc missed two categories. #110 r1: a ticket criterion (cap escalation) was left out. #104 (PR #106) r3: the ADR still described round-2 behaviour. #107 (PR #110) r2: the override existed in a skill but contradicted WORKFLOW.md. #43 (PR #127) r1: `Camera` lacked the model reference and `StreamSet`; r4: the ADR was stale. #75 (PR #122) r2: binary files over 8 MiB were refused, against ADR §7.
 - **Self-test.** List each acceptance criterion with its test name or file evidence (the
   implementer report's CRITERIA block). A criterion with no evidence is unmet.
 
 ## P9. Workflow traps (controller and implementer; no code self-test, the gate and CI catch these)
-- **Copied adversary tests:** run `cargo fmt --all` before committing them; the pre-commit hook rejects otherwise.
-- **`Policy` literals:** a new field breaks every external struct literal in the test files. Add the field with a neutral value, not a semantics change.
+- **Copied adversary tests:** run `cargo fmt --all` before committing them. **`Policy` literals:** a new field breaks every external struct literal in tests; add it with a neutral value.
 - **CodeQL:** it flags synthetic keys and passwords in tests (`hard-coded-cryptographic-value`, `cleartext-logging`). The controller dismisses **test-path** alerts with a reason (PR #90). An alert in non-test code is a security finding for the auditor or the owner. Never weaken the test.
 - **Guard hook quirks:**
   - The guard cannot resolve git after `cd $VAR` or a relative `cd`. Use `cd /abs/path &&` or `git -C /abs/path`, one worktree per Bash call.
   - Any command text containing the literal merge command without `--match-head-commit`, even inside a heredoc, is blocked. Write such text to a file with the Write tool.
   - Only dangerous `git -c` keys are blocked (for example hooks, push, alias, editor, `include.path`, `includeIf.*`, `extensions.worktreeconfig`); `user.name` and `user.email` pass.
   - These notes are for writing prose and briefs, never for getting a command past the guard.
-- **Gate then push:** chain them with `&&`, never `;`. With `;` a failed gate still pushes (it happened on #75's branch; there was no PR, so nothing merged).
-- **Escapes in tool input:** `\uXXXX` text in a tool call can be decoded into the real character. In issue bodies and briefs, describe such escapes in words ("the JSON escape for U+2028").
+- **Gate then push:** chain them with `&&`, never `;` (a failed gate still pushed on #75's branch).
+- **Gate vs CI:** CI's shellcheck has no `-x`, the gate's does (#117). Run CI's exact command too.
+- **Scratch git:** a failed `cd` let `git reset --hard` run in the main checkout (#117 r1). Use `git -C <abs temp path>`.
+- **Verdicts:** record all three before `verify carry`; `carry` read a lagging status API and a verdict was once unrecorded (#117, #43).
+- **Rework vs merge:** commit rework separately from merges of main (#32). A brief that widens scope into another crate (#43 into the scanner) should be split at r1.
+- **Escapes in tool input:** `\uXXXX` text in a tool call can be decoded into the real character. Describe such escapes in words ("the JSON escape for U+2028").
 - **Kept adversary tests:** `scripts/verify carry` accepts only `crates/*/tests/**` and `scripts/tests/**`. Tests in a `src/` test module need re-verification, so they go to the follow-up ticket instead (PR #115). Before committing kept tests, read them for sleeps or racing threads; a timing-dependent test goes to a follow-up, not to main (#116).
 - **Merge conflicts:** almost every branch adds a `pub mod` line to `crates/wardenlens-core/src/lib.rs`. Before verifying two PRs in parallel, trial-merge them; resolve conflicts by taking the union of both module lists (PR #97, #101, #102). Resolving a conflict changes the head, so all three verifiers must run again.
 
-## P10. A rule that must hold everywhere, enforced in only some places
-- **Rule.** A policy (a refusal, authentication, a rate or concurrency cap, output redaction) lives at the **one choke point** every path goes through, not in one helper that most paths happen to call.
-- **Rule.** Know how the framework applies a layer: axum's `Router::layer` wraps each route and method separately, so a stateful layer (a semaphore) becomes per-route. Wrap the finished router as one service.
-- **Rule.** Prefer an allowlist of what may pass to a denylist of what may not. A denylist fix gets re-found in the next round.
+## P10. A rule that must hold everywhere, enforced in only some places (promoted to SEC-10)
+- **Rule.** SEC-10 is the rule: one choke point, an allowlist, every entry point tested, one shared predicate for two components that must agree. Know how the framework applies a layer: axum's `Router::layer` wraps each route separately, so wrap the finished router as one service.
 - **Example.**
-  - #94 (PR #109) r1: `check-key <path>` skipped the `WARDENLENS_VAULT_KEY` refusal, which lived only in `Env::paths()`.
-  - #94 r2-r3: clap's error echo was fixed for two error kinds; `InvalidSubcommand` still echoed argv, and the fix became an allowlist.
-  - #60 (PR #115) r1: `ConcurrencyLimitLayer` through `Router::layer` gave every route its own pool of 64.
-- **Self-test.** Loop over **every** entry point (each subcommand, route, method, unknown path, error kind) and assert the policy holds for each, including a request that matches nothing.
+  - #94 (PR #109) r1-r3: `check-key <path>` skipped a refusal that lived only in `Env::paths()`; clap's echo was fixed per error kind until it became an allowlist. #60 (PR #115) r1: `Router::layer` gave every route its own pool of 64.
+  - #75 (PR #122) r1-r2: the printable-character check was a denylist and missed `Cf` characters; redaction scanned the id and kind prefix and hid clean locations.
+  - #117 (PR #125) r1-r3 and r5: hooks printed raw ref names before the scan; an unknown tree mode fell through to "file".
+  - #43 (PR #127) r1, r3: core and vault validators disagreed; the vault's deletions and the scanner's squeeze were two predicates.
+  - #32 (PR #71) r1-r5: a heuristic denylist guard was re-found each round (comments, query strings, quotes, XML, camelCase, CDATA); it became a soft lint over the exact-match scan.
+- **Self-test.**
+  - Loop over **every** entry point (each subcommand, route, method, error kind, input form, including one that matches nothing) and assert the policy holds.
+  - For two components, assert `shared_set(a) == shared_set(b)`, or feed one generated input through both.
+
+## P11. An open-ended input space fixed one instance per round (promoted to TEST-9)
+- **Rule.** TEST-9 is the rule: write the full enumeration and a table-driven test before fixing, and check any "skip what is already handled" proof in both directions.
+- **Example.**
+  - #117 (PR #125), one more instance of "every path a push publishes is scanned" per round: r1 replace refs and tree-only pushes; r2 empty directories; r3 names joined across `/`; r4 old subtrees under renamed paths (the claim "every ancestor of a new tree is new" was assumed in one direction); r5 non-canonical modes (`40755`).
+  - #43 (PR #127) r2-r5: spellings of a display name, found one at a time (decoded views not squeezed, boundary form, mixed encodings, two invisibles) until the matrix test of r5.
+  - #32 (PR #71) rw1: TOML escapes the scanner does not decode (`\U` escapes, a line-ending backslash); fixed by refusing every backslash.
+  - #75 (PR #122) r2: stored values with whitespace the views do not collapse were missed.
+- **Self-test.** The table has one row per element of the written enumeration and fails before the fix. Review it for completeness: for each form git, JSON, percent-encoding or Unicode allows, is there a row? For each optimisation, is there a row where the skipped case is the bad one (an old subtree at a new path)?
 
 ## Checklist (run before reporting DONE)
 1. **P8:** the ticket has been reread, including amendments, and every criterion maps to a named test.
@@ -194,7 +191,8 @@ Keep it current with `/retro` (the `retro` skill).
 6. **P5:** for each timeout, is it monotonic? Does a clamp leak into stored state?
 7. **P6:** is every new error variant tested? Is there no `unwrap_or`/`is_err` collapsing an I/O error?
 8. **P7:** is each assertion independent of the code under test? Do the generators reach the interesting branches? Are boundaries covered at -1, exact and +1?
-9. **P10:** for each policy, is it enforced at one choke point, as an allowlist, and tested over every entry point?
-10. Are deviations, assumptions and anything left undone listed in NOTES FOR VERIFIERS?
+9. **P10:** for each policy, is it enforced at one choke point, as an allowlist, and tested over every entry point? Do two components that must agree share one predicate?
+10. **P11:** for an invariant over an open input space, is the enumeration written and table-tested, and is every skip-optimisation proven in both directions?
+11. Are deviations, assumptions and anything left undone listed in NOTES FOR VERIFIERS?
 
-Last retro: 2026-11-24, covering PRs #93, #95, #97, #98, #101, #102, #106, #109, #110, #115 and #119.
+Last retro: 2026-11-25, covering PRs #71 (rework), #122, #125 and #127 (retro #130). Earlier: 2026-11-24, PRs #93-#119. P10 recurred in all four PRs and is now SEC-10; P11 is new (TEST-9).
