@@ -318,9 +318,15 @@ identity and every sidecar are proven by means no sidecar can influence**:
   created first, so it sits on page 2, which a commit would not otherwise touch again. **Invariant: every non-empty `-wal`
   this crate writes carries a frame of that page.** It holds because every write transaction (each migration step,
   `insert`, `set_tier`, `delete`, and any future write) goes through one choke point, `sql::write_tx`, which runs
-  `UPDATE index_meta SET generation = generation + 1` before `COMMIT`; the statements that change data take a `WriteTx`
-  that only `write_tx` can create, so a new write method cannot skip the bump (the compiler enforces it; a hygiene test
-  checks that unversioned statements are used only by the open sequence). A replayed view of a foreign index's `-wal`
+  `UPDATE index_meta SET generation = generation + 1` before `COMMIT`; what enforces it, exactly: (1) the only functions that run a data write
+  (`WriteTx::write`, `WriteTx::write_batch`) need a `&WriteTx`, which only `write_tx` can create (the compiler); (2) the read
+  wrappers `sql::prepare` and `sql::query_row` check `sqlite3_stmt_readonly` and refuse any other statement with
+  `IndexError::NotReadOnly` (at run time, tested for every write constant and for `UPDATE ... RETURNING`), so a write cannot
+  be sent through a read wrapper; (3) the setup statements that write without a bump (`journal_mode`, the creation
+  bootstrap, the reference schema) go through `execute_unversioned` and `query_row_unversioned`, which a hygiene test limits
+  to `open.rs` and `migrate.rs`; (4) the same hygiene test greps every production file for a direct `rusqlite` call outside
+  `sql.rs`. Part (4) is a text check, not the compiler: `Connection` is a plain field, so a direct `conn.execute(` is stopped
+  only by that test. A replayed view of a foreign index's `-wal`
   therefore shows the foreign instance id, and is `ForeignWal`. The main file also holds the id from its first page, so a
   deployment whose first checkpoint has not happened yet (the main file is a sound version-0 index and the `-wal` holds the
   migration and every row) still opens. **A main file torn by a crash in the middle of a checkpoint** (a page half new) may

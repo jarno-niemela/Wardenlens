@@ -53,16 +53,16 @@ pub(crate) fn check_not_newer(found: i64, migrations: &[Migration]) -> Result<()
 pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), IndexError> {
     for m in migrations {
         sql::write_tx_opt(conn, "migrate", |w| {
-            let stored = user_version(w.conn())?;
+            let stored = user_version(w.read_conn())?;
             check_not_newer(stored, migrations)?;
             if stored >= m.version {
                 return Ok(None);
             }
-            w.execute_batch(m.sql).map_err(|e| IndexError::Migration {
+            w.write_batch(m.sql).map_err(|e| IndexError::Migration {
                 version: m.version,
                 code: e.sqlite_error_code(),
             })?;
-            if user_version(w.conn())? != m.version {
+            if user_version(w.read_conn())? != m.version {
                 return Err(IndexError::MigrationDidNotAdvance { version: m.version });
             }
             Ok(Some(()))

@@ -1,10 +1,26 @@
 //! Every SQL statement of the crate, as a `&'static str` with `?N` placeholders.
 //!
-//! This is the whole enforcement of "no SQL is built from data". Every statement is a
-//! `&'static str` constant here, and the only functions in the crate that hand SQL text to
-//! `rusqlite` are the wrappers at the bottom of this file, which take `&'static str`: the compiler
-//! refuses a string built at run time. Values only ever travel as bound parameters. The
-//! `hygiene` test also greps every production source file for a direct call.
+//! What this file enforces, and by what (SEC-10, one choke point for writes):
+//!
+//! 1. **No SQL is built from data.** Every statement is a `&'static str` constant here, and the
+//!    only functions that hand SQL text to `rusqlite` are the wrappers at the bottom of this file,
+//!    which take `&'static str`: the compiler refuses a string built at run time. Values only
+//!    ever travel as bound parameters.
+//! 2. **Every data write bumps the generation.** The statement-running wrappers split in two:
+//!    - [`WriteTx::write`] and [`WriteTx::write_batch`] need a `&WriteTx`, which only [`write_tx`]
+//!      can make (the compiler enforces this), and [`write_tx`] runs [`BUMP_GENERATION`] before
+//!      `COMMIT`;
+//!    - [`prepare`] and [`query_row`] are for reads: **at run time** they prepare the statement and
+//!      refuse it with [`IndexError::NotReadOnly`] if SQLite says it is not read-only
+//!      (`sqlite3_stmt_readonly`, which is false for `UPDATE ... RETURNING` too). They cannot run
+//!      a write that skips the bump.
+//!    - The exceptions that do not bump, each limited to the open sequence and the reference
+//!      schema: [`execute_unversioned`] and [`query_row_unversioned`] (setup pragmas that write,
+//!      the creation bootstrap).
+//! 3. **The `hygiene` test greps** every production source file for a direct `rusqlite` call and
+//!    for `*_unversioned` uses outside `open.rs` and `migrate.rs`. That part is a text check, not
+//!    the compiler: `Connection` is a plain field of `Index`, so a direct `conn.execute(` is only
+//!    caught by the grep.
 
 use rusqlite::{Connection, Params, Result, Row, Statement, Transaction, TransactionBehavior};
 
@@ -71,8 +87,16 @@ pub(crate) const INTEGRITY_CHECK: &str = "PRAGMA integrity_check(1)";
 
 // The only places SQL text reaches `rusqlite`. Each takes `&'static str`.
 
+/// Prepares a **read-only** statement; any other statement is refused, unprepared for use, with
+/// `rusqlite::Error::InvalidQuery` (mapped to [`IndexError::NotReadOnly`] by
+/// [`IndexError::sqlite`]), so a write cannot be run through here and skip the generation bump.
 pub(crate) fn prepare<'c>(conn: &'c Connection, sql: &'static str) -> Result<Statement<'c>> {
-    conn.prepare(sql)
+    let stmt = conn.prepare(sql)?;
+    if stmt.readonly() {
+        Ok(stmt)
+    } else {
+        Err(rusqlite::Error::InvalidQuery)
+    }
 }
 
 /// Runs a statement that is not index data: connection setup pragmas, the creation bootstrap
@@ -82,34 +106,46 @@ pub(crate) fn execute_unversioned(conn: &Connection, sql: &'static str) -> Resul
     conn.execute_batch(sql)
 }
 
+/// [`execute_unversioned`] for the setup pragma that returns a row and writes (`journal_mode`).
+/// Open sequence only.
+pub(crate) fn query_row_unversioned<T>(
+    conn: &Connection,
+    sql: &'static str,
+    f: impl FnOnce(&Row<'_>) -> Result<T>,
+) -> Result<T> {
+    conn.query_row(sql, [], f)
+}
+
+/// A single-row read; refuses a statement that is not read-only (see [`prepare`]).
 pub(crate) fn query_row<T, P: Params>(
     conn: &Connection,
     sql: &'static str,
     params: P,
     f: impl FnOnce(&Row<'_>) -> Result<T>,
 ) -> Result<T> {
-    conn.query_row(sql, params, f)
+    prepare(conn, sql)?.query_row(params, f)
 }
 
 /// A write transaction opened by [`write_tx`]. It is the only way to run a data-changing
-/// statement (`execute`, `execute_batch`): they take a `&WriteTx`, which only [`write_tx`] can
-/// make, so a new write method cannot skip the generation bump (SEC-10: one choke point, enforced
-/// by the type).
+/// statement ([`write`](Self::write), [`write_batch`](Self::write_batch)): they take a
+/// `&WriteTx`, which only [`write_tx`] can make, so a write method cannot skip the generation
+/// bump (SEC-10: one choke point; the compiler enforces that these two need a `WriteTx`, and
+/// [`prepare`]/[`query_row`] refuse a write at run time).
 pub(crate) struct WriteTx<'a> {
     tx: &'a Transaction<'a>,
 }
 
 impl WriteTx<'_> {
-    /// For reads inside the transaction.
-    pub(crate) fn conn(&self) -> &Connection {
+    /// For reads inside the transaction (use [`prepare`] or [`query_row`] on it).
+    pub(crate) fn read_conn(&self) -> &Connection {
         self.tx
     }
 
-    pub(crate) fn execute<P: Params>(&self, sql: &'static str, params: P) -> Result<usize> {
+    pub(crate) fn write<P: Params>(&self, sql: &'static str, params: P) -> Result<usize> {
         self.tx.execute(sql, params)
     }
 
-    pub(crate) fn execute_batch(&self, sql: &'static str) -> Result<()> {
+    pub(crate) fn write_batch(&self, sql: &'static str) -> Result<()> {
         self.tx.execute_batch(sql)
     }
 }
@@ -130,7 +166,7 @@ pub(crate) fn write_tx_opt<T>(
         let Some(out) = f(&w)? else {
             return Ok(None);
         };
-        w.execute(BUMP_GENERATION, [])
+        w.write(BUMP_GENERATION, [])
             .map_err(IndexError::sqlite(op))?;
         out
     };

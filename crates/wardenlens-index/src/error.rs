@@ -159,6 +159,13 @@ pub enum IndexError {
         /// The SQLite result code, if any.
         code: Option<ErrorCode>,
     },
+    /// A read path was given a statement that is not read-only (a programming error, never
+    /// caused by data): the read wrappers refuse it so it cannot skip the generation bump.
+    #[error("{op}: refused a statement that is not read-only")]
+    NotReadOnly {
+        /// What was being done.
+        op: &'static str,
+    },
     /// A segment with the same camera and start time exists.
     #[error("a segment with this camera and start time already exists")]
     Duplicate,
@@ -205,6 +212,7 @@ impl IndexError {
     /// Maps a failed SQLite call, keeping only the result code (the message can name files).
     pub(crate) fn sqlite(op: &'static str) -> impl FnOnce(rusqlite::Error) -> Self {
         move |e| match e.sqlite_error_code() {
+            _ if matches!(e, rusqlite::Error::InvalidQuery) => Self::NotReadOnly { op },
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy { op },
             code => Self::Sqlite { op, code },
         }

@@ -533,7 +533,7 @@ fn pragma_i64(conn: &Connection, stmt: &'static str, op: &'static str) -> Result
 fn apply_pragmas(conn: &Connection) -> Result<(), IndexError> {
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(IndexError::sqlite("busy timeout"))?;
-    let mode: String = sql::query_row(conn, sql::SET_WAL, [], |r| r.get(0))
+    let mode: String = sql::query_row_unversioned(conn, sql::SET_WAL, |r| r.get(0))
         .map_err(IndexError::sqlite("journal mode"))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(IndexError::PragmaRefused {
@@ -542,7 +542,7 @@ fn apply_pragmas(conn: &Connection) -> Result<(), IndexError> {
     }
     sql::execute_unversioned(conn, sql::SET_SYNC).map_err(IndexError::sqlite("synchronous"))?;
     sql::execute_unversioned(conn, sql::SET_FK).map_err(IndexError::sqlite("foreign keys"))?;
-    // `journal_size_limit` returns a row, so it goes through `query_row`.
+    // `journal_size_limit` returns a row; SQLite reports it read-only (a connection setting).
     let _: i64 = pragma_i64(conn, sql::SET_JOURNAL_LIMIT, "journal size limit")?;
     let checks = [
         (sql::GET_SYNC, 2, "synchronous"),
