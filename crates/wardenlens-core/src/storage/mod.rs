@@ -5,6 +5,7 @@
 //! [`plan`], and executes the returned actions.
 
 mod files;
+mod index;
 mod plan;
 mod types;
 
@@ -24,6 +25,10 @@ mod tests;
 #[cfg(any(test, feature = "test-support"))]
 pub use files::{MemoryHandle, MemorySegmentFiles};
 pub use files::{OpenedSegment, SegmentFiles, SegmentOpenError};
+pub use index::{
+    IndexedSegment, MAX_LIST_LIMIT, MAX_OLDEST, MAX_SEGMENT_BYTES, SegmentCursor, SegmentIndex,
+    SegmentPage, TierTotals, TierUsage,
+};
 pub use plan::{
     Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,
 };

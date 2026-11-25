@@ -1,14 +1,15 @@
 //! The SQLite store: checked open, entries, rekey (ADR 0006 sections 3 and 4).
 
 use std::fmt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use secrecy::{ExposeSecret, SecretString};
 use wardenlens_core::entry::{EntryId, EntryKind};
-use wardenlens_fsutil::{PrivateFile, open_private_file};
+use wardenlens_fsutil::{
+    FsError, PrivateFile, Scratch, copy_bounded, immutable_uri, open_private_file,
+};
 use wardenlens_secrets::{
     Credentials, KeyFile, MAX_RECORD_LEN, RecordKind, SecretsError, open, open_credentials, seal,
     seal_credentials,
@@ -149,16 +150,13 @@ fn refuse_work_tree(parent: &Path) -> Result<(), VaultError> {
 }
 
 /// The parent must be ours and not writable by group or others, or another user could swap the
-/// file between our checks.
+/// file between our checks (the shared check of `wardenlens-fsutil`).
 fn check_parent(parent: &Path) -> Result<(), VaultError> {
-    let meta = std::fs::metadata(parent).map_err(VaultError::io("inspecting directory"))?;
-    if meta.uid() != rustix::process::geteuid().as_raw() {
-        return Err(VaultError::ParentWrongOwner);
-    }
-    if meta.mode() & 0o022 != 0 {
-        return Err(VaultError::ParentWritable);
-    }
-    Ok(())
+    wardenlens_fsutil::check_parent(parent).map_err(|e| match e {
+        FsError::ParentWrongOwner => VaultError::ParentWrongOwner,
+        FsError::ParentWritable => VaultError::ParentWritable,
+        other => VaultError::Fs(other),
+    })
 }
 
 fn parent_of(path: &Path) -> Result<&Path, VaultError> {
@@ -332,8 +330,9 @@ fn rollback_header(file: &PrivateFile) -> Result<bool, VaultError> {
 /// [`VaultError::WrongKey`] for a file that has the vault schema but fails the `open` checks
 /// (judged after rolling back a hot journal, on the copy); [`VaultError::PendingJournal`] if the
 /// copy stays corrupt after the rollback, the retry cap is exhausted, a timed-out raced read
-/// finds the file corrupt, or `create` meets a vault; [`VaultError::Io`] and non-corruption
-/// [`VaultError::Sqlite`] errors are passed on.
+/// finds the file corrupt, or `create` meets a vault; [`VaultError::Io`] (reading the header or
+/// the sidecars), [`VaultError::Fs`] (the scratch directory and the bounded copy, which are
+/// `wardenlens-fsutil` helpers) and non-corruption [`VaultError::Sqlite`] errors are passed on.
 fn probe_existing(
     path: &Path,
     file: &PrivateFile,
@@ -420,78 +419,6 @@ fn is_corruption(e: &VaultError) -> bool {
     )
 }
 
-/// Most bytes copied into the scratch directory for each of the main file and the journal.
-const MAX_COPY_LEN: u64 = 256 * 1024 * 1024;
-
-/// A private scratch directory beside the vault, removed on drop.
-struct Scratch(std::path::PathBuf);
-
-impl Scratch {
-    fn new(parent: &Path) -> Result<Self, VaultError> {
-        use std::os::unix::fs::DirBuilderExt;
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = parent.join(format!(
-            ".wardenlens-probe-{}-{nanos}-{n}",
-            std::process::id()
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(VaultError::io("creating scratch directory"))?;
-        Ok(Self(dir))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Copies `src` (at most [`MAX_COPY_LEN`] bytes) to a new private file `dst`.
-/// `Ok(false)` if the source is longer than the cap.
-fn copy_bounded(src: &std::fs::File, dst: &Path) -> Result<bool, VaultError> {
-    use std::io::Write;
-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
-    let len = src
-        .metadata()
-        .map_err(VaultError::io("inspecting vault file"))?
-        .len();
-    if len > MAX_COPY_LEN {
-        return Ok(false);
-    }
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dst)
-        .map_err(VaultError::io("creating scratch copy"))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut off = 0u64;
-    while off < len {
-        let want = usize::try_from(len.saturating_sub(off)).map_or(buf.len(), |r| r.min(buf.len()));
-        let Some(window) = buf.get_mut(..want) else {
-            break;
-        };
-        let got = src
-            .read_at(window, off)
-            .map_err(VaultError::io("reading vault file"))?;
-        let Some(done) = buf.get(..got).filter(|d| !d.is_empty()) else {
-            break;
-        };
-        out.write_all(done)
-            .map_err(VaultError::io("writing scratch copy"))?;
-        off = off.saturating_add(u64::try_from(got).unwrap_or(u64::MAX));
-    }
-    out.sync_all()
-        .map_err(VaultError::io("writing scratch copy"))?;
-    Ok(true)
-}
-
 /// Identifies the vault on a privately rolled-back copy of the main file and its `-journal`.
 /// `Ok(None)` if the journal vanished meanwhile (the caller probes the main file again). The
 /// originals are only read.
@@ -540,7 +467,7 @@ fn probe_rolled_back_copy(
     }
     let counter_before = change_counter(file)?;
     let scratch = Scratch::new(parent)?;
-    let copy = scratch.0.join("vault.db");
+    let copy = scratch.path().join("vault.db");
     let copied = copy_bounded(file.file(), &copy)?
         && copy_bounded(&journal, Path::new(&sidecar(&copy, "-journal")))?;
     if !copied {
@@ -631,21 +558,9 @@ fn immutable_probe(
     file: &PrivateFile,
     key: Option<&KeyFile>,
 ) -> Result<bool, VaultError> {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let abs = std::path::absolute(path).map_err(VaultError::io("resolving vault path"))?;
-    // `file://` + empty authority + the encoded absolute path, so a leading `//` stays path.
-    let mut uri = b"file://".to_vec();
-    for &b in abs.as_os_str().as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
-            uri.push(b);
-        } else {
-            uri.extend_from_slice(format!("%{b:02X}").as_bytes());
-        }
-    }
-    uri.extend_from_slice(b"?immutable=1");
+    let uri = immutable_uri(path)?;
     let conn = Connection::open_with_flags(
-        OsString::from_vec(uri),
+        uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX

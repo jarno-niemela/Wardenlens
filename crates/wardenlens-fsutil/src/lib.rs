@@ -4,6 +4,8 @@
 //!   owner and mode checks, device and inode comparison after SQLite opened the path).
 //! * [`RootDir`]: a directory handle; everything beneath it is opened with `openat2`
 //!   (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) and mutated one path component at a time.
+//! * [`check_parent`], [`sidecar_len`], [`Scratch`], [`copy_bounded`], [`immutable_uri`]: the shared
+//!   pieces of the read-only identity probes of SQLite files (vault and index).
 //! * [`open_regular_nofollow`]: read-open of an untrusted path (no symlink, regular files only).
 //! * [`quarantine`]: `RENAME_NOREPLACE` into `<root>/_quarantine/<same relative path>`.
 //!
@@ -11,12 +13,16 @@
 
 mod error;
 mod private_file;
+mod probe;
 mod quarantine;
 mod regular_file;
 mod root;
 
 pub use error::FsError;
-pub use private_file::{FileIdentity, PrivateFile, open_private_file, path_identity};
+pub use private_file::{FileIdentity, FileLock, PrivateFile, open_private_file, path_identity};
+pub use probe::{
+    MAX_COPY_LEN, Scratch, check_parent, copy_bounded, immutable_uri, open_sidecar, sidecar_len,
+};
 pub use quarantine::{
     MAX_QUARANTINE_SUFFIX, QUARANTINE_DIR, QuarantineOutcome, quarantine, quarantine_with_bound,
 };
