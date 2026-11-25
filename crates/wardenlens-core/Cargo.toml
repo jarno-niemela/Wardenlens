@@ -18,3 +18,7 @@ proptest.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# In-memory `SegmentFiles` fake for the tests of consumer crates (the API, #62).
+test-support = []
