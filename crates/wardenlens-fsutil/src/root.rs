@@ -46,7 +46,7 @@ pub struct FileStat {
 }
 
 impl FileStat {
-    fn from_stat(st: &Stat) -> Self {
+    pub(crate) fn from_stat(st: &Stat) -> Self {
         let kind = match FileType::from_raw_mode(st.st_mode) {
             FileType::RegularFile => FileKind::Regular,
             FileType::Directory => FileKind::Directory,

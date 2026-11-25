@@ -33,6 +33,9 @@ pub enum FsError {
         /// The effective uid.
         expected: u32,
     },
+    /// The last component of the path is a symbolic link (refused, never followed).
+    #[error("the path is a symbolic link")]
+    Symlink,
     /// The path no longer names the file that was checked (swapped between check and open).
     #[error("path no longer refers to the checked file")]
     IdentityMismatch,

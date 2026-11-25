@@ -3,8 +3,11 @@
 //! Keep this file thin: parse arguments, call into the libraries, map errors to exit codes.
 
 mod args;
+mod commands;
+mod config_file;
 mod env;
 mod error;
+mod logging;
 mod terminal;
 mod vault_cmd;
 
@@ -16,7 +19,7 @@ use clap::Parser;
 use clap::error::ErrorKind;
 use rustix::process::{Resource, Rlimit, setrlimit};
 
-use crate::args::{Cli, Command};
+use crate::args::{Cli, Command, LogFormat};
 use crate::env::Env;
 use crate::terminal::{StdTerminal, Terminal};
 
@@ -31,13 +34,43 @@ fn main() -> ExitCode {
     }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) => return usage_error(&e),
+        Err(e) => return usage_error(&e, json_requested(std::env::args_os())),
     };
+    let env = Env::from_process();
+    let format = cli.log_format.unwrap_or(LogFormat::Text);
     match cli.command {
-        None => version(),
+        None => {
+            if cli.config.is_some() {
+                return commands::usage_failure(
+                    "--config needs a subcommand (try `config check`)",
+                    format,
+                );
+            }
+            logging::init(format, &env);
+            version()
+        }
+        Some(Command::Config(cmd)) => {
+            logging::init(format, &env);
+            let ctx = commands::Context {
+                env: &env,
+                config_flag: cli.config.as_deref(),
+                log_format: format,
+            };
+            commands::config::execute(&cmd, &ctx)
+        }
         Some(Command::Vault(cmd)) => {
+            // `--config` and `--log-format` are global for the grammar, but the vault has fixed
+            // paths (ADR 0006) and does not log: a flag that would be ignored is refused, as it
+            // was before the flags existed. No logging is set up, so `RUST_LOG` cannot change
+            // the vault's output.
+            if cli.config.is_some() || cli.log_format.is_some() {
+                return commands::usage_failure(
+                    "--config and --log-format do not apply to the vault commands",
+                    format,
+                );
+            }
             let mut term = StdTerminal::new();
-            match vault_cmd::run(cmd, &Env::from_process(), &mut term) {
+            match vault_cmd::run(cmd, &env, &mut term) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     report(&e, &mut term);
@@ -51,18 +84,31 @@ fn main() -> ExitCode {
 /// Clap echoes the offending text in most error kinds, and a value put on argv by mistake must not
 /// reach a terminal log. Only kinds known to echo nothing pass through; every other kind (and any
 /// kind added later) gets a fixed message.
-fn usage_error(e: &clap::Error) -> ExitCode {
+///
+/// Clap fails before the log format is known, so argv is pre-scanned for exactly `--log-format
+/// json` or `--log-format=json` (nothing else is read from it) and, under it, a usage error is one
+/// fixed JSON line. Help and version output are not errors and stay as clap prints them.
+fn usage_error(e: &clap::Error, json: bool) -> ExitCode {
     match e.kind() {
-        ErrorKind::DisplayHelp
-        | ErrorKind::DisplayVersion
-        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => e.exit(),
+        _ if json => commands::usage_failure("invalid arguments", LogFormat::Json),
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         | ErrorKind::MissingRequiredArgument
         | ErrorKind::MissingSubcommand => e.exit(),
         _ => fail(
-            "error: invalid arguments; values are never arguments (run `wardenlens vault --help`)",
+            "error: invalid arguments; values are never arguments (run `wardenlens --help`)",
             2,
         ),
     }
+}
+
+/// True if argv holds exactly `--log-format json` or `--log-format=json`.
+fn json_requested(args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    let args: Vec<_> = args.collect();
+    args.iter().any(|a| a == "--log-format=json")
+        || args
+            .windows(2)
+            .any(|w| matches!(w, [f, v] if f == "--log-format" && v == "json"))
 }
 
 fn version() -> ExitCode {

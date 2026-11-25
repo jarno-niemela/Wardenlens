@@ -26,7 +26,9 @@
 //!
 //! # Paths
 //! A path is accepted only in one canonical lexical form: it starts with `/`, has no empty
-//! component (`//`), no trailing slash, no `.` or `..` component, no control character and is at
+//! component (`//`), no trailing slash, no `.` or `..` component, no control or invisible character (`char::is_control` or [`crate::text::is_invisible`], the
+//! one rule shared with the vault and the display names; so a printed path cannot be spoofed
+//! with a bidi override or a separator) and is at
 //! most 4096 bytes. Refusing instead of normalising means the nesting check below cannot be
 //! fooled by `/srv/a/../b`. The comparison is lexical (core does no I/O), so symlinks and bind
 //! mounts are not resolved here; the storage adapter must check the real volumes at startup.

@@ -1,5 +1,6 @@
 //! Paths and the environment, read once at startup and injectable in tests (ADR 0006 sections
-//! 4 and 6). The binary reads exactly the variables named there and no others for the vault.
+//! 4 and 6). The vault commands read exactly the variables named there and no others; the config
+//! commands add `WARDENLENS_CONFIG` and `RUST_LOG`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,10 @@ pub(crate) struct Env {
     pub(crate) vault: Option<OsString>,
     /// `WARDENLENS_VAULT_KEY_FILE`
     pub(crate) key_file: Option<OsString>,
+    /// `WARDENLENS_CONFIG`
+    pub(crate) config: Option<OsString>,
+    /// `RUST_LOG`
+    pub(crate) rust_log: Option<OsString>,
     /// True if `WARDENLENS_VAULT_KEY` is set (always an error; its value is never read).
     pub(crate) key_var_set: bool,
 }
@@ -37,6 +42,8 @@ impl Env {
             xdg_config_home: get("XDG_CONFIG_HOME"),
             vault: get("WARDENLENS_VAULT"),
             key_file: get("WARDENLENS_VAULT_KEY_FILE"),
+            config: get("WARDENLENS_CONFIG"),
+            rust_log: get("RUST_LOG"),
             key_var_set: std::env::var_os("WARDENLENS_VAULT_KEY").is_some(),
         }
     }
