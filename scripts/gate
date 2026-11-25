@@ -9,7 +9,7 @@ if [[ "${GITHUB_ACTIONS:-}" != true && "$(git config core.hooksPath || true)" !=
   exit 1
 fi
 step() { printf '\n== %s\n' "$*"; }
-# shellcheck source=scripts/lib/vault.sh
+# shellcheck source=scripts/lib/vault.sh disable=SC1091  # CI runs shellcheck without -x; scripts/gate checks vault.sh with -x
 . scripts/lib/vault.sh
 
 step "fmt";    cargo fmt --all -- --check

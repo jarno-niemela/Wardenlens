@@ -8,7 +8,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export HOME="$tmp/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 unset WARDENLENS_VAULT WARDENLENS_REQUIRE_VAULT GITHUB_ACTIONS GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 mkdir -p "$HOME/.local/share/wardenlens"; : >"$HOME/.local/share/wardenlens/dev-vault.db"
-# shellcheck source=scripts/lib/vault.sh
+# shellcheck source=scripts/lib/vault.sh disable=SC1091  # CI runs shellcheck without -x; scripts/gate checks vault.sh with -x
 . "$root/scripts/lib/vault.sh"
 fail=0
 ok()  { echo "ok   $1"; }
