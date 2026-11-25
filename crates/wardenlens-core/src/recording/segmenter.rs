@@ -114,6 +114,25 @@ pub struct SegmentRecord {
 }
 
 impl SegmentRecord {
+    /// Builds a record. The segmenter is the usual source; adapters (the index) use this to read
+    /// stored rows back. No bound is checked here: the consumer validates what it stores.
+    #[must_use]
+    pub fn new(
+        camera: CameraId,
+        started_at_ms: UnixMs,
+        duration_ms: u64,
+        bytes: u64,
+        frame_count: u64,
+    ) -> Self {
+        Self {
+            camera,
+            started_at_ms,
+            duration_ms,
+            bytes,
+            frame_count,
+        }
+    }
+
     /// `started_at_ms + duration_ms`; saturates instead of overflowing.
     #[must_use]
     pub fn ended_at_ms(&self) -> Timestamp {

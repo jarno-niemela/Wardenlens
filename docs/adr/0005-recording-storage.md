@@ -268,6 +268,79 @@ the device and inode compared; a symlink or a wrong owner is refused. Pragmas on
 checked on open, so a foreign SQLite file is refused. One writer and the rest readers (WAL): the cli keeps one write
 connection and a small number of read connections.
 
+**Sidecars and identity (#49 rounds 2 and 3, defect pattern P3).** SQLite replays a hot `-journal` and a `-wal` on the
+first read and checkpoints when the last connection closes, so **no read-write connection is opened on `index.db` until its
+identity and every sidecar are proven by means no sidecar can influence**:
+
+- the parent directory is ours and not group- or world-writable (`fsutil::check_parent`, shared with the vault); each `-wal`,
+  `-shm` and `-journal` is `lstat`ed and must be a regular file owned by the service user with no group or other bit; the
+  100-byte header is read through our own descriptor (magic, `application_id`, journal mode);
+- the settled state is judged read-only: `application_id`, `user_version` (too new is refused here, so the file stays
+  byte-identical), then **every `sqlite_master` row** (`type, name, tbl_name, sql`) compared with a reference built in
+  memory by running the compiled-in migrations up to that version (so it cannot drift from them, and it applies at version 0
+  too), then `PRAGMA integrity_check` (not `quick_check`: only it compares each index with its table, which catches a `-wal`
+  from a diverged copy of the same index). It reads the whole file once at start-up, a few seconds per hundred megabytes;
+- with no usable `-wal` that read is an `immutable=1` open. **With a valid non-empty `-wal`**: (1) the main file alone
+  (`immutable=1`, `-wal` ignored) is judged as above and its instance id read, so a damaged or foreign main file is reported
+  as itself and never blamed on the `-wal`; (2) the real files are opened with `SQLITE_OPEN_READ_ONLY` and
+  `NO_CKPT_ON_CLOSE`, so SQLite replays the `-wal` into its in-memory view, which is judged the same way; (3) **the view's
+  instance id must equal the main file's** (see below), else `ForeignWal`. No copy of the main file is made. Decision
+  record, options in the order evaluated: (a) the read-only connection, chosen; (b) validating the `-wal` frames in Rust and
+  (c) copying the `-wal` plus selected main pages were not needed. Round 2 copied the main file into a scratch directory,
+  capped at 256 MiB, so an index above about 2.7 million rows could never recover from a crash and `serve` (#68) refused to
+  start. The probe cannot write the main file or the `-wal` because of three guards, each pinned by a test
+  (`probe_connection_is_read_only_and_never_checkpoints`): `NO_CKPT_ON_CLOSE` (no checkpoint, which is the only thing that
+  writes the main file from the `-wal`, and no `-wal` delete on close), the read-only pager (`is_readonly(MAIN_DB)`; no write
+  transaction can begin, so no frame is appended) and our `O_RDONLY` main descriptor. (`SQLITE_READONLY` from a checkpoint is
+  not a guard: SQLite opens the `-wal` itself read-write.) The probe does create or update the `-shm` (the wal-index every
+  first connection rebuilds from the `-wal`). **A probe-created `-shm` is removed only when the probe refuses** (so the
+  directory is byte-identical) and **never after success**, because the read-write open uses it; an `-shm` that existed
+  before the probe is never removed. **Concurrent openers are excluded by an exclusive `flock` on the verified main-file
+  descriptor**, taken right after `open_private_file` and held until the read-write open, pragmas and migrations are done
+  (waiting up to the busy timeout, then `Busy`); it is then unlocked, **but the lock descriptor and the verified descriptor
+  stay open for the whole life of the `Index` and are closed in `Drop` after the connection**. `flock` belongs to the open
+  file description and is independent of SQLite's own POSIX locks on that file on Linux: it never blocks SQLite and SQLite
+  never blocks it, so it serialises only openers that take it. The converse matters more: POSIX record locks belong to the
+  process, and closing *any* descriptor of an inode drops every POSIX lock the process holds on it, including SQLite's WAL
+  shared lock (fcntl(2)); closing one of our own descriptors while a connection is live would tell another process's closing
+  connection that it is the last one, so it would checkpoint and delete the `-wal` under us (round 4 found this).
+  Residual: a second `Index` on the same file **in the same process** closes its own descriptors when it is dropped, which
+  drops the first one's locks; use one `Index` per file per process (share it behind a lock), or open a second one only for
+  a file no other `Index` of the process has open (follow-up). That is why removing a `-shm` we created is safe: no other
+  `Index::open` can be attached to it, and a live writer's `-shm` always pre-exists the probe. **Requirement (for #68):** every process opens the index through
+  `Index::open`, or holds the service's process lock (`wardenlens.lock`) across it; an `sqlite3` shell or another program
+  opening the file concurrently is outside this guarantee. A reader open while a writer is live is a design item for #68, not
+  handled here;
+- **the instance id and the generation** tie a `-wal` to its main file. At creation, in rollback mode and in one
+  transaction before WAL is switched on, a bootstrap script (not a numbered migration; `migrations/000_bootstrap.sql`)
+  sets the `application_id` and creates the single-row table `index_meta (id = 1, instance_id BLOB(16), generation)` with
+  `randomblob(16)`, which SQLite seeds from the operating system; the id is for uniqueness, not a secret. The table is
+  created first, so it sits on page 2, which a commit would not otherwise touch again. **Invariant: every non-empty `-wal`
+  this crate writes carries a frame of that page.** It holds because every write transaction (each migration step,
+  `insert`, `set_tier`, `delete`, and any future write) goes through one choke point, `sql::write_tx`, which runs
+  `UPDATE index_meta SET generation = generation + 1` before `COMMIT`; the statements that change data take a `WriteTx`
+  that only `write_tx` can create, so a new write method cannot skip the bump (the compiler enforces it; a hygiene test
+  checks that unversioned statements are used only by the open sequence). A replayed view of a foreign index's `-wal`
+  therefore shows the foreign instance id, and is `ForeignWal`. The main file also holds the id from its first page, so a
+  deployment whose first checkpoint has not happened yet (the main file is a sound version-0 index and the `-wal` holds the
+  migration and every row) still opens. **A main file torn by a crash in the middle of a checkpoint** (a page half new) may
+  have no readable id; then the replayed view decides, and the main file's id is used only if it can be read. `ForeignWal` is
+  reported only when both ids are readable and differ; any other failure to read the main file (I/O, busy) is the real error.
+  Residual: a torn main page plus a foreign `-wal` that has our header cannot be told apart; and a `-wal` written by a
+  program that does not bump the generation (not this crate) is not covered. Both need the privileges to edit the index.
+  The reference schema is the bootstrap plus the migrations up to the stored version, compared exactly;
+- rules by sidecar: a `-journal` is refused in every state, because an index in WAL mode never writes one and a
+  rollback-mode index exists only during creation, before any row (a non-empty one is `PendingJournal`, an empty one
+  `StraySidecar`; the message says to move it out and keep it, and nothing is lost because an index with data never has one;
+  the creation window is not identified on a private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; only a `-wal` that is **entirely zero** (checked over the whole file, up to 256 MiB), or one shorter than a header that
+  is a prefix of magic + format version (+ page size), is an empty WAL, as for SQLite (what a crash before its first frame
+  leaves); any other short, non-magic or zero-header-with-a-body `-wal` is `InvalidWal` (holds nothing of this index, never
+  opened read-write, so never deleted or rewritten; the message says to move it out and keep it); a `-wal` with another page size, or one whose replay is not an index of ours
+  (wrong `application_id`, schema or integrity), is `ForeignWal`. Every refusal message names a lossless remedy (move the
+  file out of the directory and keep it). A `-wal` copied from this very index (same instance id) by the same user is accepted when
+  it replays consistently; a stale `-wal` of an older state of this same index is indistinguishable and needs the
+  privileges to edit the index itself.
+
 **Migration scheme: `PRAGMA user_version`, migrations written in-house** as an ordered array of SQL scripts compiled in
 with `include_str!`. `Index::open` runs, under `BEGIN IMMEDIATE`, every script with a number above the stored
 `user_version`, each followed by `PRAGMA user_version = <n>` **in the same transaction** (verified in the probe), then
@@ -312,9 +385,12 @@ Queries (every one parameterised, no SQL built from data; `EXPLAIN QUERY PLAN` o
   `CHECK` bound on duration (the real maximum is 120 s), so the overlap test is exact. The cursor is the last row's
   `(started_at_ms, id)`, stable under inserts and deletes. A listing across cameras would need a second index
   `(started_at_ms, id)`, added when the API needs it.
-- `oldest(tier, n)`: `WHERE tier = ?1 ORDER BY ended_at_ms, id LIMIT ?2`. Plan: `SEARCH ... USING INDEX
-  segments_tier_end (tier=?)`, no temporary sort.
-- `bytes_by_tier()`: `SELECT tier, SUM(bytes), COUNT(*) FROM segments GROUP BY tier`. Plan: `SCAN ... USING COVERING
+- `oldest(tier, after, n)`: `WHERE tier = ?1 AND (ended_at_ms, id) > (?2, ?3) ORDER BY ended_at_ms, id LIMIT ?4`: a keyset
+  continuation (`after` is the `(ended_at, id)` of the last row of the previous page), so a caller pages through a whole
+  tier. `n` is bounded by a memory limit (`MAX_OLDEST` = 10,000 rows), not by a number of cameras. Plan: `SEARCH ... USING
+  INDEX segments_tier_end (tier=? AND ended_at_ms>?)`, no temporary sort.
+- `bytes_by_tier()`: `SELECT tier, SUM(bytes), COUNT(*), MIN(bytes), MAX(bytes) FROM segments GROUP BY tier` (each `bytes` is 1 to
+  `MAX_SEGMENT_BYTES` = 64 GiB, checked on insert and on read, so the sum cannot overflow below 2^27 rows). Plan: `SCAN ... USING COVERING
   INDEX segments_tier_end`. Rows stay bounded by disk size (about 56,000 for the 7.8 days in section 10).
 - `set_tier(id, tier)`: `UPDATE segments SET tier = ?2 WHERE id = ?1 AND tier = ?3`, which must change exactly one row.
   It takes **no path** (this overrides #49's `set_tier(id, tier, rel_path)`).
