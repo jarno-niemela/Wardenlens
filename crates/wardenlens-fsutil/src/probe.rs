@@ -33,15 +33,22 @@ pub fn check_parent(parent: &Path) -> Result<(), FsError> {
 
 /// Checks a sidecar of a database file (`-wal`, `-shm`, `-journal`) without opening it: `lstat`,
 /// then it must be a regular file owned by the effective user with no group or other permission
-/// bits and no setuid, setgid or sticky bit. Returns its length, or `None` when it is absent.
+/// bits and no setuid, setgid or sticky bit, and **exactly one hard link**: SQLite truncates and
+/// rewrites a `-shm` and a `-wal` in place, so a sidecar that is a second name of another file
+/// would clobber that file. (The main database file is not subject to the link rule: it is the
+/// file the index writes by design, and its identity is proven by its header.) Returns its
+/// length, or `None` when it is absent.
 ///
 /// # Errors
 /// [`FsError::NotRegular`] (a symlink is not regular), [`FsError::WrongOwner`],
-/// [`FsError::InsecureMode`] or a failed `lstat`.
+/// [`FsError::InsecureMode`], [`FsError::HardLinked`] or a failed `lstat`.
 pub fn sidecar_len(path: &Path) -> Result<Option<u64>, FsError> {
     match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => {
             check_stat(&st)?;
+            if st.st_nlink > 1 {
+                return Err(FsError::HardLinked { links: st.st_nlink });
+            }
             Ok(Some(u64::try_from(st.st_size).unwrap_or(u64::MAX)))
         }
         Err(Errno::NOENT) => Ok(None),
@@ -235,6 +242,19 @@ mod tests {
             );
         }
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(sidecar_len(&p).unwrap(), Some(3));
+        // A second name makes it a hard-linked sidecar: refused, and the file is untouched.
+        let twin = d.path().join("twin");
+        std::fs::hard_link(&p, &twin).unwrap();
+        assert!(matches!(
+            sidecar_len(&p),
+            Err(FsError::HardLinked { links: 2 })
+        ));
+        assert!(matches!(
+            sidecar_len(&twin),
+            Err(FsError::HardLinked { links: 2 })
+        ));
+        std::fs::remove_file(&twin).unwrap();
         assert_eq!(sidecar_len(&p).unwrap(), Some(3));
         // A symlink, a directory and a FIFO are not regular files.
         let link = d.path().join("link");

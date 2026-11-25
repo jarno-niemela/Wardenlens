@@ -53,10 +53,12 @@ pub enum IndexError {
         /// The sidecar suffix.
         suffix: &'static str,
     },
-    /// A sidecar is owned by another user or grants group or other access. SQLite would replay
-    /// or roll back whatever it holds into the index, so it is never trusted.
+    /// A sidecar is owned by another user, grants group or other access, or has more than one
+    /// hard link (SQLite rewrites a `-shm` and a `-wal` in place, which would clobber the file
+    /// that has the other name). SQLite would replay or roll back whatever it holds into the
+    /// index, so it is never trusted. Nothing was modified.
     #[error(
-        "sidecar {suffix} is not owned by the current user or is accessible to others; nothing was modified; move it out of the directory and keep it (or fix its owner and mode if it is yours)"
+        "sidecar {suffix} is not owned by the current user, is accessible to others or has more than one hard link; nothing was modified; move it out of the directory and keep it (or fix its owner, mode or links if it is yours)"
     )]
     InsecureSidecar {
         /// The sidecar suffix.

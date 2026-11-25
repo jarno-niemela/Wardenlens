@@ -411,7 +411,6 @@ fn failed_writes_leave_no_frame_and_each_success_adds_page_two() {
 /// rewrites it. A `-shm` that is a hard link to another file (here: a file of ours that holds
 /// data) is not derived state: it must be refused, or at least the linked file left intact.
 #[test]
-#[ignore = "follow-up #145"]
 fn a_hard_linked_shm_does_not_clobber_the_file_it_links_to() {
     let (dir, path) = closed_index_with("c", 3);
     let keep = dir.path().join("keep.bin");
@@ -447,10 +446,16 @@ fn a_hard_linked_wal_is_not_rewritten_through_the_other_name() {
     let other_name = image.path().join("backup-of-wal");
     std::fs::hard_link(sidecar(&ip, "-wal"), &other_name).unwrap();
     let saved = std::fs::read(&other_name).unwrap();
-    {
-        let mut idx = Index::open(&ip).unwrap();
-        idx.insert(&rec("c", BASE + 10_000), Tier::Hot).unwrap();
-    }
+    // #145: a `-wal` with a second name is refused (SQLite rewrites a `-wal` in place), so the
+    // open fails and nothing is written through either name. The expectation that the other
+    // name still holds its bytes is unchanged and now holds exactly.
+    let before = snapshot(image.path());
+    let err = Index::open(&ip).unwrap_err();
+    assert!(
+        matches!(err, IndexError::InsecureSidecar { suffix: "-wal" }),
+        "{err:?}"
+    );
+    assert!(before == snapshot(image.path()), "the refusal wrote");
     let after = std::fs::read(&other_name).unwrap();
     assert!(
         after.len() >= saved.len() && after[..32] == saved[..32],

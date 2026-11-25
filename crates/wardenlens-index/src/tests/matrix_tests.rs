@@ -407,6 +407,38 @@ fn a_sidecar_with_group_or_other_bits_or_special_bits_is_refused_untouched() {
     }
 }
 
+/// A sidecar with a second hard link is refused for every sidecar, main state and content (the
+/// link rule runs with the other sidecar checks, before the header is judged), and neither name
+/// nor anything else in the directory changes.
+#[test]
+fn a_hard_linked_sidecar_is_refused_untouched_in_every_cell() {
+    for main in MAINS {
+        for suffix in SUFFIXES {
+            for side in [Side::Empty, Side::Ours, Side::Junk] {
+                // The fixture of a live foreign WAL database holds its `-shm` mapped; overwriting
+                // it in place would crash that fixture connection (SIGBUS), not the code under test.
+                if main == Main::ForeignWal && suffix == "-shm" {
+                    continue;
+                }
+                let (f, _k) = setup_cell(main, suffix, side);
+                let sp = side_path(&f, suffix);
+                if !sp.exists() {
+                    continue;
+                }
+                let twin = f.dir.path().join("twin.bin");
+                std::fs::hard_link(&sp, &twin).unwrap();
+                let before = snapshot(f.dir.path());
+                let err = Index::open(&f.path).unwrap_err();
+                assert!(
+                    matches!(&err, IndexError::InsecureSidecar { suffix: s } if *s == suffix),
+                    "{main:?} {suffix} {side:?}: {err:?}"
+                );
+                assert_eq!(before, snapshot(f.dir.path()), "{main:?} {suffix} {side:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_sidecar_with_mode_0600_or_0400_passes_the_mode_rule() {
     let (f, _k) = setup_cell(Main::Wal, "-shm", Side::Empty);

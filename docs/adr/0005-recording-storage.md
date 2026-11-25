@@ -273,7 +273,10 @@ first read and checkpoints when the last connection closes, so **no read-write c
 identity and every sidecar are proven by means no sidecar can influence**:
 
 - the parent directory is ours and not group- or world-writable (`fsutil::check_parent`, shared with the vault); each `-wal`,
-  `-shm` and `-journal` is `lstat`ed and must be a regular file owned by the service user with no group or other bit; the
+  `-shm` and `-journal` is `lstat`ed and must be a regular file owned by the service user with no group or other bit and
+  **exactly one hard link** (SQLite rewrites a `-shm` and a `-wal` in place, so a sidecar that is a second name of another file
+  would clobber it; `InsecureSidecar`, nothing modified). The main file is not subject to the link rule: it is the file the
+  index writes by design and its header proves it is an index; a second name of it is the operator's own choice (#145); the
   100-byte header is read through our own descriptor (magic, `application_id`, journal mode);
 - the settled state is judged read-only: `application_id`, `user_version` (too new is refused here, so the file stays
   byte-identical), then **every `sqlite_master` row** (`type, name, tbl_name, sql`) compared with a reference built in

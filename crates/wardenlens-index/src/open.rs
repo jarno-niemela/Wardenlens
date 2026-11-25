@@ -70,9 +70,9 @@ impl Sidecars {
         for (slot, suffix) in out.iter_mut().zip(SUFFIXES) {
             *slot = sidecar_len(Path::new(&sidecar_path(path, suffix))).map_err(|e| match e {
                 FsError::NotRegular => IndexError::BadSidecar { suffix },
-                FsError::WrongOwner { .. } | FsError::InsecureMode { .. } => {
-                    IndexError::InsecureSidecar { suffix }
-                }
+                FsError::WrongOwner { .. }
+                | FsError::InsecureMode { .. }
+                | FsError::HardLinked { .. } => IndexError::InsecureSidecar { suffix },
                 other => IndexError::Fs(other),
             })?;
         }
