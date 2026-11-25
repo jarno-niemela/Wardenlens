@@ -472,3 +472,121 @@ fn a_crash_before_the_first_checkpoint_opens_with_every_row() {
     let idx = Index::open(&cp).unwrap();
     assert_eq!(idx.bytes_by_tier().unwrap().hot.segments, 5);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The WAL header checksum (#145)
+// ---------------------------------------------------------------------------------------------
+
+mod wal_header {
+    use std::io::Write;
+
+    use super::*;
+    use crate::open::{WalHeader, check_wal_header};
+
+    /// SQLite's WAL checksum written out independently of the code under test.
+    fn checksum(body: &[u8], big_endian: bool) -> [u8; 8] {
+        let (mut a, mut b) = (0u32, 0u32);
+        for w in body.chunks(8) {
+            let rd = |x: &[u8]| {
+                let x: [u8; 4] = x.try_into().unwrap();
+                if big_endian {
+                    u32::from_be_bytes(x)
+                } else {
+                    u32::from_le_bytes(x)
+                }
+            };
+            a = a.wrapping_add(rd(&w[..4])).wrapping_add(b);
+            b = b.wrapping_add(rd(&w[4..])).wrapping_add(a);
+        }
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&a.to_be_bytes());
+        out[4..].copy_from_slice(&b.to_be_bytes());
+        out
+    }
+
+    /// A header with a correct checksum for `magic` and `page`.
+    fn header(magic: u32, page: u32) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&magic.to_be_bytes());
+        h[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+        h[8..12].copy_from_slice(&page.to_be_bytes());
+        h[12..16].copy_from_slice(&7u32.to_be_bytes());
+        h[16..20].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        h[20..24].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        let sum = checksum(&h[..24], magic & 1 == 1);
+        h[24..].copy_from_slice(&sum);
+        h
+    }
+
+    fn main_header(page: u16) -> [u8; 100] {
+        let mut m = [0u8; 100];
+        m[16..18].copy_from_slice(&page.to_be_bytes());
+        m
+    }
+
+    fn judge(wal_bytes: &[u8]) -> Result<WalHeader, IndexError> {
+        let f = fixture();
+        let wal = f.dir.path().join("w");
+        let mut file = std::fs::File::create(&wal).unwrap();
+        file.write_all(wal_bytes).unwrap();
+        drop(file);
+        check_wal_header(&std::fs::File::open(&wal).unwrap(), &main_header(4096))
+    }
+
+    #[test]
+    fn a_correct_header_is_valid_for_both_byte_orders() {
+        for magic in [0x377f_0682, 0x377f_0683] {
+            let mut wal = header(magic, 4096).to_vec();
+            wal.extend_from_slice(&[0xAB; 40]);
+            assert!(
+                matches!(judge(&wal), Ok(WalHeader::Valid)),
+                "{magic:#x}: {:?}",
+                judge(&wal)
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_sqlite_wal_header_is_valid() {
+        let (f, mut idx) = open_new();
+        idx.insert(&rec("c", BASE, 1000, 10, 1), Tier::Hot).unwrap();
+        let wal = std::fs::read(format!("{}-wal", f.path.display())).unwrap();
+        assert!(matches!(judge(&wal), Ok(WalHeader::Valid)));
+        // The oracle agrees with SQLite's own bytes.
+        assert_eq!(
+            checksum(
+                &wal[..24],
+                u32::from_be_bytes(wal[..4].try_into().unwrap()) & 1 == 1
+            ),
+            wal[24..32]
+        );
+    }
+
+    /// Every single-bit change of the 32 header bytes is `InvalidWal`: the checksum covers
+    /// bytes 0..24 (a change of the page size, salts or counter shows) and bytes 24..32 are the
+    /// checksum itself.
+    #[test]
+    fn every_single_bit_flip_of_the_header_is_an_invalid_wal() {
+        for magic in [0x377f_0682, 0x377f_0683] {
+            let base = header(magic, 4096);
+            for bit in 0..(32 * 8) {
+                let mut h = base;
+                h[bit / 8] ^= 1 << (bit % 8);
+                let mut wal = h.to_vec();
+                wal.extend_from_slice(&[0xAB; 40]);
+                assert!(
+                    matches!(judge(&wal), Err(IndexError::InvalidWal)),
+                    "{magic:#x} bit {bit}: {:?}",
+                    judge(&wal)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_page_size_with_a_correct_checksum_is_foreign() {
+        let mut wal = header(0x377f_0682, 8192).to_vec();
+        wal.extend_from_slice(&[0xAB; 40]);
+        assert!(matches!(judge(&wal), Err(IndexError::ForeignWal)));
+    }
+}

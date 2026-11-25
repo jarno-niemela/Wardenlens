@@ -343,7 +343,7 @@ identity and every sidecar are proven by means no sidecar can influence**:
   `StraySidecar`; the message says to move it out and keep it, and nothing is lost because an index with data never has one;
   the creation window is not identified on a private copy); a `-wal` or `-shm` next to a rollback-mode or empty file is refused; only a `-wal` that is **entirely zero** (checked over the whole file, up to 256 MiB), or one shorter than a header that
   is a prefix of magic + format version (+ page size), is an empty WAL, as for SQLite (what a crash before its first frame
-  leaves); any other short, non-magic or zero-header-with-a-body `-wal` is `InvalidWal` (holds nothing of this index, never
+  leaves); any other short, non-magic, **bad-header-checksum** (SQLite ignores every frame of such a file and then rewrites and deletes it, so it must never be opened read-write; the salts are covered by that checksum) or zero-header-with-a-body `-wal` is `InvalidWal` (holds nothing of this index, never
   opened read-write, so never deleted or rewritten; the message says to move it out and keep it); a `-wal` with another page size, or one whose replay is not an index of ours
   (wrong `application_id`, schema or integrity), is `ForeignWal`. Every refusal message names a lossless remedy (move the
   file out of the directory and keep it). A `-wal` copied from this very index (same instance id) by the same user is accepted when

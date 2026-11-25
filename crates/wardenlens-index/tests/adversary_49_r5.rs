@@ -490,7 +490,6 @@ fn round_five_errors_carry_no_path() {
 /// committed rows it holds (recoverable by fixing 8 bytes). The documented rule says such a file
 /// is `InvalidWal` and kept byte-identical.
 #[test]
-#[ignore = "follow-up #145"]
 fn a_wal_with_a_bad_header_checksum_is_refused_and_kept() {
     let dir = private_tempdir();
     let path = dir.path().join("index.db");
@@ -511,7 +510,8 @@ fn a_wal_with_a_bad_header_checksum_is_refused_and_kept() {
     drop(r);
     let after = snapshot(dir.path());
     let kept = before.get("index.db-wal") == after.get("index.db-wal");
-    let rows_now = rows(&Index::open(&path).unwrap(), "c").len();
+    // Diagnostic only (#145): a refused file is refused again, so a failed open is "no rows".
+    let rows_now = Index::open(&path).map_or(0, |i| rows(&i, "c").len());
     assert!(
         kept,
         "opened={opened}: the -wal holding a committed row was {} (rows now {rows_now} of 4)",

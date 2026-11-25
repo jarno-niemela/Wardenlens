@@ -85,7 +85,8 @@ pub enum IndexError {
         "unfinished -journal next to the index; nothing was modified; move the -journal file out of the directory and keep it (an index with data never has one, so nothing is lost)"
     )]
     PendingJournal,
-    /// The `-wal` next to the index has no valid header and is not a torn one (only a file that
+    /// The `-wal` next to the index has no valid header (wrong magic or header checksum) and is
+    /// not a torn one (only a file that
     /// is entirely zero, or a short prefix of a valid header, is treated as empty): SQLite did not
     /// write it. Nothing was modified. It holds no committed data of this index; move it out of
     /// the directory and keep it.

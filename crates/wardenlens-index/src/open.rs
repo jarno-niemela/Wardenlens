@@ -161,7 +161,7 @@ fn check_sidecars(wal_mode: bool, sc: Sidecars) -> Result<(), IndexError> {
 
 /// What the start of a `-wal` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalHeader {
+pub(crate) enum WalHeader {
     /// What a crash before the first frame leaves: a file that is entirely zero, or a file
     /// shorter than a header that is a prefix of a valid one. SQLite treats it as an empty WAL
     /// (and rewrites it), and so do we.
@@ -172,6 +172,38 @@ enum WalHeader {
 
 /// The WAL format version SQLite writes, in bytes 4..8 of the header (3007000).
 const WAL_FORMAT_VERSION: u32 = 3_007_000;
+
+/// The WAL checksum of SQLite (`walChecksumBytes`) over `data` (a multiple of 8 bytes), words read
+/// big-endian when `big_endian` (the low bit of the magic is 1), starting from `(0, 0)`.
+fn wal_checksum(data: &[u8], big_endian: bool) -> (u32, u32) {
+    let word = |b: [u8; 4]| {
+        if big_endian {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        }
+    };
+    let (mut s0, mut s1) = (0u32, 0u32);
+    let (pairs, _) = data.as_chunks::<8>();
+    for &[a, b, c, d, e, f, g, h] in pairs {
+        s0 = s0.wrapping_add(word([a, b, c, d])).wrapping_add(s1);
+        s1 = s1.wrapping_add(word([e, f, g, h])).wrapping_add(s0);
+    }
+    (s0, s1)
+}
+
+/// True if bytes 24..32 of the 32-byte WAL header `head` (stored big-endian) are the checksum of
+/// bytes 0..24.
+fn wal_header_checksum_ok(head: &[u8; 32], magic: u32) -> bool {
+    let (Some(body), Some(stored)) = (head.get(..24), head.get(24..32)) else {
+        return false;
+    };
+    let (s0, s1) = wal_checksum(body, magic & 1 == 1);
+    let mut want = [0u8; 8];
+    want[..4].copy_from_slice(&s0.to_be_bytes());
+    want[4..].copy_from_slice(&s1.to_be_bytes());
+    stored == want
+}
 
 /// True if every byte of `wal` (`len` long) is zero. Reads at most [`MAX_ZERO_SCAN`] bytes; a
 /// longer file is never proven zero.
@@ -199,7 +231,10 @@ fn all_zero(wal: &File, len: u64) -> Result<bool, IndexError> {
 /// magic followed by the format version, then the page size if it is present). Anything else
 /// that is not a valid header is [`IndexError::InvalidWal`] and is never opened read-write, so it
 /// is never deleted or rewritten.
-fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHeader, IndexError> {
+pub(crate) fn check_wal_header(
+    wal: &File,
+    main_header: &[u8; HEADER_LEN],
+) -> Result<WalHeader, IndexError> {
     let len = wal
         .metadata()
         .map_err(IndexError::io("inspecting wal"))?
@@ -241,7 +276,15 @@ fn check_wal_header(wal: &File, main_header: &[u8; HEADER_LEN]) -> Result<WalHea
             Err(IndexError::InvalidWal)
         };
     }
-    if !be(&head, 0).is_some_and(|m| WAL_MAGICS.contains(&m)) {
+    let Some(magic) = be(&head, 0).filter(|m| WAL_MAGICS.contains(m)) else {
+        return Err(IndexError::InvalidWal);
+    };
+    // SQLite ignores every frame of a `-wal` whose header checksum is wrong and then rewrites
+    // and deletes the file, with the committed rows it holds. So a bad checksum is "SQLite did not
+    // write this header": `InvalidWal`, kept, never opened read-write. (The salts are not
+    // checked here: they are only compared with each frame's, and a frame with other salts is
+    // stale and ignored by SQLite itself; they are covered by this checksum.)
+    if !wal_header_checksum_ok(&head, magic) {
         return Err(IndexError::InvalidWal);
     }
     if be(&head, 8) == main_page {
