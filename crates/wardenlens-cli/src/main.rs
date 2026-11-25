@@ -3,8 +3,11 @@
 //! Keep this file thin: parse arguments, call into the libraries, map errors to exit codes.
 
 mod args;
+mod commands;
+mod config_file;
 mod env;
 mod error;
+mod logging;
 mod terminal;
 mod vault_cmd;
 
@@ -33,11 +36,26 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => return usage_error(&e),
     };
+    let env = Env::from_process();
+    logging::init(cli.log_format, &env);
     match cli.command {
         None => version(),
+        Some(Command::Config(cmd)) => {
+            let ctx = commands::Context {
+                env: &env,
+                config_flag: cli.config.as_deref(),
+                log_format: cli.log_format,
+            };
+            commands::config::execute(&cmd, &ctx)
+        }
         Some(Command::Vault(cmd)) => {
+            // `--config` is global for the grammar; the vault has fixed paths (ADR 0006), so a
+            // flag that would be ignored is refused as it was before the flag existed.
+            if cli.config.is_some() {
+                return fail("error: --config does not apply to the vault commands", 2);
+            }
             let mut term = StdTerminal::new();
-            match vault_cmd::run(cmd, &Env::from_process(), &mut term) {
+            match vault_cmd::run(cmd, &env, &mut term) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     report(&e, &mut term);
@@ -59,7 +77,7 @@ fn usage_error(e: &clap::Error) -> ExitCode {
         | ErrorKind::MissingRequiredArgument
         | ErrorKind::MissingSubcommand => e.exit(),
         _ => fail(
-            "error: invalid arguments; values are never arguments (run `wardenlens vault --help`)",
+            "error: invalid arguments; values are never arguments (run `wardenlens --help`)",
             2,
         ),
     }

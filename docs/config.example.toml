@@ -1,4 +1,7 @@
 # Example wardenlens.toml. Synthetic values only: replace the paths for your site.
+# Used with `wardenlens [--config PATH] config check`. The path is the flag, else $WARDENLENS_CONFIG (if non-empty),
+# else /etc/wardenlens/wardenlens.toml. The file must be a regular file (no symlink), at most 64 KiB, UTF-8 and not
+# world-writable. Logs go to stderr (`--log-format text|json`, level from RUST_LOG, default info).
 # Unknown keys are rejected. Durations are whole seconds.
 
 [api]

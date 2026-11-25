@@ -12,8 +12,24 @@ use wardenlens_core::entry::EntryKind;
 #[derive(Debug, Parser)]
 #[command(name = "wardenlens", version = wardenlens_core::VERSION, about)]
 pub(crate) struct Cli {
+    /// The service config file. Precedence: this flag, then `WARDENLENS_CONFIG` (ignored if
+    /// empty), then `/etc/wardenlens/wardenlens.toml`. Not used by `vault`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
+    /// Log format on stderr. The level comes from `RUST_LOG` (default `info`).
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    pub(crate) log_format: LogFormat,
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
+}
+
+/// The `--log-format` choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LogFormat {
+    /// Human-readable lines.
+    Text,
+    /// One JSON object per line.
+    Json,
 }
 
 /// Top-level commands.
@@ -22,6 +38,17 @@ pub(crate) enum Command {
     /// Manage the sensitive-data vault.
     #[command(subcommand)]
     Vault(VaultCommand),
+    /// Inspect the service config file.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+/// `wardenlens config ...`
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Read and validate the config file, then print what it sets (paths and floors, never the
+    /// contents of the key file). Exits 0 if valid, 1 if invalid, 2 if the file cannot be read.
+    Check,
 }
 
 /// `wardenlens vault ...`
