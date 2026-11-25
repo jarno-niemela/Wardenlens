@@ -7,7 +7,10 @@
 #                                                     appends a row. REF is `#N` for the implementer (a ticket; never
 #                                                     PR-checked) or the PR number for verifiers.
 #                                                     Refuses a prompt with a private address (RFC1918, ULA), a
-#                                                     scheme://user:pass@ URL, or a value from the secret file.
+#                                                     scheme://user:pass@ URL, or a vault value: with a vault the prompt is
+#                                                     scanned by $HOME/.cargo/bin/wardenlens vault scan (fixed installed
+#                                                     binary; fails closed if it is missing); with no vault the secret
+#                                                     file is the fallback (WARDENLENS_REQUIRE_VAULT=1 makes no vault a failure).
 #                                                     A URL with a port and an at-sign later in its path is also
 #                                                     refused as a credential URL (accepted false positive; fails safe).
 #   agents done AGENT_ID                              drop the row; keep the prompt as AGENT_ID.prompt.done
@@ -20,10 +23,12 @@
 # Columns (always 9): started_utc role ref sha agent_id status reset prompt_file reason. Status: running | limited.
 # `reason` is `-` until `fail` sets it. Secret file: ${WARDENLENS_SECRET_FILE:-$HOME/.config/wardenlens/agentdvr-cameras.secret.json};
 # every scalar value (length >= 6) except structural keys (name vendor model active width height codec detector onvif
-# port id) is scanned; values are never printed.
+# port id lpr face) is scanned (fallback only); values are never printed.
 set -euo pipefail
 export LC_ALL=C
 umask 077
+# shellcheck source=scripts/lib/vault.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/vault.sh"
 
 state=${WARDENLENS_AGENT_STATE:-$HOME/.local/state/wardenlens/agents}
 secret=${WARDENLENS_SECRET_FILE:-$HOME/.config/wardenlens/agentdvr-cameras.secret.json}
@@ -57,6 +62,19 @@ matches() {
   [[ $rc -eq 0 ]]
 }
 
+# vault_scan_prompt FILE: the fixed installed binary scans the prompt; exit 1 (a vault value) and 2 (could not
+# scan) both refuse, as does a missing binary when a vault exists. Output holds ids and kinds, never values.
+vault_scan_prompt() {
+  local bin=$HOME/.cargo/bin/wardenlens rc=0 out
+  [[ -x "$bin" ]] || die "refusing: a vault exists but $bin is missing (install: cargo install --locked --path crates/wardenlens-cli)"
+  out=$("$bin" vault scan -- "$1" 2>&1) || rc=$?
+  case $rc in
+    0) ;;
+    1) printf '%s\n' "$out" >&2; die "refusing: prompt contains a vault value" ;;
+    *) printf '%s\n' "$out" >&2; die "refusing: the vault scan could not run (exit $rc); failing closed" ;;
+  esac
+}
+
 scan_prompt() {  # FILE: refuse LAN addresses, credentials in URLs and secret-file values; never echo a value
   local f=$1 pats
   # First octet must not follow a digit or `digit.` (keeps version strings like 1.10.20.1.2.3 allowed).
@@ -72,12 +90,21 @@ scan_prompt() {  # FILE: refuse LAN addresses, credentials in URLs and secret-fi
   if matches -q -P -- '[A-Za-z][A-Za-z0-9+.-]*://[^/\s@:]*:\S*@' "$f"; then
     die "refusing: prompt contains a scheme://user:pass@ credential"
   fi
+  # ADR 0006 section 9: with a vault the exact-match scan replaces the secret-file check; the regexes above
+  # stay (blocking). With no vault the secret file is the fallback.
+  local rc=0
+  vault_check >/dev/null || rc=$?
+  case $rc in
+    0) vault_scan_prompt "$f"; return 0 ;;
+    10) [[ -z "${announce:-}" ]] || echo "agents: no vault; the secret-file fallback is the only value check" >&2 ;;
+    *) die "refusing: no vault and WARDENLENS_REQUIRE_VAULT=1" ;;
+  esac
   [[ -f "$secret" ]] || return 0
   command -v jq >/dev/null || die "missing dependency: jq"
   pats=$(jq -r '
     def vals: if type == "object" then
                 to_entries[]
-                | if (.key | IN("name","vendor","model","active","width","height","codec","detector","onvif","port","id"))
+                | if (.key | IN("name","vendor","model","active","width","height","codec","detector","onvif","port","id","lpr","face"))
                      and (.value | type | IN("object","array") | not) then empty else .value | vals end
               elif type == "array" then .[] | vals
               elif type == "null" or type == "boolean" then empty
@@ -98,6 +125,7 @@ vet_prompt() {
 
 cmd_check() {
   [[ $# -eq 1 ]] || die "usage: check PROMPT_FILE"
+  announce=1
   vet_prompt "$1"
 }
 

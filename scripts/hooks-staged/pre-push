@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Authoritative push control. Git runs this before every push with the remote name and URL as $1 and
+# $2 (unused) and one line per ref update on stdin: <local ref> <local sha> <remote ref> <remote sha>.
+# It sees the real updates, whatever the command line looked like (refspecs, config, aliases, wrappers).
+#
+# Refused:
+#   - any update of refs/heads/main or refs/heads/master (open a PR instead)
+#   - any update or deletion of an EXISTING remote tag (refs/tags/*), even with WARDENLENS_ALLOW_REWRITE=1;
+#     creating a new tag is allowed
+#   - any deletion (deleting remote branches requires the user)
+#   - a remote sha not present locally (unknown remote state; fetch first)
+#   - a non-fast-forward update (force push)
+#   - commits that change any file under .github/workflows/ (workflows are privileged: a PR could
+#     redefine the CI check). The commits examined are those reachable from local_sha but not from
+#     remote_sha or any remote-tracking ref (so merging/pulling main that already carries a human
+#     workflow change is fine). Merge commits are judged by their combined diff: a path counts only
+#     when the merge result differs from every parent (an evil merge), not when it takes one side.
+#     A merge must also keep every workflow change a parent brought in since their merge base, so
+#     `merge -s ours origin/main` (or restoring "our" side) cannot silently revert a change on main.
+#   - a push whose new content holds a vault value (ADR 0006 section 9), see below
+# Exceptions (human-only; the Bash guard denies agents setting either name):
+#   - a non-fast-forward update of a refs/heads/* branch other than main/master is allowed when
+#     WARDENLENS_ALLOW_REWRITE=1, because `--force-with-lease` on your own feature branch is legitimate
+#     and a pre-push hook cannot tell it from `--force`.
+#   - a push that changes .github/workflows/ is allowed when WARDENLENS_ALLOW_WORKFLOWS=1.
+#
+# Vault scan (ADR 0006 section 9). It runs FIRST, over every update, before any check below can print a ref name or a
+# path (a name can hold a value). For every ref update: `wardenlens vault scan --range <remote_sha>..<local_sha>` over
+# what the push would publish: the new blobs (binary ones too), the full path of every entry of the new trees (walked from
+# the root of every new commit and from every tree a tag or the range end points at; empty directories too), the raw commit and tag objects (every header and the message) and the ref names.
+# All ref names of the push (the remote ones first, then the local ones) are given to every scan, in input order, so one
+# is reported as ref:<index>; the refusal never prints a ref name.
+#   - The scanner is the FIXED installed binary $HOME/.cargo/bin/wardenlens (cargo install --locked --path
+#     crates/wardenlens-cli). There is no WARDENLENS_BIN override, and a binary built from the working tree is never used.
+#   - The vault and key are the fixed default paths. WARDENLENS_VAULT*, XDG_* are ignored: they are unset for the scanner,
+#     which also gets --default-paths, so a variable set for one push cannot point the hook at an empty vault.
+#   - No vault file: prints SKIPPED once and goes on, unless WARDENLENS_REQUIRE_VAULT=1 (then the push is refused).
+#   - A vault but no scanner, a hit (exit 1) or a scan that could not run (exit 2): refused.
+#   - GITHUB_ACTIONS is not consulted: with a vault present a scan is never skipped.
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+is_zero() { [[ "$1" =~ ^0+$ ]]; }
+refuse() { echo "pre-push: refused: $1 ($2)" >&2; exit 1; }
+
+remote=${1:-}
+vault_db=$HOME/.local/share/wardenlens/dev-vault.db
+vault_bin=$HOME/.cargo/bin/wardenlens
+vault_noted=0
+all_refs=()   # the remote refs of this push in input order, then the local ones: index n and up is a local name; the scanner reports a name as ref:<index>
+
+# vault_scan_push LSHA RSHA IDX: scan what pushing LSHA over RSHA (all zeros: a new branch) publishes, and every ref
+# name of the push. A ref name can hold a value, so the refusal says ref:IDX and never the name. A deletion (LSHA all
+# zeros) publishes nothing: it scans the empty range, so the ref names are still checked.
+vault_scan_push() {
+  local lsha=$1 rsha=$2 idx=$3 remote_opt=() ref_opts=() r range
+  if ! is_zero "$lsha"; then range="$rsha..$lsha"
+  elif ! is_zero "$rsha"; then range="$rsha..$rsha"
+  else range="HEAD..HEAD"; fi
+  if [[ ! -e "$vault_db" && ! -L "$vault_db" ]]; then
+    if [[ "${WARDENLENS_REQUIRE_VAULT:-}" == 1 ]]; then refuse "no vault and WARDENLENS_REQUIRE_VAULT=1" "$vault_db"; fi
+    if [[ $vault_noted -eq 0 ]]; then echo "vault scan: SKIPPED (no vault at $vault_db)" >&2; vault_noted=1; fi
+    return 0
+  fi
+  [[ -x "$vault_bin" ]] || refuse "a vault exists but the scanner is not installed (cargo install --locked --path crates/wardenlens-cli)" "$vault_bin"
+  # The destination's tracking refs count as published. A URL or an odd name excludes nothing (it scans more).
+  if [[ "$remote" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then remote_opt=("--remote=$remote"); fi
+  for r in "${all_refs[@]}"; do ref_opts+=("--ref=$r"); done
+  env -u WARDENLENS_VAULT -u WARDENLENS_VAULT_KEY_FILE -u WARDENLENS_VAULT_KEY -u XDG_DATA_HOME -u XDG_CONFIG_HOME \
+    "$vault_bin" vault scan --default-paths "--range=$range" ${remote_opt[@]+"${remote_opt[@]}"} "${ref_opts[@]}" </dev/null >&2 \
+    || refuse "vault scan found a vault value, or could not run (see above; fetch first if the remote moved)" "ref:$idx"
+}
+
+# workflow_files LSHA RSHA: print the paths under .github/workflows/ touched by the pushed commits
+workflow_files() {
+  local lsha=$1 rsha=$2 base=()
+  if ! is_zero "$rsha"; then base=("$rsha"); fi
+  git log --full-history --diff-merges=combined --no-renames --format= --name-only \
+    "$lsha" --not "${base[@]}" --remotes -- ':(top).github/workflows'
+  local m b par
+  local -a parents
+  while read -r m; do
+    mapfile -t parents < <(git rev-parse "$m^@")
+    b=$(git merge-base --octopus "${parents[@]}") || b=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+    for par in "${parents[@]}"; do
+      comm -12 <(git diff --no-renames --name-only "$b" "$par" -- ':(top).github/workflows' | sort) \
+               <(git diff --no-renames --name-only "$par" "$m" -- ':(top).github/workflows' | sort)
+    done
+  done < <(git rev-list --merges "$lsha" --not "${base[@]}" --remotes)
+}
+
+input=()
+local_refs=()
+while read -r lref lsha rref rsha; do
+  input+=("$lref $lsha $rref $rsha")
+  all_refs+=("$rref")
+  if ! is_zero "$lsha"; then local_refs+=("$lref"); fi
+done
+# The local names come after the remote ones, so a remote name keeps its update's index.
+for r in ${local_refs[@]+"${local_refs[@]}"}; do all_refs+=("$r"); done
+# The vault scan runs FIRST, over every update, before any refusal below can print a ref name or a path (a name can hold
+# a value): a hit is refused as ref:<index> and nothing else is printed.
+idx=-1
+for line in ${input[@]+"${input[@]}"}; do
+  idx=$((idx + 1))
+  read -r lref lsha rref rsha <<<"$line"
+  vault_scan_push "$lsha" "$rsha" "$idx"
+done
+idx=-1
+for line in ${input[@]+"${input[@]}"}; do
+  idx=$((idx + 1))
+  read -r lref lsha rref rsha <<<"$line"
+  case "$rref" in
+    refs/heads/main|refs/heads/master) refuse "never push to main; open a PR" "$lref -> $rref" ;;
+  esac
+  case "$rref" in
+    refs/tags/*) if ! is_zero "$rsha"; then refuse "existing tags are immutable (no update or deletion, forward or rewrite)" "$rref"; fi ;;
+  esac
+  if is_zero "$lsha"; then refuse "deleting remote branches requires the user" "$rref"; fi
+  if ! is_zero "$rsha"; then
+    git cat-file -e "$rsha^{commit}" 2>/dev/null || refuse "unknown remote state; fetch first" "$rref at $rsha"
+    if ! git merge-base --is-ancestor "$rsha" "$lsha" 2>/dev/null; then
+      if [[ "${WARDENLENS_ALLOW_REWRITE:-}" == 1 && "$rref" == refs/heads/* ]]; then
+        echo "pre-push: WARNING: rewriting $rref (WARDENLENS_ALLOW_REWRITE=1)" >&2
+      else
+        refuse "non-fast-forward / force push" "$rref"
+      fi
+    fi
+  fi
+  wf=$(workflow_files "$lsha" "$rsha" 2>/dev/null) || refuse "cannot inspect the pushed commits for workflow changes" "$rref"
+  if [[ -n "$wf" ]]; then
+    if [[ "${WARDENLENS_ALLOW_WORKFLOWS:-}" == 1 ]]; then
+      echo "pre-push: WARNING: pushing changes to .github/workflows/ (WARDENLENS_ALLOW_WORKFLOWS=1)" >&2
+    else
+      refuse "changes to .github/workflows/ need the user (WARDENLENS_ALLOW_WORKFLOWS=1, human only)" "$rref: $(head -n1 <<<"$wf")"
+    fi
+  fi
+done
+exit 0

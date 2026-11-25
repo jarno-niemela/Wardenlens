@@ -6,6 +6,8 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 hooks_src=${HOOKS:-$root/.githooks}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# Hermetic: no vault, no installed scanner, whatever this machine has (the hook under test may scan pushes).
+export HOME="$tmp/home"; mkdir -p "$HOME"; unset WARDENLENS_VAULT WARDENLENS_REQUIRE_VAULT
 hooks=$tmp/hooks; mkdir -p "$hooks"; ln -s "$hooks_src/pre-push" "$hooks/pre-push"
 fail=0; n=0
 unset GIT_DIR GIT_WORK_TREE WARDENLENS_ALLOW_REWRITE WARDENLENS_ALLOW_WORKFLOWS GIT_CONFIG_PARAMETERS
