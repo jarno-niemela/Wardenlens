@@ -166,47 +166,51 @@ fn crash_mid_rekey_then_new_key_is_wrong_key_and_old_key_recovers() {
     assert!(res.is_ok(), "old key after recovery: {res:?}");
 }
 
-/// Opens racing a stream of committed writes from another connection must all succeed (ADR 0006
-/// section 3: a scan during a write waits). Exercises the window between the probe's journal
-/// check and its immutable (lock-free) read of the main file.
+/// An open racing a committed write must succeed (ADR 0006 section 3: a scan during a write
+/// waits). Each round has the writer hold a transaction with its `-journal` on disk, then commit
+/// as the open starts, so the open sees the hot journal or the committed file depending on the
+/// scheduler; both outcomes must be `Ok`. The channels (no sleeps, no clocks: TEST-5) keep
+/// exactly one write in flight per open. An unbounded writer loop is not a valid race: a writer
+/// that holds the lock almost continuously starves any reader, SQLite's own included, for longer
+/// than `BUSY_TIMEOUT` (#134), which is a refusal by design.
 #[test]
 fn opens_racing_committed_writes_never_fail() {
+    use std::sync::mpsc::sync_channel;
+    const ROUNDS: u32 = 25;
     let tmp = dir();
     let db = vault_with(&tmp, "v.db", "k", 5);
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (hot_tx, hot_rx) = sync_channel::<()>(0);
+    let (go_tx, go_rx) = sync_channel::<()>(0);
+    let (done_tx, done_rx) = sync_channel::<()>(0);
     let writer = {
         let db = db.clone();
-        let stop = stop.clone();
         std::thread::spawn(move || {
             let c = rusqlite::Connection::open(&db).unwrap();
             c.busy_timeout(Duration::from_secs(5)).unwrap();
-            let mut i = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                c.execute_batch(
-                    "BEGIN IMMEDIATE; UPDATE entries SET updated_at = updated_at + 1; COMMIT;",
-                )
-                .unwrap();
-                i += 1;
+            for _ in 0..ROUNDS {
+                c.execute_batch("BEGIN IMMEDIATE; UPDATE entries SET updated_at = updated_at + 1;")
+                    .unwrap();
+                hot_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                c.execute_batch("COMMIT;").unwrap();
+                done_rx.recv().unwrap();
             }
-            i
         })
     };
     let mut failures = Vec::new();
-    let start = std::time::Instant::now();
-    let mut n = 0;
-    while start.elapsed() < Duration::from_secs(3) {
+    for _ in 0..ROUNDS {
+        hot_rx.recv().unwrap();
+        go_tx.send(()).unwrap();
         match Vault::open(&db, KeyFile::load(&tmp.path().join("k")).unwrap()) {
             Ok(v) => drop(v),
             Err(e) => failures.push(format!("{e:?}")),
         }
-        n += 1;
+        done_tx.send(()).unwrap();
     }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let write_count = writer.join().unwrap();
-    assert!(write_count > 0 && n > 0);
+    writer.join().unwrap();
     assert!(
         failures.is_empty(),
-        "{} of {n} opens failed: {:?}",
+        "{} of {ROUNDS} opens failed: {:?}",
         failures.len(),
         &failures[..failures.len().min(3)]
     );

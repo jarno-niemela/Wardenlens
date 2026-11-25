@@ -923,6 +923,41 @@ fn a_held_lock_refuses_recovery_and_leaves_next_in_place() {
     ok(&h, &["rm", "cam:a:host"], Fake::pipe());
 }
 
+/// A lock released while the next writer is still inside its grace period is taken (#134: a
+/// child copied the descriptor across a concurrent `fork` and held the lock until `exec`).
+#[test]
+fn a_lock_released_during_the_grace_period_is_acquired() {
+    let h = Home::new();
+    h.init();
+    let dir = h.paths().key.parent().unwrap().to_owned();
+    let mut held = Some(super::session::DirLock::acquire(&dir).unwrap());
+    let mut pauses = Vec::new();
+    let got = super::session::DirLock::acquire_with(&dir, 5, |n| {
+        pauses.push(n);
+        if n == 2 {
+            drop(held.take());
+        }
+    });
+    assert!(got.is_ok());
+    assert_eq!(pauses, [1, 2]);
+}
+
+/// A lock that stays held is still refused, after exactly `attempts - 1` pauses.
+#[test]
+fn a_lock_held_throughout_the_grace_period_is_refused() {
+    let h = Home::new();
+    h.init();
+    let dir = h.paths().key.parent().unwrap().to_owned();
+    let _held = super::session::DirLock::acquire(&dir).unwrap();
+    let mut pauses = 0u32;
+    let err = super::session::DirLock::acquire_with(&dir, 4, |_| pauses += 1)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("another vault write"), "{err}");
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(pauses, 3);
+}
+
 // ---- import-legacy --------------------------------------------------------------------------
 
 struct Legacy {

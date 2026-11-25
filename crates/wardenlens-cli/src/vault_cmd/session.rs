@@ -25,8 +25,26 @@ pub(super) struct DirLock {
     _fd: OwnedFd,
 }
 
+/// Tries made to take the key-directory lock before refusing, and the pause between two tries.
+/// A lock whose holder has just released it can still be held for a moment by a child that a
+/// concurrent `fork` (a `git` spawn from another thread) copied the descriptor into and that has
+/// not yet reached `exec`, which closes it (`O_CLOEXEC`). A brief grace rides that out; a real
+/// second writer still gets the refusal, half a second later (#134, #128).
+const LOCK_ATTEMPTS: u32 = 50;
+const LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
 impl DirLock {
     pub(super) fn acquire(dir: &Path) -> Result<Self, CliError> {
+        Self::acquire_with(dir, LOCK_ATTEMPTS, |_| std::thread::sleep(LOCK_PAUSE))
+    }
+
+    /// Takes the lock, making at most `attempts` tries and calling `pause(n)` after the `n`th
+    /// failed one (not after the last). A test passes a `pause` that does not sleep.
+    pub(super) fn acquire_with(
+        dir: &Path,
+        attempts: u32,
+        mut pause: impl FnMut(u32),
+    ) -> Result<Self, CliError> {
         let fd = rustix::fs::open(
             dir,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -40,12 +58,21 @@ impl DirLock {
                 CliError::io("opening key directory")(e.into())
             }
         })?;
-        match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Self { _fd: fd }),
-            Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(CliError::Refused(
-                "another vault write command is running; try again when it finishes",
-            )),
-            Err(e) => Err(CliError::io("locking key directory")(e.into())),
+        let mut tries = 0u32;
+        loop {
+            tries = tries.saturating_add(1);
+            match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(Self { _fd: fd }),
+                Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+                    if tries >= attempts {
+                        return Err(CliError::Refused(
+                            "another vault write command is running; try again when it finishes",
+                        ));
+                    }
+                    pause(tries);
+                }
+                Err(e) => return Err(CliError::io("locking key directory")(e.into())),
+            }
         }
     }
 }
