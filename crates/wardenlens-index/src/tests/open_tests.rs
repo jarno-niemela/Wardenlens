@@ -82,6 +82,15 @@ fn make_foreign(f: &Fixture, setup: &str, wal: bool) -> Connection {
     }
     c.execute_batch(setup).unwrap();
     chmod(&f.path, 0o600);
+    // SQLite made `-wal` and `-shm` with the mode of the day (0644): the content rules are
+    // under test here, the mode rule has its own rows.
+    for suffix in ["-wal", "-shm"] {
+        let mut n = f.path.as_os_str().to_owned();
+        n.push(suffix);
+        if std::path::Path::new(&n).exists() {
+            chmod(std::path::Path::new(&n), 0o600);
+        }
+    }
     c
 }
 

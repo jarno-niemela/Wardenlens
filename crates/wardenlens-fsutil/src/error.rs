@@ -33,6 +33,12 @@ pub enum FsError {
         /// The effective uid.
         expected: u32,
     },
+    /// The directory is not owned by the effective user.
+    #[error("directory is not owned by the current user")]
+    ParentWrongOwner,
+    /// The directory is writable by group or others.
+    #[error("directory is writable by group or others")]
+    ParentWritable,
     /// The path no longer names the file that was checked (swapped between check and open).
     #[error("path no longer refers to the checked file")]
     IdentityMismatch,
@@ -41,6 +47,14 @@ pub enum FsError {
 impl FsError {
     pub(crate) fn io(op: &'static str) -> impl FnOnce(Errno) -> Self {
         move |source| Self::Io { op, source }
+    }
+
+    /// Keeps only the errno of a `std::io::Error` (`EIO` when it has none).
+    pub(crate) fn io_err(op: &'static str) -> impl FnOnce(std::io::Error) -> Self {
+        move |e| Self::Io {
+            op,
+            source: Errno::from_raw_os_error(e.raw_os_error().unwrap_or(Errno::IO.raw_os_error())),
+        }
     }
 
     /// The errno, if this is a system-call failure.

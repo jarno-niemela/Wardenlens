@@ -1,90 +1,118 @@
-//! Invariant 5: no SQL is built from data. The production sources are read at compile time and
-//! scanned; the enforcement is the shape (statements are `&'static str` constants in `sql.rs`)
-//! plus this grep.
+//! Invariant 5: no SQL is built from data. The compiler enforces the shape: every function that
+//! hands SQL text to `rusqlite` is in `sql.rs` and takes `&'static str`. This test checks that
+//! nothing else in the crate calls the SQL entry points directly, over every production source
+//! file found on disk (not a hand-kept list), joining the lines of a wrapped call first.
 
-const SOURCES: [(&str, &str); 9] = [
-    ("lib.rs", include_str!("../lib.rs")),
-    ("error.rs", include_str!("../error.rs")),
-    ("migrate.rs", include_str!("../migrate.rs")),
-    ("open.rs", include_str!("../open.rs")),
-    ("ops.rs", include_str!("../ops.rs")),
-    ("rows.rs", include_str!("../rows.rs")),
-    ("sql.rs", include_str!("../sql.rs")),
-    ("cursor.rs", include_str!("../cursor.rs")),
-    ("tests-excluded", ""),
-];
+use std::path::{Path, PathBuf};
 
-/// Calls that take SQL text.
-const SQL_CALLS: [&str; 7] = [
+/// `rusqlite` methods that take SQL text.
+const SQL_CALLS: [&str; 8] = [
     ".prepare(",
+    ".prepare_cached(",
     ".execute(",
     ".execute_batch(",
     ".query_row(",
-    ".prepare_cached(",
     ".query_one(",
     ".pragma_update(",
+    ".pragma_query_value(",
 ];
 
-fn code_lines(src: &str) -> Vec<&str> {
-    // Production code only: stop at the first test module.
-    src.lines()
+fn production_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "tests") {
+                    continue; // the test modules
+                }
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    out.sort();
+    out
+}
+
+/// The text of a production file without comments, and without the `#[cfg(test)]` modules.
+fn code(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
         .take_while(|l| !l.starts_with("#[cfg(test)]"))
-        .collect()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name().unwrap().to_string_lossy().into_owned()
 }
 
 #[test]
-fn no_source_formats_or_concatenates_sql() {
-    for (name, src) in SOURCES {
-        for (n, line) in code_lines(src).into_iter().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            // `format!` is allowed only for the cursor text, which is not SQL.
-            if code.contains("format!") {
-                assert!(
-                    name == "cursor.rs",
-                    "{name}:{n}: format! in production code: {line}"
-                );
-            }
-            assert!(!code.contains("concat!"), "{name}:{n}: {line}");
-            assert!(
-                !code.contains("+ \"") && !code.contains("\" +"),
-                "{name}:{n}: {line}"
-            );
-            assert!(!code.contains("push_str("), "{name}:{n}: {line}");
-        }
+fn the_scan_sees_the_production_sources() {
+    let names: Vec<_> = production_sources().iter().map(|p| file_name(p)).collect();
+    for want in [
+        "sql.rs",
+        "open.rs",
+        "ops.rs",
+        "migrate.rs",
+        "lib.rs",
+        "cursor.rs",
+    ] {
+        assert!(
+            names.iter().any(|n| n == want),
+            "{want} not found in {names:?}"
+        );
     }
 }
 
 #[test]
-fn every_sql_call_takes_a_constant_from_the_sql_module_or_a_script() {
-    let mut calls = 0;
-    for (name, src) in SOURCES {
-        for (n, line) in code_lines(src).into_iter().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            for call in SQL_CALLS {
-                if let Some(at) = code.find(call) {
-                    calls += 1;
-                    let args = code.get(at + call.len()..).unwrap_or("");
-                    // An argument on a later line (rustfmt wraps) is the identifier `sql::X`, the
-                    // function parameter `sql`, or a migration script `m.sql`.
-                    let ok = args.trim().is_empty()
-                        || args.starts_with("sql::")
-                        || args.starts_with("m.sql")
-                        || args.starts_with("sql,")
-                        || args.starts_with("query,");
-                    assert!(ok, "{name}:{n}: {line}");
-                }
+fn only_sql_rs_calls_the_driver_with_sql_text() {
+    let mut calls_in_sql_rs = 0;
+    for p in production_sources() {
+        let text = code(&p);
+        for call in SQL_CALLS {
+            let n = text.matches(call).count();
+            if file_name(&p) == "sql.rs" {
+                calls_in_sql_rs += n;
+            } else {
+                assert_eq!(n, 0, "{}: direct call {call} outside sql.rs", p.display());
             }
         }
     }
     assert!(
-        calls > 10,
-        "the grep saw only {calls} calls: the scan is not reaching the code"
+        calls_in_sql_rs >= 4,
+        "the scan did not find the sql.rs wrappers"
     );
 }
 
 #[test]
-fn sql_constants_carry_no_interpolation() {
-    let src = include_str!("../sql.rs");
-    assert!(!src.contains("{}") && !src.contains("{0}"));
-    assert!(src.contains("&str"));
+fn no_source_formats_or_concatenates_strings_into_sql() {
+    for p in production_sources() {
+        let text = code(&p);
+        let name = file_name(&p);
+        // `format!` builds the cursor text and the scratch directory name only; neither is SQL.
+        if name != "cursor.rs" {
+            assert!(!text.contains("format!"), "{name}: format!");
+        }
+        assert!(!text.contains("concat!"), "{name}");
+        assert!(!text.contains("push_str("), "{name}");
+        assert!(!text.contains("+ \"") && !text.contains("\" +"), "{name}");
+    }
+}
+
+#[test]
+fn the_wrappers_take_only_static_strings() {
+    let sql = code(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sql.rs"));
+    for f in ["prepare", "execute", "execute_batch", "query_row"] {
+        let at = sql
+            .find(&format!("fn {f}"))
+            .unwrap_or_else(|| panic!("{f}"));
+        let sig: String = sql[at..].chars().take_while(|c| *c != '{').collect();
+        assert!(sig.contains("&'static str"), "{f}: {sig}");
+    }
 }

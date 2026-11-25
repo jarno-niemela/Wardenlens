@@ -295,7 +295,7 @@ fn every_bad_stored_value_is_a_typed_corrupt_row_on_get_list_and_oldest() {
             assert!(is(&e), "{name} list: {e:?}");
         }
         for t in [Tier::Hot, Tier::Archive] {
-            if let Err(e) = idx.oldest(t, 10) {
+            if let Err(e) = idx.oldest(t, None, 10) {
                 assert!(
                     matches!(e, IndexError::CorruptRow { .. }),
                     "{name} oldest: {e:?}"
@@ -422,5 +422,124 @@ fn overflowing_sum_is_an_error_not_a_wrap() {
             "",
         ),
     );
-    assert!(idx.bytes_by_tier().is_err());
+    // SQLite refuses the overflowing SUM; it is never wrapped into a small number.
+    assert!(matches!(
+        idx.bytes_by_tier().unwrap_err(),
+        IndexError::Sqlite {
+            op: "bytes by tier",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn bytes_by_tier_rejects_a_bad_row_hidden_in_a_plausible_sum() {
+    for (name, a, b) in [
+        ("zero", "0", "10"),
+        ("negative offset by a large row", "-5", "15"),
+        ("above the bound", "68719476737", "1"),
+    ] {
+        let (f, idx) = open_new();
+        let row = |start: &'static str, end: &'static str, bytes: &'static str| {
+            ("'cam1'", start, "1000", end, bytes, "1", "0", "")
+        };
+        write_bad(&f.path, row("1700000000000", "1700000001000", a));
+        write_bad(&f.path, row("1700000010000", "1700000011000", b));
+        assert!(
+            matches!(
+                idx.bytes_by_tier().unwrap_err(),
+                IndexError::CorruptRow { field: "bytes", .. }
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// Removes `STRICT` so a column can hold another storage class (a file edited outside SQLite).
+fn loosen(path: &std::path::Path) {
+    let c = raw(path);
+    let sql: String = c
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'segments'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    c.execute_batch("PRAGMA writable_schema = ON").unwrap();
+    c.execute(
+        "UPDATE sqlite_master SET sql = ?1 WHERE name = 'segments'",
+        [sql.replace(") STRICT", ")")],
+    )
+    .unwrap();
+}
+
+/// Every integer column, holding text: each read path that touches it says `CorruptRow`.
+#[test]
+fn a_wrong_storage_class_in_any_column_is_a_corrupt_row_on_every_read_path() {
+    let columns = [
+        "started_at_ms",
+        "duration_ms",
+        "ended_at_ms",
+        "bytes",
+        "frame_count",
+        "tier",
+    ];
+    for col in columns {
+        let (f, idx) = open_new();
+        loosen(&f.path);
+        let mut values = ["1700000000000", "1000", "1700000001000", "5", "1", "0"];
+        let at = columns.iter().position(|c| *c == col).unwrap();
+        values[at] = "'x'";
+        raw(&f.path)
+            .execute_batch(&format!(
+                "PRAGMA ignore_check_constraints = ON; INSERT INTO segments \
+                 (camera_id, started_at_ms, duration_ms, ended_at_ms, bytes, frame_count, tier) \
+                 VALUES ('cam1', {});",
+                values.join(", ")
+            ))
+            .unwrap();
+        let is =
+            |e: &IndexError| matches!(e, IndexError::CorruptRow { field, .. } if *field == col);
+        let e = idx.get(SegmentId::new(1)).unwrap_err();
+        assert!(is(&e), "{col} get: {e:?}");
+        // Text sorts after every integer, so a text start is not selected by the range at all.
+        let listed = idx.list(&cam("cam1"), ts(i64::MIN), ts(i64::MAX), 10, None);
+        if col == "started_at_ms" {
+            assert_eq!(listed.unwrap().items, []);
+        } else {
+            let e = listed.unwrap_err();
+            assert!(is(&e), "{col} list: {e:?}");
+        }
+        // The statements that read a column report it too (those that do not read it succeed).
+        match col {
+            "tier" => {
+                assert!(matches!(
+                    idx.bytes_by_tier().unwrap_err(),
+                    IndexError::CorruptRow { field: "tier", .. }
+                ));
+            }
+            "bytes" => {
+                assert!(matches!(
+                    idx.bytes_by_tier().unwrap_err(),
+                    IndexError::CorruptRow { field: "bytes", .. }
+                ));
+                let e = idx.oldest(Tier::Hot, None, 10).unwrap_err();
+                assert!(is(&e), "oldest: {e:?}");
+            }
+            "ended_at_ms" => {
+                let e = idx.oldest(Tier::Hot, None, 10).unwrap_err();
+                assert!(is(&e), "oldest: {e:?}");
+            }
+            "started_at_ms" => {
+                assert!(matches!(
+                    idx.latest_started_at(&cam("cam1")).unwrap_err(),
+                    IndexError::CorruptRow {
+                        field: "started_at_ms",
+                        ..
+                    }
+                ));
+            }
+            _ => {}
+        }
+    }
 }

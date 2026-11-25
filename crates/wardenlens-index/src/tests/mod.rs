@@ -2,6 +2,7 @@
 
 mod cursor_tests;
 mod hygiene;
+mod matrix_tests;
 mod migrate_tests;
 mod model;
 mod open_tests;
@@ -38,8 +39,15 @@ pub(crate) struct Fixture {
     pub(crate) path: PathBuf,
 }
 
-pub(crate) fn fixture() -> Fixture {
+/// A temporary directory nobody else can write (tempfile follows the umask).
+pub(crate) fn private_tempdir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
+    chmod(dir.path(), 0o700);
+    dir
+}
+
+pub(crate) fn fixture() -> Fixture {
+    let dir = private_tempdir();
     let path = dir.path().join("index.db");
     Fixture { dir, path }
 }

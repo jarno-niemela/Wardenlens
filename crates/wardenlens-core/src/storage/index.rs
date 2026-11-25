@@ -22,8 +22,16 @@ use super::types::{SegmentId, StoredSegment, Tier};
 /// Most rows one [`SegmentIndex::list`] page may hold.
 pub const MAX_LIST_LIMIT: usize = 1000;
 
-/// Most rows one [`SegmentIndex::oldest`] call may return (about 14 days of five cameras).
-pub const MAX_OLDEST: usize = 100_000;
+/// Most rows one [`SegmentIndex::oldest`] call may return. A memory bound (SEC-2): a
+/// [`StoredSegment`] is a few dozen bytes, so one call holds well under a megabyte. Callers that
+/// need more page through the tier with the `after` key.
+pub const MAX_OLDEST: usize = 10_000;
+
+/// Largest segment the index accepts, in bytes (64 GiB, far above the recorder's 1 GiB default cap
+/// and still about 850 Mbit/s for the longest accepted segment). With it, the sum of all `bytes`
+/// stays inside `i64` for up to 2^27 rows, so [`SegmentIndex::bytes_by_tier`] cannot overflow on
+/// rows that `insert` accepted.
+pub const MAX_SEGMENT_BYTES: u64 = 1 << 36;
 
 /// An opaque position in a listing.
 ///
@@ -152,12 +160,21 @@ pub trait SegmentIndex {
     /// An unknown id or a storage failure.
     fn delete(&mut self, id: SegmentId) -> Result<(), Self::Error>;
 
-    /// The `n` segments of `tier` that ended first (1 to [`MAX_OLDEST`]), ordered by
-    /// `(ended_at, id)`.
+    /// Up to `n` segments of `tier` (1 to [`MAX_OLDEST`]) in the order `(ended_at, id)`, starting
+    /// after the key `after` (`None` starts at the oldest).
+    ///
+    /// One call is bounded, so a caller that needs the whole tier **pages through it**: pass the
+    /// `(ended_at, id)` of the last row of the previous page as `after` until a page comes back
+    /// shorter than `n`. The key is stable under inserts and deletes between calls.
     ///
     /// # Errors
     /// An `n` outside the range, or a storage failure.
-    fn oldest(&self, tier: Tier, n: usize) -> Result<Vec<StoredSegment>, Self::Error>;
+    fn oldest(
+        &self,
+        tier: Tier,
+        after: Option<(Timestamp, SegmentId)>,
+        n: usize,
+    ) -> Result<Vec<StoredSegment>, Self::Error>;
 
     /// Bytes and segment counts per tier.
     ///

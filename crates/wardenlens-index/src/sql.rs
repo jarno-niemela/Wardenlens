@@ -1,8 +1,12 @@
 //! Every SQL statement of the crate, as a `&'static str` with `?N` placeholders.
 //!
-//! This is the whole enforcement of "no SQL is built from data": nothing in the crate formats or
-//! concatenates SQL, values only ever travel as bound parameters, and the `hygiene` test greps the
-//! production sources to keep it that way.
+//! This is the whole enforcement of "no SQL is built from data". Every statement is a
+//! `&'static str` constant here, and the only functions in the crate that hand SQL text to
+//! `rusqlite` are the wrappers at the bottom of this file, which take `&'static str`: the compiler
+//! refuses a string built at run time. Values only ever travel as bound parameters. The
+//! `hygiene` test also greps every production source file for a direct call.
+
+use rusqlite::{Connection, Params, Result, Row, Statement};
 
 // The column list of a full row is repeated in `GET` and `LIST` on purpose, in the order
 // `rows::decode_segment` reads it: a `concat!` would be one more way to build SQL.
@@ -28,11 +32,12 @@ pub(crate) const TIER_OF: &str = "SELECT tier FROM segments WHERE id = ?1";
 
 pub(crate) const DELETE: &str = "DELETE FROM segments WHERE id = ?1";
 
+/// ?1 tier, ?2 and ?3 the keyset position `(ended_at_ms, id)` to continue after, ?4 the row count.
 pub(crate) const OLDEST: &str = "SELECT id, tier, bytes, ended_at_ms FROM segments \
-    WHERE tier = ?1 ORDER BY ended_at_ms, id LIMIT ?2";
+    WHERE tier = ?1 AND (ended_at_ms, id) > (?2, ?3) ORDER BY ended_at_ms, id LIMIT ?4";
 
 pub(crate) const BYTES_BY_TIER: &str =
-    "SELECT tier, SUM(bytes), COUNT(*) FROM segments GROUP BY tier";
+    "SELECT tier, SUM(bytes), COUNT(*), MIN(bytes), MAX(bytes) FROM segments GROUP BY tier";
 
 pub(crate) const LATEST_START: &str =
     "SELECT MAX(started_at_ms) FROM segments WHERE camera_id = ?1";
@@ -52,3 +57,29 @@ pub(crate) const GET_SYNC: &str = "PRAGMA synchronous";
 pub(crate) const GET_FK: &str = "PRAGMA foreign_keys";
 pub(crate) const GET_JOURNAL_LIMIT: &str = "PRAGMA journal_size_limit";
 pub(crate) const GET_BUSY: &str = "PRAGMA busy_timeout";
+pub(crate) const SCHEMA_OBJECTS: &str = "SELECT type, name FROM sqlite_master \
+    WHERE substr(name, 1, 17) != 'sqlite_autoindex_'";
+pub(crate) const QUICK_CHECK: &str = "PRAGMA quick_check(1)";
+
+// The only places SQL text reaches `rusqlite`. Each takes `&'static str`.
+
+pub(crate) fn prepare<'c>(conn: &'c Connection, sql: &'static str) -> Result<Statement<'c>> {
+    conn.prepare(sql)
+}
+
+pub(crate) fn execute<P: Params>(conn: &Connection, sql: &'static str, params: P) -> Result<usize> {
+    conn.execute(sql, params)
+}
+
+pub(crate) fn execute_batch(conn: &Connection, sql: &'static str) -> Result<()> {
+    conn.execute_batch(sql)
+}
+
+pub(crate) fn query_row<T, P: Params>(
+    conn: &Connection,
+    sql: &'static str,
+    params: P,
+    f: impl FnOnce(&Row<'_>) -> Result<T>,
+) -> Result<T> {
+    conn.query_row(sql, params, f)
+}

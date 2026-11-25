@@ -6,7 +6,7 @@ use rusqlite::Row;
 use rusqlite::types::ValueRef;
 use wardenlens_core::camera::CameraId;
 use wardenlens_core::recording::SegmentRecord;
-use wardenlens_core::storage::{IndexedSegment, SegmentId, Tier};
+use wardenlens_core::storage::{IndexedSegment, MAX_SEGMENT_BYTES, SegmentId, Tier};
 use wardenlens_core::time::UnixMs;
 
 use crate::error::IndexError;
@@ -56,6 +56,13 @@ pub(crate) fn integer(
         Ok(_) => Err(IndexError::CorruptRow { id, field }),
         Err(e) => Err(IndexError::sqlite("read row")(e)),
     }
+}
+
+/// A segment size: 1 to [`MAX_SEGMENT_BYTES`].
+pub(crate) fn segment_bytes(raw: i64) -> Option<u64> {
+    u64::try_from(raw)
+        .ok()
+        .filter(|b| (1..=MAX_SEGMENT_BYTES).contains(b))
 }
 
 fn positive(row: &Row<'_>, idx: usize, id: i64, field: &'static str) -> Result<u64, IndexError> {
@@ -111,7 +118,10 @@ pub(crate) fn decode_segment(row: &Row<'_>) -> Result<IndexedSegment, IndexError
             field: "ended_at_ms",
         });
     }
-    let bytes = positive(row, 5, raw, "bytes")?;
+    let bytes = segment_bytes(integer(row, 5, raw, "bytes")?).ok_or(IndexError::CorruptRow {
+        id: raw,
+        field: "bytes",
+    })?;
     let frames = positive(row, 6, raw, "frame_count")?;
     let tier = tier_from_code(integer(row, 7, raw, "tier")?, raw)?;
     let duration = u64::try_from(duration).map_err(|_| IndexError::CorruptRow {

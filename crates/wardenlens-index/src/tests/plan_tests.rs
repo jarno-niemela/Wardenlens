@@ -72,10 +72,10 @@ fn list_searches_the_camera_start_index_without_a_sort() {
 #[test]
 fn oldest_searches_the_tier_end_index_without_a_sort() {
     let (_f, idx) = populated();
-    let p = plan(&idx, sql::OLDEST, &[&0_i64, &10_i64]);
+    let p = plan(&idx, sql::OLDEST, &[&0_i64, &1_i64, &2_i64, &10_i64]);
     assert_eq!(p.len(), 1, "{p:?}");
     assert!(p[0].starts_with("SEARCH segments USING"), "{p:?}");
-    assert!(p[0].contains("INDEX segments_tier_end (tier=?)"), "{p:?}");
+    assert!(p[0].contains("INDEX segments_tier_end (tier=?"), "{p:?}");
     no_scan_or_sort(&p);
 }
 
@@ -128,7 +128,7 @@ fn plan_assertions_fail_without_the_indexes() {
     idx.conn
         .execute_batch("DROP INDEX segments_camera_start; DROP INDEX segments_tier_end;")
         .unwrap();
-    let p = plan(&idx, sql::OLDEST, &[&0_i64, &10_i64]);
+    let p = plan(&idx, sql::OLDEST, &[&0_i64, &1_i64, &2_i64, &10_i64]);
     assert!(!p[0].contains("segments_tier_end"), "{p:?}");
     let p = plan(
         &idx,

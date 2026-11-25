@@ -1,13 +1,12 @@
 //! Invariants 2 and 3: segment operations against the model, and the cursor walk.
 
 use proptest::prelude::*;
-use wardenlens_core::camera::CameraId;
 use wardenlens_core::recording::SegmentRecord;
 use wardenlens_core::storage::{
     IndexedSegment, MAX_LIST_LIMIT, MAX_OLDEST, SegmentCursor, SegmentId, SegmentIndex,
     SegmentPage, StoredSegment, Tier, TierTotals,
 };
-use wardenlens_core::time::{Timestamp, UnixMs};
+use wardenlens_core::time::UnixMs;
 
 use super::model::{HasKind, Kind, Model};
 use super::*;
@@ -43,6 +42,11 @@ enum Op {
     SetTier(u64, bool),
     Delete(u64),
     Oldest(bool, usize),
+    OldestWalk {
+        tier: bool,
+        n: usize,
+        between: Vec<Op>,
+    },
     Bytes,
     Latest(usize),
 }
@@ -59,6 +63,7 @@ enum Out {
     Walked(Vec<Vec<IndexedSegment>>),
     Unit,
     Oldest(Vec<StoredSegment>),
+    OldestPages(Vec<Vec<StoredSegment>>),
     Totals(TierTotals),
     Latest(Option<UnixMs>),
     Err(Kind),
@@ -81,7 +86,7 @@ fn limit() -> impl Strategy<Value = usize> {
 fn simple_op() -> impl Strategy<Value = Op> {
     let id = prop_oneof![8 => 0_u64..14, 1 => Just(u64::MAX), 1 => Just(i64::MAX as u64 + 1), 1 => Just(i64::MAX as u64)];
     prop_oneof![
-        6 => (0..3_usize, 0_i64..10, 0..6_usize, prop_oneof![9 => 1_u64..1_000_000, 1 => Just(0_u64), 1 => Just(u64::MAX)], prop_oneof![9 => 1_u64..100, 1 => Just(0_u64)], any::<bool>())
+        6 => (0..3_usize, 0_i64..10, 0..6_usize, prop_oneof![9 => 1_u64..1_000_000, 1 => Just(0_u64), 1 => Just(u64::MAX), 1 => Just(1_u64 << 36), 1 => Just((1_u64 << 36) + 1)], prop_oneof![9 => 1_u64..100, 1 => Just(0_u64)], any::<bool>())
             .prop_map(|(cam, k, d, bytes, frames, t)| Op::Insert {
                 cam, start: BASE + k * 10_000, dur: DURS[d], bytes, frames, tier: t }),
         // Out-of-range duration.
@@ -100,6 +105,8 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         6 => simple_op(),
         3 => (0..3_usize, time(), time(), limit()).prop_map(|(cam, from, to, limit)| Op::List { cam, from, to, limit }),
+        2 => (any::<bool>(), 1_usize..4, prop::collection::vec(simple_op(), 0..3))
+            .prop_map(|(tier, n, between)| Op::OldestWalk { tier, n, between }),
         2 => (0..3_usize, time(), time(), 1_usize..4, prop::collection::vec(simple_op(), 0..3))
             .prop_map(|(cam, from, to, limit, between)| Op::Walk { cam, from, to, limit, between }),
     ]
@@ -177,8 +184,33 @@ where
             .delete(SegmentId::new(*id))
             .map_or_else(|e| Out::Err(e.kind()), |()| Out::Unit),
         Op::Oldest(t, n) => i
-            .oldest(tier(*t), *n)
+            .oldest(tier(*t), None, *n)
             .map_or_else(|e| Out::Err(e.kind()), Out::Oldest),
+        Op::OldestWalk {
+            tier: t,
+            n,
+            between,
+        } => {
+            let mut pages = Vec::new();
+            let mut after = None;
+            let mut pending = between.iter();
+            loop {
+                let page = match i.oldest(tier(*t), after, *n) {
+                    Ok(p) => p,
+                    Err(e) => return Out::Err(e.kind()),
+                };
+                let full = page.len() == *n;
+                after = page.last().map(|s| (s.ended_at, s.id));
+                pages.push(page);
+                if !full {
+                    break;
+                }
+                if let Some(m) = pending.next() {
+                    let _ = run(i, m);
+                }
+            }
+            Out::OldestPages(pages)
+        }
         Op::Bytes => i
             .bytes_by_tier()
             .map_or_else(|e| Out::Err(e.kind()), Out::Totals),
@@ -295,10 +327,11 @@ fn insert_bounds_each_field_exactly() {
     bad(&mut idx, rec("cam1", BASE, 600_001, 1, 1), "duration_ms");
     bad(&mut idx, rec("cam1", BASE, 1, 0, 1), "bytes");
     bad(&mut idx, rec("cam1", BASE, 1, u64::MAX, 1), "bytes");
+    bad(&mut idx, rec("cam1", BASE, 1, (1 << 36) + 1, 1), "bytes");
     bad(&mut idx, rec("cam1", BASE, 1, 1, 0), "frame_count");
     bad(&mut idx, rec("cam1", BASE, 1, 1, u64::MAX), "frame_count");
     idx.insert(
-        &rec("cam1", BASE, 600_000, i64::MAX as u64, i64::MAX as u64),
+        &rec("cam1", BASE, 600_000, 1 << 36, i64::MAX as u64),
         Tier::Hot,
     )
     .unwrap();
@@ -337,7 +370,7 @@ fn limits_are_validated_before_anything_else() {
         (MAX_OLDEST, true),
         (MAX_OLDEST + 1, false),
     ] {
-        assert_eq!(idx.oldest(Tier::Hot, n).is_ok(), ok, "oldest n {n}");
+        assert_eq!(idx.oldest(Tier::Hot, None, n).is_ok(), ok, "oldest n {n}");
     }
     assert_eq!(MAX_LIST_LIMIT, 1000);
 }
@@ -500,14 +533,14 @@ fn oldest_orders_by_end_then_id_and_filters_tier() {
         .insert(&rec("cam1", BASE + 5000, 10, 7, 1), Tier::Archive)
         .unwrap();
     let ids: Vec<_> = idx
-        .oldest(Tier::Hot, 10)
+        .oldest(Tier::Hot, None, 10)
         .unwrap()
         .iter()
         .map(|s| s.id)
         .collect();
     assert_eq!(ids, [c, a, b]);
-    assert_eq!(idx.oldest(Tier::Hot, 2).unwrap().len(), 2);
-    let arch = idx.oldest(Tier::Archive, 10).unwrap();
+    assert_eq!(idx.oldest(Tier::Hot, None, 2).unwrap().len(), 2);
+    let arch = idx.oldest(Tier::Archive, None, 10).unwrap();
     assert_eq!((arch[0].id, arch[0].bytes), (d, 7));
     assert_eq!(arch[0].ended_at, ts(BASE + 5010));
 }
@@ -582,16 +615,67 @@ fn cursor_walk_is_exactly_once_under_concurrent_inserts_and_deletes() {
     );
 }
 
+/// A cursor is issued only when a row follows the page: exactly `limit` rows leave none,
+/// `limit + 1` rows leave one, and following it returns the last row.
 #[test]
-fn cursor_is_issued_only_when_more_rows_exist_and_ties_use_the_id() {
-    // (camera, start) is unique, so a tie in `started_at` cannot occur inside one camera; the
-    // listing order key is still (started_at, id), which the SQL and the cursor both use.
-    assert!(crate::sql::LIST.contains("ORDER BY started_at_ms, id"));
-    assert!(crate::sql::LIST.contains("(started_at_ms, id) > (?5, ?6)"));
+fn cursor_exists_exactly_when_one_more_row_follows() {
+    let (_f, mut idx) = open_new();
+    let c = cam("cam1");
+    for k in 0..4 {
+        ins(&mut idx, "cam1", BASE + k * 1000, 500);
+        let rows = usize::try_from(k + 1).unwrap();
+        let page = idx.list(&c, ts(0), ts(i64::MAX), 3, None).unwrap();
+        assert_eq!(page.items.len(), rows.min(3));
+        assert_eq!(page.next.is_some(), rows > 3, "{rows} rows, limit 3");
+        if let Some(next) = page.next {
+            let rest = idx.list(&c, ts(0), ts(i64::MAX), 3, Some(&next)).unwrap();
+            assert_eq!(rest.items.len(), 1);
+            assert!(rest.next.is_none());
+        }
+    }
 }
 
+/// Keyset walk of `oldest`: pages of 2 over 5 rows, ordered by `(ended_at, id)`, with the key
+/// of the last row continuing; a row inserted behind the key does not reappear.
 #[test]
-fn camera_id_type_used_by_the_tests_is_the_core_type() {
-    let _: CameraId = cam("cam1");
-    let _: Timestamp = ts(0);
+fn oldest_pages_by_keyset_exactly_once() {
+    let (_f, mut idx) = open_new();
+    let ids: Vec<_> = (0..5)
+        .map(|k| ins(&mut idx, "cam1", BASE + k * 1000, 100))
+        .collect();
+    let p1 = idx.oldest(Tier::Hot, None, 2).unwrap();
+    assert_eq!(p1.iter().map(|s| s.id).collect::<Vec<_>>(), ids[..2]);
+    ins(&mut idx, "cam1", BASE - 5000, 100); // ends before the key: not seen again
+    idx.delete(ids[3]).unwrap();
+    let last = p1.last().unwrap();
+    let p2 = idx
+        .oldest(Tier::Hot, Some((last.ended_at, last.id)), 2)
+        .unwrap();
+    assert_eq!(
+        p2.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [ids[2], ids[4]]
+    );
+    let last = p2.last().unwrap();
+    assert_eq!(
+        idx.oldest(Tier::Hot, Some((last.ended_at, last.id)), 2)
+            .unwrap(),
+        []
+    );
+    // Equal end times are broken by id: both rows end at BASE + 10_000.
+    let a = ins(&mut idx, "cam2", BASE + 9_000, 1_000);
+    let b = ins(&mut idx, "cam3", BASE + 8_000, 2_000);
+    let all = idx
+        .oldest(Tier::Hot, Some((ts(BASE + 9_999), SegmentId::new(0))), 10)
+        .unwrap();
+    assert_eq!(all.iter().map(|s| s.id).collect::<Vec<_>>(), [a, b]);
+    let after_a = idx
+        .oldest(Tier::Hot, Some((ts(BASE + 10_000), a)), 10)
+        .unwrap();
+    assert_eq!(after_a.iter().map(|s| s.id).collect::<Vec<_>>(), [b]);
+    // A key above any id names no row and sorts before nothing.
+    assert_eq!(
+        idx.oldest(Tier::Hot, Some((ts(0), SegmentId::new(u64::MAX))), 10)
+            .unwrap(),
+        []
+    );
 }

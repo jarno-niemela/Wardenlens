@@ -14,12 +14,20 @@ pub(crate) struct Migration {
     pub(crate) version: i64,
     /// The script, ending with `PRAGMA user_version = <version>;`.
     pub(crate) sql: &'static str,
+    /// The `(type, name)` of the tables and indexes the script creates (`sqlite_sequence` is implied once
+    /// any migration ran). The identity probe requires the schema to be exactly these.
+    pub(crate) objects: &'static [(&'static str, &'static str)],
 }
 
 /// All migrations of this build. Append-only.
 pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     sql: include_str!("../migrations/001_segments.sql"),
+    objects: &[
+        ("table", "segments"),
+        ("index", "segments_camera_start"),
+        ("index", "segments_tier_end"),
+    ],
 }];
 
 /// The newest version `migrations` reaches.
@@ -29,8 +37,7 @@ pub(crate) fn latest(migrations: &[Migration]) -> i64 {
 
 /// Reads `user_version`; a negative value is refused.
 pub(crate) fn user_version(conn: &Connection) -> Result<i64, IndexError> {
-    let v: i64 = conn
-        .query_row(sql::USER_VERSION, [], |r| r.get(0))
+    let v: i64 = sql::query_row(conn, sql::USER_VERSION, [], |r| r.get(0))
         .map_err(IndexError::sqlite("read schema version"))?;
     if v < 0 {
         return Err(IndexError::InvalidSchemaVersion { found: v });
@@ -60,7 +67,7 @@ pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(),
         if stored >= m.version {
             continue;
         }
-        tx.execute_batch(m.sql).map_err(|e| IndexError::Migration {
+        sql::execute_batch(&tx, m.sql).map_err(|e| IndexError::Migration {
             version: m.version,
             code: e.sqlite_error_code(),
         })?;

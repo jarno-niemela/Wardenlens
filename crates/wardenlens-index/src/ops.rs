@@ -1,5 +1,6 @@
 //! [`SegmentIndex`] on SQLite.
 
+use rusqlite::types::ValueRef;
 use rusqlite::{ErrorCode, params};
 use wardenlens_core::camera::CameraId;
 use wardenlens_core::recording::SegmentRecord;
@@ -13,7 +14,7 @@ use crate::cursor::{self, Position};
 use crate::error::IndexError;
 use crate::rows::{
     MAX_DURATION_MS, MAX_ENDED_MS, MIN_ENDED_MS, decode_segment, integer, other_tier, row_id,
-    tier_code, tier_from_code,
+    segment_bytes, tier_code, tier_from_code,
 };
 use crate::{Index, sql};
 
@@ -60,26 +61,26 @@ impl SegmentIndex for Index {
             .ok_or(invalid("ended_at_ms"))?;
         let bytes = i64::try_from(record.bytes)
             .ok()
-            .filter(|b| *b > 0)
+            .filter(|b| segment_bytes(*b).is_some())
             .ok_or(invalid("bytes"))?;
         let frames = i64::try_from(record.frame_count)
             .ok()
             .filter(|f| *f > 0)
             .ok_or(invalid("frame_count"))?;
-        self.conn
-            .execute(
-                sql::INSERT,
-                params![
-                    record.camera.as_str(),
-                    started,
-                    duration,
-                    ended,
-                    bytes,
-                    frames,
-                    tier_code(tier)?
-                ],
-            )
-            .map_err(map_insert)?;
+        sql::execute(
+            &self.conn,
+            sql::INSERT,
+            params![
+                record.camera.as_str(),
+                started,
+                duration,
+                ended,
+                bytes,
+                frames,
+                tier_code(tier)?
+            ],
+        )
+        .map_err(map_insert)?;
         let raw = self.conn.last_insert_rowid();
         u64::try_from(raw)
             .map(SegmentId::new)
@@ -93,10 +94,7 @@ impl SegmentIndex for Index {
         let Some(raw) = raw_id(id) else {
             return Ok(None); // no row can have an id above i64::MAX
         };
-        let mut stmt = self
-            .conn
-            .prepare(sql::GET)
-            .map_err(IndexError::sqlite("get"))?;
+        let mut stmt = sql::prepare(&self.conn, sql::GET).map_err(IndexError::sqlite("get"))?;
         let mut rows = stmt.query([raw]).map_err(IndexError::sqlite("get"))?;
         match rows.next().map_err(IndexError::sqlite("get"))? {
             Some(row) => decode_segment(row).map(Some),
@@ -124,10 +122,7 @@ impl SegmentIndex for Index {
         if from >= to {
             return Ok(SegmentPage::new(Vec::new(), None));
         }
-        let mut stmt = self
-            .conn
-            .prepare(sql::LIST)
-            .map_err(IndexError::sqlite("list"))?;
+        let mut stmt = sql::prepare(&self.conn, sql::LIST).map_err(IndexError::sqlite("list"))?;
         // One row more than asked tells whether another page follows.
         let mut rows = stmt
             .query(params![
@@ -166,20 +161,17 @@ impl SegmentIndex for Index {
         let Some(raw) = raw_id(id) else {
             return Err(IndexError::NotFound(id.as_u64()));
         };
-        let changed = self
-            .conn
-            .execute(
-                sql::SET_TIER,
-                params![raw, tier_code(tier)?, tier_code(other_tier(tier)?)?],
-            )
-            .map_err(IndexError::sqlite("set tier"))?;
+        let changed = sql::execute(
+            &self.conn,
+            sql::SET_TIER,
+            params![raw, tier_code(tier)?, tier_code(other_tier(tier)?)?],
+        )
+        .map_err(IndexError::sqlite("set tier"))?;
         if changed == 1 {
             return Ok(());
         }
-        let mut stmt = self
-            .conn
-            .prepare(sql::TIER_OF)
-            .map_err(IndexError::sqlite("set tier"))?;
+        let mut stmt =
+            sql::prepare(&self.conn, sql::TIER_OF).map_err(IndexError::sqlite("set tier"))?;
         let mut rows = stmt.query([raw]).map_err(IndexError::sqlite("set tier"))?;
         match rows.next().map_err(IndexError::sqlite("set tier"))? {
             None => Err(IndexError::NotFound(id.as_u64())),
@@ -191,10 +183,8 @@ impl SegmentIndex for Index {
         let Some(raw) = raw_id(id) else {
             return Err(IndexError::NotFound(id.as_u64()));
         };
-        let changed = self
-            .conn
-            .execute(sql::DELETE, [raw])
-            .map_err(IndexError::sqlite("delete"))?;
+        let changed =
+            sql::execute(&self.conn, sql::DELETE, [raw]).map_err(IndexError::sqlite("delete"))?;
         if changed == 1 {
             Ok(())
         } else {
@@ -202,23 +192,33 @@ impl SegmentIndex for Index {
         }
     }
 
-    fn oldest(&self, tier: Tier, n: usize) -> Result<Vec<StoredSegment>, IndexError> {
+    fn oldest(
+        &self,
+        tier: Tier,
+        after: Option<(Timestamp, SegmentId)>,
+        n: usize,
+    ) -> Result<Vec<StoredSegment>, IndexError> {
         let n_i = check_limit(n, MAX_OLDEST)?;
-        let mut stmt = self
-            .conn
-            .prepare(sql::OLDEST)
-            .map_err(IndexError::sqlite("oldest"))?;
+        // The key of the row to continue after; `(MIN, 0)` is before every row.
+        let (after_end, after_id) = match after {
+            None => (i64::MIN, 0),
+            // An id above i64::MAX names no row: everything sorts before it.
+            Some((ended, id)) => match raw_id(id) {
+                Some(raw) => (ended.as_unix_millis(), raw),
+                None => return Ok(Vec::new()),
+            },
+        };
+        let mut stmt =
+            sql::prepare(&self.conn, sql::OLDEST).map_err(IndexError::sqlite("oldest"))?;
         let mut rows = stmt
-            .query(params![tier_code(tier)?, n_i])
+            .query(params![tier_code(tier)?, after_end, after_id, n_i])
             .map_err(IndexError::sqlite("oldest"))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(IndexError::sqlite("oldest"))? {
             let (raw, id) = row_id(row)?;
             let stored_tier = tier_from_code(integer(row, 1, raw, "tier")?, raw)?;
-            let bytes = u64::try_from(integer(row, 2, raw, "bytes")?)
-                .ok()
-                .filter(|b| *b > 0)
-                .ok_or(IndexError::CorruptRow {
+            let bytes =
+                segment_bytes(integer(row, 2, raw, "bytes")?).ok_or(IndexError::CorruptRow {
                     id: raw,
                     field: "bytes",
                 })?;
@@ -240,9 +240,7 @@ impl SegmentIndex for Index {
     }
 
     fn bytes_by_tier(&self) -> Result<TierTotals, IndexError> {
-        let mut stmt = self
-            .conn
-            .prepare(sql::BYTES_BY_TIER)
+        let mut stmt = sql::prepare(&self.conn, sql::BYTES_BY_TIER)
             .map_err(IndexError::sqlite("bytes by tier"))?;
         let mut rows = stmt
             .query([])
@@ -250,46 +248,48 @@ impl SegmentIndex for Index {
         let mut totals = TierTotals::default();
         while let Some(row) = rows.next().map_err(IndexError::sqlite("bytes by tier"))? {
             let tier = tier_from_code(integer(row, 0, 0, "tier")?, 0)?;
+            let corrupt = |field| IndexError::CorruptRow { id: 0, field };
+            let sum = u64::try_from(integer(row, 1, 0, "bytes")?).map_err(|_| corrupt("bytes"))?;
+            let segments =
+                u64::try_from(integer(row, 2, 0, "count")?).map_err(|_| corrupt("count"))?;
+            // The smallest and largest row must each be a valid size: a stored zero, a negative
+            // or an oversized value hides inside a sum that still looks plausible.
+            let smallest = integer(row, 3, 0, "bytes")?;
+            let largest = integer(row, 4, 0, "bytes")?;
+            if segment_bytes(smallest).is_none() || segment_bytes(largest).is_none() {
+                return Err(corrupt("bytes"));
+            }
             let usage = TierUsage {
-                bytes: u64::try_from(integer(row, 1, 0, "bytes")?).map_err(|_| {
-                    IndexError::CorruptRow {
-                        id: 0,
-                        field: "bytes",
-                    }
-                })?,
-                segments: u64::try_from(integer(row, 2, 0, "count")?).map_err(|_| {
-                    IndexError::CorruptRow {
-                        id: 0,
-                        field: "count",
-                    }
-                })?,
+                bytes: sum,
+                segments,
             };
             match tier {
                 Tier::Hot => totals.hot = usage,
                 Tier::Archive => totals.archive = usage,
-                _ => {
-                    return Err(IndexError::CorruptRow {
-                        id: 0,
-                        field: "tier",
-                    });
-                }
+                _ => return Err(corrupt("tier")),
             }
         }
         Ok(totals)
     }
 
     fn latest_started_at(&self, camera: &CameraId) -> Result<Option<UnixMs>, IndexError> {
-        let value: Option<i64> = self
-            .conn
-            .query_row(sql::LATEST_START, [camera.as_str()], |r| r.get(0))
-            .map_err(IndexError::sqlite("latest start"))?;
-        value
-            .map(|ms| {
-                UnixMs::new(ms).map_err(|_| IndexError::CorruptRow {
-                    id: 0,
-                    field: "started_at_ms",
-                })
+        let corrupt = IndexError::CorruptRow {
+            id: 0,
+            field: "started_at_ms",
+        };
+        // The storage class is checked by hand: a wrong type is a corrupt row, not a driver error.
+        let value = sql::query_row(&self.conn, sql::LATEST_START, [camera.as_str()], |r| {
+            Ok(match r.get_ref(0)? {
+                ValueRef::Null => Some(None),
+                ValueRef::Integer(i) => Some(Some(i)),
+                _ => None,
             })
-            .transpose()
+        })
+        .map_err(IndexError::sqlite("latest start"))?;
+        match value {
+            Some(None) => Ok(None),
+            Some(Some(ms)) => UnixMs::new(ms).map(Some).map_err(|_| corrupt),
+            None => Err(corrupt),
+        }
     }
 }

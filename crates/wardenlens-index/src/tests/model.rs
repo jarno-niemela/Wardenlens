@@ -83,7 +83,7 @@ impl SegmentIndex for Model {
 
     fn insert(&mut self, record: &SegmentRecord, tier: Tier) -> Result<SegmentId, ModelError> {
         let ok = (1..=600_000).contains(&record.duration_ms)
-            && (1..=i64::MAX as u64).contains(&record.bytes)
+            && (1..=wardenlens_core::storage::MAX_SEGMENT_BYTES).contains(&record.bytes)
             && (1..=i64::MAX as u64).contains(&record.frame_count);
         if !ok {
             return err(Kind::InvalidRecord);
@@ -179,13 +179,21 @@ impl SegmentIndex for Model {
         }
     }
 
-    fn oldest(&self, tier: Tier, n: usize) -> Result<Vec<StoredSegment>, ModelError> {
+    fn oldest(
+        &self,
+        tier: Tier,
+        after: Option<(Timestamp, SegmentId)>,
+        n: usize,
+    ) -> Result<Vec<StoredSegment>, ModelError> {
         if n == 0 || n > MAX_OLDEST {
             return err(Kind::InvalidLimit);
         }
         let mut v: Vec<&IndexedSegment> = self.rows.iter().filter(|r| r.tier == tier).collect();
         v.sort_by_key(|r| (ended(&r.record), r.id));
         Ok(v.into_iter()
+            .filter(|r| {
+                after.is_none_or(|(t, id)| (ended(&r.record), r.id) > (t.as_unix_millis(), id))
+            })
             .take(n)
             .map(|r| StoredSegment {
                 id: r.id,

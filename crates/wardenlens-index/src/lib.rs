@@ -1,9 +1,10 @@
 //! The SQLite index of recorded segments (ADR 0005 section 5; ticket #49).
 //!
 //! [`Index`] is one SQLite file in WAL mode with `synchronous = FULL`, opened only through the
-//! checked sequence in `open`: our own `O_NOFOLLOW` descriptor, a header-only identity check
-//! (`application_id`, journal mode, sidecars) before SQLite writes anything, then
-//! `SQLITE_OPEN_NOFOLLOW` and a device and inode comparison. The schema is versioned with
+//! checked sequence in `open`: a private parent directory, our own `O_NOFOLLOW` descriptor, every
+//! sidecar checked for kind, owner and mode, and the identity of the file and of its `-wal` proven
+//! read-only (header, an immutable open or a private copy) before any read-write connection exists,
+//! then `SQLITE_OPEN_NOFOLLOW` and a device and inode comparison. The schema is versioned with
 //! `PRAGMA user_version`; an older file is migrated step by step, a newer one is refused and left
 //! untouched. [`Index`] implements the core port [`wardenlens_core::storage::SegmentIndex`].
 //!
@@ -40,6 +41,14 @@ pub struct Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Index { .. }")
+    }
+}
+
+/// The directory that holds `path` (`.` for a bare file name).
+pub(crate) fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
     }
 }
 

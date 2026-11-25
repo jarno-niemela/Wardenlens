@@ -132,7 +132,7 @@ fn create_new(path: &Path) -> Result<rustix::fd::OwnedFd, Errno> {
     )
 }
 
-fn check_stat(st: &Stat) -> Result<(), FsError> {
+pub(crate) fn check_stat(st: &Stat) -> Result<(), FsError> {
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
         return Err(FsError::NotRegular);
     }

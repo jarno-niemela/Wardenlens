@@ -47,20 +47,48 @@ pub enum IndexError {
         /// The sidecar suffix.
         suffix: &'static str,
     },
-    /// A sidecar sits next to an empty database file: it belongs to something else and SQLite
-    /// would delete or replay it on first open. Nothing was modified.
-    #[error("sidecar {suffix} exists next to an empty database")]
+    /// A sidecar is owned by another user or grants group or other access. SQLite would replay
+    /// or roll back whatever it holds into the index, so it is never trusted.
+    #[error("sidecar {suffix} is not owned by the current user or is accessible to others")]
+    InsecureSidecar {
+        /// The sidecar suffix.
+        suffix: &'static str,
+    },
+    /// A sidecar exists that cannot belong to this database in its state: any sidecar next to an
+    /// empty file, a `-wal` or `-shm` next to a rollback-mode file, or an empty `-journal`.
+    /// Nothing was modified. If it is not another program's, remove it: an index holds no
+    /// unrecoverable data in a sidecar that does not match its mode.
+    #[error(
+        "sidecar {suffix} does not belong to this database; nothing was modified (remove it if it is not another program's)"
+    )]
     StraySidecar {
         /// The sidecar suffix.
         suffix: &'static str,
     },
-    /// The database is in rollback-journal mode and has a non-empty `-journal`: a write was
-    /// interrupted (the only such window is the first creation of the file) or the file is
-    /// somebody else's. Nothing was modified. Do not delete the journal on a guess: it may hold
-    /// the data needed to roll a database back. The index can be rebuilt from the recordings
-    /// (ADR 0005 section 9), so when no other process runs, the owner may remove `index.db*`.
-    #[error("database has an unfinished rollback journal; nothing was modified")]
+    /// A non-empty `-journal` next to the index. An index in WAL mode never writes a rollback
+    /// journal, so this is either left by an interrupted creation (the file is in rollback mode
+    /// only before the first row exists) or not ours. Nothing was modified and nothing was
+    /// replayed. Decision (ADR 0005 section 5): no private-copy identification of a creation
+    /// window; deleting the `-journal` is safe, because an index holding recordings data never
+    /// has one, and the empty file that is left is adopted again.
+    #[error(
+        "unfinished -journal next to the index; nothing was modified; delete the -journal file (an index with data never has one)"
+    )]
     PendingJournal,
+    /// The `-wal` next to the index is not this index's: a wrong header, another page size, or
+    /// replaying it onto the index gives a database that is not an index of ours. Nothing was
+    /// modified. If it is not another program's, remove it (frames not yet checkpointed are lost).
+    #[error("the -wal file does not belong to this index; nothing was modified")]
+    ForeignWal,
+    /// The schema (every `sqlite_master` row) is not the one of its `user_version`.
+    #[error("index schema differs from its version")]
+    UnexpectedSchema,
+    /// The database failed an integrity check or SQLite reports it corrupt. Nothing was modified.
+    #[error("index file is damaged")]
+    Damaged,
+    /// The file or its `-wal` is larger than the identification copy allows.
+    #[error("index file is too large to verify")]
+    TooLargeToProbe,
     /// The file was written by a newer build.
     #[error("index schema version {found} is newer than the supported {supported}")]
     SchemaTooNew {

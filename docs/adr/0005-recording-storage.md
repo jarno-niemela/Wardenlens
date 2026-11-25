@@ -268,6 +268,23 @@ the device and inode compared; a symlink or a wrong owner is refused. Pragmas on
 checked on open, so a foreign SQLite file is refused. One writer and the rest readers (WAL): the cli keeps one write
 connection and a small number of read connections.
 
+**Sidecars and identity (#49 round 2, defect pattern P3).** SQLite replays a hot `-journal` and a `-wal` on the first
+read and checkpoints when the last connection closes, so **no read-write connection is opened on `index.db` until its
+identity and every sidecar are proven by means no sidecar can influence**: the parent directory is ours and not group- or
+world-writable (`fsutil::check_parent`, shared with the vault); each `-wal`, `-shm` and `-journal` is `lstat`ed and must
+be a regular file owned by the service user with no group or other bit; the 100-byte header is read through our own
+descriptor (magic, `application_id`, journal mode); the settled state (`application_id`, `user_version`, exactly the
+`sqlite_master` objects of that version, `quick_check`) is judged read-only, by an `immutable=1` open when there is no
+`-wal`, and otherwise on a **private copy** of the main file and the `-wal` in a `0700` scratch directory (the vault's
+rolled-back-copy technique, helpers in `fsutil`). Rules by sidecar: a `-journal` is refused in every state, because an
+index in WAL mode never writes one and a rollback-mode index exists only during creation, before any row (a non-empty one
+is `PendingJournal`, an empty one `StraySidecar`; **deleting it is safe**, and the index is recreated or adopted again);
+a `-wal` or `-shm` next to a rollback-mode or empty file is refused; a `-wal` must have a WAL header of the main file's page
+size and must replay, on the copy, to a database that is still ours (`ForeignWal` otherwise). A `-wal` copied from another
+copy of this index by the same user is accepted: that needs the privileges to edit the index itself. A too-new
+`user_version` is refused from the same read-only view, so the file and its sidecars stay byte-identical. The creation-window
+`-journal` is **not** identified on a private copy: refusing it with a remedy that loses nothing is simpler and safe.
+
 **Migration scheme: `PRAGMA user_version`, migrations written in-house** as an ordered array of SQL scripts compiled in
 with `include_str!`. `Index::open` runs, under `BEGIN IMMEDIATE`, every script with a number above the stored
 `user_version`, each followed by `PRAGMA user_version = <n>` **in the same transaction** (verified in the probe), then
@@ -312,9 +329,12 @@ Queries (every one parameterised, no SQL built from data; `EXPLAIN QUERY PLAN` o
   `CHECK` bound on duration (the real maximum is 120 s), so the overlap test is exact. The cursor is the last row's
   `(started_at_ms, id)`, stable under inserts and deletes. A listing across cameras would need a second index
   `(started_at_ms, id)`, added when the API needs it.
-- `oldest(tier, n)`: `WHERE tier = ?1 ORDER BY ended_at_ms, id LIMIT ?2`. Plan: `SEARCH ... USING INDEX
-  segments_tier_end (tier=?)`, no temporary sort.
-- `bytes_by_tier()`: `SELECT tier, SUM(bytes), COUNT(*) FROM segments GROUP BY tier`. Plan: `SCAN ... USING COVERING
+- `oldest(tier, after, n)`: `WHERE tier = ?1 AND (ended_at_ms, id) > (?2, ?3) ORDER BY ended_at_ms, id LIMIT ?4`: a keyset
+  continuation (`after` is the `(ended_at, id)` of the last row of the previous page), so a caller pages through a whole
+  tier. `n` is bounded by a memory limit (`MAX_OLDEST` = 10,000 rows), not by a number of cameras. Plan: `SEARCH ... USING
+  INDEX segments_tier_end (tier=? AND ended_at_ms>?)`, no temporary sort.
+- `bytes_by_tier()`: `SELECT tier, SUM(bytes), COUNT(*), MIN(bytes), MAX(bytes) FROM segments GROUP BY tier` (each `bytes` is 1 to
+  `MAX_SEGMENT_BYTES` = 64 GiB, checked on insert and on read, so the sum cannot overflow below 2^27 rows). Plan: `SCAN ... USING COVERING
   INDEX segments_tier_end`. Rows stay bounded by disk size (about 56,000 for the 7.8 days in section 10).
 - `set_tier(id, tier)`: `UPDATE segments SET tier = ?2 WHERE id = ?1 AND tier = ?3`, which must change exactly one row.
   It takes **no path** (this overrides #49's `set_tier(id, tier, rel_path)`).
