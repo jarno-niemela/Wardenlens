@@ -3,9 +3,9 @@
 use std::net::IpAddr;
 
 use secrecy::zeroize::Zeroizing;
-use wardenlens_core::camera::{CameraError, DisplayName, Host};
+use wardenlens_core::camera::{CameraError, Credential, CredentialRule, DisplayName, Host};
 use wardenlens_core::entry::EntryKind;
-use wardenlens_core::text::is_dropped_invisible;
+use wardenlens_core::text::normalise_display_name;
 
 use crate::error::VaultError;
 use crate::store::MAX_VALUE_LEN;
@@ -26,18 +26,14 @@ pub(crate) fn check_len(kind: EntryKind, text: &str) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// Validates a credential pair (lengths and NUL only; the password is never inspected further).
+/// Validates a credential pair with core's one rule, [`Credential::check`].
 pub(crate) fn check_credential(username: &str, password: &str) -> Result<(), VaultError> {
     let kind = EntryKind::Credential;
-    check_len(kind, username)?;
-    check_len(kind, password)?;
-    if username.is_empty() {
-        return Err(invalid(kind, "username is empty"));
-    }
-    if username.contains('\0') || password.contains('\0') {
-        return Err(invalid(kind, "contains a NUL character"));
-    }
-    Ok(())
+    Credential::check(username, password).map_err(|rule| match rule {
+        CredentialRule::TooLong => VaultError::ValueTooLarge { kind },
+        CredentialRule::UserEmpty => invalid(kind, "username is empty"),
+        _ => invalid(kind, "contains a NUL character"),
+    })
 }
 
 /// Validates a text value for `kind` and returns the normalised form to store. Every
@@ -105,20 +101,7 @@ fn host_rule(e: CameraError) -> &'static str {
 /// ends are trimmed. A hand-written name with an NBSP or a narrow NBSP therefore stays usable
 /// and is stored in the one plain-space form the scanner looks for.
 pub(crate) fn display_name_text(raw: &str) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::with_capacity(raw.len()));
-    let mut pending_space = false;
-    for c in raw.chars() {
-        if c.is_whitespace() {
-            pending_space = true;
-        } else if !is_dropped_invisible(c) {
-            if pending_space && !out.is_empty() {
-                out.push(' ');
-            }
-            pending_space = false;
-            out.push(c);
-        }
-    }
-    out
+    Zeroizing::new(normalise_display_name(raw))
 }
 
 /// The display-name rule: whitespace and invisible characters are normalised
@@ -421,6 +404,14 @@ mod tests {
         // 1366 three-byte chars = 4098 bytes.
         assert!(n(EntryKind::Other, &"\u{20ac}".repeat(1366)).is_err());
         assert!(n(EntryKind::Other, &"\u{20ac}".repeat(1365)).is_ok());
+    }
+
+    #[test]
+    fn core_and_vault_agree_on_the_credential_length_limit() {
+        assert_eq!(
+            wardenlens_core::camera::MAX_CREDENTIAL_PART_LEN,
+            MAX_VALUE_LEN
+        );
     }
 
     #[test]
