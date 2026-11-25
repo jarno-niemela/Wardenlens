@@ -301,6 +301,12 @@ These bind the controller; `/work` gives the details.
   verification round. (A verified head is not re-verified only because `main` moved later.)
 - **Kept adversary tests** go into the branch only when they live under `crates/*/tests/**` or
   `scripts/tests/**` (carryable) and do not depend on timing; others go to the follow-up ticket.
+- **Verdicts before carry:** record all three verifier verdicts (`verify mark`) before any `verify carry`; if
+  `carry` still reports fewer than 3, run `verify check` and mark the missing one on the verified SHA (only from a complete verifier report), then re-run `verify carry PR SHA`.
+- **Scope split at round 1:** a fix brief that would widen a ticket into another crate becomes its own ticket.
+- **Rework separate from merges:** commit rework apart from the merge of `main`.
+- **Scratch git:** experiments use `git -C <absolute temp path>`, never `cd`; say so in every implementer brief.
+- **CI shellcheck:** before every push, run gate, then CI's exact `run: shellcheck …` line (no `-x`), then push, chained with `&&`.
 - **Real devices and site data:** spikes are read-only towards cameras; a write needs the owner's approval
   for that one change, with the old value recorded and reverted. Inventory ids only, never addresses,
   credentials, serials or display names, in the repo or in a brief.
