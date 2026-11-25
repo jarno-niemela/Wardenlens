@@ -53,10 +53,10 @@ fn render(r: &Result<crate::Import, ImportError>) -> String {
     out
 }
 
-/// A camera with a plain name (a camera id is derived from the name and is not sensitive) and
-/// sentinel login fields.
+/// A camera whose name is a sentinel too: no id, `Debug` or error may show it (an id is opaque,
+/// ADR 0006), plus sentinel login fields.
 fn sentinel_cam(source: &str) -> Cam {
-    Cam::new("Camera", source).login(USER, PW)
+    Cam::new(NAME, source).login(USER, PW)
 }
 
 fn url(userinfo: &str, host: &str, tail: &str) -> String {
@@ -66,9 +66,8 @@ fn url(userinfo: &str, host: &str, tail: &str) -> String {
 #[test]
 #[expect(clippy::too_many_lines, reason = "a data table of cases")]
 fn every_import_error_variant_is_produced_and_clean() {
-    let mut ok_cam = sentinel_cam(&url(&format!("{USER}:{PW}@"), HOST, &format!("/{PATH}")));
-    ok_cam.name = Some(NAME.to_owned());
-    let good = doc(&[ok_cam.clone()]);
+    let ok_cam = sentinel_cam(&url(&format!("{USER}:{PW}@"), HOST, &format!("/{PATH}")));
+    let good = doc(std::slice::from_ref(&ok_cam));
     let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
     let mut too_large = good.clone().into_bytes();
     too_large.resize(MAX_INPUT_BYTES + 1, b' ');
@@ -128,7 +127,10 @@ fn every_import_error_variant_is_produced_and_clean() {
         ImportError::TooDeep,
         ImportError::TooManyCameras,
         ImportError::NotObjects,
-        ImportError::DuplicateName,
+        ImportError::DuplicateName {
+            first: 0,
+            second: 1,
+        },
     ];
     for v in variants {
         match v {
@@ -140,7 +142,7 @@ fn every_import_error_variant_is_produced_and_clean() {
             | ImportError::TooDeep
             | ImportError::TooManyCameras
             | ImportError::NotObjects
-            | ImportError::DuplicateName => {}
+            | ImportError::DuplicateName { .. } => {}
         }
         assert!(
             seen.contains(&std::mem::discriminant(&v)),
@@ -177,7 +179,19 @@ fn skip_case(reason: SkipReason) -> Cam {
         SkipReason::CredentialInPath => {
             c.source = Some(url("", HOST, &format!("/user={USER}&password={PW}")));
         }
-        SkipReason::InvalidCredential => c.password = Some(format!("{PW}\u{7f}")),
+        SkipReason::InvalidCredential => {
+            c.source = Some(url("", HOST, &format!("/{PATH}")));
+            c.password = Some(format!("{PW}\u{7f}"));
+        }
+        SkipReason::CredentialWithoutUser => {
+            c.source = Some(url("", HOST, &format!("/{PATH}")));
+            c.login = None;
+        }
+        SkipReason::ConflictingCredential => {
+            c.source = Some(url(&format!("{USER}x:{PW}x@"), HOST, &format!("/{PATH}")));
+        }
+        // Cannot be produced: the id is `agentdvr-` and digits (pinned in `identity`).
+        SkipReason::IdRefused => {}
     }
     c
 }
@@ -185,6 +199,10 @@ fn skip_case(reason: SkipReason) -> Cam {
 #[test]
 fn every_skip_reason_is_produced_and_clean() {
     for reason in ALL_SKIPS {
+        if reason == SkipReason::IdRefused {
+            assert_clean(&reason.to_string(), "skip display");
+            continue;
+        }
         let cam = skip_case(reason);
         let r = if reason == SkipReason::RepeatedElement {
             let xml = doc(&[cam]).replace(
@@ -284,14 +302,14 @@ fn no_userinfo_spelling_and_no_failure_leaks() {
 #[test]
 fn draft_debug_shows_no_host_path_name_or_credential() {
     let cam = Cam::new(
-        "Plain Name",
+        NAME,
         &url(&format!("{USER}:{PW}@"), HOST, &format!("/{PATH}")),
     );
     let i = parse(doc(&[cam]).as_bytes()).expect("parses");
     assert_eq!(i.cameras.len(), 1);
     let shown = render(&Ok(i));
     assert_clean(&shown, "draft");
-    assert!(!shown.contains("Plain Name"));
+    assert!(!shown.contains(NAME));
 }
 
 #[test]

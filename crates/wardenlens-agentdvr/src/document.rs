@@ -11,14 +11,14 @@ use std::borrow::Cow;
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
-use secrecy::SecretString;
+use secrecy::zeroize::Zeroizing;
 
 use crate::{ImportError, MAX_CAMERAS, MAX_DEPTH, MAX_FIELD_BYTES};
 
 /// One text field of `settings`, with what is needed to tell a repeat or an over-long value.
 #[derive(Default)]
 pub(crate) struct Slot {
-    pub text: Option<String>,
+    pub text: Option<Zeroizing<String>>,
     pub count: u8,
     pub too_long: bool,
 }
@@ -34,13 +34,6 @@ pub(crate) struct RawCamera {
     pub source: Slot,
     pub login: Slot,
     pub password: Slot,
-}
-
-impl RawCamera {
-    /// The password as a secret, taken out of the slot.
-    pub(crate) fn take_password(&mut self) -> Option<SecretString> {
-        self.password.text.take().map(SecretString::from)
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,7 +75,7 @@ struct Walker {
     stack: Vec<Node>,
     cameras: Vec<RawCamera>,
     camera_count: usize,
-    text: String,
+    text: Zeroizing<String>,
     text_too_long: bool,
     root_seen: bool,
     root_done: bool,
@@ -94,7 +87,7 @@ impl Walker {
             stack: Vec::new(),
             cameras: Vec::new(),
             camera_count: 0,
-            text: String::new(),
+            text: Zeroizing::default(),
             text_too_long: false,
             root_seen: false,
             root_done: false,
@@ -172,7 +165,7 @@ impl Walker {
                     let slot = slot_of(c, f);
                     slot.count = slot.count.saturating_add(1);
                 }
-                self.text.clear();
+                self.text = Zeroizing::default();
                 self.text_too_long = false;
             }
             _ => {}
@@ -245,6 +238,7 @@ pub(crate) fn read(text: &str) -> Result<Vec<RawCamera>, ImportError> {
     let mut reader = Reader::from_str(text);
     reader.config_mut().expand_empty_elements = true;
     let mut w = Walker::new();
+    let mut at_start = true;
     loop {
         let malformed = |r: &Reader<&[u8]>| ImportError::Malformed {
             position: r.error_position(),
@@ -252,6 +246,9 @@ pub(crate) fn read(text: &str) -> Result<Vec<RawCamera>, ImportError> {
         let Ok(event) = reader.read_event() else {
             return Err(malformed(&reader));
         };
+        let was_at_start = at_start;
+        at_start = at_start && matches!(event, Event::Text(_));
+        let at_start_for_event = was_at_start;
         match event {
             Event::Start(e) => match w.start(&e) {
                 Ok(Ok(())) => {}
@@ -288,6 +285,11 @@ pub(crate) fn read(text: &str) -> Result<Vec<RawCamera>, ImportError> {
                 }
             }
             Event::Decl(d) => {
+                // Only as the first thing in the document (white space may precede it here);
+                // a second or a mid-document declaration is malformed, never an encoding error.
+                if !at_start_for_event {
+                    return Err(malformed(&reader));
+                }
                 if let Some(enc) = d.encoding() {
                     match enc {
                         Ok(v) if v.eq_ignore_ascii_case("utf-8") => {}

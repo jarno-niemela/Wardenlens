@@ -223,7 +223,7 @@ fn rows() -> Vec<(String, Want)> {
         ),
         (
             "rtsp://:secret@192.0.2.10/s".into(),
-            ok("192.0.2.10", 554, "/s", Some(("", "secret"))),
+            Want::Skip(S::CredentialWithoutUser),
         ),
         (
             "rtsp://:@192.0.2.10/s".into(),
@@ -255,7 +255,7 @@ fn rows() -> Vec<(String, Want)> {
         ),
         (
             "rtsp://a%3Ab:secret@192.0.2.10/s".into(),
-            ok("192.0.2.10", 554, "/s", Some(("a:b", "secret"))),
+            Want::Skip(S::InvalidCredential),
         ),
         (
             "rtsp://a:b:c@192.0.2.10/s".into(),
@@ -468,6 +468,7 @@ fn every_source_form_is_imported_or_skipped_as_listed() {
         S::InvalidPath,
         S::CredentialInPath,
         S::InvalidCredential,
+        S::CredentialWithoutUser,
     ] {
         assert!(seen.contains(&reason), "no source row for {reason:?}");
     }

@@ -35,7 +35,8 @@
 //!    schema is public; `AgentDVR`'s own format is not documented separately.
 //! 2. That `login` and `password` hold plaintext. iSpy could store an encrypted password in some
 //!    versions; an encrypted value would be imported as if it were the password.
-//! 3. Which source wins when the URL has userinfo and the login fields differ (decided below).
+//! 3. Whether login fields and URL userinfo ever both appear, and with what values (a mismatch
+//!    is skipped, see below).
 //! 4. That a source of kind "local device" or "ONVIF only" has no `rtsp://` URL in
 //!    `videosourcestring` (such entries are skipped, see [`SkipReason`]).
 //!
@@ -56,23 +57,29 @@
 //!   query are passed unchanged to core's [`RtspPath`], which refuses `%`, `@`, `#`, dot
 //!   segments, any character outside its pass-list and credential parameters. A source with a
 //!   control character is skipped before anything else.
-//! - **Credentials.** If `login` or `password` is non-empty, they are the credential and the URL
-//!   userinfo is ignored (the explicit fields win over the URL when both are present and differ;
-//!   no mixing of the two). Otherwise the URL userinfo is used when its user or password is
-//!   non-empty (`rtsp://:@host` has none). An empty password is kept as empty. A user or password
-//!   with a control character is skipped ([`SkipReason::InvalidCredential`]): such a value could
-//!   inject RTSP headers.
+//! - **Credentials.** From the `login` and `password` fields and the URL userinfo. A login that
+//!   is empty or only white space is no user. If only one source has a credential, that one is
+//!   used. If both do, they must be the same pair (the URL's percent-decoded, and decoded only
+//!   then); otherwise the camera is skipped as [`SkipReason::ConflictingCredential`]: nothing is
+//!   chosen, merged or dropped, so a password is never replaced by an empty one. The pair must
+//!   pass core's storable-login rule (`Credential::check`, the vault's own): a password with no
+//!   user is [`SkipReason::CredentialWithoutUser`]; a control character (RTSP header injection),
+//!   invalid UTF-8 after decoding, or a `:` in the user (ambiguous under Basic authentication)
+//!   is [`SkipReason::InvalidCredential`]. An empty password with a user is kept. `rtsp://:@host`
+//!   has no userinfo.
 //! - **Credentials in the path** (the Xiongmai `/user=..&password=..` form): the camera is
 //!   skipped with [`SkipReason::CredentialInPath`]; the path is never imported, because moving
 //!   the credential out of it would be a heuristic.
-//! - **Identity.** The name is normalised exactly as the vault normalises a display name (every
-//!   white-space char becomes one space, runs collapse, invisible characters are dropped, ends
-//!   trimmed) and then validated by [`DisplayName::new`]. Two imported cameras whose normalised
-//!   names are equal (case-sensitive, as in the vault's legacy import) fail the import with
-//!   [`ImportError::DuplicateName`]; they are never merged. The [`CameraId`] slug is the ASCII
-//!   lower-case alphanumerics of the name with other runs as one `-`, prefixed `cam-` when it
-//!   does not start with a letter and `cam` when empty, at most 28 bytes; a slug already used
-//!   gets `-2`, `-3`, ... in document order among imported cameras (skipped entries take no id).
+//! - **Identity.** The name is normalised by core's `text::normalise_display_name` (the vault's
+//!   own function: white space becomes single spaces, invisible characters are dropped, ends
+//!   trimmed) and validated by [`DisplayName::new`]. Two imported cameras whose normalised names
+//!   are equal (case-sensitive, as in the vault's legacy import) fail the import with
+//!   [`ImportError::DuplicateName`], naming their positions; they are never merged. The
+//!   [`CameraId`] is **not derived from the name** or any other value (ADR 0006 section 1: ids
+//!   are opaque and non-sensitive; a name in an id would reach logs, vault entry ids and
+//!   recording paths): `agentdvr-<n>` with `n` `AgentDVR`'s numeric `id` attribute when it is
+//!   present and not used by an earlier imported camera, else `agentdvr-pos-<p>` with `p` the
+//!   position of the `camera` element. Stable across runs, unique, no search.
 //!
 //! # Limits and hostile input
 //!
@@ -90,6 +97,7 @@
 //! [`RtspPath`]: wardenlens_core::camera::RtspPath
 //! [`Credential`]: wardenlens_core::camera::Credential
 
+mod credential;
 mod document;
 mod error;
 mod identity;
@@ -98,11 +106,11 @@ mod source;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 
-use secrecy::{ExposeSecret, SecretString};
 use wardenlens_core::camera::{CameraId, Credential, DisplayName, Host, RtspPath};
+use wardenlens_core::text::normalise_display_name;
 
 pub use error::{ImportError, SkipReason};
 
@@ -171,35 +179,45 @@ pub fn parse(input: &[u8]) -> Result<Import, ImportError> {
     let raws = document::read(text)?;
     let mut import = Import::default();
     let mut ids = identity::IdAllocator::default();
-    let mut names = BTreeSet::new();
+    // Normalised name to the position of the camera that has it.
+    let mut names: BTreeMap<String, usize> = BTreeMap::new();
     for raw in raws {
         let (position, agent_id) = (raw.position, raw.agent_id);
-        match build(raw) {
-            Ok(p) => {
-                // One name, one camera: never merged, never first-wins (#43, ADR 0006).
-                if !names.insert(p.name.expose().to_owned()) {
-                    return Err(ImportError::DuplicateName);
-                }
-                match ids.allocate(p.name.expose()) {
-                    Ok(id) => import.cameras.push(CameraDraft {
-                        id,
-                        name: p.name,
-                        host: p.host,
-                        port: p.port,
-                        path: p.path,
-                        credential: p.credential,
-                    }),
-                    Err(_) => import.skipped.push(Skipped {
-                        position,
-                        agent_id,
-                        reason: SkipReason::NameRefused,
-                    }),
-                }
+        let pending = match build(raw) {
+            Ok(p) => p,
+            Err(reason) => {
+                import.skipped.push(Skipped {
+                    position,
+                    agent_id,
+                    reason,
+                });
+                continue;
             }
-            Err(reason) => import.skipped.push(Skipped {
+        };
+        // One name, one camera: never merged, never first-wins (#43, ADR 0006).
+        if let Some(&first) = names.get(pending.name.expose()) {
+            return Err(ImportError::DuplicateName {
+                first,
+                second: position,
+            });
+        }
+        // The name is reserved only once the camera is really imported.
+        match ids.allocate(position, agent_id) {
+            Ok(id) => {
+                names.insert(pending.name.expose().to_owned(), position);
+                import.cameras.push(CameraDraft {
+                    id,
+                    name: pending.name,
+                    host: pending.host,
+                    port: pending.port,
+                    path: pending.path,
+                    credential: pending.credential,
+                });
+            }
+            Err(_) => import.skipped.push(Skipped {
                 position,
                 agent_id,
-                reason,
+                reason: SkipReason::IdRefused,
             }),
         }
     }
@@ -228,11 +246,15 @@ fn build(mut raw: document::RawCamera) -> Result<Pending, SkipReason> {
         return Err(SkipReason::FieldTooLong);
     }
     let name = raw.name.take().ok_or(SkipReason::MissingName)?;
-    let normalised = identity::normalise_name(&name);
+    let normalised = normalise_display_name(&name);
     let name = DisplayName::new(&normalised).map_err(|_| SkipReason::NameRefused)?;
     let source = raw.source.text.take().unwrap_or_default();
     let parts = source::split(&source)?;
-    let credential = credential_of(&mut raw, parts.userinfo)?;
+    let credential = credential::choose(
+        raw.login.text.take(),
+        raw.password.text.take(),
+        parts.userinfo.as_ref(),
+    )?;
     Ok(Pending {
         name,
         host: parts.host,
@@ -240,25 +262,4 @@ fn build(mut raw: document::RawCamera) -> Result<Pending, SkipReason> {
         path: parts.path,
         credential,
     })
-}
-
-/// The login fields win when either is non-empty; otherwise the URL userinfo. Never mixed.
-fn credential_of(
-    raw: &mut document::RawCamera,
-    userinfo: Option<(String, SecretString)>,
-) -> Result<Option<Credential>, SkipReason> {
-    let login = raw.login.text.take().unwrap_or_default();
-    let password = raw.take_password();
-    let password_empty = password
-        .as_ref()
-        .is_none_or(|p| p.expose_secret().is_empty());
-    if login.is_empty() && password_empty {
-        return Ok(userinfo.map(|(user, password)| Credential::new(user, password)));
-    }
-    let password = password.unwrap_or_else(|| SecretString::from(String::new()));
-    if login.chars().any(char::is_control) || password.expose_secret().chars().any(char::is_control)
-    {
-        return Err(SkipReason::InvalidCredential);
-    }
-    Ok(Some(Credential::new(login, password)))
 }

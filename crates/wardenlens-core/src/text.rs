@@ -50,8 +50,48 @@ pub fn is_dropped_invisible(c: char) -> bool {
     is_invisible(c) && !c.is_whitespace()
 }
 
+/// A display name as it is stored (ADR 0006 section 1): every `char::is_whitespace` character
+/// becomes U+0020, a run of them is one space, invisible characters
+/// ([`is_dropped_invisible`]) are dropped and the ends are trimmed. The result is not validated:
+/// pass it to `camera::DisplayName::new`. This is the one normaliser: the vault and the
+/// `AgentDVR` importer both call it, so a name in a file and a stored name reduce to the same
+/// text. The output is allocated once at the input's length (no regrowth), so a caller that
+/// wraps it in `Zeroizing` leaves no stray copy.
+#[must_use]
+pub fn normalise_display_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+        } else if !is_dropped_invisible(c) {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::normalise_display_name;
+
+    #[test]
+    fn normalise_display_name_table() {
+        for (raw, want) in [
+            ("Front Door", "Front Door"),
+            ("  Front\t\u{a0}Door\u{200b}\n Cam ", "Front Door Cam"),
+            ("a\u{2028}b", "a b"),
+            ("F\u{feff}r\u{200d}ont", "Front"),
+            ("\u{200b}\u{a0}", ""),
+            ("", ""),
+        ] {
+            assert_eq!(normalise_display_name(raw), want, "{raw:?}");
+        }
+    }
     use super::{is_dropped_invisible, is_invisible};
 
     #[test]

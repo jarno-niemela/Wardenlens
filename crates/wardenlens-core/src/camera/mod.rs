@@ -25,7 +25,7 @@ mod name;
 mod path;
 
 pub use crate::catalogue::StreamRole;
-pub use credential::{Credential, CredentialSource};
+pub use credential::{Credential, CredentialRule, CredentialSource, MAX_CREDENTIAL_PART_LEN};
 pub use error::CameraError;
 pub use host::{Host, MAX_HOST_LEN};
 pub use id::{CameraId, MAX_CAMERA_ID_LEN};

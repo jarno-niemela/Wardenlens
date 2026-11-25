@@ -6,11 +6,12 @@
 //! tabs and newlines. Here nothing is rewritten: the path and query reach [`RtspPath`] exactly as
 //! written, and every part is checked by core's validator (one choke point, SEC-10).
 //!
-//! The only input-dependent output is a [`SkipReason`], which carries no text.
+//! The userinfo is returned undecoded. The only input-dependent error is a [`SkipReason`], which
+//! carries no text.
 
 use std::num::NonZeroU16;
 
-use secrecy::SecretString;
+use secrecy::zeroize::Zeroizing;
 use wardenlens_core::camera::{CameraError, DEFAULT_RTSP_PORT, Host, RtspPath};
 
 use crate::SkipReason;
@@ -20,8 +21,22 @@ pub(crate) struct Parts {
     pub host: Host,
     pub port: NonZeroU16,
     pub path: RtspPath,
-    /// The decoded URL userinfo, when its user or password is non-empty.
-    pub userinfo: Option<(String, SecretString)>,
+    /// The URL userinfo, still percent-encoded, when its user or password is non-empty. It is
+    /// decoded only when it is the credential that will be used (or must be compared).
+    pub userinfo: Option<RawUserinfo>,
+}
+
+/// The userinfo as written: user and password, percent-encoded.
+pub(crate) struct RawUserinfo {
+    user: Zeroizing<String>,
+    password: Zeroizing<String>,
+}
+
+impl RawUserinfo {
+    /// The decoded `(user, password)`. Invalid UTF-8 after decoding is refused.
+    pub(crate) fn decode(&self) -> Result<(Zeroizing<String>, Zeroizing<String>), SkipReason> {
+        Ok((decode(&self.user)?, decode(&self.password)?))
+    }
 }
 
 /// Splits `raw`, or says why the camera cannot be imported.
@@ -50,7 +65,7 @@ pub(crate) fn split(raw: &str) -> Result<Parts, SkipReason> {
     };
     let (host, port) = host_port_of(host_port)?;
     let path = path_of(tail)?;
-    let userinfo = userinfo_of(userinfo)?;
+    let userinfo = userinfo_of(userinfo);
     Ok(Parts {
         host,
         port,
@@ -111,22 +126,23 @@ fn path_of(tail: &str) -> Result<RtspPath, SkipReason> {
     })
 }
 
-/// `user[:password]`, percent-decoded; none when both are empty.
-fn userinfo_of(ui: &str) -> Result<Option<(String, SecretString)>, SkipReason> {
+/// `user[:password]`, kept encoded; none when both are empty.
+fn userinfo_of(ui: &str) -> Option<RawUserinfo> {
     let (user, password) = ui.split_once(':').unwrap_or((ui, ""));
     if user.is_empty() && password.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let user = decode(user)?;
-    let password = decode(password)?;
-    Ok(Some((user, SecretString::from(password))))
+    Some(RawUserinfo {
+        user: Zeroizing::new(user.to_owned()),
+        password: Zeroizing::new(password.to_owned()),
+    })
 }
 
-/// Percent-decoding; a `%` not followed by two hex digits stays literal. Invalid UTF-8 and
-/// control characters (RTSP header injection) are refused.
-fn decode(s: &str) -> Result<String, SkipReason> {
+/// Percent-decoding; a `%` not followed by two hex digits stays literal. Invalid UTF-8 is
+/// refused. Every buffer is zeroised on drop.
+fn decode(s: &str) -> Result<Zeroizing<String>, SkipReason> {
     let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
     let mut i = 0_usize;
     while let Some(&b) = bytes.get(i) {
         let escaped = if b == b'%' {
@@ -144,11 +160,8 @@ fn decode(s: &str) -> Result<String, SkipReason> {
             i = i.saturating_add(1);
         }
     }
-    let text = String::from_utf8(out).map_err(|_| SkipReason::InvalidCredential)?;
-    if text.chars().any(char::is_control) {
-        return Err(SkipReason::InvalidCredential);
-    }
-    Ok(text)
+    let text = std::str::from_utf8(&out).map_err(|_| SkipReason::InvalidCredential)?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 fn hex(b: u8) -> Option<u8> {

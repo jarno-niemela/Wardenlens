@@ -153,7 +153,10 @@ fn names_equal_after_normalisation_refuse_the_import() {
             "<videosourcestring>rtsp://192.0.2.11/s</videosourcestring>"
         ),
     ));
-    assert_eq!(parse(d.as_bytes()).unwrap_err(), ImportError::DuplicateName);
+    assert!(matches!(
+        parse(d.as_bytes()).unwrap_err(),
+        ImportError::DuplicateName { .. }
+    ));
 }
 
 #[test]

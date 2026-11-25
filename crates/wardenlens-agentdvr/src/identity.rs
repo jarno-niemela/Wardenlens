@@ -1,101 +1,69 @@
-//! Names and ids: display-name normalisation, slugs and the id allocator.
+//! Camera ids. An id is an opaque, non-sensitive reference (ADR 0006 section 1, core
+//! `CameraId`): it is never derived from the camera name, host or any other value of the file.
 //!
-//! The normalisation is the vault's display-name rule (`wardenlens-vault`, `display_name_text`,
-//! ADR 0006 section 1), restated here because this crate depends on core only (ADR 0004). Both
-//! use core's one predicate, `text::is_dropped_invisible`, for what is deleted.
+//! The id is `agentdvr-<n>` where `n` is `AgentDVR`'s own numeric `id` attribute, when the entry
+//! has one that no earlier imported camera used; otherwise `agentdvr-pos-<p>` with `p` the
+//! zero-based position of the `camera` element. The two forms cannot collide with each other,
+//! positions are unique, and the numeric form is unique by construction, so ids are unique
+//! without any search. Both are stable across runs. The numeric form also survives re-exports
+//! that reorder the file; the position form does not, and is only the fallback.
 
 use std::collections::BTreeSet;
 
-use wardenlens_core::camera::{CameraError, CameraId, MAX_CAMERA_ID_LEN};
-use wardenlens_core::text::is_dropped_invisible;
+use wardenlens_core::camera::{CameraError, CameraId};
 
-/// Longest slug before a dedup suffix: leaves room for `-256` (4 bytes) in 32.
-const MAX_SLUG_LEN: usize = MAX_CAMERA_ID_LEN - 4;
-
-/// The name as stored: every white-space character is one U+0020, a run is one space, invisible
-/// characters are dropped and the ends are trimmed.
-pub(crate) fn normalise_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut pending_space = false;
-    for c in raw.chars() {
-        if c.is_whitespace() {
-            pending_space = true;
-        } else if !is_dropped_invisible(c) {
-            if pending_space && !out.is_empty() {
-                out.push(' ');
-            }
-            pending_space = false;
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The slug of a normalised name: ASCII lower-case letters and digits, any other run as one `-`,
-/// no leading or trailing `-`, `cam-` in front when it does not start with a letter (`cam` when
-/// empty), at most [`MAX_SLUG_LEN`] bytes.
-pub(crate) fn slug(name: &str) -> String {
-    let mut out = String::new();
-    let mut pending_dash = false;
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            if pending_dash && !out.is_empty() {
-                out.push('-');
-            }
-            pending_dash = false;
-            out.push(c.to_ascii_lowercase());
-        } else {
-            pending_dash = true;
-        }
-    }
-    if !out.starts_with(|c: char| c.is_ascii_lowercase()) {
-        out = if out.is_empty() {
-            "cam".to_owned()
-        } else {
-            format!("cam-{out}")
-        };
-    }
-    truncate_slug(&mut out, MAX_SLUG_LEN);
-    out
-}
-
-/// Cuts to `max` bytes (the text is ASCII) and drops a trailing `-`.
-fn truncate_slug(s: &mut String, max: usize) {
-    s.truncate(max);
-    while s.ends_with('-') {
-        s.pop();
-    }
-}
-
-/// Hands out unique [`CameraId`]s in call order: the slug, then `-2`, `-3`, ...
+/// Hands out ids in document order.
 #[derive(Default)]
 pub(crate) struct IdAllocator {
-    used: BTreeSet<String>,
+    numeric_used: BTreeSet<u32>,
 }
 
 impl IdAllocator {
-    pub(crate) fn allocate(&mut self, normalised_name: &str) -> Result<CameraId, CameraError> {
-        let base = slug(normalised_name);
-        let chosen = if self.used.contains(&base) {
-            // At most 256 ids are ever in `used`, so a free number below 258 always exists; the
-            // range is bounded by `u32::MAX` only so the search cannot loop forever.
-            (2_u32..=u32::MAX)
-                .map(|n| suffixed(&base, n))
-                .find(|candidate| !self.used.contains(candidate))
-                .ok_or(CameraError::IdTooLong)?
-        } else {
-            base
-        };
-        let id = CameraId::new(&chosen)?;
-        self.used.insert(chosen);
-        Ok(id)
+    /// The id of the camera at `position` with `AgentDVR` id `agent_id`.
+    pub(crate) fn allocate(
+        &mut self,
+        position: usize,
+        agent_id: Option<u32>,
+    ) -> Result<CameraId, CameraError> {
+        match agent_id {
+            Some(n) if self.numeric_used.insert(n) => CameraId::new(&format!("agentdvr-{n}")),
+            _ => CameraId::new(&format!("agentdvr-pos-{position}")),
+        }
     }
 }
 
-/// `base-n`, with `base` cut so the whole id stays within the id length limit.
-fn suffixed(base: &str, n: u32) -> String {
-    let suffix = format!("-{n}");
-    let mut head = base.to_owned();
-    truncate_slug(&mut head, MAX_CAMERA_ID_LEN.saturating_sub(suffix.len()));
-    format!("{head}{suffix}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_longest_ids_are_valid() {
+        let mut a = IdAllocator::default();
+        let id = a
+            .allocate(crate::MAX_CAMERAS, Some(u32::MAX))
+            .expect("numeric");
+        assert_eq!(id.as_str(), "agentdvr-4294967295");
+        let id = a
+            .allocate(crate::MAX_CAMERAS, Some(u32::MAX))
+            .expect("fallback");
+        assert!(id.as_str().len() <= wardenlens_core::camera::MAX_CAMERA_ID_LEN);
+    }
+
+    #[test]
+    fn numeric_ids_are_used_once_then_fall_back_to_the_position() {
+        let mut a = IdAllocator::default();
+        let ids: Vec<String> = [(0, Some(7)), (1, Some(7)), (2, None), (3, Some(0))]
+            .into_iter()
+            .map(|(p, n)| a.allocate(p, n).expect("id").to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "agentdvr-7",
+                "agentdvr-pos-1",
+                "agentdvr-pos-2",
+                "agentdvr-0"
+            ]
+        );
+    }
 }

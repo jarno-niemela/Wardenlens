@@ -359,3 +359,25 @@ fn many_attributes_do_not_take_quadratic_time() {
     );
     assert!(r.is_ok());
 }
+
+#[test]
+fn xml_declaration_is_only_legal_first() {
+    // White space before the declaration is tolerated; anything else before it, a second
+    // declaration, or one inside the document is malformed (never an encoding error).
+    let ok = ["  \n<?xml version=\"1.0\" encoding=\"utf-8\"?><objects/>"];
+    for d in ok {
+        assert!(parse(d.as_bytes()).is_ok(), "{d:?}");
+    }
+    let bad = [
+        "<?xml version=\"1.0\"?><?xml version=\"1.0\"?><objects/>",
+        "<?xml version=\"1.0\"?> <?xml version=\"1.0\" encoding=\"latin1\"?><objects/>",
+        "<!-- c --><?xml version=\"1.0\"?><objects/>",
+        "<objects/><?xml version=\"1.0\"?>",
+        "<objects><?xml version=\"1.0\" encoding=\"utf-8\"?></objects>",
+        "<objects><?xml version=\"1.0\" encoding=\"latin1\"?></objects>",
+        "<?pi x?><?xml version=\"1.0\"?><objects/>",
+    ];
+    for d in bad {
+        assert!(is_malformed(err(d.as_bytes())), "{d:?}");
+    }
+}

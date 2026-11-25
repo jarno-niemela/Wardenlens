@@ -17,7 +17,7 @@ use crate::SkipReason;
 
 /// Every skip reason. Adding a variant is a compile error in `index` until it is listed here, and
 /// the tests that loop over this list then need a row for it.
-pub(crate) const ALL_SKIPS: [SkipReason; 14] = [
+pub(crate) const ALL_SKIPS: [SkipReason; 17] = [
     SkipReason::Deleted,
     SkipReason::RepeatedElement,
     SkipReason::FieldTooLong,
@@ -32,6 +32,9 @@ pub(crate) const ALL_SKIPS: [SkipReason; 14] = [
     SkipReason::InvalidPath,
     SkipReason::CredentialInPath,
     SkipReason::InvalidCredential,
+    SkipReason::CredentialWithoutUser,
+    SkipReason::ConflictingCredential,
+    SkipReason::IdRefused,
 ];
 
 #[test]
@@ -52,6 +55,9 @@ fn all_skips_is_complete_and_unique() {
             SkipReason::InvalidPath => 11,
             SkipReason::CredentialInPath => 12,
             SkipReason::InvalidCredential => 13,
+            SkipReason::CredentialWithoutUser => 14,
+            SkipReason::ConflictingCredential => 15,
+            SkipReason::IdRefused => 16,
         }
     }
     let seen: std::collections::BTreeSet<usize> = ALL_SKIPS.iter().map(|r| index(*r)).collect();

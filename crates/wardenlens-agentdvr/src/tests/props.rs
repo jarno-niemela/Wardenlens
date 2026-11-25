@@ -111,7 +111,10 @@ proptest! {
                     prop_assert!(c.id.as_str().len() <= 32);
                 }
             }
-            Err(e) => prop_assert_eq!(e, ImportError::DuplicateName),
+            Err(e) => {
+                let ok = matches!(e, ImportError::DuplicateName { .. });
+                prop_assert!(ok);
+            }
         }
     }
 }
@@ -137,7 +140,7 @@ proptest! {
         ],
         port in proptest::option::of(1u16..=65535),
         path in "(/[A-Za-z0-9_.~,-]{1,12}){0,4}(\\?zq[a-z]{0,4}=[0-9]{1,3}(&zq[a-z]{0,4}=[0-9]{1,3}){0,2})?",
-        user_pw in proptest::option::of(("\\PC{0,12}", "\\PC{0,12}")),
+        user_pw in proptest::option::of(("[^:\\p{C}]{1,12}", "\\PC{0,12}")),
     ) {
         prop_assume!(!path.split(['/', '?']).any(|s| s == "." || s == ".."));
         let userinfo = user_pw.as_ref().map_or_else(String::new, |(u, p)| format!("{}:{}@", pct_all(u), pct_all(p)));
@@ -150,7 +153,7 @@ proptest! {
         prop_assert_eq!(d.port.get(), port.unwrap_or(554));
         let want_path = if path.is_empty() { "/".to_owned() } else if path.starts_with('?') { format!("/{path}") } else { path.clone() };
         prop_assert_eq!(d.path.as_str(), want_path.as_str());
-        let want_cred = user_pw.filter(|(u, p)| !u.is_empty() || !p.is_empty());
+        let want_cred = user_pw;
         let got = d.credential.as_ref().map(|c| (c.user.clone(), c.password.expose_secret().to_owned()));
         prop_assert_eq!(got, want_cred);
     }

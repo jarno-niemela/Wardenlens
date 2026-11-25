@@ -36,9 +36,15 @@ pub enum ImportError {
     #[error("the document is not an AgentDVR objects file")]
     NotObjects,
     /// Two imported cameras have the same name once normalised. Never merged and never resolved
-    /// by first-wins: a credential must not land on the wrong camera (ADR 0006, #43).
-    #[error("two cameras have the same name after normalisation")]
-    DuplicateName,
+    /// by first-wins: a credential must not land on the wrong camera (ADR 0006, #43). The
+    /// positions are those of the two `camera` elements (the name itself is not reported).
+    #[error("cameras {first} and {second} have the same name after normalisation")]
+    DuplicateName {
+        /// Zero-based position of the first camera with the name.
+        first: usize,
+        /// Zero-based position of the later one.
+        second: usize,
+    },
 }
 
 /// Why one camera entry was not imported. The rest of the import goes on.
@@ -86,7 +92,19 @@ pub enum SkipReason {
     /// moved to the vault safely, so the camera is skipped.
     #[error("source path carries a credential")]
     CredentialInPath,
-    /// The user or password has a control character or percent-decodes to invalid UTF-8.
+    /// The user or password has a control character, percent-decodes to invalid UTF-8, or the
+    /// user has a `:` (ambiguous under RTSP Basic authentication).
     #[error("source login is malformed")]
     InvalidCredential,
+    /// There is a password but no user (the vault refuses a credential with an empty user).
+    #[error("login has a password but no user")]
+    CredentialWithoutUser,
+    /// The login fields and the URL userinfo both hold a credential and they differ. Neither is
+    /// chosen and nothing is merged.
+    #[error("login fields and URL userinfo disagree")]
+    ConflictingCredential,
+    /// The camera id could not be built. Cannot happen today (the id is `agentdvr-` and digits,
+    /// and a test pins the extremes); it is a typed skip so no panic path exists.
+    #[error("camera id could not be built")]
+    IdRefused,
 }

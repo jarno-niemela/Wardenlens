@@ -20,7 +20,45 @@ pub struct Credential {
     pub password: SecretString,
 }
 
+/// Longest user name or password in bytes (the vault's value limit; a vault test pins that the
+/// two are equal).
+pub const MAX_CREDENTIAL_PART_LEN: usize = 4096;
+
+/// Why a user and password pair cannot be stored as a [`Credential`]. Never carries the values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CredentialRule {
+    /// The user or the password is longer than [`MAX_CREDENTIAL_PART_LEN`] bytes.
+    #[error("user or password is longer than 4096 bytes")]
+    TooLong,
+    /// The user is empty (a password alone identifies nobody).
+    #[error("user is empty")]
+    UserEmpty,
+    /// The user or the password has a NUL character.
+    #[error("user or password has a NUL character")]
+    Nul,
+}
+
 impl Credential {
+    /// The one rule for a storable login, shared by the vault (`check_credential`) and the
+    /// importers: both parts at most [`MAX_CREDENTIAL_PART_LEN`] bytes, a non-empty user, no NUL.
+    /// An empty password is allowed. The password is not inspected further.
+    ///
+    /// # Errors
+    /// The first rule the pair breaks, in that order.
+    pub fn check(user: &str, password: &str) -> Result<(), CredentialRule> {
+        if user.len() > MAX_CREDENTIAL_PART_LEN || password.len() > MAX_CREDENTIAL_PART_LEN {
+            return Err(CredentialRule::TooLong);
+        }
+        if user.is_empty() {
+            return Err(CredentialRule::UserEmpty);
+        }
+        if user.contains('\0') || password.contains('\0') {
+            return Err(CredentialRule::Nul);
+        }
+        Ok(())
+    }
+
     /// Builds a credential from its two parts.
     #[must_use]
     pub fn new(user: impl Into<String>, password: SecretString) -> Self {
@@ -61,6 +99,23 @@ mod tests {
 
     fn cred() -> Credential {
         Credential::new("svc-reader", SecretString::from("Tr0ub4dor-x9".to_owned()))
+    }
+
+    #[test]
+    fn check_table() {
+        use CredentialRule::{Nul, TooLong, UserEmpty};
+        let long = "x".repeat(MAX_CREDENTIAL_PART_LEN + 1);
+        let at = "x".repeat(MAX_CREDENTIAL_PART_LEN);
+        assert_eq!(Credential::check("u", "p"), Ok(()));
+        assert_eq!(Credential::check("u", ""), Ok(()));
+        assert_eq!(Credential::check(&at, &at), Ok(()));
+        assert_eq!(Credential::check("", "p"), Err(UserEmpty));
+        assert_eq!(Credential::check("", ""), Err(UserEmpty));
+        assert_eq!(Credential::check("u\0", "p"), Err(Nul));
+        assert_eq!(Credential::check("u", "p\0"), Err(Nul));
+        assert_eq!(Credential::check(&long, "p"), Err(TooLong));
+        assert_eq!(Credential::check("u", &long), Err(TooLong));
+        assert_eq!(Credential::check("", &long), Err(TooLong));
     }
 
     #[test]

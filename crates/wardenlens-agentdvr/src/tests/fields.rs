@@ -32,30 +32,37 @@ fn login_fields_are_the_credential() {
 }
 
 #[test]
-fn login_fields_win_over_url_userinfo_when_both_differ() {
-    let d = imported(&Cam::new("A", "rtsp://other:pw@192.0.2.10/s").login("user", "secret"));
+fn login_fields_and_url_userinfo_that_agree_are_one_credential() {
+    let d = imported(&Cam::new("A", "rtsp://user:secret@192.0.2.10/s").login("user", "secret"));
     assert_eq!(cred(&d), Some(("user".into(), "secret".into())));
+    // The URL's side is compared after percent-decoding.
+    let d = imported(&Cam::new("A", "rtsp://us%40er:p%40ss@192.0.2.10/s").login("us@er", "p@ss"));
+    assert_eq!(cred(&d), Some(("us@er".into(), "p@ss".into())));
 }
 
 #[test]
-fn login_fields_are_never_mixed_with_userinfo() {
-    // Only the password field is set: the credential is ("", secret), not (url user, secret).
-    let c = with(|c| {
-        c.source = Some("rtsp://other:pw@192.0.2.10/s".into());
-        c.login = Some(String::new());
-        c.password = Some("secret".into());
-    });
-    assert_eq!(cred(&imported(&c)), Some((String::new(), "secret".into())));
-    // Only the login field is set: the password is empty, not the URL's.
-    let c = with(|c| {
-        c.source = Some("rtsp://other:pw@192.0.2.10/s".into());
-        c.login = Some("user".into());
-    });
-    assert_eq!(cred(&imported(&c)), Some(("user".into(), String::new())));
+fn login_fields_and_url_userinfo_that_differ_conflict_and_nothing_is_chosen() {
+    let rows = [
+        // (url userinfo, login field, password field)
+        ("other:pw", "user", "secret"),
+        ("user:pw", "user", "secret"),
+        ("other:secret", "user", "secret"),
+        // the login field has a user but no password; the URL has the password (dropping it
+        // would import an empty one)
+        ("user:secret", "user", ""),
+        ("user", "user", "secret"),
+        ("user:secret", "", "secret"),
+        (":secret", "user", "secret"),
+    ];
+    for (ui, l, p) in rows {
+        let c = Cam::new("A", &format!("rtsp://{ui}@192.0.2.10/s")).login(l, p);
+        assert_eq!(skip_of(&c), S::ConflictingCredential, "{ui} / {l} / {p}");
+    }
 }
 
 #[test]
-fn empty_login_fields_fall_back_to_userinfo() {
+fn only_one_source_present_is_used_whichever_it_is() {
+    // Fields only, URL only; the other side empty in every spelling.
     for (l, p) in [
         (Some(""), Some("")),
         (None, None),
@@ -73,6 +80,94 @@ fn empty_login_fields_fall_back_to_userinfo() {
             "{l:?} {p:?}"
         );
     }
+    let fields_only = Cam::new("A", "rtsp://192.0.2.10/s").login("user", "");
+    assert_eq!(
+        cred(&imported(&fields_only)),
+        Some(("user".into(), String::new()))
+    );
+}
+
+#[test]
+fn a_whitespace_only_login_is_no_user() {
+    // Treated as empty (not skipped): the URL userinfo is then the only credential.
+    for blank in [" ", "\t", "  \n ", "\u{a0}"] {
+        let c = with(|c| {
+            c.source = Some("rtsp://user:secret@192.0.2.10/s".into());
+            c.login = Some(blank.into());
+            c.password = Some(String::new());
+        });
+        assert_eq!(
+            cred(&imported(&c)),
+            Some(("user".into(), "secret".into())),
+            "{blank:?}"
+        );
+        // With a password field and no real user it is a password without a user.
+        let c = Cam::new("A", "rtsp://192.0.2.10/s").login(blank, "secret");
+        assert_eq!(skip_of(&c), S::CredentialWithoutUser, "{blank:?}");
+    }
+}
+
+#[test]
+fn a_password_without_a_user_is_never_emitted() {
+    let rows = [
+        // Cam with fields
+        Cam::new("A", "rtsp://192.0.2.10/s").login("", "secret"),
+        Cam::new("A", "rtsp://:secret@192.0.2.10/s"),
+        Cam::new("A", "rtsp://%20:secret@192.0.2.10/s").login("", ""),
+    ];
+    for (n, c) in rows.iter().enumerate() {
+        let i = parse_ok(std::slice::from_ref(c));
+        // The third row is a user of one space: accepted by the vault rule (non-empty).
+        if n == 2 {
+            assert_eq!(i.cameras.len(), 1);
+            continue;
+        }
+        assert_eq!(i.skipped[0].reason, S::CredentialWithoutUser, "row {n}");
+    }
+}
+
+#[test]
+fn a_colon_in_the_user_is_refused_from_every_source() {
+    for c in [
+        Cam::new("A", "rtsp://192.0.2.10/s").login("a:b", "secret"),
+        Cam::new("A", "rtsp://a%3Ab:secret@192.0.2.10/s"),
+    ] {
+        assert_eq!(skip_of(&c), S::InvalidCredential);
+    }
+    // A colon in the password is fine.
+    let c = Cam::new("A", "rtsp://192.0.2.10/s").login("user", "a:b");
+    assert_eq!(cred(&imported(&c)), Some(("user".into(), "a:b".into())));
+}
+
+#[test]
+fn every_emitted_credential_passes_the_vault_rule() {
+    // Every spelling that reaches an emitted credential, through the one shared rule.
+    let sources = [
+        Cam::new("A", "rtsp://user:secret@192.0.2.10/s"),
+        Cam::new("A", "rtsp://user@192.0.2.10/s"),
+        Cam::new("A", "rtsp://user:@192.0.2.10/s"),
+        Cam::new("A", "rtsp://:secret@192.0.2.10/s"),
+        Cam::new("A", "rtsp://%00:secret@192.0.2.10/s"),
+        Cam::new("A", "rtsp://user:p%00@192.0.2.10/s"),
+        Cam::new("A", "rtsp://192.0.2.10/s").login("user", "secret"),
+        Cam::new("A", "rtsp://192.0.2.10/s").login("", "secret"),
+        Cam::new("A", "rtsp://192.0.2.10/s").login("user", ""),
+        Cam::new("A", "rtsp://192.0.2.10/s").login("u\u{0}", "secret"),
+        Cam::new("A", "rtsp://192.0.2.10/s").login(&"u".repeat(4096), &"p".repeat(4096)),
+        Cam::new("A", &format!("rtsp://{}:p@192.0.2.10/s", "u".repeat(4000))),
+    ];
+    let mut emitted = 0;
+    for c in sources {
+        let i = parse(doc(&[c]).as_bytes());
+        let Ok(i) = i else { continue };
+        for d in i.cameras {
+            if let Some((u, p)) = cred(&d) {
+                assert_eq!(wardenlens_core::camera::Credential::check(&u, &p), Ok(()));
+                emitted += 1;
+            }
+        }
+    }
+    assert!(emitted >= 5);
 }
 
 #[test]
@@ -82,10 +177,10 @@ fn no_login_anywhere_is_no_credential() {
 
 #[test]
 fn login_fields_are_exact_text_not_url_decoded_or_trimmed() {
-    let c = Cam::new("A", "rtsp://192.0.2.10/s").login(" us%40er:x@ ", " p%40ss@:/? ");
+    let c = Cam::new("A", "rtsp://192.0.2.10/s").login(" us%40er@x ", " p%40ss@:/? ");
     assert_eq!(
         cred(&imported(&c)),
-        Some((" us%40er:x@ ".into(), " p%40ss@:/? ".into()))
+        Some((" us%40er@x ".into(), " p%40ss@:/? ".into()))
     );
 }
 
