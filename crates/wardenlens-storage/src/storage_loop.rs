@@ -29,6 +29,9 @@ use crate::probe::{ArchiveProbe, Probe, ProbeResult, VolumeUsage};
 /// added from outside, faster than evicted), the plan is made from the oldest-first prefix, the
 /// unseen archive rows are accounted for by their true total, and the report says so.
 pub const MAX_SEGMENTS: usize = 1_000_000;
+/// Ticks, per failed cap tick of the cycle, after which the row cap's cursors go back to the
+/// oldest rows so that rows that could not be deleted are tried again.
+const CAP_RETRY_TICKS: u32 = 16;
 /// Consecutive ticks with an index error after which the report carries a health error.
 pub const INDEX_ERROR_TICKS: u32 = 3;
 /// Most times one tick re-plans because the archive state changed under it.
@@ -141,6 +144,9 @@ pub struct StorageLoop<I, F, U> {
     /// Per tier the key of the last row the row cap attempted: the next pass
     /// resumes after it, so stuck rows cannot hold the cap back.
     cap_after: CapCursors,
+    /// Ticks, and ticks with a failed cap delete, since the cursors were last cleared.
+    cap_cycle_ticks: u32,
+    cap_cycle_failures: u32,
     observer: Box<dyn Observer>,
 }
 
@@ -226,6 +232,8 @@ impl Storage {
             max_segments: MAX_SEGMENTS,
             max_rows: MAX_SEGMENTS,
             cap_after: CapCursors::default(),
+            cap_cycle_ticks: 0,
+            cap_cycle_failures: 0,
             observer: Box::new(NoObserver),
         };
         Ok((looper, files))
@@ -359,7 +367,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
 
     /// Test hook: how many tiers have a row-cap paging cursor set (0 to 2).
     #[cfg(test)]
-    pub(crate) fn cap_failed_len(&self) -> usize {
+    pub(crate) fn cap_cursor_count(&self) -> usize {
         [self.cap_after.archive, self.cap_after.hot]
             .iter()
             .flatten()
@@ -767,21 +775,29 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// same `max_actions_per_tick`).
     ///
     /// With the archive available the rows of both tiers together may not exceed `max_rows`: the
-    /// oldest deletable archive rows go first, and what the archive pass could not evict (no
-    /// deletable row left) is taken from the oldest hot rows in the same tick. With the archive
-    /// unavailable only the hot tier's own excess goes: archive rows are never a reason to delete
-    /// the only copy of hot video. Deletes use the normal protocol.
+    /// oldest deletable archive rows go first, and the hot tier gives only what is left above the
+    /// archive's row count (`excess - archive_rows`). With the archive unavailable only the hot
+    /// tier's own excess goes. Archive rows that cannot be deleted never cost hot video: the
+    /// shortfall stays over the cap and is reported (`cap_delete_failed`, `cap_truncated`).
+    /// Deletes use the normal protocol.
     ///
-    /// Each tier pass has a bound of its own (`max_actions_per_tick`) and a paging cursor carried
-    /// across ticks (see `evict_oldest`). The cursors are cleared when a tick ends with no failed
-    /// cap delete and with the cap fully caught up (its bound not hit): the next tick then
-    /// starts at the oldest rows again, so a row whose fault has gone is retried. While the cap
-    /// is behind (its bound is hit every tick) the cursors are kept, so retrying stuck rows
-    /// never takes the bound away from the deletable rows behind them.
+    /// Each tier pass has a bound of its own and a paging cursor carried across ticks (see
+    /// `evict_oldest`). The cursors are cleared when the cap has nothing to do, when a pass wraps
+    /// at the end of a tier, and, so that stuck rows are retried while new rows keep arriving
+    /// behind the cursor, after `CAP_RETRY_TICKS` ticks for each failure of the cycle (a rare
+    /// retry, so the stuck rows never take the bound from the deletable rows for long).
     fn enforce_row_cap(&mut self, current: &mut ProbeResult, report: &mut TickReport) {
         self.row_cap_passes(current, report);
-        if !report.cap_delete_failed && !report.cap_truncated {
+        self.cap_cycle_ticks = self.cap_cycle_ticks.saturating_add(1);
+        if report.cap_delete_failed {
+            self.cap_cycle_failures = self.cap_cycle_failures.saturating_add(1);
+        }
+        let due =
+            self.cap_cycle_ticks >= CAP_RETRY_TICKS.saturating_mul(self.cap_cycle_failures.max(1));
+        if due || self.cap_after.is_clear() {
             self.cap_after = CapCursors::default();
+            self.cap_cycle_ticks = 0;
+            self.cap_cycle_failures = 0;
         }
     }
 
@@ -792,7 +808,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         };
         let rows = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         let (hot_rows, archive_rows) = (rows(totals.hot.segments), rows(totals.archive.segments));
-        let (from_archive, mut from_hot) = if current.archive.is_available() {
+        let (from_archive, from_hot) = if current.archive.is_available() {
             let excess = hot_rows
                 .saturating_add(archive_rows)
                 .saturating_sub(self.max_rows);
@@ -801,18 +817,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         } else {
             (0, hot_rows.saturating_sub(self.max_rows))
         };
-        if from_archive > 0 {
-            let Some((evicted, blocked)) =
-                self.evict_oldest(Tier::Archive, from_archive, current, report)
-            else {
-                return;
-            };
-            // What the archive could not supply (no deletable row left, or a bound spent on stuck
-            // rows without one eviction) is taken from the hot tier. A pass that is merely
-            // behind (it evicted, and the bound ended it) leaves the rest for the next tick.
-            if blocked {
-                from_hot = from_hot.saturating_add(from_archive.saturating_sub(evicted));
-            }
+        if from_archive > 0
+            && self
+                .evict_oldest(Tier::Archive, from_archive, current, report)
+                .is_none()
+        {
+            return;
         }
         if from_hot > 0 {
             self.evict_oldest(Tier::Hot, from_hot, current, report);
@@ -824,21 +834,22 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// The tier has a paging cursor (`cap_after`) carried across ticks: the pass starts after the
     /// last row attempted, attempts rows oldest first until it has evicted `count` or spent the
     /// pass's own bound, and wraps to the oldest row at the end of the tier (once, up to where it
-    /// started). A row whose delete fails (`DeleteFailed`) is skipped and counted; so any number
-    /// of stuck rows cannot hold the cap back, and a stuck row is retried when the cycle wraps.
-    /// Other outcomes (a stale row, an index error) are skipped without a flag; an archive that
-    /// went away stops the archive pass without moving the cursor past the row.
+    /// started). A row whose delete fails (`DeleteFailed`) is skipped and counted, so any number
+    /// of stuck rows cannot hold the cap back. Rows keyed behind the cursor (older than the last
+    /// attempt) are not looked at again until the cursor wraps or is cleared (see
+    /// `enforce_row_cap`), so the cap may evict newer rows before an older stuck one. Other
+    /// outcomes (a stale row, an index error) are skipped without a flag; an archive that went
+    /// away stops the archive pass without moving the cursor past the row.
     ///
-    /// Returns the rows evicted and whether the tier is `blocked` (it has no more deletable rows
-    /// this cycle, or the bound went on stuck rows without one eviction), or `None` when the cap
-    /// must stop for the tick: a failed read, the archive gone or a failed hot probe.
+    /// Returns the rows evicted, or `None` when the cap must stop for the tick: a failed read,
+    /// the archive gone or a failed hot probe.
     fn evict_oldest(
         &mut self,
         tier: Tier,
         count: usize,
         current: &mut ProbeResult,
         report: &mut TickReport,
-    ) -> Option<(usize, bool)> {
+    ) -> Option<usize> {
         let mut used = 0_usize;
         let start = self.cap_after.get(tier);
         let mut after = start;
@@ -856,14 +867,13 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 if wrapped && start.is_some_and(|s| key > s) {
                     // A full cycle: everything up to where this pass started was attempted.
                     self.cap_after.set(tier, None);
-                    return Some((count.saturating_sub(left), true));
+                    return Some(count.saturating_sub(left));
                 }
                 if used >= self.cfg.max_actions_per_tick {
                     // Out of bound: what is left waits (the caller still takes the rest from the
                     // hot tier, which has its own bound).
                     report.cap_truncated = true;
-                    let evicted = count.saturating_sub(left);
-                    return Some((evicted, evicted == 0));
+                    return Some(count.saturating_sub(left));
                 }
                 used = used.saturating_add(1);
                 let outcome = self.execute(seg.id, false, current.archive.is_available());
@@ -906,7 +916,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 after = None;
             }
         }
-        Some((count.saturating_sub(left), left > 0))
+        Some(count.saturating_sub(left))
     }
 
     /// Page through both tiers (`oldest` is bounded per call, SEC-2). A tier above the cap
@@ -1078,6 +1088,10 @@ struct CapCursors {
 }
 
 impl CapCursors {
+    const fn is_clear(&self) -> bool {
+        self.archive.is_none() && self.hot.is_none()
+    }
+
     const fn get(&self, tier: Tier) -> Option<(Timestamp, SegmentId)> {
         match tier {
             Tier::Hot => self.hot,

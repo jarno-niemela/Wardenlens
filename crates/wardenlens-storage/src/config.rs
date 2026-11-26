@@ -18,9 +18,10 @@ const DEFAULT_MAX_ACTIONS: usize = 64;
 /// actions of a tick, each tier pass with a bound of its own (`max_actions_per_tick` again). A
 /// row whose delete fails is skipped and reported, and a paging cursor carried across ticks lets
 /// the cap continue past it. With the archive available the rows of both tiers together are
-/// capped: the oldest deletable archive rows go first, and what the archive cannot supply comes
-/// from the oldest hot rows. With the archive unavailable only the hot tier's own excess is
-/// evicted: hot video is never deleted because of archive rows. The cap is a fixed, generic
+/// capped: the oldest deletable archive rows go first, and the hot tier gives only the excess
+/// above the archive's row count. With the archive unavailable only the hot tier's own excess is
+/// evicted. Archive rows that cannot be deleted never cost hot video: the shortfall stays over
+/// the cap and is reported. The cap is a fixed, generic
 /// bound, not a per-site setting.
 #[derive(Debug, Clone)]
 #[non_exhaustive]

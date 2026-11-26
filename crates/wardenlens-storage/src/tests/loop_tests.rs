@@ -1846,7 +1846,7 @@ fn a_failed_cap_delete_is_skipped_and_the_cap_continues() {
 }
 
 #[test]
-fn the_cap_resumes_after_a_stuck_row_and_does_not_flag_a_clean_tick() {
+fn the_cap_resumes_after_a_stuck_row_and_does_not_flag_a_tick_past_it() {
     // The oldest of 4 archive rows is pinned for good (a directory planted over its file).
     let env = Env::new();
     for n in 0..4 {
@@ -1864,14 +1864,15 @@ fn the_cap_resumes_after_a_stuck_row_and_does_not_flag_a_clean_tick() {
     // Bound 2: the stuck row fails, the next one goes, then the bound is spent.
     assert!(r.cap_delete_failed && r.cap_truncated, "{r:?}");
     assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
-    assert_eq!(lp.cap_failed_len(), 1, "the cursor is carried over");
+    assert_eq!(lp.cap_cursor_count(), 1, "the cursor is carried over");
     let r = lp.tick(now()).unwrap();
     // The cursor is past the stuck row: no attempt on it, so no failure either.
     assert_eq!(r.delete_failed, 0, "{r:?}");
     assert!(!r.cap_delete_failed, "{r:?}");
     assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
     assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 2);
-    assert_eq!(lp.cap_failed_len(), 0, "a clean tick clears the cursor");
+    // The cursor is kept (stuck rows are retried at the wrap, or after the retry interval).
+    assert_eq!(lp.cap_cursor_count(), 1);
 }
 
 #[test]
@@ -1934,7 +1935,8 @@ fn an_archive_that_goes_away_mid_pass_stops_the_cap_without_a_failure_or_a_curso
     assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
     assert!(!r.cap_delete_failed, "{r:?}");
     assert_eq!(r.skipped, 1, "{r:?}");
-    assert_eq!(lp.cap_failed_len(), 0);
+    // The cursor stays on the last row attempted (the first one), not past the skipped row.
+    assert_eq!(lp.cap_cursor_count(), 1);
 }
 
 #[test]

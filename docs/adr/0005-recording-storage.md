@@ -494,17 +494,19 @@ a safety action: it runs **after** the plan's actions of the tick, each tier pas
 same `max_actions_per_tick`, a separate counter), so it can never consume the plan's actions (moves, floor and reserve
 deletes). It uses the normal delete protocol of section 7.
 - *Archive available:* hot and archive rows together may not exceed the cap. The oldest deletable archive rows
-  (`ended_at_ms`, then `id`) are deleted first. What the archive cannot supply (no deletable row left, or its whole
-  bound spent on rows that cannot be deleted) is taken from the oldest deletable hot rows in the same tick; a pass
-  that is merely behind leaves the rest for the next tick.
+  (`ended_at_ms`, then `id`) are deleted first; the hot tier gives only what is left above the archive's row count
+  (`excess - archive_rows`, computed once from the totals). Archive rows that cannot be deleted never cost hot video:
+  the shortfall stays over the cap, is reported (`cap_delete_failed`, `cap_truncated`), and the truncation defence
+  below covers it until the fault clears. The cap is retention, not safety.
 - *Archive unavailable:* only the hot tier's own excess over the cap is deleted. Archive rows are never a reason to
   delete hot video: it is the only copy and would be moved once the archive returns.
 
 **Oldest deletable first.** Each tier keeps a paging cursor across ticks: a pass resumes after the last row it
 attempted, and wraps to the oldest row at the end of the tier. A row whose delete fails is skipped (and reported as
-`cap_delete_failed`), so any number of undeletable rows cannot hold the cap back, and newer rows may go before an older
-stuck one. A stuck row is retried when the cursor wraps, and from the oldest again on the first tick on which the cap
-is caught up. A row skipped because the archive went away is not a failure and does not move the cursor.
+`cap_delete_failed`), so any number of undeletable rows cannot hold the cap back, and newer rows may go before an
+older stuck one. Stuck rows are retried when the cursor wraps and, because new rows keep arriving behind the cursor,
+also after 16 ticks for each tick of the cycle that had a failure (so the retries stay rare). A row skipped because
+the archive went away is not a failure and does not move the cursor.
 
 In normal operation no tier then exceeds the cap, so the plan never sees a truncated prefix. **Defence in depth:** if a
 tier still exceeds it (rows added from outside faster than they are evicted), the plan is made from the oldest-first

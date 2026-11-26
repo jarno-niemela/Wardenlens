@@ -74,11 +74,17 @@ fn a_camera_day_of_pinned_rows_does_not_disable_the_row_cap_at_the_default_bound
         evicted += lp.tick(now()).unwrap().rows_evicted_over_cap;
     }
     let (h, a) = rows(&env);
-    assert!(
-        h + a <= 410,
-        "rows {} (hot {h}, archive {a}), cap 410 with 400 pinned; evicted {evicted} in 30 ticks",
-        h + a
+    // Edited in round 5 (PR #161, controller ruling: the cap is retention, not safety). The old
+    // expectation (at most 410 rows) needed hot evictions caused by the stuck archive rows. Now:
+    // hot rows go only for the excess above the archive's row count (none here), every deletable
+    // archive row is evicted, and the rows stay bounded by the cap plus the stuck rows and the
+    // ingest.
+    assert_eq!(h, 30, "no hot row is evicted for stuck archive rows");
+    assert_eq!(
+        a, 400,
+        "every deletable archive row was evicted (evicted {evicted})"
     );
+    assert!(h + a <= 410 + 30, "rows {} (hot {h}, archive {a})", h + a);
 }
 
 /// A failure that has gone (one transient EIO): the remembered row is the oldest and should be
@@ -141,7 +147,7 @@ fn rows_skipped_because_the_archive_went_away_are_not_remembered_as_stuck() {
         None,
         "healthy oldest row kept while newer ones went; remembered {} (flag while offline: \
          {flagged_while_offline}): {r2:?} {r3:?}",
-        lp.cap_failed_len()
+        lp.cap_cursor_count()
     );
     assert!(!r3.cap_delete_failed, "no row is stuck: {r3:?}");
 }
