@@ -49,5 +49,6 @@ pub use probe::{
 };
 pub use reconcile::{Newest, ReconcileReport, Reconciled};
 pub use storage_loop::{
-    Built, INDEX_ERROR_TICKS, MAX_REPLANS, MAX_SEGMENTS, Observer, Storage, StorageLoop, TickReport,
+    Built, INDEX_ERROR_TICKS, MAX_REPLANS, MAX_SEGMENTS, Observer, RETURNED_PASS_BACKOFF_TICKS,
+    RETURNED_PASS_TRIES, Storage, StorageLoop, TickReport,
 };

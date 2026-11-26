@@ -652,7 +652,6 @@ fn a_flapping_archive_over_many_ticks_loses_no_row_and_no_file_and_never_touches
         let now = Timestamp::from_unix_millis(T0 + (200 + t) * 60_000);
         let r = lp.tick(now).unwrap();
         moved += r.moved;
-        let _ = moved; // lint only: the running total is written for its readers' sake
         if returning {
             returns += 1;
             assert!(r.archive_returned, "tick {t}: {r:?}");
@@ -703,6 +702,8 @@ fn a_flapping_archive_over_many_ticks_loses_no_row_and_no_file_and_never_touches
         .tick(Timestamp::from_unix_millis(T0 + 10_000 * 60_000))
         .unwrap();
     assert!(!r.archive_returned);
+    moved += r.moved;
+    assert!(moved > 0, "the flapping archive still received moves");
     assert!(quarantined(&w.hot).is_empty() && quarantined(&w.arch).is_empty());
 }
 

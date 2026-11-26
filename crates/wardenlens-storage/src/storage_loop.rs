@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use wardenlens_core::storage::{
-    Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, PlanInput, SegmentId, SegmentIndex,
-    StoredSegment, Tier, VolumeSpace, plan,
+    Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, MinFreePercent, PlanInput, Policy,
+    SegmentId, SegmentIndex, StoredSegment, Tier, VolumeSpace, plan,
 };
 use wardenlens_core::time::Timestamp;
 use wardenlens_fsutil::RootDir;
@@ -35,6 +35,10 @@ pub const MAX_SEGMENTS: usize = 1_000_000;
 const CAP_RETRY_TICKS: u32 = 16;
 /// Consecutive ticks with an index error after which the report carries a health error.
 pub const INDEX_ERROR_TICKS: u32 = 3;
+/// Unfinished "archive returned" passes in a row after which the pass is backed off.
+pub const RETURNED_PASS_TRIES: u32 = 3;
+/// Ticks between two attempts of a backed-off "archive returned" pass.
+pub const RETURNED_PASS_BACKOFF_TICKS: u32 = 16;
 /// Most times one tick re-plans because the archive state changed under it.
 pub const MAX_REPLANS: u32 = 2;
 
@@ -125,6 +129,9 @@ pub struct TickReport {
     pub rows_evicted_over_cap: u32,
     /// The hot volume could not be probed after an action; the tick stopped.
     pub hot_probe_failed: bool,
+    /// The "archive returned" pass has been unfinished [`RETURNED_PASS_TRIES`] times in a row and
+    /// is backed off (a persistent health error until a pass finishes).
+    pub returned_pass_unfinished: bool,
     /// The "archive returned" pass of section 9 ran at the end of this tick (it is due on the
     /// tick that reports `archive_returned`, and clears the hold on moves). Its scope is strictly
     /// limited because the recorders are running: only keys with an archive file, a
@@ -149,6 +156,10 @@ pub struct StorageLoop<I, F, U> {
     index_error_ticks: u32,
     archive_was_available: Option<bool>,
     returned_pending: bool,
+    /// Consecutive "archive returned" passes that could not finish (walk cap or index error).
+    returned_unfinished: u32,
+    /// Ticks since the last unfinished pass, while the pass is backed off.
+    returned_wait: u32,
     max_segments: usize,
     max_rows: usize,
     /// Per tier the key of the last row the row cap attempted: the next pass
@@ -158,6 +169,18 @@ pub struct StorageLoop<I, F, U> {
     cap_cycle_ticks: u32,
     cap_cycle_failures: u32,
     observer: Box<dyn Observer>,
+}
+
+/// How one plan treats the archive.
+#[derive(Debug, Clone, Copy, Default)]
+struct PlanMode {
+    /// The archive counts as unavailable (its true total is unknown).
+    archive_unknown: bool,
+    /// The "archive returned" hold has outlived an unfinished pass: plan the hot side as if the
+    /// archive were unavailable, the emergency reserve acting as a floor.
+    held: bool,
+    /// Plan with the hot video out of sight (only the archive's own floor).
+    archive_only: bool,
 }
 
 /// Which tiers were cut to their oldest-first prefix by the segment cap.
@@ -239,6 +262,8 @@ impl Storage {
             index_error_ticks: 0,
             archive_was_available: None,
             returned_pending: false,
+            returned_unfinished: 0,
+            returned_wait: 0,
             max_segments: MAX_SEGMENTS,
             max_rows: MAX_SEGMENTS,
             cap_after: CapCursors::default(),
@@ -338,6 +363,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             rolling_deletes_refused: false,
             hot_probe_failed: false,
             returned: None,
+            returned_pass_unfinished: false,
         };
         let mut executed = 0_usize;
         let mut current = first;
@@ -351,17 +377,31 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         report.archive_returned = self.returned_pending;
         // The pass runs on this task, after the plan's actions, so no move is in flight. With the
         // archive away again it cannot run, and the next tick that sees it available runs it. A
-        // pass that hit the walk cap or an index error did not finish its work: the hold stays and
-        // the pass runs again next tick.
+        // pass that hit the walk cap or an index error did not finish its work: the hold stays
+        // and the pass runs again, but after [`RETURNED_PASS_TRIES`] unfinished passes in a row
+        // only every [`RETURNED_PASS_BACKOFF_TICKS`] ticks (the walk is not repeated every tick),
+        // with a persistent health error until one finishes.
         let mut pass_index_errors = false;
         if result.is_ok() && self.returned_pending && current.archive.is_available() {
-            let pass = self.run_returned_pass();
-            pass_index_errors = pass.index_errors > 0;
-            if !pass.health_error() && !pass.walk_cap_exceeded {
-                self.returned_pending = false;
+            let due = self.returned_unfinished < RETURNED_PASS_TRIES
+                || self.returned_wait >= RETURNED_PASS_BACKOFF_TICKS;
+            if due {
+                let pass = self.run_returned_pass();
+                pass_index_errors = pass.index_errors > 0;
+                if pass.health_error() || pass.walk_cap_exceeded {
+                    self.returned_unfinished = self.returned_unfinished.saturating_add(1);
+                    self.returned_wait = 0;
+                } else {
+                    self.returned_pending = false;
+                    self.returned_unfinished = 0;
+                    self.returned_wait = 0;
+                }
+                report.returned = Some(pass);
+            } else {
+                self.returned_wait = self.returned_wait.saturating_add(1);
             }
-            report.returned = Some(pass);
         }
+        report.returned_pass_unfinished = self.returned_pass_unfinished();
         // Only index failures count toward the index health (not a planner or probe error), the
         // returned pass's included.
         let index_failed =
@@ -417,6 +457,14 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             self.cfg.walk_max_dir_rows,
         )
         .run())
+    }
+
+    /// The "archive returned" pass could not finish [`RETURNED_PASS_TRIES`] times in a row (the
+    /// walk cap or the index): it is backed off, the hold on moves stays, and the hot tier is
+    /// planned as if the archive were unavailable. A health error until a pass finishes.
+    #[must_use]
+    pub const fn returned_pass_unfinished(&self) -> bool {
+        self.returned_pending && self.returned_unfinished >= RETURNED_PASS_TRIES
     }
 
     /// The index failed on [`INDEX_ERROR_TICKS`] consecutive ticks (a health error: the index is
@@ -513,9 +561,13 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         segments: &[StoredSegment],
         now: Timestamp,
         hot_total: u64,
-        archive_only: bool,
-        archive_unknown: bool,
+        mode: PlanMode,
     ) -> Result<wardenlens_core::storage::Plan, TickError> {
+        let PlanMode {
+            archive_unknown,
+            held,
+            archive_only,
+        } = mode;
         let hot_space = current.hot.map_err(TickError::HotVolume)?;
         let ingested = self
             .hot_after_last_tick
@@ -533,20 +585,47 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         } else {
             segments
         };
+        let mut policy = self.cfg.policy;
+        if held {
+            // While the archive cannot relieve the hot tier, the emergency reserve is a floor
+            // too: the recorder keeps writing, and a reserve that only a rolling buffer keeps
+            // would let the volume run down to the plain floor and below between ticks.
+            // Unreachable goals fall to the planner's own rules (nothing is deleted for them).
+            if let Some(p) = Self::reserve_percent(hot_space.capacity_bytes, policy) {
+                policy.hot_min_free = policy.hot_min_free.max(p);
+            }
+        }
         plan(&PlanInput {
             hot: hot_space,
-            archive: if archive_unknown {
+            archive: if archive_unknown || held {
                 ArchiveState::Unavailable
             } else {
                 archive_state(&current.archive)
             },
             segments: used,
             now,
-            policy: self.cfg.policy,
+            policy,
             ingested_bytes: ingested,
             rolling_budget: self.rolling_budget,
         })
         .map_err(TickError::Plan)
+    }
+
+    /// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
+    /// accepted floor), or `None` for no reserve.
+    fn reserve_percent(
+        capacity: u64,
+        policy: Policy,
+    ) -> Option<wardenlens_core::storage::MinFreePercent> {
+        let reserve = policy.emergency_reserve_bytes;
+        if reserve == 0 || capacity == 0 {
+            return None;
+        }
+        let pct = u128::from(reserve)
+            .checked_mul(100)?
+            .div_ceil(u128::from(capacity));
+        let pct = u8::try_from(pct.min(u128::from(MinFreePercent::MAX))).ok()?;
+        MinFreePercent::new(pct).ok()
     }
 
     /// Bytes of each tier's video that `actions` delete.
@@ -625,8 +704,51 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 } else {
                     (Cow::Borrowed(&segments[..]), None, false)
                 };
-            let planned =
-                self.make_plan(current, &plan_segments, now, hot_total, false, degraded)?;
+            // While the "archive returned" pass is pending, the hot side is planned as if the
+            // archive were unavailable (the degraded path): the floor and reserve deletes of the
+            // hot tier still run, so a pass that never finishes cannot starve the hot volume
+            // (never ENOSPC). No move runs and no archive video is evicted: the archive is not
+            // trusted until the pass has run.
+            let hold = self.returned_pending && planned_available;
+            // A hold that has outlived a pass that could not finish no longer waits: the hot side
+            // is planned as if the archive were unavailable (the floor and reserve deletes run, so
+            // the recorder cannot fill the volume), still with no move. The first held tick of a
+            // healthy return keeps the plain hold: its pass finishes that very tick.
+            let hold_degraded = hold && self.returned_unfinished > 0;
+            let planned = self.make_plan(
+                current,
+                &plan_segments,
+                now,
+                hot_total,
+                PlanMode {
+                    archive_unknown: degraded,
+                    held: hold_degraded,
+                    archive_only: false,
+                },
+            )?;
+            // The archive's own-floor evictions stay while held (they are not on behalf of a
+            // move): the same plan with the hot video out of sight and the archive trusted as the
+            // probe saw it.
+            let own_floor: Vec<Action> = if hold {
+                self.make_plan(
+                    current,
+                    &plan_segments,
+                    now,
+                    hot_total,
+                    PlanMode {
+                        archive_unknown: degraded,
+                        held: false,
+                        archive_only: true,
+                    },
+                )?
+                .actions
+                .iter()
+                .filter(|a| matches!(a, Action::Delete(_)))
+                .copied()
+                .collect()
+            } else {
+                Vec::new()
+            };
             // The stand-in is never executed: the room it would free is not there, so the moves
             // sized on it wait for the next tick (the visible evictions still run).
             let standin_evicted =
@@ -639,23 +761,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // possible move); they are not refused.
             let refuse_hot = truncated.hot && planned.hot == HotState::RollingBuffer;
             let by_id: HashMap<SegmentId, Tier> = segments.iter().map(|s| (s.id, s.tier)).collect();
-            // While the "archive returned" pass is pending no move runs, and no archive video is
-            // evicted on behalf of one: only the evictions the archive's own floor needs stay.
-            // Hot deletes stay (the rolling buffer must not be halved by a flapping archive).
-            let hold = self.returned_pending && planned_available;
-            let own_floor: HashSet<SegmentId> = if hold {
-                self.make_plan(current, &plan_segments, now, hot_total, true, degraded)?
-                    .actions
-                    .iter()
-                    .filter_map(|a| match a {
-                        Action::Delete(id) => Some(*id),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                HashSet::new()
-            };
-            let actions: Vec<Action> = planned
+            let held_plan: Vec<Action> = planned
                 .actions
                 .iter()
                 .copied()
@@ -667,11 +773,15 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                         Some(Tier::Hot) => !refuse_hot,
                         // The stand-in for the unseen rows is never executed.
                         None => false,
-                        _ => !hold || own_floor.contains(id),
+                        // The plan's archive deletes are for the moves it holds back.
+                        _ => !hold,
                     },
                     _ => true,
                 })
                 .collect();
+            // The archive's own-floor evictions come first (the plan's own archive deletes are
+            // dropped while held).
+            let actions: Vec<Action> = own_floor.iter().copied().chain(held_plan).collect();
             report.rolling_deletes_refused |= refuse_hot;
             // Quarantine first, whenever the plan deletes a tier's video (any planner state): evict
             // that tier's quarantine, sized to the bytes the plan would delete, then plan again.

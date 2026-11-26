@@ -1425,6 +1425,8 @@ fn the_per_day_row_bound_is_exact_and_exceeding_it_changes_nothing() {
         // A row without a file (`missing` when seen) and an orphan file (adopted when seen).
         let gone = env.row("cam-1", 5, 100, Tier::Hot);
         let orphan = put(&env.hot, &Env::rel("cam-1", 7), &good());
+        let hot_part = put(&env.hot, "cam-1/2023-11-14/221400-001.mp4.part", b"h");
+        let arch_part = put(&env.arch, "cam-1/2023-11-14/221400-002.mp4.part", b"a");
         let cfg = env.cfg().with_walk_max_dir_rows(bound);
         let (mut lp, _) = crate::Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
         let before = snapshot(&env.hot);
@@ -1436,11 +1438,16 @@ fn the_per_day_row_bound_is_exact_and_exceeding_it_changes_nothing() {
             assert_eq!(snapshot(&env.hot), before, "bound {bound}: files untouched");
             assert_eq!(r.adopted + r.missing, 0, "bound {bound}");
             assert!(orphan.exists());
+            assert!(
+                hot_part.exists() && arch_part.exists(),
+                "bound {bound}: `.part` files survive"
+            );
             assert!(env.find("cam-1", 7).is_none());
             assert!(r.unverified > 0);
         } else {
             assert_eq!(env.tier_of(gone), None, "bound {bound}");
             assert_eq!((r.missing, r.adopted), (1, 1), "bound {bound}");
+            assert!(!hot_part.exists() && !arch_part.exists(), "bound {bound}");
         }
     }
 }
@@ -1487,8 +1494,11 @@ fn the_row_only_phase_reads_no_row_that_a_directory_already_handled() {
     );
 }
 
+/// Round 3: an unfinished pass keeps the hold and runs again, but only `RETURNED_PASS_TRIES`
+/// times in a row at full rate; then every `RETURNED_PASS_BACKOFF_TICKS` ticks, with a persistent
+/// health error until a pass finishes (the earlier "every tick" rule is replaced).
 #[test]
-fn a_returned_pass_that_hit_the_cap_or_an_index_error_keeps_the_hold_and_runs_again() {
+fn an_unfinished_returned_pass_keeps_the_hold_is_backed_off_and_raises_a_health_error() {
     for index_error in [false, true] {
         let env = Env::new();
         unmount(&env);
@@ -1502,29 +1512,45 @@ fn a_returned_pass_that_hit_the_cap_or_an_index_error_keeps_the_hold_and_runs_ag
         if index_error {
             env.index.faults.lock().unwrap().list = true;
         }
-        let mut last_moved = 0;
-        for tick in 1..=3 {
+        let tries = crate::RETURNED_PASS_TRIES;
+        let wait = crate::RETURNED_PASS_BACKOFF_TICKS;
+        let mut ran_on = Vec::new();
+        let mut moved = 0;
+        for tick in 1..=(tries + wait + 1) {
             let r = lp.tick(late()).unwrap();
-            let pass = r
-                .returned
-                .expect("the pass reruns while it could not finish");
-            assert!(pass.health_error() || pass.walk_cap_exceeded, "{pass:?}");
             assert!(r.archive_returned, "tick {tick}: the hold stays");
-            last_moved += r.moved;
+            if let Some(pass) = &r.returned {
+                assert!(pass.health_error() || pass.walk_cap_exceeded, "{pass:?}");
+                ran_on.push(tick);
+            }
+            moved += r.moved;
             assert_eq!(
-                lp.index_health_error(),
-                index_error && tick == 3,
-                "tick {tick}: the pass's index errors feed the health counter"
+                r.returned_pass_unfinished,
+                tick >= tries,
+                "tick {tick}: a persistent health error once backed off"
             );
+            assert_eq!(lp.returned_pass_unfinished(), tick >= tries);
+            if index_error && tick == tries {
+                assert!(
+                    lp.index_health_error(),
+                    "the pass's index errors feed the counter"
+                );
+            }
         }
-        assert_eq!(last_moved, 0, "no move while the hold stays");
+        assert_eq!(
+            ran_on,
+            vec![1, 2, 3, tries + wait + 1],
+            "full rate for {tries} tries, then the walk waits {wait} ticks (not every tick)"
+        );
+        assert_eq!(moved, 0, "no move while the hold stays");
         if index_error {
-            // The index recovers: the pass completes and the hold ends.
+            // The index recovers: the next due pass completes and the hold ends.
             env.index.faults.lock().unwrap().list = false;
-            let r = lp.tick(late()).unwrap();
-            assert_eq!(r.returned.expect("ran").index_errors, 0);
-            assert!(!lp.index_health_error());
-            assert!(lp.tick(late()).unwrap().moved >= 1);
+            for _ in 0..=wait {
+                lp.tick(late()).unwrap();
+            }
+            assert!(!lp.returned_pass_unfinished());
+            assert!(lp.tick(late()).unwrap().moved >= 1, "moves resume");
         }
     }
 }

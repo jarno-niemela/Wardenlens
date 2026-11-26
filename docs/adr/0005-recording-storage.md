@@ -660,6 +660,10 @@ match the section 3 patterns as ours. **Anything else is left in place and repor
 walk is bounded in entries (default 5,000,000); **when the cap is exceeded at start-up the service starts anyway**: it stops walking, reports the affected tier as
 `unverified`, raises a health error and concludes nothing from the part it did not see (SEC-2). Reports contain
 **counts and the tier only, never a file name or a path** (the names carry camera ids and times).
+Files and rows are processed **one `(camera, day)` directory at a time** (a listing, its rows, at most 200,000 rows
+per day by default); the pass also keeps the set of handled `(camera, day)` names and of handled row ids until it
+ends, so memory is bounded by the index row count (at most 1,000,000 rows, section 6), not by the directory.
+A name that is not UTF-8 is counted against the entry cap and reported `unknown_left`.
 
 **`.part` files first.** `*.mp4.part` in the hot root: **delete** (an interrupted segment, at most one per camera per
 crash, at most about 120 s each). In the archive root: delete (an interrupted move), only when the archive is
@@ -747,6 +751,17 @@ in the recorder's rename-to-insert window); those two rules run only at start-up
 **on the storage-loop task, serialised with the mover**, so no move is in flight. (On the tick that reports the return, the
 segment row cap of section 6 may still evict the oldest archive rows: that is retention, not part of this pass.) Required test (#58/#59): the pass
 runs while a recorder is mid-segment and mid-rename, and no hot file or hot row is affected.
+
+**Hold and back-off.** From the probe that sees the archive return until the pass has run to completion, the
+storage loop *holds*: no move runs and no archive video is evicted on behalf of one (the archive's own floor
+evictions stay). The pass runs at the end of the first tick that completes with the archive available. A pass that
+hits the walk cap or an index error did **not** finish: the hold stays and the pass runs again on the next tick.
+Once a pass has been unfinished, the hold no longer waits: the hot side is planned as if the archive were
+unavailable (section 6, case 2), with the emergency reserve acting as a floor, so the hot floor and reserve deletes run
+and a pass that never finishes cannot fill the hot volume (**never ENOSPC**); still no move. After 3 unfinished
+passes in a row the pass is rerun only every 16 ticks (the walk is not repeated every tick) and a persistent health
+error (`returned_pass_unfinished`) is raised until a pass finishes; the pass's index errors count toward the index
+health. A tick that finds the archive away again does not run the pass and keeps the hold.
 
 **Checked against the move crash table (section 7):** every crash row maps to one cell: before M3 and the `.part`
 rows to (hot, valid, none); after M6 and M7 to (hot, valid, valid) or (hot, valid, none); after M8 to (archive, valid,

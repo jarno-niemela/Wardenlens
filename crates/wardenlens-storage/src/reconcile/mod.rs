@@ -31,8 +31,12 @@
 //! **Bounds.** The walk is `<root>/<camera>/<day>/<file>`: a directory below a day directory is
 //! not entered, a symlink is never followed, and the entries visited are capped
 //! (`StorageConfig::walk_max_entries`, default 5,000,000; one day holds at most
-//! `walk_max_dir_rows` rows, default 200,000). One `(camera, day)` directory and its
-//! rows are held in memory at a time. Past the cap the walk stops, the report says `unverified`
+//! `walk_max_dir_rows` rows, default 200,000). Files and rows are processed one
+//! `(camera, day)` directory at a time, and only that directory's listing and rows are held. The
+//! pass also keeps two sets until it ends: the `(camera, day)` names it handled and the ids of
+//! the rows it handled (so the row-only phase reads no row twice). Both are bounded by the index
+//! row count (at most 1,000,000 rows, ADR 0005 section 6) and are dropped when the pass ends.
+//! Past the cap the walk stops, the report says `unverified`
 //! for the tiers and carries a health error, and nothing is concluded from the part not seen.
 //!
 //! **Reports** hold counts and flags only: never a camera, a path or a time.
