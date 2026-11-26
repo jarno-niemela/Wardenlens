@@ -110,6 +110,13 @@ pub enum IndexError {
         "the -wal file does not belong to this index, or replaying it gives a damaged database; nothing was modified; move it and its -shm out of the directory and keep them until you know whose they are"
     )]
     ForeignWal,
+    /// The sidecars of the index kept appearing or disappearing while it was judged, for every
+    /// one of the bounded attempts: a process holding the index open was closing it as we looked.
+    /// Nothing was modified.
+    #[error(
+        "the index's -wal and -shm kept changing while it was opened (another process was closing it); nothing was modified; try again"
+    )]
+    SidecarsChanging,
     /// The schema (every `sqlite_master` row) is not the one of its `user_version`.
     #[error(
         "index schema differs from its version; nothing was modified; keep the file and restore a backup, or move it aside (the index can be rebuilt from the recordings)"

@@ -427,7 +427,10 @@ pub(crate) fn open_wal_probe(path: &Path, file: &PrivateFile) -> Result<Db, Inde
 /// because `Index::open` holds an exclusive `flock` on the verified main descriptor from
 /// `classify` until the read-write open is established, so no other `Index::open` can be
 /// attached to a `-shm` we created, and a `-shm` that existed before the probe is never touched
-/// by removal.
+/// by removal. The `flock` excludes other **openers** only, not connections that are already
+/// open: one of those may close its last connection (checkpoint, delete `-wal` and `-shm`) at any
+/// moment, which is why `classify` retries when the sidecars change under it, and why a `-shm`
+/// that existed before the probe is never removed.
 pub(crate) fn probe_wal_readonly(
     path: &Path,
     file: &PrivateFile,
@@ -506,9 +509,91 @@ pub(crate) fn main_unreadable(e: &IndexError) -> bool {
     }
 }
 
+/// How many times `classify` reads and judges the file again when a sidecar changed under it.
+/// A closer can only delete sidecars while we hold the lock (nobody can create them: every
+/// creator is an opener, and we exclude those), so each retry sees strictly fewer sidecars and the
+/// state settles in at most three steps; eight is the margin for the main file changing as well.
+pub(crate) const MAX_CLASSIFY_ATTEMPTS: u32 = 8;
+
+/// The points of `classify` a test can act at (`Index::open_with_hooks`). Production passes a
+/// no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Just before the sidecars are read (the attempt number, from 0).
+    BeforeRead(u32),
+    /// After the sidecars were read and before anything uses them: the window in which a
+    /// concurrent last close deletes `-wal` and `-shm`.
+    AfterRead(u32),
+}
+
+/// Why one classification attempt did not end in a verdict.
+enum Step {
+    /// A sidecar the attempt had read was gone when it was opened: the state changed.
+    Vanished,
+    /// The attempt refused the file; this stands only if the sidecars did not change meanwhile.
+    Refused(IndexError),
+}
+
+impl From<IndexError> for Step {
+    fn from(e: IndexError) -> Self {
+        Self::Refused(e)
+    }
+}
+
+/// True when `a` and `b` have the same sidecars present. Lengths are not compared: a live writer
+/// grows its `-wal` legitimately, and what a closer does is delete.
+fn same_presence(a: Sidecars, b: Sidecars) -> bool {
+    a.wal.is_some() == b.wal.is_some()
+        && a.shm.is_some() == b.shm.is_some()
+        && a.journal.is_some() == b.journal.is_some()
+}
+
 /// Judges the file without any read-write connection.
-fn classify(path: &Path, file: &PrivateFile, migrations: &[Migration]) -> Result<Kind, IndexError> {
-    let sc = Sidecars::read(path)?;
+///
+/// **The exclusive `flock` excludes other openers, not other connections**: a process that already
+/// has the index open can close its last connection at any moment, and SQLite then checkpoints and
+/// deletes `-wal` and `-shm`. So the sidecars read at the start can be gone by the time they are
+/// opened or probed, or a pair can be read that never coexisted. A refusal that follows a sidecar
+/// change is therefore not trusted: the sidecars are read again and, if their presence differs from
+/// what the attempt judged, the whole classification starts over (bounded by
+/// [`MAX_CLASSIFY_ATTEMPTS`]; then [`IndexError::SidecarsChanging`]). A refusal with unchanged
+/// sidecars stands. The alternative, a shared `flock` held for the life of every connection so a
+/// closer cannot delete sidecars while an opener classifies, would make every `Index` hold off every
+/// opener for as long as it lives and a stuck service would block `token create`; re-classifying
+/// is correct because sidecars only ever disappear while we hold the lock (see
+/// [`MAX_CLASSIFY_ATTEMPTS`]) and a verdict on a settled state is the same however it was reached.
+/// Residual: the lock-free `immutable=1` read of the main file can overlap the checkpoint of a
+/// closer that has not yet deleted the `-wal`; the `-wal` path then waits on SQLite's own lock and
+/// judges the replayed view, and a refusal in that window is retried if the `-wal` is gone by then.
+fn classify(
+    path: &Path,
+    file: &PrivateFile,
+    migrations: &[Migration],
+    hook: &mut dyn FnMut(Stage),
+) -> Result<Kind, IndexError> {
+    for attempt in 0..MAX_CLASSIFY_ATTEMPTS {
+        hook(Stage::BeforeRead(attempt));
+        let sc = Sidecars::read(path)?;
+        hook(Stage::AfterRead(attempt));
+        match classify_once(sc, path, file, migrations) {
+            Ok(kind) => return Ok(kind),
+            Err(Step::Vanished) => {}
+            Err(Step::Refused(e)) => {
+                if same_presence(sc, Sidecars::read(path)?) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Err(IndexError::SidecarsChanging)
+}
+
+fn classify_once(
+    sc: Sidecars,
+    path: &Path,
+    file: &PrivateFile,
+    migrations: &[Migration],
+) -> Result<Kind, Step> {
     let len = file
         .file()
         .metadata()
@@ -517,7 +602,7 @@ fn classify(path: &Path, file: &PrivateFile, migrations: &[Migration]) -> Result
     if len == 0 {
         // SQLite deletes or replays a sidecar next to a zero-page database on first open.
         return match sc.first_present() {
-            Some(suffix) => Err(IndexError::StraySidecar { suffix }),
+            Some(suffix) => Err(IndexError::StraySidecar { suffix }.into()),
             None => Ok(Kind::New),
         };
     }
@@ -525,13 +610,17 @@ fn classify(path: &Path, file: &PrivateFile, migrations: &[Migration]) -> Result
     check_sidecars(wal_mode, sc)?;
     let usable_wal = match sc.wal {
         Some(n) if n > 0 => {
-            let wal = open_sidecar(Path::new(&sidecar_path(path, "-wal")))?;
+            let wal = match open_sidecar(Path::new(&sidecar_path(path, "-wal"))) {
+                Ok(wal) => wal,
+                Err(e) if e.is_not_found() => return Err(Step::Vanished),
+                Err(e) => return Err(IndexError::Fs(e).into()),
+            };
             if !wal
                 .metadata()
                 .map_err(IndexError::io("inspecting wal"))?
                 .is_file()
             {
-                return Err(IndexError::BadSidecar { suffix: "-wal" });
+                return Err(IndexError::BadSidecar { suffix: "-wal" }.into());
             }
             check_wal_header(&wal, &head)? == WalHeader::Valid
         }
@@ -641,12 +730,13 @@ pub(crate) struct Opened {
 }
 
 /// The whole checked open. `between` runs after our own checks and before SQLite opens the path
-/// (the window a swap needs); tests use it.
+/// (the window a swap needs); `hook` runs at the [`Stage`]s of `classify`; tests use both.
 pub(crate) fn open(
     path: &Path,
     migrations: &[Migration],
     between: impl FnOnce(),
     lock_wait: Duration,
+    hook: &mut dyn FnMut(Stage),
 ) -> Result<Opened, IndexError> {
     check_parent(crate::parent_of(path))?;
     let file = open_private_file(path)?;
@@ -668,7 +758,7 @@ pub(crate) fn open(
     // us created must not be attached to by another process, and two first creators must not
     // both claim the file). Unlocked after migrations; the descriptor then lives on in `Opened`.
     let lock = lock_file(&file, lock_wait)?;
-    let kind = match classify(path, &file, migrations) {
+    let kind = match classify(path, &file, migrations, hook) {
         Ok(kind) => kind,
         Err(e) => {
             discard_if_created(path, &file);
@@ -710,10 +800,19 @@ pub(crate) fn open(
     Ok(Opened { conn, lock, file })
 }
 
-/// Removes the empty file this call created when the open is refused before anything was
-/// written, so a refusal leaves no litter. Only if the path still names our file.
+/// Removes the file this call created when the open is refused before anything was written, so a
+/// refusal leaves no litter. **Only if it is still the file this call created and still empty**:
+/// the path must still name the inode of our descriptor (device and inode) and that file must have
+/// size 0. Another opener may have populated it between our `create` and our refusal (it needs the
+/// lock, which we hold, but a refusal can also come from a stale view); a populated index is never
+/// unlinked. Every caller holds the exclusive `flock`, so no crate opener can populate the file
+/// between the size check and the unlink.
 fn discard_if_created(path: &Path, file: &PrivateFile) {
-    if file.created() && file.verify_path_unchanged(path).is_ok() {
+    if !file.created() {
+        return;
+    }
+    let still_empty = file.file().metadata().is_ok_and(|m| m.len() == 0);
+    if still_empty && file.verify_path_unchanged(path).is_ok() {
         // ERR-4: best effort; an empty file left behind is harmless and is refused or adopted
         // by the next open the same way.
         let _ = std::fs::remove_file(path);

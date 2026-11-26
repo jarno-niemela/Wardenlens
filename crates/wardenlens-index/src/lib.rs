@@ -82,6 +82,8 @@ impl Index {
     /// - [`IndexError::Migration`], [`IndexError::MigrationDidNotAdvance`]: a step failed and was
     ///   rolled back; earlier steps stay committed.
     /// - [`IndexError::PragmaRefused`]: a pragma did not take its value.
+    /// - [`IndexError::SidecarsChanging`]: the sidecars kept changing (a process was closing the
+    ///   index) for every one of the bounded attempts; nothing was modified, try again.
     /// - [`IndexError::Busy`]: another opener or writer held the file past the timeout.
     /// - [`IndexError::Sqlite`]: any other SQLite failure.
     ///
@@ -105,7 +107,17 @@ impl Index {
         between: impl FnOnce(),
         lock_wait: std::time::Duration,
     ) -> Result<Self, IndexError> {
-        let opened = open::open(path, migrations, between, lock_wait)?;
+        Self::open_with_hooks(path, migrations, between, lock_wait, &mut |_| {})
+    }
+
+    pub(crate) fn open_with_hooks(
+        path: &Path,
+        migrations: &[migrate::Migration],
+        between: impl FnOnce(),
+        lock_wait: std::time::Duration,
+        hook: &mut dyn FnMut(open::Stage),
+    ) -> Result<Self, IndexError> {
+        let opened = open::open(path, migrations, between, lock_wait, hook)?;
         Ok(Self {
             conn: opened.conn,
             _lock: opened.lock,
