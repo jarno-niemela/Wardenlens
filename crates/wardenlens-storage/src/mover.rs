@@ -522,15 +522,16 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
             if tier == other && skip_other {
                 continue;
             }
+            // ENOENT or ENOTDIR (a planted file where a directory should be): no file can exist.
             match self.fs.unlink(tier, &rel.dir(), &rel.name) {
                 Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
+                Err(e) if gone(&e) => {}
                 Err(_) => return Outcome::DeleteFailed,
             }
             // Before the row goes, so a power cut cannot bring the file back after the DELETE.
             match self.fs.sync_dir(tier, &rel.dir()) {
                 Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
+                Err(e) if gone(&e) => {}
                 Err(_) => return Outcome::DeleteFailed,
             }
         }
@@ -540,4 +541,10 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
             Err(_) => Outcome::IndexError,
         }
     }
+}
+
+/// The file cannot exist: `ENOENT`, or `ENOTDIR` (a regular file planted where one of its
+/// directories should be), so a planted object never pins a row.
+fn gone(e: &FsError) -> bool {
+    e.is_not_found() || e.errno() == Some(Errno::NOTDIR)
 }

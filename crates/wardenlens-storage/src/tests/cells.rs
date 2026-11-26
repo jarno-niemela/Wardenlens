@@ -439,7 +439,7 @@ fn delete_never_removes_the_row_before_the_unlink_and_the_directory_fsync() {
 }
 
 #[test]
-fn delete_tolerates_a_missing_file_but_only_enoent() {
+fn delete_tolerates_a_missing_file_or_a_file_over_its_directory_but_no_other_errno() {
     let env = Env::new();
     let id = env.row("cam-1", 0, 100, Tier::Hot);
     let (lp, _) = build(&env, None);
@@ -448,13 +448,16 @@ fn delete_tolerates_a_missing_file_but_only_enoent() {
         Outcome::Deleted,
         "ENOENT is tolerated"
     );
-    // ENOTDIR (a file where the directory should be) is not ENOENT: the row stays.
+    // ENOTDIR (a file where the directory should be): no segment file can exist there, so it is
+    // tolerated like ENOENT (ticket #160, round 2) and never pins the row. The planted object
+    // is left alone. Any other errno is still a failure (the fault tests above).
     let env = Env::new();
     let id = env.row("cam-1", 0, 100, Tier::Hot);
     std::fs::write(env.hot.join("cam-1"), b"x").unwrap();
     let (lp, _) = build(&env, None);
-    assert_eq!(lp.delete_now(id, true), Outcome::DeleteFailed);
-    assert_eq!(env.tier_of(id), Some(Tier::Hot));
+    assert_eq!(lp.delete_now(id, true), Outcome::Deleted);
+    assert_eq!(env.tier_of(id), None);
+    assert_eq!(std::fs::read(env.hot.join("cam-1")).unwrap(), b"x");
 }
 
 #[test]

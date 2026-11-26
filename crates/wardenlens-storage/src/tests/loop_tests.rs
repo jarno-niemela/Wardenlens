@@ -1277,7 +1277,8 @@ fn a_failed_totals_read_skips_quarantine_eviction_and_counts_as_an_index_error()
     env.index.faults.lock().unwrap().totals = true;
     let (mut lp, _) = build(&env, None);
     let r = lp.tick(now()).unwrap();
-    assert_eq!(r.index_errors, 1, "{r:?}");
+    // The quarantine step's read and the row cap's read (which counts its own failure).
+    assert_eq!(r.index_errors, 2, "{r:?}");
     assert_eq!(r.quarantine_evicted, 0);
 }
 
@@ -1786,7 +1787,7 @@ fn rows_at_or_under_the_cap_are_never_touched() {
 
 #[test]
 fn hot_rows_are_evicted_when_there_is_no_archive_or_no_archive_rows() {
-    // Archive unavailable, with archive rows: the hot tier pays, the archive rows are untouched.
+    // Archive unavailable: only the hot tier's own excess goes, and archive rows never count.
     let env = Env::new();
     std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
     let arch = env.row("cam-2", 0, 1000, Tier::Archive);
@@ -1794,12 +1795,25 @@ fn hot_rows_are_evicted_when_there_is_no_archive_or_no_archive_rows() {
         .map(|n| env.add("cam-1", n, 1000, Tier::Hot))
         .collect();
     let r = cap_tick(&env, 4, 64);
-    assert_eq!(r.rows_evicted_over_cap, 2, "{r:?}");
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
     assert_eq!(env.tier_of(hot[0]), None);
-    assert_eq!(env.tier_of(hot[1]), None);
     assert!(!env.hot_file("cam-1", 20).exists());
-    assert_eq!(env.tier_of(hot[2]), Some(Tier::Hot));
+    assert_eq!(env.tier_of(hot[1]), Some(Tier::Hot));
     assert_eq!(env.tier_of(arch), Some(Tier::Archive));
+    // 3 hot + 5 archive rows, cap 4, archive offline: the hot tier is under the cap, nothing goes.
+    let env = Env::new();
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    for n in 0..5 {
+        env.row("cam-2", n, 1000, Tier::Archive);
+    }
+    let hot: Vec<_> = (20..23)
+        .map(|n| env.add("cam-1", n, 1000, Tier::Hot))
+        .collect();
+    let r = cap_tick(&env, 4, 64);
+    assert_eq!((r.rows_evicted_over_cap, r.deleted), (0, 0), "{r:?}");
+    for id in hot {
+        assert_eq!(env.tier_of(id), Some(Tier::Hot));
+    }
     // Archive available but without rows.
     let env = Env::new();
     let hot: Vec<_> = (20..24)
@@ -1812,7 +1826,7 @@ fn hot_rows_are_evicted_when_there_is_no_archive_or_no_archive_rows() {
 }
 
 #[test]
-fn a_failing_cap_eviction_is_not_retried_and_counts_toward_the_tick_bound() {
+fn the_first_failed_cap_delete_ends_the_cap_for_the_tick() {
     let env = Env::new();
     for n in 0..5 {
         env.add("cam-2", n, 1000, Tier::Archive);
@@ -1821,21 +1835,147 @@ fn a_failing_cap_eviction_is_not_retried_and_counts_toward_the_tick_bound() {
         errno: rustix::io::Errno::IO,
         ..Fault::once(Op::Unlink(Tier::Archive), 1)
     };
-    let mut cfg = env.cfg();
-    cfg.max_actions_per_tick = 2;
-    let state = Arc::new(Mutex::new(super::fault::State {
-        fault: Some(fault),
-        ..super::fault::State::default()
-    }));
-    let (mut lp, _) = Storage::open_with(cfg, env.index.clone(), env.usage.clone(), |r| {
-        super::fault::FaultFs::new(r, state)
-    })
-    .unwrap();
+    let (mut lp, _) = build(&env, Some(fault));
     lp.set_max_rows(2);
     let r = lp.tick(now()).unwrap();
     assert_eq!(r.delete_failed, 1, "{r:?}");
-    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
-    assert!(r.truncated, "{r:?}");
+    // Without the stop the next row would have been deleted (the fault fires once).
+    assert_eq!(r.rows_evicted_over_cap, 0, "{r:?}");
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 5);
+}
+
+#[test]
+fn the_row_cap_has_its_own_bound_and_never_takes_the_plans_actions() {
+    // 4 aged hot segments to move (bound 4 per tick) and 6 archive rows over a cap of 2: the
+    // moves all run, then the cap runs on a bound of its own.
+    let env = Env::new();
+    for n in 0..6 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    for n in 20..24 {
+        env.add("cam-1", n, 1000, Tier::Hot);
+    }
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 4;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_rows(2);
+    let r = lp.tick(late()).unwrap();
+    assert_eq!(r.moved, 4, "{r:?}");
+    assert_eq!(r.rows_evicted_over_cap, 4, "{r:?}");
+    assert!(r.truncated, "the cap hit its own bound: {r:?}");
+}
+
+/// A tick with one aged move to run, whose first `get` runs `hook` (a fault that appears after
+/// the plan was made).
+fn tick_with_hook_after_the_move(
+    env: &Env,
+    max_rows: usize,
+    hook: impl FnOnce() + Send + 'static,
+) -> crate::TickReport {
+    for n in 0..3 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    env.add("cam-1", 20, 1000, Tier::Hot);
+    env.index.faults.lock().unwrap().get_hook = Some(Box::new(hook));
+    let (mut lp, _) = build(env, None);
+    lp.set_max_rows(max_rows);
+    lp.tick(late()).unwrap()
+}
+
+#[test]
+fn a_failed_totals_read_in_the_row_cap_is_an_index_error_and_evicts_nothing() {
+    let env = Env::new();
+    let faults = Arc::clone(&env.index.faults);
+    let r = tick_with_hook_after_the_move(&env, 2, move || {
+        faults.lock().unwrap().totals = true;
+    });
+    assert_eq!(r.moved, 1, "{r:?}");
+    assert_eq!((r.index_errors, r.rows_evicted_over_cap), (1, 0), "{r:?}");
+    assert_eq!(
+        env.index
+            .bytes_by_tier()
+            .unwrap_or_default()
+            .archive
+            .segments,
+        0
+    );
+}
+
+#[test]
+fn a_failed_oldest_read_in_the_row_cap_is_an_index_error_and_evicts_nothing() {
+    let env = Env::new();
+    let faults = Arc::clone(&env.index.faults);
+    let r = tick_with_hook_after_the_move(&env, 2, move || {
+        faults.lock().unwrap().oldest = true;
+    });
+    assert_eq!(r.moved, 1, "{r:?}");
+    assert_eq!((r.index_errors, r.rows_evicted_over_cap), (1, 0), "{r:?}");
+    env.index.faults.lock().unwrap().oldest = false;
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 4);
+}
+
+#[test]
+fn a_hot_probe_failure_during_the_plan_skips_the_row_cap() {
+    let env = Env::new();
+    let usage = env.usage.clone();
+    let r = tick_with_hook_after_the_move(&env, 2, move || {
+        usage.io_error.lock().unwrap().push(Tier::Hot);
+    });
+    assert!(r.hot_probe_failed, "{r:?}");
+    assert_eq!((r.moved, r.rows_evicted_over_cap), (1, 0), "{r:?}");
+}
+
+#[test]
+fn a_hot_probe_failure_after_a_cap_eviction_is_reported_and_keeps_the_counts() {
+    let env = Env::new();
+    for n in 0..3 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    let usage = env.usage.clone();
+    env.index.faults.lock().unwrap().get_hook = Some(Box::new(move || {
+        usage.io_error.lock().unwrap().push(Tier::Hot);
+    }));
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_rows(1);
+    let r = lp.tick(now()).unwrap();
+    assert!(r.hot_probe_failed, "{r:?}");
+    assert_eq!((r.rows_evicted_over_cap, r.deleted), (1, 1), "{r:?}");
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 2);
+}
+
+#[test]
+fn a_failed_totals_read_on_a_truncated_archive_degrades_instead_of_aborting() {
+    // 10 archive rows cut to 3 (hot whole); the archive's true total cannot be read.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    env.set_cap("arch", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 600_000]).unwrap();
+    for n in 0..10 {
+        env.add("cam-2", n, 80_000, Tier::Archive);
+    }
+    let hot: Vec<_> = (50..53)
+        .map(|n| env.add("cam-1", n, 100_000, Tier::Hot))
+        .collect();
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_segments(3);
+    env.index.faults.lock().unwrap().totals = true;
+    let r = lp.tick(now()).unwrap();
+    // Quarantine step, the stand-in read and the row cap each count one.
+    assert_eq!(r.index_errors, 3, "{r:?}");
+    assert_eq!(
+        (r.moved, r.deleted),
+        (0, 0),
+        "no archive-driven action: {r:?}"
+    );
+    for id in hot {
+        assert_eq!(
+            env.tier_of(id),
+            Some(Tier::Hot),
+            "the floor delete waits: {r:?}"
+        );
+    }
+    env.index.faults.lock().unwrap().totals = false;
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 10);
 }
 
 #[test]

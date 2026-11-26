@@ -14,11 +14,12 @@ const DEFAULT_MAX_ACTIONS: usize = 64;
 /// `#[non_exhaustive]`, so a field added later does not break a caller).
 ///
 /// **Segment row cap.** The loop holds at most [`MAX_SEGMENTS`](crate::MAX_SEGMENTS) (1,000,000)
-/// segment rows in total, hot and archive together (ADR 0005 section 6). Above it, each tick
-/// first evicts the oldest archive segments (the oldest hot ones when the archive is unavailable
-/// or holds no rows) with the normal delete protocol, at most `max_actions_per_tick` of them.
-/// The cap is a fixed, generic bound on memory (SEC-2), not a per-site setting; so normal
-/// operation never plans from a truncated prefix.
+/// segment rows (ADR 0005 section 6). It is retention, not safety: it runs after the plan's
+/// actions of a tick with a bound of its own (`max_actions_per_tick` again), and stops for the
+/// tick at its first failed delete. With the archive available the rows of both tiers together
+/// are capped, oldest archive rows first and then the oldest hot rows. With the archive
+/// unavailable only the hot tier's own excess is evicted: hot video is never deleted because of
+/// archive rows. The cap is a fixed, generic bound, not a per-site setting.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct StorageConfig {
