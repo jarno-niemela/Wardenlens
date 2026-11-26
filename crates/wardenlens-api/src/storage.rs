@@ -21,7 +21,7 @@ use wardenlens_core::time::Timestamp;
 
 use crate::error::ErrorBody;
 
-/// One tier. The space fields are `null` when the volume could not be measured.
+/// One tier. The space fields, except `min_free_percent`, are `null` when the volume could not be measured.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TierDto {
     /// Capacity as the floor arithmetic sees it: `(f_blocks - f_bfree + f_bavail) * f_frsize`.
@@ -30,7 +30,8 @@ pub(crate) struct TierDto {
     free_bytes: Option<u64>,
     /// `free_bytes * 100 / total_bytes`, rounded down.
     free_percent: Option<u8>,
-    /// The configured floor, in percent.
+    /// The configured floor, in percent; present whenever a tick has run, even while the volume
+    /// is not measured.
     min_free_percent: Option<u8>,
     /// Free space is under the floor.
     below_floor: Option<bool>,
@@ -107,9 +108,10 @@ pub(crate) enum TickErrorDto {
 pub(crate) struct StorageDto {
     hot: TierDto,
     archive: ArchiveDto,
-    /// Segments left alone since start because nothing could be concluded about them.
+    /// Event counter: times, since start, a segment was left alone because nothing could be
+    /// concluded about it (the same segment can count again on a later tick).
     unverified_total: u64,
-    /// Files quarantined since start.
+    /// Event counter: files moved into a quarantine since start, whatever the reason.
     quarantined_total: u64,
     /// When the latest tick ran, in UTC Unix milliseconds; `null` before the first tick.
     last_tick: Option<i64>,
@@ -121,11 +123,11 @@ pub(crate) struct StorageDto {
 
 fn tier_dto(t: &TierStatus) -> TierDto {
     TierDto {
-        total_bytes: t.volume.map(|v| v.total_bytes),
-        free_bytes: t.volume.map(|v| v.free_bytes),
-        free_percent: t.volume.map(|v| v.free_percent),
-        min_free_percent: t.volume.map(|v| v.min_free_percent),
-        below_floor: t.volume.map(|v| v.below_floor),
+        total_bytes: t.volume.map(|v| v.total_bytes()),
+        free_bytes: t.volume.map(|v| v.free_bytes()),
+        free_percent: t.volume.map(|v| v.free_percent()),
+        min_free_percent: t.min_free_percent,
+        below_floor: t.volume.map(|v| v.below_floor()),
         segments: t.segments,
         oldest_segment: t.oldest.map(Timestamp::as_unix_millis),
         newest_segment: t.newest.map(Timestamp::as_unix_millis),

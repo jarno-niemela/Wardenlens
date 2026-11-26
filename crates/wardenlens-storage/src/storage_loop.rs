@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wardenlens_core::storage::{
     Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, MinFreePercent, PlanInput, Policy,
@@ -82,6 +83,9 @@ pub struct TickReport {
     pub rows_dropped: u32,
     /// Hot segments quarantined after a read error.
     pub source_quarantined: u32,
+    /// Files moved into a quarantine this tick, whatever the reason (source, move cells, stale
+    /// twin, delete twin, the "archive returned" pass). Counted at `Fs::quarantine`.
+    pub quarantined: u32,
     /// Segments left alone because nothing could be concluded.
     pub unverified: u32,
     /// Archive-side move failures this tick.
@@ -174,6 +178,8 @@ pub struct StorageLoop<I, F, U> {
     observer: Box<dyn Observer>,
     /// What the API reads (ticket #63): rebuilt after every tick.
     snapshot: StorageSnapshot,
+    /// Files moved into a quarantine since start (bumped by `RealFs::quarantine`).
+    quarantine_count: Arc<AtomicU64>,
     /// The rows of both tiers as last read; kept when the index cannot be read.
     rows: (TierRows, TierRows),
 }
@@ -256,7 +262,8 @@ impl Storage {
             Arc::clone(&slot),
             allow_same(&cfg),
         );
-        let fs = wrap(RealFs::new(hot, slot));
+        let quarantine_count = Arc::new(AtomicU64::new(0));
+        let fs = wrap(RealFs::new(hot, slot, Arc::clone(&quarantine_count)));
         let looper = StorageLoop {
             cfg,
             index,
@@ -278,6 +285,7 @@ impl Storage {
             cap_cycle_failures: 0,
             observer: Box::new(NoObserver),
             snapshot: StorageSnapshot::initial(),
+            quarantine_count,
             rows: (TierRows::default(), TierRows::default()),
         };
         Ok((looper, files))
@@ -345,6 +353,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// input. The next tick starts afresh.
     pub fn tick(&mut self, now: Timestamp) -> Result<TickReport, TickError> {
         // Only the first probe of a tick may clear the move failures.
+        let quarantined_before = self.quarantine_count.load(Ordering::Relaxed);
         let first = self.probe_now(true);
         self.count_breaches(&first);
         if let Err(e) = first.hot {
@@ -361,6 +370,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             rolled_forward: 0,
             rows_dropped: 0,
             source_quarantined: 0,
+            quarantined: 0,
             unverified: 0,
             archive_failures: 0,
             index_errors: 0,
@@ -431,6 +441,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             0
         };
         report.index_health_error = self.index_health_error();
+        report.quarantined = self.quarantined_since(quarantined_before);
         let kind = result.as_ref().err().map(status::error_kind);
         self.record_tick(now, &current, Some(&report), kind);
         result.map(|()| report)
@@ -442,6 +453,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     #[must_use]
     pub const fn snapshot(&self) -> StorageSnapshot {
         self.snapshot
+    }
+
+    /// Files quarantined since the counter read `before`.
+    fn quarantined_since(&self, before: u64) -> u32 {
+        let now = self.quarantine_count.load(Ordering::Relaxed);
+        u32::try_from(now.saturating_sub(before)).unwrap_or(u32::MAX)
     }
 
     /// One more breach per volume the first probe of a tick found under its floor (saturating).
@@ -466,6 +483,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         error: Option<TickErrorKind>,
     ) {
         let mut error = error;
+        // A hot probe that failed after an action leaves the volume unmeasured, and the tick
+        // itself completed: say why the hot volume is missing rather than show a clean tick.
+        if report.is_some_and(|r| r.hot_probe_failed) {
+            error = error.or(Some(TickErrorKind::HotVolume));
+        }
         match status::read_rows(&self.index) {
             Some(rows) => self.rows = rows,
             None => error = error.or(Some(TickErrorKind::Index)),
@@ -480,11 +502,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             let unverified = r
                 .unverified
                 .saturating_add(r.returned.as_ref().map_or(0, |p| p.unverified));
-            let quarantined = r
-                .source_quarantined
-                .saturating_add(r.returned.as_ref().map_or(0, |p| p.quarantined));
-            self.add_counts(unverified, quarantined);
+            self.add_unverified(unverified);
         }
+        self.snapshot.quarantined_total = self.quarantine_count.load(Ordering::Relaxed);
         let s = &mut self.snapshot;
         s.hot = status::tier_status(probe.hot.ok(), policy.hot_min_free, &self.rows.0);
         s.archive = status::tier_status(archive_space, policy.archive_min_free, &self.rows.1);
@@ -493,10 +513,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         s.last_error = error;
     }
 
-    fn add_counts(&mut self, unverified: u32, quarantined: u32) {
+    fn add_unverified(&mut self, unverified: u32) {
         let s = &mut self.snapshot;
         s.unverified_total = s.unverified_total.saturating_add(u64::from(unverified));
-        s.quarantined_total = s.quarantined_total.saturating_add(u64::from(quarantined));
     }
 
     /// The "archive returned" pass of section 9 (see [`crate::reconcile`]): only keys with an
@@ -541,7 +560,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             self.cfg.walk_max_dir_rows,
         )
         .run();
-        self.add_counts(done.report.unverified, done.report.quarantined);
+        self.add_unverified(done.report.unverified);
+        // Its quarantines went through `Fs::quarantine` like every other. The archive condition
+        // of this probe seeds the snapshot until the first tick.
+        self.snapshot.quarantined_total = self.quarantine_count.load(Ordering::Relaxed);
+        self.snapshot.archive_condition = status::archive_condition(&p.archive, false);
         Ok(done)
     }
 

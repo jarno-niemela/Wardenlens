@@ -52,21 +52,23 @@ fn vol(cap: u64, free: u64, floor: u8) -> VolumeStatus {
 }
 
 fn snapshot() -> StorageSnapshot {
-    StorageSnapshot {
-        hot: TierStatus {
-            volume: Some(vol(1000, 200, 25)),
-            segments: 7,
-            oldest: Some(Timestamp::from_unix_millis(1_000)),
-            newest: Some(Timestamp::from_unix_millis(9_000)),
-        },
-        archive: TierStatus::default(),
-        archive_condition: ArchiveCondition::Unavailable(ArchiveUnavailableCause::NoMarker),
-        unverified_total: 3,
-        quarantined_total: 2,
-        last_tick: Some(Timestamp::from_unix_millis(12_345)),
-        last_error: Some(TickErrorKind::Index),
-        floor_breaches_total: 4,
-    }
+    // `non_exhaustive`: start from `initial()` and set the fields.
+    let mut s = StorageSnapshot::initial();
+    s.hot = TierStatus::new(
+        MinFreePercent::new(25).unwrap(),
+        Some(vol(1000, 200, 25)),
+        7,
+        Some(Timestamp::from_unix_millis(1_000)),
+        Some(Timestamp::from_unix_millis(9_000)),
+    );
+    s.archive = TierStatus::new(MinFreePercent::new(30).unwrap(), None, 0, None, None);
+    s.archive_condition = ArchiveCondition::Unavailable(ArchiveUnavailableCause::NoMarker);
+    s.unverified_total = 3;
+    s.quarantined_total = 2;
+    s.last_tick = Some(Timestamp::from_unix_millis(12_345));
+    s.last_error = Some(TickErrorKind::Index);
+    s.floor_breaches_total = 4;
+    s
 }
 
 #[tokio::test]
@@ -101,6 +103,10 @@ async fn storage_reports_the_snapshot_field_by_field() {
     assert_eq!(arch["state"], "unavailable");
     assert_eq!(arch["unavailable_cause"], "no_marker");
     assert!(arch["total_bytes"].is_null(), "an absent volume is null");
+    assert_eq!(
+        arch["min_free_percent"], 30,
+        "the floor is shown regardless"
+    );
     assert!(arch["below_floor"].is_null());
     assert_eq!(arch["segments"], 0);
     assert!(arch["oldest_segment"].is_null());

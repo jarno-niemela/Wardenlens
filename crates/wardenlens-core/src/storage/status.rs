@@ -24,20 +24,14 @@ pub fn free_percent(free: u64, capacity: u64) -> u8 {
     u8::try_from(scaled.min(100)).unwrap_or(100)
 }
 
-/// Space of one volume against its floor.
+/// Space of one volume against its floor. Built only by [`VolumeStatus::new`], so the derived
+/// fields always agree with the space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeStatus {
-    /// Capacity as the floor arithmetic sees it, in bytes.
-    pub total_bytes: u64,
-    /// Space available to the service, in bytes.
-    pub free_bytes: u64,
-    /// `free_bytes * 100 / total_bytes`, rounded down (see [`free_percent`]).
-    pub free_percent: u8,
-    /// The configured floor, in percent.
-    pub min_free_percent: u8,
-    /// Free space is under the floor, by the same byte rule the planner uses
-    /// (`free < capacity * min_free / 100`, rounded down).
-    pub below_floor: bool,
+    total_bytes: u64,
+    free_bytes: u64,
+    free_percent: u8,
+    below_floor: bool,
 }
 
 impl VolumeStatus {
@@ -50,15 +44,43 @@ impl VolumeStatus {
             total_bytes: space.capacity_bytes,
             free_bytes: space.free_bytes,
             free_percent: free_percent(space.free_bytes, space.capacity_bytes),
-            min_free_percent: min_free.get(),
             below_floor: u128::from(space.free_bytes) < floor_bytes,
         }
     }
+
+    /// Capacity as the floor arithmetic sees it, in bytes.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Space available to the service, in bytes.
+    #[must_use]
+    pub const fn free_bytes(&self) -> u64 {
+        self.free_bytes
+    }
+
+    /// `free_bytes * 100 / total_bytes`, rounded down (see [`free_percent`]).
+    #[must_use]
+    pub const fn free_percent(&self) -> u8 {
+        self.free_percent
+    }
+
+    /// Free space is under the floor, by the same byte rule the planner uses
+    /// (`free < capacity * min_free / 100`, rounded down).
+    #[must_use]
+    pub const fn below_floor(&self) -> bool {
+        self.below_floor
+    }
 }
 
-/// One tier: its volume (when it could be measured) and its rows.
+/// One tier: its floor, its volume (when it could be measured) and its rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct TierStatus {
+    /// The configured floor, in percent: known even while the volume is not measured. `None`
+    /// only in the initial snapshot, before any tick or probe.
+    pub min_free_percent: Option<u8>,
     /// `None` when the volume could not be measured (the archive is away, or the probe failed).
     pub volume: Option<VolumeStatus>,
     /// Segment rows on this tier.
@@ -67,6 +89,26 @@ pub struct TierStatus {
     pub oldest: Option<Timestamp>,
     /// End time of the newest segment, `None` for an empty tier.
     pub newest: Option<Timestamp>,
+}
+
+impl TierStatus {
+    /// A tier from its parts.
+    #[must_use]
+    pub const fn new(
+        min_free: MinFreePercent,
+        volume: Option<VolumeStatus>,
+        segments: u64,
+        oldest: Option<Timestamp>,
+        newest: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            min_free_percent: Some(min_free.get()),
+            volume,
+            segments,
+            oldest,
+            newest,
+        }
+    }
 }
 
 /// Why the archive is unavailable (ADR 0005 section 8). A class, never a path.
@@ -119,7 +161,12 @@ pub enum TickErrorKind {
 }
 
 /// The storage loop's state after its latest tick.
+///
+/// Before the first tick (`last_tick` is `None`) nothing is measured yet: the tiers are empty and
+/// unmeasured, and the archive condition is `unavailable (other)`, unless the start-up
+/// reconciliation probed the archive first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StorageSnapshot {
     /// The hot tier.
     pub hot: TierStatus,
@@ -127,9 +174,12 @@ pub struct StorageSnapshot {
     pub archive: TierStatus,
     /// State of the archive.
     pub archive_condition: ArchiveCondition,
-    /// Segments left alone since start because nothing could be concluded about them.
+    /// An event counter: how many times, since start, a segment was left alone because nothing
+    /// could be concluded about it. One segment can count again on a later tick.
     pub unverified_total: u64,
-    /// Files quarantined since start.
+    /// An event counter: how many files, since start, were moved into a quarantine, whatever the
+    /// reason (counted at the one place that quarantines). Files already there at start, and
+    /// ones later evicted, are not counted or subtracted.
     pub quarantined_total: u64,
     /// When the latest tick ran (UTC Unix milliseconds); `None` before the first tick.
     pub last_tick: Option<Timestamp>,
@@ -143,19 +193,16 @@ impl StorageSnapshot {
     /// The snapshot before the first tick: nothing measured, nothing counted.
     #[must_use]
     pub const fn initial() -> Self {
+        let empty = TierStatus {
+            min_free_percent: None,
+            volume: None,
+            segments: 0,
+            oldest: None,
+            newest: None,
+        };
         Self {
-            hot: TierStatus {
-                volume: None,
-                segments: 0,
-                oldest: None,
-                newest: None,
-            },
-            archive: TierStatus {
-                volume: None,
-                segments: 0,
-                oldest: None,
-                newest: None,
-            },
+            hot: empty,
+            archive: empty,
             archive_condition: ArchiveCondition::Unavailable(ArchiveUnavailableCause::Other),
             unverified_total: 0,
             quarantined_total: 0,
@@ -214,11 +261,10 @@ mod tests {
                 pct(25),
             )
         };
-        assert!(at(249).below_floor);
-        assert!(!at(250).below_floor);
-        assert!(at(0).below_floor);
-        assert_eq!(at(249).free_percent, 24);
-        assert_eq!(at(250).min_free_percent, 25);
+        assert!(at(249).below_floor());
+        assert!(!at(250).below_floor());
+        assert!(at(0).below_floor());
+        assert_eq!(at(249).free_percent(), 24);
     }
 
     #[test]
@@ -233,13 +279,13 @@ mod tests {
                         },
                         pct(p),
                     );
-                    assert!(s.free_percent <= 100);
+                    assert!(s.free_percent() <= 100);
                     if p == 0 {
-                        assert!(!s.below_floor, "a zero floor is never breached");
+                        assert!(!s.below_floor(), "a zero floor is never breached");
                     }
                     if cap == 0 {
-                        assert!(!s.below_floor);
-                        assert_eq!(s.free_percent, 0);
+                        assert!(!s.below_floor());
+                        assert_eq!(s.free_percent(), 0);
                     }
                 }
             }

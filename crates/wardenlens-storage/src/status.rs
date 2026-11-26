@@ -48,9 +48,9 @@ pub(crate) fn breaches(
     archive: &ArchiveProbe,
     archive_floor: MinFreePercent,
 ) -> u64 {
-    let hot = hot.is_some_and(|s| VolumeStatus::new(s, hot_floor).below_floor);
+    let hot = hot.is_some_and(|s| VolumeStatus::new(s, hot_floor).below_floor());
     let archive = match archive {
-        ArchiveProbe::Available(s) => VolumeStatus::new(*s, archive_floor).below_floor,
+        ArchiveProbe::Available(s) => VolumeStatus::new(*s, archive_floor).below_floor(),
         _ => false,
     };
     u64::from(hot).saturating_add(u64::from(archive))
@@ -62,12 +62,13 @@ pub(crate) fn tier_status(
     floor: MinFreePercent,
     rows: &TierRows,
 ) -> TierStatus {
-    TierStatus {
-        volume: space.map(|s| VolumeStatus::new(s, floor)),
-        segments: rows.segments,
-        oldest: rows.oldest.map(|s| s.ended_at),
-        newest: rows.newest.map(|s| s.ended_at),
-    }
+    TierStatus::new(
+        floor,
+        space.map(|s| VolumeStatus::new(s, floor)),
+        rows.segments,
+        rows.oldest.map(|s| s.ended_at),
+        rows.newest.map(|s| s.ended_at),
+    )
 }
 
 /// The rows of one tier as the index reports them.
