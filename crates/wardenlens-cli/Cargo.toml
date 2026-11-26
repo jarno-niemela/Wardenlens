@@ -12,6 +12,7 @@ name = "wardenlens"
 path = "src/main.rs"
 
 [dependencies]
+aho-corasick = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rustix = { workspace = true, features = ["termios"] }
 secrecy.workspace = true
