@@ -350,3 +350,54 @@ fn errors_honour_the_json_log_format_and_never_hold_a_token() {
     assert_eq!(v["level"], "ERROR");
     assert!(!line.contains(&secret_of(&t)));
 }
+
+/// Runs the binary with fd 1 rewired by the shell (`redirect` is a shell redirection of fd 1).
+fn run_with_stdout(site: &Site, redirect: &str, args: &[&str]) -> Output {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("exec \"$@\" {redirect}"))
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_wardenlens"))
+        .arg("--config")
+        .arg(site.config())
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn create_refuses_up_front_when_stdout_is_closed_or_read_only() {
+    for redirect in ["1>&-", "1</dev/null", "1>/dev/null", "1<<<READONLY_FILE>>"] {
+        let site = Site::new();
+        let readonly = site.dir.path().join("readonly.txt");
+        fs::write(&readonly, "x").unwrap();
+        let redirect = redirect.replace("<<READONLY_FILE>>", &readonly.display().to_string());
+        let redirect = redirect.as_str();
+        let out = run_with_stdout(&site, redirect, &["token", "create", "--name", "ci"]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{redirect}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stderr).contains("stdout is not open for writing"),
+            "{redirect}: {}",
+            text(&out.stderr)
+        );
+        assert!(!site.db().exists(), "{redirect}: the index was created");
+    }
+}
+
+#[test]
+fn a_writable_redirected_stdout_is_still_accepted() {
+    let site = Site::new();
+    let target = site.dir.path().join("out.txt");
+    let redirect = format!(">{}", target.display());
+    let out = run_with_stdout(&site, &redirect, &["token", "create", "--name", "ci"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(fs::read_to_string(&target).unwrap().starts_with("wl_"));
+    assert_eq!(site.list().len(), 1);
+}

@@ -7,13 +7,20 @@
 //!   token, stores its id, digest, name and time, and prints the `wl_<id>_<secret>` string as the
 //!   only line on stdout. Everything else goes to stderr. The secret is never logged and is
 //!   zeroised after printing. An id collision (an id of an active **or revoked** token) generates
-//!   a new token, at most [`MAX_ATTEMPTS`] times, then fails with [`TokenError::IdCollision`]. If
-//!   the token cannot be written to stdout it is revoked again, so no token exists that nobody saw.
+//!   a new token, at most [`MAX_ATTEMPTS`] times, then fails with [`TokenError::IdCollision`].
+//!   Before anything is generated, stdout must be open for writing (`fcntl(F_GETFL)`) and not
+//!   `/dev/null` (which is also what the Rust runtime turns a closed fd 1 into), else
+//!   [`TokenError::StdoutClosed`] and nothing is created. The token is delivered once its line
+//!   has been written **and flushed** to stdout; the stderr hint after that is best-effort (its
+//!   failure is ignored, exit 0). If writing or flushing stdout fails, the token is revoked: when
+//!   that succeeds the result is [`TokenError::Output`]; when it fails the token may still be
+//!   active and the result is [`TokenError::OutputUnrevoked`], which names the id.
 //! * `list` prints a tab-separated table, oldest first: id, name, created and last used (UTC, or
 //!   `never`), revoked (`yes`/`no`). Names hold no control character (checked when stored and when
 //!   read), so a name cannot forge a line or a column.
 //! * `revoke <id>` sets `revoked` (the row stays). An already revoked token is a success; an
-//!   unknown id is [`TokenError::NotFound`] (exit 1).
+//!   unknown id is [`TokenError::NotFound`] (exit 1). Its stderr confirmation is best-effort:
+//!   once the token is revoked the command exits 0 whatever stderr does.
 //!
 //! Exit codes: 0 success; 1 an unknown id or an invalid config; 2 everything else.
 
@@ -56,7 +63,7 @@ pub(crate) enum TokenError {
     /// The index refused.
     #[error("the token store cannot be used")]
     Index(#[source] IndexError),
-    /// Every generated token had an id that exists.
+    /// Every generated token had an id that exists; nothing was stored.
     #[error("no unused token id found in {attempts} attempts; nothing was stored")]
     IdCollision { attempts: u32 },
     /// The system random generator is unavailable.
@@ -65,9 +72,24 @@ pub(crate) enum TokenError {
     /// The clock is outside 2000 to 2099.
     #[error("the system clock is outside the supported range")]
     Clock,
-    /// Writing to stdout failed. When a token had been stored it was revoked again.
+    /// Writing to stdout failed. For `create`, a token that had been stored was revoked again
+    /// (so none is left active); `list` has nothing to undo.
     #[error("cannot write to stdout")]
     Output(#[source] io::Error),
+    /// `create` could not write its token to stdout and could not revoke it either: the token
+    /// may still be active, but nobody has its secret. Names the id (never the secret).
+    #[error(
+        "cannot write to stdout, and token {id} could not be revoked; run `wardenlens token revoke {id}`"
+    )]
+    OutputUnrevoked {
+        id: String,
+        #[source]
+        source: io::Error,
+    },
+    /// `create` needs stdout to deliver the token and it is closed (seen as `/dev/null`),
+    /// read-only or `/dev/null`; nothing was created.
+    #[error("stdout is not open for writing (or is /dev/null); nothing was created")]
+    StdoutClosed,
 }
 
 impl TokenError {
@@ -99,7 +121,11 @@ fn run(
     // Arguments are checked before any file is opened, so a bad one creates nothing.
     let parsed = match cmd {
         TokenCommand::Create { name } => {
-            Parsed::Create(TokenName::new(name).map_err(TokenError::Name)?)
+            let name = TokenName::new(name).map_err(TokenError::Name)?;
+            // Before anything is generated or stored: a token that cannot be delivered is
+            // never made.
+            stdout_is_writable()?;
+            Parsed::Create(name)
         }
         TokenCommand::List => Parsed::List,
         TokenCommand::Revoke { id } => {
@@ -122,6 +148,35 @@ enum Parsed {
     Create(TokenName),
     List,
     Revoke(TokenId),
+}
+
+/// Fails with [`TokenError::StdoutClosed`] unless fd 1 can show the token to somebody: it must be
+/// open with a write access mode and must not be `/dev/null`. (A full or broken stdout that is
+/// open is caught later, by the write itself.)
+///
+/// Rust's runtime reopens a closed fd 1 as `/dev/null` before `main`, so "closed" cannot be seen
+/// as `EBADF` here; it looks exactly like a redirect to `/dev/null`, which would swallow the token
+/// just the same, so both are refused.
+fn stdout_is_writable() -> Result<(), TokenError> {
+    use rustix::fs::{FileType, OFlags, fcntl_getfl, fstat, stat};
+    use std::os::fd::AsFd as _;
+    let fd = io::stdout().as_fd().try_clone_to_owned().ok();
+    let usable = fd.as_ref().is_some_and(|fd| {
+        let writable = fcntl_getfl(fd).is_ok_and(|f| f.intersects(OFlags::WRONLY | OFlags::RDWR));
+        let null = match (fstat(fd), stat("/dev/null")) {
+            (Ok(a), Ok(b)) => {
+                FileType::from_raw_mode(a.st_mode) == FileType::CharacterDevice
+                    && a.st_rdev == b.st_rdev
+            }
+            _ => false,
+        };
+        writable && !null
+    });
+    if usable {
+        Ok(())
+    } else {
+        Err(TokenError::StdoutClosed)
+    }
 }
 
 fn now() -> Result<UnixMs, TokenError> {
@@ -167,22 +222,42 @@ fn create(
     err: &mut impl Write,
 ) -> Result<(), TokenError> {
     let token = store_new_token(index, name, now()?, generate)?;
-    let shown = Zeroizing::new(token.expose());
-    let printed = writeln!(out, "{}", shown.as_str()).and_then(|()| out.flush());
-    if let Err(e) = printed {
-        // Nobody saw the token: do not leave it valid. A failure here changes nothing for the
-        // caller, who gets the output error either way.
-        let _ = index.revoke_token(token.id());
-        return Err(TokenError::Output(e));
-    }
-    // The id is public; the secret is not repeated.
-    writeln!(
+    deliver(&token, out, |id| {
+        matches!(
+            index.revoke_token(id),
+            Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked)
+        )
+    })?;
+    // The token has been delivered (written and flushed). From here nothing may fail the
+    // command: a script that saw a failure exit would discard a token that is valid. The hint
+    // is best-effort; the id is public and the secret is not repeated.
+    let _ = writeln!(
         err,
         "created token {} (\"{}\"); this is the only time it is shown",
         token.id(),
         name.as_str()
-    )
-    .map_err(TokenError::Output)
+    );
+    Ok(())
+}
+
+/// Writes the token line to `out` and flushes. On a write or flush failure nobody has the
+/// secret, so `revoke` is called: if it reports success the error is [`TokenError::Output`],
+/// otherwise [`TokenError::OutputUnrevoked`].
+fn deliver(
+    token: &Token,
+    out: &mut impl Write,
+    revoke: impl FnOnce(&TokenId) -> bool,
+) -> Result<(), TokenError> {
+    let shown = Zeroizing::new(token.expose());
+    let printed = writeln!(out, "{}", shown.as_str()).and_then(|()| out.flush());
+    match printed {
+        Ok(()) => Ok(()),
+        Err(source) if revoke(token.id()) => Err(TokenError::Output(source)),
+        Err(source) => Err(TokenError::OutputUnrevoked {
+            id: token.id().to_string(),
+            source,
+        }),
+    }
 }
 
 fn revoke(index: &mut Index, id: TokenId, err: &mut impl Write) -> Result<(), TokenError> {
@@ -191,7 +266,10 @@ fn revoke(index: &mut Index, id: TokenId, err: &mut impl Write) -> Result<(), To
         RevokeOutcome::AlreadyRevoked => format!("token {id} was already revoked"),
         RevokeOutcome::NotFound => return Err(TokenError::NotFound { id: id.to_string() }),
     };
-    writeln!(err, "{message}").map_err(TokenError::Output)
+    // Revoked: the command has done its work. A failing stderr must not turn that into a
+    // failure exit (best-effort, like the `create` hint).
+    let _ = writeln!(err, "{message}");
+    Ok(())
 }
 
 fn print_table(tokens: &[TokenSummary], out: &mut impl Write) -> io::Result<()> {
@@ -401,6 +479,97 @@ mod tests {
         let listed = index.list_tokens().unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].revoked);
+    }
+
+    /// Fails only on `flush`: the line may sit in a buffer, so the token is not delivered.
+    struct FlushFails(Vec<u8>);
+    impl Write for FlushFails {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_counts_as_not_delivered_and_revokes() {
+        let (_d, mut index) = open();
+        let err = create(
+            &mut index,
+            &name("ci"),
+            Token::generate,
+            &mut FlushFails(Vec::new()),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TokenError::Output(_)), "{err:?}");
+        assert!(index.list_tokens().unwrap()[0].revoked);
+    }
+
+    #[test]
+    fn deliver_revokes_once_on_failure_and_never_on_success() {
+        let t = token("aaaaaaaa", 'B');
+        for (out_ok, revoke_ok) in [(true, true), (false, true), (false, false)] {
+            let mut calls = 0_u32;
+            let mut seen = None;
+            let result = if out_ok {
+                deliver(&t, &mut Vec::new(), |id| {
+                    calls += 1;
+                    seen = Some(*id);
+                    revoke_ok
+                })
+            } else {
+                deliver(&t, &mut Broken, |id| {
+                    calls += 1;
+                    seen = Some(*id);
+                    revoke_ok
+                })
+            };
+            match (out_ok, revoke_ok) {
+                (true, _) => {
+                    assert!(result.is_ok());
+                    assert_eq!(calls, 0, "a delivered token is never revoked");
+                }
+                (false, true) => {
+                    assert!(matches!(result, Err(TokenError::Output(_))));
+                    assert_eq!((calls, seen), (1, Some(*t.id())));
+                }
+                (false, false) => {
+                    let e = result.unwrap_err();
+                    assert_eq!((calls, seen), (1, Some(*t.id())));
+                    assert_eq!(e.exit_code(), 2);
+                    let msg = e.to_string();
+                    assert!(msg.contains("aaaaaaaa"), "{msg}");
+                    assert!(msg.contains("wardenlens token revoke aaaaaaaa"), "{msg}");
+                    let secret = t.expose().splitn(3, '_').nth(2).unwrap().to_owned();
+                    assert!(!msg.contains(&secret) && !format!("{e:?}").contains(&secret));
+                    assert!(matches!(e, TokenError::OutputUnrevoked { .. }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_stderr_after_delivery_is_never_a_failure() {
+        let (_d, mut index) = open();
+        let mut out = Vec::new();
+        create(
+            &mut index,
+            &name("ci"),
+            Token::generate,
+            &mut out,
+            &mut Broken,
+        )
+        .unwrap();
+        // The token was printed and is still active.
+        let printed = String::from_utf8(out).unwrap();
+        let parsed = Token::parse(printed.trim_end()).unwrap();
+        assert!(parsed.verify(index.find_token(parsed.id()).unwrap().as_ref()));
+        // The same for the confirmation of `revoke`.
+        revoke(&mut index, *parsed.id(), &mut Broken).unwrap();
+        assert!(!parsed.verify(index.find_token(parsed.id()).unwrap().as_ref()));
     }
 
     #[test]
