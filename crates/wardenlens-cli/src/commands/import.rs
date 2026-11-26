@@ -21,14 +21,19 @@
 //!   (their statuses are `would import`; whether a camera is new is only known by opening the
 //!   index, which creates files).
 //! * A real run needs the key file. A missing file points at `wardenlens secrets init`.
-//! * Per camera, in this order: vault host, vault name, vault login (an entry left by an earlier
-//!   run is removed when the file no longer has a login), then the registry row. The two stores
+//! * Per camera, in this order: remove the vault login of an earlier run, write the vault host and
+//!   name, write the new vault login last (none when the file has no login), then the registry
+//!   row. A failure midway thus never pairs an old login with a new host. The two stores
 //!   cannot share a transaction, so a run that fails midway is repaired by running it again
 //!   (every write is an upsert). The registry row is last so a listed camera always has its
 //!   vault entries.
 //! * The registry stores model `agentdvr/imported`, which is in no catalogue, so a path with a query
 //!   string is skipped (`path has a query string`): the registry accepts a query only for a model
 //!   whose catalogue entry lists it (SEC-10). The check runs in a dry run too, so both agree.
+//! * A path that contains any user or password of the file (any camera's, since sites share
+//!   passwords; ASCII-case-insensitive, also percent-decoded) is skipped and its path is not
+//!   shown, so a login hidden in a path never reaches the registry or the output. A very short
+//!   login (one character) matches many paths and over-refuses; that is fail-safe.
 //! * Output (stdout) is a table of id, host, path and status. The host identifies the site: the
 //!   owner runs this locally and never pastes the output. No login, password or source URL is
 //!   ever printed, and no error carries input text.
@@ -40,7 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretString};
 use wardenlens_agentdvr::{CameraDraft, MAX_INPUT_BYTES, SkipReason, Skipped};
-use wardenlens_core::camera::{CameraError, ModelRef, StreamSet};
+use wardenlens_core::camera::{CameraError, ModelRef, RtspPath, StreamSet};
 use wardenlens_core::catalogue::query_allowed;
 use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
@@ -252,8 +257,11 @@ fn read_input(path: &Path) -> Result<Zeroizing<Vec<u8>>, ImportError> {
 fn screen(drafts: Vec<CameraDraft>, model: &ModelRef) -> (Vec<CameraDraft>, Vec<Row>) {
     let mut ready = Vec::new();
     let mut rows = Vec::new();
+    // The logins of every camera in the file: sites share passwords, so a path is checked
+    // against all of them, not only its own camera's.
+    let logins = collect_logins(&drafts);
     for d in drafts {
-        if path_holds_login(&d) {
+        if path_holds_login(&d.path, &logins) {
             let mut r = row(
                 &d,
                 Status::Skipped("path contains the login (path not shown)".to_owned()),
@@ -307,16 +315,25 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// True if the path holds the draft's non-empty password or user, as written or percent-decoded.
-fn path_holds_login(d: &CameraDraft) -> bool {
-    let Some(c) = &d.credential else {
-        return false;
-    };
-    let written = d.path.as_str().as_bytes();
-    let decoded = percent_decode(d.path.as_str());
-    [c.user.as_bytes(), c.password.expose_secret().as_bytes()]
+/// Every non-empty user and password of the parse, zeroised on drop.
+fn collect_logins(drafts: &[CameraDraft]) -> Vec<Zeroizing<Vec<u8>>> {
+    drafts
         .iter()
-        .any(|needle| contains_bytes(written, needle) || contains_bytes(&decoded, needle))
+        .filter_map(|d| d.credential.as_ref())
+        .flat_map(|c| [c.user.as_bytes(), c.password.expose_secret().as_bytes()])
+        .filter(|b| !b.is_empty())
+        .map(|b| Zeroizing::new(b.to_ascii_lowercase()))
+        .collect()
+}
+
+/// True if the path holds any of `logins` (already ASCII-lowercased), compared
+/// ASCII-case-insensitively, as written or percent-decoded.
+fn path_holds_login(path: &RtspPath, logins: &[Zeroizing<Vec<u8>>]) -> bool {
+    let written = Zeroizing::new(path.as_str().to_ascii_lowercase().into_bytes());
+    let decoded = Zeroizing::new(percent_decode(path.as_str()).to_ascii_lowercase());
+    logins
+        .iter()
+        .any(|l| contains_bytes(&written, l) || contains_bytes(&decoded, l))
 }
 
 fn row(d: &CameraDraft, status: Status) -> Row {
@@ -533,7 +550,7 @@ mod tests {
         for (path, user, pw) in [
             ("/live/Fake-pw-1/main", "u-fake", "Fake-pw-1"),
             ("/a/u-fake/b", "u-fake", "Fake-pw-1"),
-            ("/x_psw=Fake-pw-1", "u-fake", "Fake-pw-1"),
+            ("/x_zzq=Fake-pw-1", "u-fake", "Fake-pw-1"),
         ] {
             let (ready, rows) = screen(drafts(path, user, pw), &model);
             assert!(ready.is_empty(), "{path}");
@@ -547,6 +564,27 @@ mod tests {
         assert_eq!(ready.len(), 1);
         let (ready, _) = screen(drafts("/live/main", "u-fake", "Fake-pw-1"), &model);
         assert_eq!(ready.len(), 1);
+    }
+
+    #[test]
+    fn another_cameras_login_and_other_case_are_refused() {
+        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+        let xml = "<objects><cameras>\
+            <camera id=\"1\" name=\"A\"><settings><videosourcestring>rtsp://192.0.2.5/s\
+            </videosourcestring><login>u-fake</login><password>Fake-pw-1</password></settings></camera>\
+            <camera id=\"2\" name=\"B\"><settings><videosourcestring>rtsp://192.0.2.6/x/FAKE-PW-1/y\
+            </videosourcestring></settings></camera>\
+            <camera id=\"3\" name=\"C\"><settings><videosourcestring>rtsp://192.0.2.7/ok\
+            </videosourcestring></settings></camera></cameras></objects>";
+        let (ready, rows) = screen(
+            wardenlens_agentdvr::parse(xml.as_bytes()).unwrap().cameras,
+            &model,
+        );
+        let ids: Vec<_> = ready.iter().map(|d| d.id.to_string()).collect();
+        assert_eq!(ids, ["agentdvr-1", "agentdvr-3"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "-");
+        assert!(!format!("{rows:?}").to_lowercase().contains("fake-pw-1"));
     }
 
     #[test]

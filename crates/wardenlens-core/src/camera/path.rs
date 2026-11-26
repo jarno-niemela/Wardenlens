@@ -25,7 +25,7 @@
 //! lies in the query). A name is compared case-insensitively with this list: `pass`, `passw`,
 //! `passwd`, `password`, `passcode`, `pw`, `pwd`, `p`, `user`, `usr`, `u`, `username`,
 //! `user_name`, `user-name`, `userid`, `user_id`, `login`, `loginuse`, `loginpas`, `token`,
-//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`, `pword`, `account`. Also, for every `=`, the run of ASCII
+//! `access_token`, `auth`, `key`, `apikey`, `api_key`, `api-key`, `secret`, `pword`, `account`, `psw`, `pswd`, `passwort`, `passphrase`, `authcode`, `authtoken`, `credential`. Also, for every `=`, the run of ASCII
 //! alphanumerics, `_` and `-` right before it is split on `_` and `-` and every trailing join of
 //! its pieces is compared with the list (separators removed), so `x_user_name=`, `+user_id=`, `_password=`, `0_user=`,
 //! `+password=`, `(password=` and `:password=` are refused. This covers the
@@ -42,7 +42,7 @@ use super::CameraError;
 /// Longest path (with query) in bytes.
 pub const MAX_PATH_LEN: usize = 512;
 
-const DENIED_PARAMS: [&str; 29] = [
+const DENIED_PARAMS: [&str; 36] = [
     "pass",
     "passw",
     "passwd",
@@ -72,6 +72,13 @@ const DENIED_PARAMS: [&str; 29] = [
     "secret",
     "pword",
     "account",
+    "psw",
+    "pswd",
+    "passwort",
+    "passphrase",
+    "authcode",
+    "authtoken",
+    "credential",
 ];
 
 /// What `Debug` and `Display` print.
@@ -225,6 +232,34 @@ mod tests {
             ("/?x=1", Some("x=1")),
         ] {
             assert_eq!(RtspPath::new(p).unwrap().query(), q, "{p}");
+        }
+    }
+
+    #[test]
+    fn newly_listed_credential_names_are_refused_in_path_and_query() {
+        for name in [
+            "psw",
+            "PSW",
+            "pswd",
+            "passwort",
+            "passphrase",
+            "authcode",
+            "auth_code",
+            "authtoken",
+            "auth-token",
+            "credential",
+        ] {
+            for p in [
+                format!("/live/ch0_{name}=x"),
+                format!("/a?{name}=x"),
+                format!("/{name}=x"),
+            ] {
+                assert_eq!(
+                    RtspPath::new(&p),
+                    Err(CameraError::PathCredentialParam),
+                    "{p}"
+                );
+            }
         }
     }
 
