@@ -51,11 +51,8 @@ pub enum NoReorderReason {
     PocType2,
     /// The VUI declares `max_num_reorder_frames` 0.
     VuiZeroReorder,
-    /// An intra-only profile (44, or a High family profile with `constraint_set3_flag`).
+    /// An intra-only profile (44, or 86, 110, 122 or 244 with `constraint_set3_flag`).
     IntraOnlyProfile,
-    /// Baseline (`profile_idc` 66) has no B slices; the verdict assumes picture order counts rise
-    /// in decoding order, as every encoder produces for P-only streams.
-    BaselineProfile,
 }
 
 /// Whether the SPS lets the stream reorder frames.
@@ -94,16 +91,16 @@ impl SpsSummary {
         if self.is_intra_only() {
             return ReorderVerdict::NoReordering(NoReorderReason::IntraOnlyProfile);
         }
-        if self.profile_idc == 66 {
-            return ReorderVerdict::NoReordering(NoReorderReason::BaselineProfile);
-        }
         ReorderVerdict::Undetermined
     }
 
     fn is_intra_only(&self) -> bool {
-        // constraint_set3_flag is bit 0x10 of the constraint byte (spec A.2.8 to A.2.11).
+        // constraint_set3_flag is bit 0x10 of the constraint byte. Intra profiles: High 10 Intra
+        // (110), High 4:2:2 Intra (122), High 4:4:4 Intra (244) with the flag (spec A.2.8 to
+        // A.2.10), CAVLC 4:4:4 Intra (44, always, A.2.11) and Scalable High Intra (86 with the
+        // flag). High (100) with the flag is an ordinary High stream.
         let set3 = self.constraint_flags & 0x10 != 0;
-        self.profile_idc == 44 || (set3 && matches!(self.profile_idc, 86 | 100 | 110 | 122 | 244))
+        self.profile_idc == 44 || (set3 && matches!(self.profile_idc, 86 | 110 | 122 | 244))
     }
 }
 
@@ -454,7 +451,21 @@ mod tests {
             ("main, poc 0, no vui", none(77), Undetermined),
             ("high, poc 0, no vui", none(100), Undetermined),
             ("extended, poc 0, no vui", none(88), Undetermined),
-            ("baseline", none(66), NoReordering(BaselineProfile)),
+            ("baseline, poc 0: not proven", none(66), Undetermined),
+            (
+                "baseline, poc 1: not proven",
+                poc(
+                    66,
+                    Poc::One {
+                        always_zero: false,
+                        non_ref: 0,
+                        top_bottom: 0,
+                        cycle: vec![],
+                    },
+                ),
+                Undetermined,
+            ),
+            ("baseline, poc 2", poc(66, Poc::Two), NoReordering(PocType2)),
             ("poc 2", poc(77, Poc::Two), NoReordering(PocType2)),
             (
                 "poc 1 stays undetermined",
@@ -490,11 +501,6 @@ mod tests {
                 Undetermined,
             ),
             (
-                "high intra (set3)",
-                flags(100, 0x10),
-                NoReordering(IntraOnlyProfile),
-            ),
-            (
                 "high 10 intra",
                 flags(110, 0x10),
                 NoReordering(IntraOnlyProfile),
@@ -520,6 +526,11 @@ mod tests {
                 NoReordering(IntraOnlyProfile),
             ),
             ("main with set3 is not intra", flags(77, 0x10), Undetermined),
+            (
+                "high (100) with set3 is not intra",
+                flags(100, 0x10),
+                Undetermined,
+            ),
             ("high with other flags only", flags(100, 0xef), Undetermined),
             (
                 "poc 2 but vui says reorder",

@@ -190,7 +190,9 @@ impl FrameMapper {
             return Ok(None);
         }
         check_avcc(&raw.data)?;
-        let params = params.or_else(|| self.pending_params.take());
+        // Always consume the held value: a newer change must not leave a stale one behind.
+        let held = self.pending_params.take();
+        let params = params.or(held);
         self.params_delivered |= params.is_some();
         let discontinuity = self.pending_discontinuity || raw.loss > 0;
         self.pending_discontinuity = false;
@@ -271,7 +273,8 @@ fn check_avcc(data: &[u8]) -> Result<(), MapError> {
 /// evidence that it does not. Only the first two syntax elements of each slice are read.
 ///
 /// # Errors
-/// [`MapError::MalformedFrame`] when the data is not AVCC or a slice header is cut off.
+/// [`MapError::MalformedFrame`] when the data is not AVCC, a slice header is cut off or a
+/// `slice_type` is above 9.
 pub fn contains_b_slice(avcc: &[u8]) -> Result<bool, MapError> {
     for nal in nal_units(avcc) {
         let nal = nal.map_err(|_| MapError::MalformedFrame)?;
@@ -289,6 +292,9 @@ pub fn contains_b_slice(avcc: &[u8]) -> Result<bool, MapError> {
         let mut r = Bits::new(&head);
         r.ue().map_err(|_| MapError::MalformedFrame)?; // first_mb_in_slice
         let slice_type = r.ue().map_err(|_| MapError::MalformedFrame)?;
+        if slice_type > 9 {
+            return Err(MapError::MalformedFrame); // table 7-6 allows 0 to 9
+        }
         if matches!(slice_type, 1 | 6) {
             return Ok(true);
         }
@@ -456,6 +462,63 @@ mod tests {
             let _ = m.map(raw(vec![0; MAX_FRAME_BYTES + 1]), T0);
         }
         assert_eq!(m.dropped_oversize(), 4);
+    }
+
+    fn tagged(tag: u8) -> RawParams {
+        RawParams {
+            sps: vec![0x67, tag],
+            pps: vec![0x68, tag],
+        }
+    }
+
+    /// Regression (round 1): A on a normal frame, A again on an oversize frame, B on a normal
+    /// frame, then none. The last frame must not get the stale A.
+    #[test]
+    fn stale_held_back_params_are_not_redelivered() {
+        let mut m = FrameMapper::new();
+        let with = |p: Option<RawParams>| RawVideoFrame {
+            params: p,
+            ..raw(data())
+        };
+        let big = |p: Option<RawParams>| RawVideoFrame {
+            params: p,
+            ..raw(vec![0; MAX_FRAME_BYTES + 1])
+        };
+        assert_eq!(
+            m.map(with(Some(tagged(1))), T0)
+                .unwrap()
+                .unwrap()
+                .params
+                .unwrap()
+                .sps[1],
+            1
+        );
+        assert_eq!(m.map(big(Some(tagged(1))), T0).unwrap(), None);
+        assert_eq!(
+            m.map(with(Some(tagged(2))), T0)
+                .unwrap()
+                .unwrap()
+                .params
+                .unwrap()
+                .sps[1],
+            2
+        );
+        assert_eq!(m.map(with(None), T0).unwrap().unwrap().params, None);
+    }
+
+    #[test]
+    fn invalid_slice_type_is_malformed() {
+        for t in [10, 11, 255, u32::MAX - 1] {
+            assert_eq!(
+                contains_b_slice(&avcc(&[slice_nal(false, 0, t)])),
+                Err(MapError::MalformedFrame),
+                "{t}"
+            );
+        }
+        assert_eq!(
+            contains_b_slice(&avcc(&[slice_nal(false, 0, 9)])),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -661,6 +724,29 @@ mod tests {
     }
 
     proptest! {
+        /// Over random sequences of (oversize?, params?) frames, the parameters a delivered frame
+        /// carries are exactly the newest change not yet delivered, and none is ever repeated.
+        #[test]
+        fn params_delivered_are_the_latest_undelivered_change(
+            steps in prop::collection::vec((any::<bool>(), prop::option::of(0..4_u8)), 0..40)
+        ) {
+            let mut m = FrameMapper::new();
+            let mut newest_undelivered: Option<u8> = None;
+            for (oversize, tag) in steps {
+                if let Some(t) = tag { newest_undelivered = Some(t); }
+                let data = if oversize { vec![0; MAX_FRAME_BYTES + 1] } else { data() };
+                let r = RawVideoFrame { params: tag.map(tagged), ..raw(data) };
+                let out = m.map(r, T0).unwrap();
+                if oversize {
+                    prop_assert!(out.is_none());
+                } else {
+                    let got = out.unwrap().params.map(|p| p.sps[1]);
+                    prop_assert_eq!(got, newest_undelivered);
+                    newest_undelivered = None;
+                }
+            }
+        }
+
         /// Whatever bytes arrive, mapping never panics; a delivered frame is valid AVCC within
         /// the cap and equals the input; a refusal is typed.
         #[test]

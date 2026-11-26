@@ -50,6 +50,8 @@ enum Mode {
     RtcpOnly,
     /// Answer 401 to every DESCRIBE, whatever it carries.
     Reject401,
+    /// As `Frames`, but the second frame is a NAL unit with the forbidden bit set.
+    CorruptMedia,
     /// Answer 403 to DESCRIBE.
     Forbidden,
     /// Answer 404 to DESCRIBE.
@@ -241,6 +243,17 @@ async fn serve(
                 if mode == Mode::RtcpOnly {
                     rtcp_forever(&mut sock, channel).await;
                     return;
+                }
+                if mode == Mode::CorruptMedia {
+                    send_interleaved(
+                        &mut sock,
+                        channel,
+                        &rtp(100, 90_000, true, &[0x65, 0x88, 0x84, 0x00, 0x10]),
+                    )
+                    .await;
+                    send_interleaved(&mut sock, channel, &rtp(101, 93_600, true, &[0xe5, 0x00]))
+                        .await;
+                    continue;
                 }
                 send_frames(&mut sock, channel).await;
                 if mode == Mode::FramesThenClose {
@@ -484,23 +497,40 @@ async fn a_camera_that_stops_sending_times_out_on_frames() {
     assert!(started.elapsed() < FRAME_TIMEOUT * 2);
 }
 
-/// Keep-alive traffic must not extend the wait: the deadline is per call, not per item. Real time
-/// with a short timeout: the camera sends an RTCP report every 50 ms, far more often than the
-/// 300 ms limit, so a timer that restarts per item would never fire (the outer guard then fails).
+/// Keep-alive traffic must not extend the wait: the deadline is per call, not per item. Real
+/// time, not paused time: with the clock paused the scripted RTCP never reaches the client before
+/// the timer jumps, and the per-item mutant then survives (checked in round 2). The camera sends
+/// a report every 50 ms, far more often than the 300 ms limit, so a timer that restarted per item
+/// would never fire and the outer guard would fail the test.
 #[tokio::test]
 async fn rtcp_traffic_does_not_defer_the_frame_timeout() {
     let server = spawn(Sdp::H264, Mode::RtcpOnly).await;
     let cred = credential();
+    let limit = std::time::Duration::from_millis(300);
     let mut stream = open(&server, Some(&cred))
         .await
         .unwrap()
-        .with_frame_timeout(std::time::Duration::from_millis(300));
+        .with_frame_timeout(limit);
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), stream.next_frame())
         .await
         .expect("the frame timeout must fire while RTCP keeps arriving");
     assert_eq!(result.unwrap_err(), IngestError::FrameTimeout);
-    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    assert!(started.elapsed() >= limit);
+}
+
+/// A session error is typed without camera data, and the stream is fused afterwards.
+#[tokio::test]
+async fn corrupt_media_is_stream_failed_without_leaking_and_fuses() {
+    let server = spawn(Sdp::H264, Mode::CorruptMedia).await;
+    let cred = credential();
+    let mut stream = open(&server, Some(&cred)).await.unwrap();
+    assert!(stream.next_frame().await.unwrap().is_some());
+    let e = stream.next_frame().await.unwrap_err();
+    assert_eq!(e, IngestError::StreamFailed);
+    assert_no_camera_data(&format!("{e} {e:?}"), &server);
+    assert!(stream.next_frame().await.unwrap().is_none());
+    assert!(stream.next_frame().await.unwrap().is_none());
 }
 
 #[tokio::test]

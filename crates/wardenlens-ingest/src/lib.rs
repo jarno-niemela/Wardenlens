@@ -9,8 +9,11 @@
 //! [`contains_b_slice`] answer ADR 0005 open risk 1 (does a stream reorder frames?) for the
 //! owner's manual run; they work on any SPS bytes and need no camera.
 //!
-//! Everything a camera sends is untrusted: sizes are capped, nothing panics and errors carry no
-//! camera data (see [`IngestError`]). The crate does not log. retina logs through the `log`
+//! Everything a camera sends is untrusted: nothing here panics and errors carry no camera data
+//! (see [`IngestError`]). The 8 MiB frame cap ([`MAX_FRAME_BYTES`]) applies to a frame after
+//! retina has assembled it from RTP packets; retina does not bound that assembly, so a hostile
+//! camera can make one session hold memory up to its link rate times [`FRAME_TIMEOUT`] before the
+//! cap sees the frame (ADR 0002 accepted risk 12, follow-up #155). The crate does not log. retina logs through the `log`
 //! facade and some of its records (for example the unassigned-channel warning) include peer
 //! addresses, so the binary must not forward `retina` records below `error` to its logs.
 

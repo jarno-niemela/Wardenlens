@@ -25,7 +25,7 @@ use crate::frame::{Frame, FrameMapper, RawParams, RawVideoFrame};
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Longest wait for the next video frame. RTCP and audio do not extend it.
-pub const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Largest RTSP response retina will buffer (a DESCRIBE answer is a few KiB). Interleaved RTP is
 /// not covered, retina limits each message to under 64 KiB itself.
@@ -99,6 +99,7 @@ pub struct FrameStream<C> {
     clock: C,
     role: StreamRole,
     frame_timeout: Duration,
+    finished: bool,
 }
 
 /// Opens an RTSP session over TCP (interleaved) and starts playing the first H.264 video stream.
@@ -134,6 +135,7 @@ pub async fn open_stream<C: Clock>(
         clock,
         role,
         frame_timeout: FRAME_TIMEOUT,
+        finished: false,
     })
 }
 
@@ -197,16 +199,36 @@ impl<C: Clock> FrameStream<C> {
 
     /// The next video frame, or `None` when the camera closed the session.
     ///
-    /// Waits at most the frame timeout ([`FRAME_TIMEOUT`] unless changed) in total, whatever else the camera sends meanwhile. A
-    /// dropped oversize frame is not an error and does not end the wait early.
+    /// Waits at most the frame timeout ([`FRAME_TIMEOUT`] unless changed) in total, whatever else
+    /// the camera sends meanwhile. A dropped oversize frame is not an error and does not end the
+    /// wait early. A timeout too large to add to the clock is treated as "never".
     ///
     /// # Errors
     /// `FrameTimeout`, `StreamFailed` (or `AuthRejected`/`Rejected` if retina reports a status),
-    /// or `Map` for a frame that cannot be mapped. After an error the stream is finished.
+    /// `UnsupportedCodec` if the parameters turn out not to be H.264, or `Map` for a frame that
+    /// cannot be mapped.
+    ///
+    /// The stream is fused: after any error, and after `Ok(None)`, every later call returns
+    /// `Ok(None)` without touching the session, including after `FrameTimeout` and after a
+    /// changed timeout. Open a new session to continue; its first frame is a discontinuity.
     pub async fn next_frame(&mut self) -> Result<Option<Frame>, IngestError> {
-        let deadline = Instant::now()
+        if self.finished {
+            return Ok(None);
+        }
+        let out = self.read_frame().await;
+        if !matches!(out, Ok(Some(_))) {
+            self.finished = true;
+        }
+        out
+    }
+
+    async fn read_frame(&mut self) -> Result<Option<Frame>, IngestError> {
+        let now = Instant::now();
+        // About 30 years, as tokio's own "far future".
+        let deadline = now
             .checked_add(self.frame_timeout)
-            .ok_or(IngestError::FrameTimeout)?;
+            .or_else(|| now.checked_add(Duration::from_hours(262_800)))
+            .unwrap_or(now);
         loop {
             let item = match timeout_at(deadline, self.demuxed.next()).await {
                 Err(_) => return Err(IngestError::FrameTimeout),
