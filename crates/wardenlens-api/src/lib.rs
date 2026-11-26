@@ -3,7 +3,8 @@
 //!
 //! This crate builds a [`axum::Router`] and does not bind sockets or serve it; the
 //! composition root does that. It talks to storage only through the
-//! [`TokenStore`], [`CameraDirectory`], [`CameraStatus`] and [`StorageStatus`] traits from `wardenlens-core`,
+//! [`TokenStore`], [`CameraDirectory`], [`CameraStatus`], [`StorageStatus`], [`SegmentLister`] and
+//! [`SegmentFiles`] traits from `wardenlens-core`,
 //! taken as generics.
 //!
 //! # Middleware order
@@ -24,12 +25,15 @@
 //! 5. `TimeoutLayer` answers `408` when a handler runs too long.
 //! 6. `RequestBodyLimitLayer` rejects bodies over 64 KiB with `413`.
 //!
-//! Neither limit covers a streamed response body, and the connection cap and header
+//! Neither limit covers a streamed response body: the recordings download has its own idle
+//! timeout and download cap (see the `recordings` module). The connection cap and header
 //! read timeout belong to the server, not to this router.
 
 mod auth;
 mod cameras;
 mod error;
+mod recordings;
+mod rfc3339;
 mod routes;
 mod storage;
 pub mod token;
@@ -45,6 +49,7 @@ use axum::http::header::{
 };
 use axum::middleware::{self, Next};
 use axum::response::Response;
+use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -56,12 +61,13 @@ use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use wardenlens_core::camera::{CameraDirectory, CameraStatus};
-use wardenlens_core::storage::StorageStatus;
+use wardenlens_core::storage::{SegmentFiles, SegmentLister, StorageStatus};
 use wardenlens_core::token_store::TokenStore;
 
 use crate::auth::{AuthState, require_token};
 use crate::cameras::CameraPorts;
 use crate::error::error_response;
+use crate::recordings::{DOWNLOAD_IDLE, MAX_DOWNLOADS, RecordingPorts};
 
 /// Largest accepted request body: 64 KiB (Phase 1 has no upload routes).
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -99,12 +105,18 @@ struct Limits {
     max_body_bytes: usize,
     max_in_flight: usize,
     timeout: Duration,
+    /// How long a streamed chunk may wait for the client before the download is cut.
+    download_idle: Duration,
+    /// Downloads streaming at once.
+    max_downloads: usize,
 }
 
 const LIMITS: Limits = Limits {
     max_body_bytes: MAX_BODY_BYTES,
     max_in_flight: MAX_IN_FLIGHT,
     timeout: REQUEST_TIMEOUT,
+    download_idle: DOWNLOAD_IDLE,
+    max_downloads: MAX_DOWNLOADS,
 };
 
 /// Replaces non-JSON error responses (from the limit layers, `404`, `405`) with the
@@ -167,12 +179,23 @@ fn with_layers(router: Router, limits: Limits) -> Router {
     Router::new().fallback_service(service)
 }
 
-fn build<S, D, C, T>(store: Arc<S>, directory: D, status: C, storage: T, limits: Limits) -> Router
+fn build<S, D, C, T, R, F>(
+    store: Arc<S>,
+    directory: D,
+    status: C,
+    storage: T,
+    recordings: R,
+    files: F,
+    limits: Limits,
+) -> Router
 where
     S: TokenStore + Send + Sync + 'static,
     D: CameraDirectory + Send + Sync + 'static,
     C: CameraStatus + Send + Sync + 'static,
     T: StorageStatus + Send + Sync + 'static,
+    R: SegmentLister + Send + Sync + 'static,
+    F: SegmentFiles + Send + Sync + 'static,
+    F::Handle: 'static,
 {
     let ports = Arc::new(CameraPorts { directory, status });
     let auth = Arc::new(AuthState::new(store));
@@ -189,9 +212,19 @@ where
     let storage = OpenApiRouter::<Arc<T>>::new()
         .routes(routes!(storage::get_storage))
         .with_state(Arc::new(storage));
+    let recordings = OpenApiRouter::<Arc<RecordingPorts<R, F>>>::new()
+        .routes(routes!(recordings::list_recordings))
+        .routes(routes!(recordings::download_segment))
+        .with_state(Arc::new(RecordingPorts {
+            lister: recordings,
+            files: Arc::new(files),
+            downloads: Arc::new(Semaphore::new(limits.max_downloads)),
+            idle: limits.download_idle,
+        }));
     let protected = OpenApiRouter::new()
         .merge(cameras)
         .merge(storage)
+        .merge(recordings)
         .routes(routes!(routes::openapi_json))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(auth, require_token::<S>));
@@ -206,16 +239,27 @@ where
 ///
 /// `GET /api/v1/health` is open; every other route, and any unknown path, needs
 /// `Authorization: Bearer <token>` checked against `store`. The camera routes read
-/// `directory` and `status`, the storage route reads `storage`; the API never sees a credential
-/// or a vault.
-pub fn router<S, D, C, T>(store: Arc<S>, directory: D, status: C, storage: T) -> Router
+/// `directory` and `status`, the storage route reads `storage`, the recordings list reads
+/// `recordings` and the download opens segments through `files` only; the API never sees a
+/// credential, a vault, a path or a volume root.
+pub fn router<S, D, C, T, R, F>(
+    store: Arc<S>,
+    directory: D,
+    status: C,
+    storage: T,
+    recordings: R,
+    files: F,
+) -> Router
 where
     S: TokenStore + Send + Sync + 'static,
     D: CameraDirectory + Send + Sync + 'static,
     C: CameraStatus + Send + Sync + 'static,
     T: StorageStatus + Send + Sync + 'static,
+    R: SegmentLister + Send + Sync + 'static,
+    F: SegmentFiles + Send + Sync + 'static,
+    F::Handle: 'static,
 {
-    build(store, directory, status, storage, LIMITS)
+    build(store, directory, status, storage, recordings, files, LIMITS)
 }
 
 #[cfg(test)]

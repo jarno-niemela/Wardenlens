@@ -53,6 +53,8 @@ fn app_of(dir: FakeDirectory, st: FakeStatus) -> (Router, String) {
             dir,
             st,
             super::FakeStorage::default(),
+            super::FakeLister::default(),
+            wardenlens_core::storage::MemorySegmentFiles::new(),
             LIMITS,
         ),
         auth,
