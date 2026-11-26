@@ -1408,15 +1408,24 @@ mod tests {
             ])
         };
         let mut r = rig(vec![session(), session(), session()], cfg);
-        let mut last = 0;
-        while last < 3 {
+        let mut attempts: Vec<u32> = Vec::new();
+        let mut was_backoff = false;
+        while attempts.len() < 3 {
             let s = timeout(Duration::from_secs(300), r.state.changed()).await;
             assert!(s.is_ok());
-            if let Some(a) = backoff_attempt(&r.state.borrow()) {
-                assert!(a >= last, "outage reset: {a} after {last}");
-                last = a;
+            let now = backoff_attempt(&r.state.borrow());
+            if let Some(a) = now
+                && !was_backoff
+            {
+                attempts.push(a);
             }
+            was_backoff = now.is_some();
         }
+        assert_eq!(
+            attempts,
+            [1, 2, 3],
+            "an outage was reset by a stalling stream"
+        );
         r.cancel.cancel();
     }
 
