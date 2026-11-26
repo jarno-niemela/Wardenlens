@@ -238,8 +238,9 @@ pub enum RevokeOutcome {
     NotFound,
 }
 
-/// Plain data access to stored tokens: no hashing and no comparison (that is
-/// `wardenlens-api::token`). Rows are never deleted.
+/// Verification lookup: plain data access to stored tokens, no hashing and no comparison (that
+/// is `wardenlens-api::token`). This is all the API's authentication needs; token management and
+/// bookkeeping are [`TokenAdmin`].
 pub trait TokenStore {
     /// Looks a token up by id; `Ok(None)` when the id is unknown.
     ///
@@ -249,7 +250,12 @@ pub trait TokenStore {
         &self,
         id: &TokenId,
     ) -> impl Future<Output = Result<Option<TokenRecord>, TokenStoreError>> + Send;
+}
 
+/// Token management and bookkeeping (the CLI, and the API's `last_used` update): plain data
+/// access, no hashing. Rows are never deleted. Split from [`TokenStore`] so the verifier depends
+/// on lookup only (interface segregation); an index implements both.
+pub trait TokenAdmin {
     /// Stores a new token, active, never used.
     ///
     /// # Errors

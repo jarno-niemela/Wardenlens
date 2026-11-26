@@ -1,5 +1,5 @@
 //! The API token table (ticket #65): plain data access, rows never deleted, the `last_used` rate
-//! limit in the store, and the `TokenStore` adapter.
+//! limit in the store, and the `TokenStore` and `TokenAdmin` adapter.
 
 use std::future::Future;
 use std::pin::pin;
@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Waker};
 
 use wardenlens_core::time::UnixMs;
 use wardenlens_core::token_store::{
-    InsertError, MAX_TOKENS, NewToken, RevokeOutcome, TOKEN_ID_LEN, TokenId, TokenName,
+    InsertError, MAX_TOKENS, NewToken, RevokeOutcome, TOKEN_ID_LEN, TokenAdmin, TokenId, TokenName,
     TokenRecord, TokenStore, TokenStoreError,
 };
 

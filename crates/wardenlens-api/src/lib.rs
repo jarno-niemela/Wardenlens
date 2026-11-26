@@ -3,7 +3,8 @@
 //!
 //! This crate builds a [`axum::Router`] and does not bind sockets or serve it; the
 //! composition root does that. It talks to storage only through the
-//! [`TokenStore`] trait from `wardenlens-core`, taken as a generic.
+//! [`TokenStore`], [`CameraDirectory`] and [`CameraStatus`] traits from `wardenlens-core`,
+//! taken as generics.
 //!
 //! # Middleware order
 //!
@@ -27,6 +28,7 @@
 //! read timeout belong to the server, not to this router.
 
 mod auth;
+mod cameras;
 mod error;
 mod routes;
 pub mod token;
@@ -52,9 +54,11 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use wardenlens_core::camera::{CameraDirectory, CameraStatus};
 use wardenlens_core::token_store::TokenStore;
 
 use crate::auth::{AuthState, require_token};
+use crate::cameras::CameraPorts;
 use crate::error::error_response;
 
 /// Largest accepted request body: 64 KiB (Phase 1 has no upload routes).
@@ -161,16 +165,26 @@ fn with_layers(router: Router, limits: Limits) -> Router {
     Router::new().fallback_service(service)
 }
 
-fn build<S>(store: Arc<S>, limits: Limits) -> Router
+fn build<S, D, C>(store: Arc<S>, directory: D, status: C, limits: Limits) -> Router
 where
     S: TokenStore + Send + Sync + 'static,
+    D: CameraDirectory + Send + Sync + 'static,
+    C: CameraStatus + Send + Sync + 'static,
 {
+    let ports = Arc::new(CameraPorts { directory, status });
     let auth = Arc::new(AuthState::new(store));
     // Everything except health, unknown paths included, requires a token, so a
     // caller without one learns nothing about which routes exist.
     // `build` takes only `OpenApiRouter` fragments (`routes!` with `#[utoipa::path]`), so
     // every route is documented by construction.
+    // The handlers are generic over the ports, which `routes!` cannot spell with a turbofish,
+    // so the ports are the router state and the handler types are inferred from it.
+    let cameras = OpenApiRouter::<Arc<CameraPorts<D, C>>>::new()
+        .routes(routes!(cameras::list_cameras))
+        .routes(routes!(cameras::get_camera))
+        .with_state(ports);
     let protected = OpenApiRouter::new()
+        .merge(cameras)
         .routes(routes!(routes::openapi_json))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(auth, require_token::<S>));
@@ -184,12 +198,15 @@ where
 /// Builds the API router with authentication and request limits applied.
 ///
 /// `GET /api/v1/health` is open; every other route, and any unknown path, needs
-/// `Authorization: Bearer <token>` checked against `store`.
-pub fn router<S>(store: Arc<S>) -> Router
+/// `Authorization: Bearer <token>` checked against `store`. The camera routes read
+/// `directory` and `status`; the API never sees a credential or a vault.
+pub fn router<S, D, C>(store: Arc<S>, directory: D, status: C) -> Router
 where
     S: TokenStore + Send + Sync + 'static,
+    D: CameraDirectory + Send + Sync + 'static,
+    C: CameraStatus + Send + Sync + 'static,
 {
-    build(store, LIMITS)
+    build(store, directory, status, LIMITS)
 }
 
 #[cfg(test)]

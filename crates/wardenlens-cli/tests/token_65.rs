@@ -20,7 +20,7 @@ use std::task::{Context, Poll, Waker};
 use tempfile::TempDir;
 use wardenlens_api::token::Token;
 use wardenlens_core::time::UnixMs;
-use wardenlens_core::token_store::{TokenStore, TokenSummary};
+use wardenlens_core::token_store::{TokenAdmin, TokenStore, TokenSummary};
 use wardenlens_index::{Index, TokenIndex};
 
 struct Site {

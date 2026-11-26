@@ -16,7 +16,8 @@
 //! clock steps back, `last_used_at_ms` stays ahead of `now` and is not written until `now`
 //! catches up (never an unbounded write rate).
 //!
-//! [`TokenIndex`] makes an [`Index`] a core [`TokenStore`] for the async API. Its futures are
+//! [`TokenIndex`] makes an [`Index`] a core [`TokenStore`] (verification lookup, for the async API) and a
+//! [`TokenAdmin`] (insert, list, revoke, `last_used`). Its futures are
 //! already complete when returned and the SQLite call runs on the calling thread, so an async
 //! caller on a busy executor wraps calls in `spawn_blocking`, as for the rest of this crate.
 
@@ -26,8 +27,8 @@ use std::sync::Mutex;
 use rusqlite::types::ValueRef;
 use wardenlens_core::time::UnixMs;
 use wardenlens_core::token_store::{
-    InsertError, MAX_TOKENS, NewToken, RevokeOutcome, TokenId, TokenName, TokenRecord, TokenStore,
-    TokenStoreError, TokenSummary,
+    InsertError, MAX_TOKENS, NewToken, RevokeOutcome, TokenAdmin, TokenId, TokenName, TokenRecord,
+    TokenStore, TokenStoreError, TokenSummary,
 };
 
 use crate::error::IndexError;
@@ -230,7 +231,7 @@ fn touch_due(db: &sql::Db, id: &str, due: i64) -> Result<i64, IndexError> {
     .map_err(IndexError::sqlite("touch token"))
 }
 
-/// An [`Index`] as a core [`TokenStore`]. The connection is behind a `Mutex`, so the store is
+/// An [`Index`] as a core [`TokenStore`] and [`TokenAdmin`]. The connection is behind a `Mutex`, so the store is
 /// `Send + Sync`; a poisoned lock is a store failure, never a panic. Store errors reach callers
 /// without detail ([`TokenStoreError`]); use the [`Index`] methods for typed ones.
 pub struct TokenIndex {
@@ -271,7 +272,9 @@ impl TokenStore for TokenIndex {
     ) -> impl Future<Output = Result<Option<TokenRecord>, TokenStoreError>> + Send {
         std::future::ready(self.with(|i| i.find_token(id)).map_err(|_| TokenStoreError))
     }
+}
 
+impl TokenAdmin for TokenIndex {
     fn insert(&self, token: &NewToken) -> impl Future<Output = Result<(), InsertError>> + Send {
         std::future::ready(self.with(|i| i.insert_token(token)).map_err(|e| match e {
             IndexError::TokenIdTaken => InsertError::IdTaken,

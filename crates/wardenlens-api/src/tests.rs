@@ -11,11 +11,10 @@ use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::get;
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
-use wardenlens_core::time::UnixMs;
-use wardenlens_core::token_store::{
-    InsertError, NewToken, RevokeOutcome, TokenId, TokenRecord, TokenStore, TokenStoreError,
-    TokenSummary,
+use wardenlens_core::camera::{
+    Camera, CameraDirectory, CameraId, CameraStatus, Credential, DirectoryError, LinkStatus,
 };
+use wardenlens_core::token_store::{TokenId, TokenRecord, TokenStore, TokenStoreError};
 
 use super::{LIMITS, Limits, build, with_layers};
 use crate::token::Token;
@@ -53,36 +52,60 @@ impl TokenStore for FakeStore {
         };
         std::future::ready(out)
     }
+}
 
-    // The middleware only reads (`find`); the rest of the port is the CLI's and the index's.
-    fn insert(&self, _token: &NewToken) -> impl Future<Output = Result<(), InsertError>> + Send {
-        std::future::ready(Err(InsertError::Store(TokenStoreError)))
+/// Synthetic camera directory: a fixed list, or a failure.
+#[derive(Default)]
+struct FakeDirectory {
+    cameras: Vec<Camera>,
+    fail: bool,
+    /// What a real directory's vault would hold for each camera. Never served.
+    credentials: HashMap<String, Credential>,
+}
+
+impl CameraDirectory for FakeDirectory {
+    fn list(&self) -> impl Future<Output = Result<Vec<Camera>, DirectoryError>> + Send {
+        std::future::ready(if self.fail {
+            Err(DirectoryError)
+        } else {
+            Ok(self.cameras.clone())
+        })
     }
 
-    fn list(&self) -> impl Future<Output = Result<Vec<TokenSummary>, TokenStoreError>> + Send {
-        std::future::ready(Err(TokenStoreError))
-    }
-
-    fn revoke(
+    fn get(
         &self,
-        _id: &TokenId,
-    ) -> impl Future<Output = Result<RevokeOutcome, TokenStoreError>> + Send {
-        std::future::ready(Err(TokenStoreError))
+        id: &CameraId,
+    ) -> impl Future<Output = Result<Option<Camera>, DirectoryError>> + Send {
+        std::future::ready(if self.fail {
+            Err(DirectoryError)
+        } else {
+            Ok(self.cameras.iter().find(|c| c.id() == id).cloned())
+        })
     }
+}
 
-    fn touch_last_used(
-        &self,
-        _id: &TokenId,
-        _now: UnixMs,
-    ) -> impl Future<Output = Result<bool, TokenStoreError>> + Send {
-        std::future::ready(Err(TokenStoreError))
+/// Synthetic live status by camera id.
+#[derive(Default)]
+struct FakeStatus(HashMap<String, LinkStatus>);
+
+impl CameraStatus for FakeStatus {
+    fn status(&self, id: &CameraId) -> impl Future<Output = Option<LinkStatus>> + Send {
+        std::future::ready(self.0.get(id.as_str()).copied())
     }
 }
 
 fn app_with(store: FakeStore) -> (Router, Token) {
     let token = Token::generate().unwrap();
     store.add(&token, false);
-    (build(Arc::new(store), LIMITS), token)
+    (
+        build(
+            Arc::new(store),
+            FakeDirectory::default(),
+            FakeStatus::default(),
+            LIMITS,
+        ),
+        token,
+    )
 }
 
 fn app() -> (Router, Token) {
@@ -146,7 +169,15 @@ async fn openapi_lists_every_route_and_declares_bearer_scheme() {
         .collect();
     paths.sort_unstable();
     // Add every new route here; a route missing from the document fails this test.
-    assert_eq!(paths, ["/api/v1/health", "/api/v1/openapi.json"]);
+    assert_eq!(
+        paths,
+        [
+            "/api/v1/cameras",
+            "/api/v1/cameras/{id}",
+            "/api/v1/health",
+            "/api/v1/openapi.json"
+        ]
+    );
     let scheme = &doc["components"]["securitySchemes"]["bearer"];
     assert_eq!(scheme["type"], "http");
     assert_eq!(scheme["scheme"], "bearer");
@@ -160,7 +191,12 @@ async fn all_authentication_failures_look_identical() {
     store.add(&revoked, true);
     let known = Token::generate().unwrap();
     store.add(&known, false);
-    let app = build(Arc::new(store), LIMITS);
+    let app = build(
+        Arc::new(store),
+        FakeDirectory::default(),
+        FakeStatus::default(),
+        LIMITS,
+    );
     let unknown = Token::generate().unwrap();
     let wrong_secret = {
         let other = Token::generate().unwrap();
@@ -554,3 +590,4 @@ async fn undocumented_path_is_never_served() {
 }
 
 mod adversary;
+mod cameras;
