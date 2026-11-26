@@ -537,3 +537,31 @@ fn an_unlisted_carrier_of_another_cameras_password_is_refused_end_to_end() {
         assert!(stdout.contains("agentdvr-1"));
     }
 }
+
+/// Camera 1 repeats its password element, so the parser skips it and keeps only one of the two
+/// texts; camera 2 carries the other under an unlisted name. Both must be known to the screen.
+#[test]
+fn a_repeated_password_element_of_a_skipped_camera_is_still_screened() {
+    let site = Site::new();
+    site.init_key();
+    let body = format!(
+        "<camera id=\"1\" name=\"Cam One\"><settings>\
+         <videosourcestring>rtsp://192.0.2.1/s</videosourcestring>\
+         <login>{USER}</login><password>first-fake-pw</password><password>{PASSWORD}</password>\
+         </settings></camera>{}",
+        cam(
+            2,
+            "Cam Two",
+            "192.0.2.2",
+            &format!("/live/{PASSWORD}/main"),
+            "",
+            ""
+        )
+    );
+    let out = site.import(&site.xml(&body), &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    no_secrets(&out);
+    assert!(!contains(&site.state_bytes(), PASSWORD));
+    assert!(!contains(&site.state_bytes(), "first-fake-pw"));
+    assert!(text(&out.stdout).contains("path contains the login"));
+}

@@ -74,29 +74,6 @@ pub(crate) fn split(raw: &str) -> Result<Parts, SkipReason> {
     })
 }
 
-/// The non-empty user and password texts of the userinfo of any `scheme://` source, percent-decoded
-/// (a part that does not decode to UTF-8 is left out). Lenient on purpose: it runs on entries that
-/// are skipped, whose scheme or host may be refused, so that their logins can still be compared
-/// with the paths of the other cameras. At most two values.
-pub(crate) fn userinfo_values(raw: &str) -> Vec<Zeroizing<String>> {
-    let s = raw.trim_matches(|c: char| c.is_ascii_whitespace());
-    let Some((_, rest)) = s.split_once("://") else {
-        return Vec::new();
-    };
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = rest.split_at_checked(end).map_or(rest, |(a, _)| a);
-    let Some(at) = authority.rfind('@') else {
-        return Vec::new();
-    };
-    let userinfo = authority.split_at_checked(at).map_or("", |(u, _)| u);
-    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    [user, password]
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| decode(p).ok())
-        .collect()
-}
-
 /// `host`, `host:port`, `[v6]`, `[v6]:port`; an empty port (`host:`) is the default.
 fn host_port_of(hp: &str) -> Result<(Host, NonZeroU16), SkipReason> {
     let (host_text, port_text) = if hp.starts_with('[') {
@@ -159,6 +136,31 @@ fn userinfo_of(ui: &str) -> Option<RawUserinfo> {
         user: Zeroizing::new(user.to_owned()),
         password: Zeroizing::new(password.to_owned()),
     })
+}
+
+/// Lenient login candidates of a source text, with or without a scheme (see `Logins`): the part
+/// before the LAST `@` of everything after `://` (or of the whole text), not cut at a `/` or `?`,
+/// split at the first `:` into user and password; each part raw, and percent-decoded when that is
+/// valid UTF-8. Also the same for the authority-bounded userinfo, which is the true split of a
+/// well-formed URL that has a `@` further on.
+pub(crate) fn userinfo_candidates(raw: &str) -> Vec<Zeroizing<String>> {
+    let s = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    let rest = s.split_once("://").map_or(s, |(_, r)| r);
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = rest.split_at_checked(end).map_or(rest, |(a, _)| a);
+    let mut out = Vec::new();
+    for scope in [rest, authority] {
+        let Some(at) = scope.rfind('@') else { continue };
+        let userinfo = scope.split_at_checked(at).map_or("", |(u, _)| u);
+        let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+        for part in [user, password] {
+            out.push(Zeroizing::new(part.to_owned()));
+            if let Ok(decoded) = decode(part) {
+                out.push(decoded);
+            }
+        }
+    }
+    out
 }
 
 /// Percent-decoding; a `%` not followed by two hex digits stays literal. Invalid UTF-8 is

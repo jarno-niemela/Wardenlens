@@ -34,6 +34,8 @@
 //!   passwords, and the logins of skipped entries too; ASCII-case-insensitive) is skipped and its path is not
 //!   shown, so a login hidden in a path never reaches the registry or the output. A very short
 //!   login (one character) matches many paths and over-refuses; that is fail-safe.
+//! * Only the path is screened. The host is not: it is a site identifier the table prints by design,
+//!   and a host that equals a login is not a leak path into the registry (which stores no host).
 //! * Output (stdout) is a table of id, host, path and status. The host identifies the site: the
 //!   owner runs this locally and never pastes the output. No login, password or source URL is
 //!   ever printed, and no error carries input text.
