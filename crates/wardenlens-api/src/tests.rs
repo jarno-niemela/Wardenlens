@@ -14,7 +14,11 @@ use tower::ServiceExt as _;
 use wardenlens_core::camera::{
     Camera, CameraDirectory, CameraId, CameraStatus, Credential, DirectoryError, LinkStatus,
 };
-use wardenlens_core::storage::{StorageSnapshot, StorageStatus, StorageStatusError};
+use wardenlens_core::storage::{
+    SegmentCursor, SegmentListError, SegmentLister, SegmentPage, StorageSnapshot, StorageStatus,
+    StorageStatusError,
+};
+use wardenlens_core::time::Timestamp;
 use wardenlens_core::token_store::{TokenId, TokenRecord, TokenStore, TokenStoreError};
 
 use super::{LIMITS, Limits, build, with_layers};
@@ -120,6 +124,42 @@ impl StorageStatus for FakeStorage {
     }
 }
 
+/// Synthetic segment listing: a fixed result, or a failure.
+#[derive(Default)]
+struct FakeLister {
+    result: Option<Result<SegmentPage, SegmentListError>>,
+    /// The arguments of every call, for assertions.
+    calls: Mutex<Vec<ListCall>>,
+}
+
+type ListCall = (String, i64, i64, usize, Option<String>);
+
+impl SegmentLister for FakeLister {
+    fn list(
+        &self,
+        camera: &CameraId,
+        from: Timestamp,
+        to: Timestamp,
+        limit: usize,
+        cursor: Option<&SegmentCursor>,
+    ) -> impl Future<Output = Result<SegmentPage, SegmentListError>> + Send {
+        if let Ok(mut c) = self.calls.lock() {
+            c.push((
+                camera.as_str().to_owned(),
+                from.as_unix_millis(),
+                to.as_unix_millis(),
+                limit,
+                cursor.map(|c| c.as_token().to_owned()),
+            ));
+        }
+        std::future::ready(
+            self.result
+                .clone()
+                .unwrap_or_else(|| Ok(SegmentPage::new(Vec::new(), None))),
+        )
+    }
+}
+
 fn app_with(store: FakeStore) -> (Router, Token) {
     let token = Token::generate().unwrap();
     store.add(&token, false);
@@ -129,6 +169,8 @@ fn app_with(store: FakeStore) -> (Router, Token) {
             FakeDirectory::default(),
             FakeStatus::default(),
             FakeStorage::default(),
+            FakeLister::default(),
+            wardenlens_core::storage::MemorySegmentFiles::new(),
             LIMITS,
         ),
         token,
@@ -203,6 +245,8 @@ async fn openapi_lists_every_route_and_declares_bearer_scheme() {
             "/api/v1/cameras/{id}",
             "/api/v1/health",
             "/api/v1/openapi.json",
+            "/api/v1/recordings",
+            "/api/v1/recordings/{id}/file",
             "/api/v1/storage"
         ]
     );
@@ -224,6 +268,8 @@ async fn all_authentication_failures_look_identical() {
         FakeDirectory::default(),
         FakeStatus::default(),
         FakeStorage::default(),
+        FakeLister::default(),
+        wardenlens_core::storage::MemorySegmentFiles::new(),
         LIMITS,
     );
     let unknown = Token::generate().unwrap();
@@ -620,4 +666,5 @@ async fn undocumented_path_is_never_served() {
 
 mod adversary;
 mod cameras;
+mod recordings;
 mod storage;

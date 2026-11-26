@@ -26,6 +26,8 @@ fn app_of(storage: FakeStorage) -> (Router, String) {
             FakeDirectory::default(),
             FakeStatus::default(),
             storage,
+            super::FakeLister::default(),
+            wardenlens_core::storage::MemorySegmentFiles::new(),
             LIMITS,
         ),
         auth,

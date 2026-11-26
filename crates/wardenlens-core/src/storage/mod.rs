@@ -6,6 +6,7 @@
 
 mod files;
 mod index;
+mod lister;
 mod plan;
 mod status;
 mod types;
@@ -30,6 +31,7 @@ pub use index::{
     IndexedSegment, MAX_DURATION_MS, MAX_LIST_LIMIT, MAX_OLDEST, MAX_SEGMENT_BYTES, SegmentCursor,
     SegmentIndex, SegmentPage, TierTotals, TierUsage,
 };
+pub use lister::{SegmentListError, SegmentLister};
 pub use plan::{
     Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,
 };

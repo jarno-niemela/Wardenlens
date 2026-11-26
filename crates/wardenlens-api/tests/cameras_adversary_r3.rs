@@ -12,6 +12,8 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
+mod common;
+
 use wardenlens_api::router;
 use wardenlens_api::token::Token;
 use wardenlens_core::camera::{
@@ -83,7 +85,14 @@ fn app(dir: Dir, st: St) -> (Router, String) {
         },
     );
     (
-        router(Arc::new(store), dir, st, NoStorage),
+        router(
+            Arc::new(store),
+            dir,
+            st,
+            NoStorage,
+            common::NoLister,
+            wardenlens_core::storage::MemorySegmentFiles::new(),
+        ),
         format!("Bearer {}", token.expose()),
     )
 }
