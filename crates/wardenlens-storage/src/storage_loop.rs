@@ -72,6 +72,9 @@ pub struct TickReport {
     pub index_errors: u32,
     /// Segments deleted.
     pub deleted: u32,
+    /// Deletes that left a non-regular twin (a symlink, FIFO, ...) on the other tier alone: it is
+    /// not a segment, so the row went anyway; counted so it is never silent.
+    pub twins_left: u32,
     /// Deletes that could not unlink or fsync.
     pub delete_failed: u32,
     /// Quarantined files deleted first.
@@ -97,8 +100,8 @@ pub struct TickReport {
     /// The plan was made from a truncated prefix of the index, so its rolling-buffer deletes of
     /// hot video were refused (the budget would be computed from an understated total).
     pub rolling_deletes_refused: bool,
-    /// A tier holds more segments than the loop plans from: the plan used the oldest-first prefix
-    /// (health warning; moves and floor deletes still run).
+    /// A tier (either) holds more segments than the loop plans from: the plan used the oldest-first
+    /// prefix (health warning; moves and floor deletes still run).
     pub segments_truncated: bool,
     /// The hot volume could not be probed after an action; the tick stopped.
     pub hot_probe_failed: bool,
@@ -119,6 +122,19 @@ pub struct StorageLoop<I, F, U> {
     returned_pending: bool,
     max_segments: usize,
     observer: Box<dyn Observer>,
+}
+
+/// Which tiers were cut to their oldest-first prefix by the segment cap.
+#[derive(Debug, Clone, Copy, Default)]
+struct Truncated {
+    hot: bool,
+    archive: bool,
+}
+
+impl Truncated {
+    const fn any(self) -> bool {
+        self.hot || self.archive
+    }
 }
 
 /// The loop and the `SegmentFiles` implementation that share one index and one archive handle.
@@ -263,6 +279,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             index_errors: 0,
             deleted: 0,
             delete_failed: 0,
+            twins_left: 0,
             quarantine_evicted: 0,
             skipped: 0,
             truncated: false,
@@ -319,6 +336,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         cap: usize,
     ) -> Result<(Vec<StoredSegment>, bool), TickError> {
         self.load_segments_with(page, cap)
+            .map(|(v, t)| (v, t.any()))
     }
 
     /// Test hook: hot video bytes left after the last tick's actions.
@@ -446,7 +464,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         loop {
             current.hot.map_err(TickError::HotVolume)?;
             let (segments, truncated) = self.load_segments()?;
-            report.segments_truncated |= truncated;
+            report.segments_truncated |= truncated.any();
             let hot_total = segments
                 .iter()
                 .filter(|s| s.tier == Tier::Hot)
@@ -454,9 +472,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 .unwrap_or(u64::MAX);
             let planned_available = current.archive.is_available();
             let planned = self.make_plan(current, &segments, now, hot_total, false)?;
-            // From a truncated prefix the rolling buffer's budget is understated: refuse its
-            // hot deletes (and say so) rather than delete video on a wrong number.
-            let refuse_hot = truncated && planned.hot == HotState::RollingBuffer;
+            // From a truncated hot prefix the rolling buffer's budget is understated: refuse its
+            // hot deletes (and say so) rather than delete video on a wrong number. An archive-only
+            // truncation does not touch the hot numbers.
+            let refuse_hot = truncated.hot && planned.hot == HotState::RollingBuffer;
             let by_id: HashMap<SegmentId, Tier> = segments.iter().map(|s| (s.id, s.tier)).collect();
             // While the "archive returned" pass is pending no move runs, and no archive video is
             // evicted on behalf of one: only the evictions the archive's own floor needs stay.
@@ -508,11 +527,13 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 continue;
             }
             // The plan that is executed: only now are its rolling budget and states kept.
+            // Only the budget is withheld when the hot deletes were refused (it was computed from
+            // an understated total); the states are always reported.
             if !refuse_hot {
                 self.rolling_budget = planned.rolling_budget;
-                report.hot = Some(planned.hot);
-                report.archive_full = planned.archive == ArchiveStatus::Full;
             }
+            report.hot = Some(planned.hot);
+            report.archive_full = planned.archive == ArchiveStatus::Full;
             let mut hot_left = hot_total;
             let mut replan = false;
             for action in &actions {
@@ -602,6 +623,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             }
             Outcome::IndexError => bump(&mut report.index_errors),
             Outcome::Deleted => bump(&mut report.deleted),
+            Outcome::DeletedTwinLeft => {
+                bump(&mut report.deleted);
+                bump(&mut report.twins_left);
+            }
             Outcome::DeleteFailed => bump(&mut report.delete_failed),
             Outcome::Skipped(_) => bump(&mut report.skipped),
         }
@@ -609,7 +634,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
 
     /// Page through both tiers (`oldest` is bounded per call, SEC-2). A tier above the cap
     /// yields its oldest `cap` segments and `true`: the planner consumes oldest first anyway.
-    fn load_segments(&self) -> Result<(Vec<StoredSegment>, bool), TickError> {
+    fn load_segments(&self) -> Result<(Vec<StoredSegment>, Truncated), TickError> {
         self.load_segments_with(MAX_OLDEST, self.max_segments)
     }
 
@@ -617,9 +642,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         &self,
         page: usize,
         cap: usize,
-    ) -> Result<(Vec<StoredSegment>, bool), TickError> {
+    ) -> Result<(Vec<StoredSegment>, Truncated), TickError> {
         let mut all = Vec::new();
-        let mut truncated = false;
+        let mut truncated = Truncated::default();
         for tier in [Tier::Hot, Tier::Archive] {
             let start = all.len();
             let mut after = None;
@@ -633,7 +658,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 all.extend(rows);
                 if all.len().saturating_sub(start) > cap {
                     all.truncate(start.saturating_add(cap));
-                    truncated = true;
+                    match tier {
+                        Tier::Hot => truncated.hot = true,
+                        _ => truncated.archive = true,
+                    }
                     break;
                 }
                 if !full {

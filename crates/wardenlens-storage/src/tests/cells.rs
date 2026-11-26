@@ -396,9 +396,9 @@ fn delete_unlinks_fsyncs_each_directory_and_removes_the_row_last() {
     assert_eq!(
         log,
         vec![
+            Op::Open(Tier::Archive), // the twin is looked at before anything is unlinked
             Op::Unlink(Tier::Hot),
             Op::SyncDir(Tier::Hot),
-            Op::Open(Tier::Archive), // the twin's length is checked before it is unlinked
             Op::Unlink(Tier::Archive),
             Op::SyncDir(Tier::Archive)
         ]

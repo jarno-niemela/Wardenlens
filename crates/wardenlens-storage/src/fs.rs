@@ -35,7 +35,7 @@ pub struct Opened {
     pub file: Box<dyn SourceFile>,
     /// Its length.
     pub len: u64,
-    /// Bytes allocated on the volume, at most `len`.
+    /// Bytes allocated on the volume (what deleting the file frees; not capped at `len`).
     pub allocated: u64,
 }
 

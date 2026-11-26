@@ -83,6 +83,8 @@ pub(crate) enum Outcome {
     IndexError,
     /// Deleted (files unlinked, directories fsynced, row removed).
     Deleted,
+    /// As `Deleted`, but a non-regular twin (symlink, FIFO, ...) on the other tier was left alone.
+    DeletedTwinLeft,
     /// A delete could not unlink or fsync a file; the row is kept.
     DeleteFailed,
     /// Skipped, see [`Skip`].
@@ -106,6 +108,7 @@ impl Outcome {
             Self::Moved
                 | Self::MovedHotLeft
                 | Self::Deleted
+                | Self::DeletedTwinLeft
                 | Self::SourceQuarantined
                 | Self::RolledForward
                 | Self::RowDropped(_)
@@ -124,6 +127,7 @@ impl Outcome {
                 | Self::RowDropped(_)
                 | Self::SourceQuarantined
                 | Self::Deleted
+                | Self::DeletedTwinLeft
         )
     }
 }
@@ -469,26 +473,43 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
         } else {
             &[Tier::Hot]
         };
-        for &tier in tiers {
-            if tier != row.tier {
-                // The other tier holds at most a twin (a crash between M6 and M9). A twin of the
-                // wrong size is an invalid file: quarantined, never deleted (section 9).
-                match self.fs.open_read(tier, &rel.comps()) {
-                    Ok(o) if o.len == row.record.bytes => drop(o),
-                    Ok(o) => {
-                        drop(o);
-                        if !self.quarantined(tier, &rel) {
-                            return Outcome::DeleteFailed;
-                        }
-                        continue;
+        // First look at the twin on the other tier, before anything is unlinked: an error there
+        // must never leave an unlinked file behind a kept row.
+        let other = if row.tier == Tier::Hot {
+            Tier::Archive
+        } else {
+            Tier::Hot
+        };
+        let mut twin_left = false;
+        let mut skip_other = false;
+        if tiers.contains(&other) {
+            match self.fs.open_read(other, &rel.comps()) {
+                Ok(o) if o.len == row.record.bytes => drop(o),
+                Ok(o) => {
+                    // A wrong-size twin is an invalid file: quarantined, never deleted (section 9).
+                    drop(o);
+                    if !self.quarantined(other, &rel) {
+                        return Outcome::DeleteFailed;
                     }
-                    Err(e) if e.is_not_found() => {}
-                    // A symlink (ELOOP) or another non-regular object is not a segment and cannot
-                    // be quarantined: it is left where it is and never pins the row.
-                    Err(FsError::NotRegular) => continue,
-                    Err(e) if e.errno() == Some(Errno::LOOP) => continue,
-                    Err(_) => return Outcome::DeleteFailed,
+                    skip_other = true;
                 }
+                Err(e) if e.is_not_found() => {}
+                // A symlink (ELOOP) or another non-regular object is not a segment and cannot be
+                // quarantined: it is left where it is, counted, and never pins the row.
+                Err(FsError::NotRegular) => {
+                    twin_left = true;
+                    skip_other = true;
+                }
+                Err(e) if e.errno() == Some(Errno::LOOP) => {
+                    twin_left = true;
+                    skip_other = true;
+                }
+                Err(_) => return Outcome::DeleteFailed,
+            }
+        }
+        for &tier in tiers {
+            if tier == other && skip_other {
+                continue;
             }
             match self.fs.unlink(tier, &rel.dir(), &rel.name) {
                 Ok(()) => {}
@@ -503,6 +524,7 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
             }
         }
         match self.index.delete(id) {
+            Ok(()) if twin_left => Outcome::DeletedTwinLeft,
             Ok(()) => Outcome::Deleted,
             Err(_) => Outcome::IndexError,
         }

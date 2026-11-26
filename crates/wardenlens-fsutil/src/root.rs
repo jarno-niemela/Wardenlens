@@ -90,7 +90,8 @@ pub struct ReadFile {
     pub file: File,
     /// Its length in bytes.
     pub len: u64,
-    /// Bytes allocated on the volume, at most `len` (a sparse file frees less than its length).
+    /// Bytes allocated on the volume (`st_blocks * 512`): less than `len` for a sparse file, and
+    /// more for a small one (whole blocks), which is what deleting the file frees.
     pub allocated: u64,
 }
 
@@ -248,7 +249,7 @@ impl RootDir {
         Ok(ReadFile {
             file: File::from(fd),
             len: st.size,
-            allocated: st.allocated.min(st.size),
+            allocated: st.allocated,
         })
     }
 

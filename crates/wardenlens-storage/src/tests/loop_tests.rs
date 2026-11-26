@@ -1401,7 +1401,7 @@ fn hot_quarantine_bytes(env: &Env) -> u64 {
 }
 
 #[test]
-fn rolling_buffer_with_a_met_reserve_after_eviction_deletes_nothing_over_several_ticks() {
+fn rolling_buffer_deletes_no_video_while_quarantine_remains_over_several_ticks() {
     // The reviewer's reproduction: hot 1 MB, 760 kB foreign, 20 x 10 kB hot segments, 3 x 10 kB
     // of quarantine, no archive. The evicted quarantine alone must be enough.
     let env = Env::new();
@@ -1551,7 +1551,11 @@ fn a_planted_symlink_or_fifo_twin_never_pins_the_row_of_a_delete() {
             .unwrap();
         }
         let (lp, _) = build(&env, None);
-        assert_eq!(lp.delete_now(id, true), crate::Outcome::Deleted, "{kind}");
+        assert_eq!(
+            lp.delete_now(id, true),
+            crate::Outcome::DeletedTwinLeft,
+            "{kind}"
+        );
         assert_eq!(env.tier_of(id), None, "{kind}");
         assert!(
             std::fs::symlink_metadata(&twin).is_ok(),
@@ -1571,6 +1575,14 @@ fn quarantine_is_sized_by_allocated_bytes_so_a_sparse_file_is_not_counted() {
     // 100 kB apparent, nothing allocated: deleting it frees nothing.
     let f = std::fs::File::create(d.join("000000-000.mp4")).unwrap();
     f.set_len(100_000).unwrap();
+    // Precondition: the filesystem of the temporary directory makes `set_len` sparse. If it does
+    // not (it allocates the blocks), there is nothing to test here.
+    let blocks = std::os::unix::fs::MetadataExt::blocks(
+        &std::fs::metadata(d.join("000000-000.mp4")).unwrap(),
+    );
+    if blocks != 0 {
+        return;
+    }
     std::fs::write(d.join("000001-000.mp4"), pattern(20_000)).unwrap();
     // free = 180 kB, floor 250 kB. Counting the apparent 120 kB would reach it (300 kB); the
     // 20 kB that deleting really frees would not (200 kB), so nothing is evicted.
@@ -1578,4 +1590,101 @@ fn quarantine_is_sized_by_allocated_bytes_so_a_sparse_file_is_not_counted() {
     let r = lp.tick(now()).unwrap();
     assert_eq!(r.quarantine_evicted, 0, "{r:?}");
     assert!(d.join("000000-000.mp4").exists() && d.join("000001-000.mp4").exists());
+}
+
+// ---- round 5 -------------------------------------------------------------------------------
+
+/// Hot 1 MB, 800 kB foreign data, 2 x 75 kB hot segments (free 50 kB), reserve 100 kB, archive
+/// unavailable: the hot volume is in the rolling-buffer state. `archive_rows` archive rows give
+/// the archive tier something to truncate.
+fn truncation_world(archive_rows: i64) -> Env {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 800_000]).unwrap();
+    for n in 0..archive_rows {
+        env.row("cam-2", n, SEG, Tier::Archive);
+    }
+    for n in 0..2 {
+        env.add("cam-1", n, 75_000, Tier::Hot);
+    }
+    env
+}
+
+/// Tick once to seed the rolling buffer, add a segment, then tick again.
+fn rolling_second_tick(env: &Env, cap: Option<usize>) -> crate::TickReport {
+    let mut cfg = env.cfg();
+    cfg.policy.emergency_reserve_bytes = 100_000;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.tick(now()).unwrap();
+    env.add("cam-1", 5, 60_000, Tier::Hot);
+    if let Some(c) = cap {
+        lp.set_max_segments(c);
+    }
+    lp.tick(now()).unwrap()
+}
+
+#[test]
+fn archive_only_truncation_does_not_refuse_the_hot_rolling_buffer_deletes() {
+    let env = truncation_world(3);
+    // Cap 3: the archive's three rows fit... hot has 3 rows too; cap 2 cuts only the archive?
+    // Hot holds 3 rows (2 + the new one), the archive 3: use per-tier counts to cut one tier.
+    let r = rolling_second_tick(&env, Some(5));
+    assert!(!r.segments_truncated, "{r:?}");
+    assert_eq!(
+        r.hot,
+        Some(wardenlens_core::storage::HotState::RollingBuffer),
+        "{r:?}"
+    );
+    assert!(r.deleted >= 1, "{r:?}");
+    // Only the archive tier above the cap: 6 archive rows, cap 4, hot has 3 rows.
+    let env = truncation_world(6);
+    let r = rolling_second_tick(&env, Some(4));
+    assert!(r.segments_truncated, "{r:?}");
+    assert!(!r.rolling_deletes_refused, "{r:?}");
+    assert_eq!(
+        r.hot,
+        Some(wardenlens_core::storage::HotState::RollingBuffer),
+        "{r:?}"
+    );
+    assert!(r.deleted >= 1, "the hot rolling buffer still runs: {r:?}");
+}
+
+#[test]
+fn hot_truncation_refuses_the_rolling_deletes_but_still_reports_the_state() {
+    let env = truncation_world(1);
+    // After the first tick hot holds 2 rows (one went, one was added), the archive 1: cap 1 cuts
+    // only the hot tier.
+    let r = rolling_second_tick(&env, Some(1));
+    assert!(r.segments_truncated && r.rolling_deletes_refused, "{r:?}");
+    assert_eq!(r.deleted, 0, "{r:?}");
+    assert_eq!(
+        r.hot,
+        Some(wardenlens_core::storage::HotState::RollingBuffer),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_twin_open_error_fails_the_delete_before_anything_is_unlinked() {
+    for errno in [rustix::io::Errno::ACCESS, rustix::io::Errno::IO] {
+        let env = Env::new();
+        let id = env.add("cam-1", 0, 100, Tier::Hot);
+        let fault = Fault {
+            errno,
+            ..Fault::once(Op::Open(Tier::Archive), 1)
+        };
+        let (lp, state) = build(&env, Some(fault));
+        assert_eq!(
+            lp.delete_now(id, true),
+            crate::Outcome::DeleteFailed,
+            "{errno:?}"
+        );
+        assert!(
+            env.hot_file("cam-1", 0).exists(),
+            "{errno:?}: nothing was unlinked"
+        );
+        assert_eq!(env.tier_of(id), Some(Tier::Hot));
+        assert_eq!(count(&state, Op::Unlink(Tier::Hot)), 0);
+    }
 }
