@@ -488,3 +488,27 @@ fn skipped_entries_are_listed_with_a_reason() {
         "{stdout}"
     );
 }
+
+#[test]
+fn a_database_named_vault_db_is_refused_up_front_even_in_a_dry_run() {
+    let site = Site::new();
+    let config = fs::read_to_string(site.config())
+        .unwrap()
+        .replace("state/index.db", "state/vault.db");
+    fs::write(site.config(), config).unwrap();
+    let before = site.snapshot();
+    let out = site.import(&one(&site), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("same path"),
+        "{}",
+        text(&out.stderr)
+    );
+    no_secrets(&out);
+    assert!(!site.p("state/vault.db").exists());
+    assert_eq!(
+        before.len(),
+        site.snapshot().len() - 1,
+        "only the input was written"
+    );
+}

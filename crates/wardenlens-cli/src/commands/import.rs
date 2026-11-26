@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use wardenlens_agentdvr::{CameraDraft, MAX_INPUT_BYTES, SkipReason, Skipped};
 use wardenlens_core::camera::{CameraError, ModelRef, StreamSet};
 use wardenlens_core::catalogue::query_allowed;
@@ -111,6 +111,9 @@ pub(crate) enum ImportError {
     /// A built-in camera constant or entry id was refused (cannot happen today).
     #[error("internal camera value refused")]
     Camera(#[source] CameraError),
+    /// The vault file would be the index file.
+    #[error("the vault file and the index file are the same path; rename `database.path`")]
+    SameFile,
     /// The clock is outside 2000 to 2099.
     #[error("the system clock is outside the supported range")]
     Clock,
@@ -186,6 +189,9 @@ pub(crate) fn execute(cmd: &ImportCommand, ctx: &Context<'_>) -> ExitCode {
 
 fn agentdvr(ctx: &Context<'_>, file: &Path, dry_run: bool) -> Result<(), ImportError> {
     let config = load(&resolve_path(ctx.config_flag, ctx.env)?)?;
+    if vault_path(&config) == config.database_path() {
+        return Err(ImportError::SameFile);
+    }
     let bytes = read_input(file)?;
     let parsed = wardenlens_agentdvr::parse(&bytes).map_err(ImportError::Parse)?;
     drop(bytes);
@@ -238,21 +244,79 @@ fn read_input(path: &Path) -> Result<Zeroizing<Vec<u8>>, ImportError> {
 }
 
 /// Splits the drafts into those that can be written and the rows of those that cannot.
+///
+/// A draft is refused when its path carries its own login (the password or the user, compared
+/// case-sensitively with the path as written and percent-decoded): the registry would hold it in
+/// plaintext. Such a row shows `-` for the path, and a query path that is skipped shows only the
+/// part before `?`, so no refused path ever reaches the output.
 fn screen(drafts: Vec<CameraDraft>, model: &ModelRef) -> (Vec<CameraDraft>, Vec<Row>) {
     let mut ready = Vec::new();
     let mut rows = Vec::new();
     for d in drafts {
-        // The registry vets the same thing on write; checking here keeps a dry run honest.
-        if query_allowed(&[], model, &d.path) {
+        if path_holds_login(&d) {
+            let mut r = row(
+                &d,
+                Status::Skipped("path contains the login (path not shown)".to_owned()),
+            );
+            "-".clone_into(&mut r.path);
+            rows.push(r);
+        } else if query_allowed(&[], model, &d.path) {
             ready.push(d);
         } else {
-            rows.push(row(
+            // The registry vets the same thing on write; checking here keeps a dry run honest.
+            let mut r = row(
                 &d,
                 Status::Skipped("path has a query string (no catalogue model lists it)".to_owned()),
-            ));
+            );
+            let head = before_query(&r.path).to_owned();
+            r.path = head;
+            rows.push(r);
         }
     }
     (ready, rows)
+}
+
+/// The part of a path before its query string.
+fn before_query(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(head, _)| head)
+}
+
+/// Percent-decoding for the comparison only; a `%` not followed by two hex digits stays literal.
+fn percent_decode(s: &str) -> Zeroizing<Vec<u8>> {
+    let bytes = s.as_bytes();
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    let mut i = 0_usize;
+    while let Some(&b) = bytes.get(i) {
+        let hex = |off: usize| {
+            bytes
+                .get(i.saturating_add(off))
+                .and_then(|c| char::from(*c).to_digit(16))
+        };
+        if let (b'%', Some(h), Some(l)) = (b, hex(1), hex(2)) {
+            out.push(u8::try_from(h.saturating_mul(16).saturating_add(l)).unwrap_or(b));
+            i = i.saturating_add(3);
+        } else {
+            out.push(b);
+            i = i.saturating_add(1);
+        }
+    }
+    out
+}
+
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// True if the path holds the draft's non-empty password or user, as written or percent-decoded.
+fn path_holds_login(d: &CameraDraft) -> bool {
+    let Some(c) = &d.credential else {
+        return false;
+    };
+    let written = d.path.as_str().as_bytes();
+    let decoded = percent_decode(d.path.as_str());
+    [c.user.as_bytes(), c.password.expose_secret().as_bytes()]
+        .iter()
+        .any(|needle| contains_bytes(written, needle) || contains_bytes(&decoded, needle))
 }
 
 fn row(d: &CameraDraft, status: Status) -> Row {
@@ -346,9 +410,13 @@ fn write_all(
     Ok(rows)
 }
 
+/// Writes one camera's vault entries. The order matters: the old login goes first and the new one
+/// last, so a failure in between never leaves an old login next to a new host.
 fn write_vault(vault: &mut Vault, d: &CameraDraft) -> Result<(), ImportError> {
     let id_for = |kind| d.id.entry_id(kind).map_err(ImportError::Camera);
     let text = |s: &str| Value::Text(SecretString::from(s.to_owned()));
+    let credential_id = id_for(EntryKind::Credential)?;
+    vault.rm(&credential_id).map_err(ImportError::Vault)?;
     vault
         .set(
             &id_for(EntryKind::Host)?,
@@ -365,21 +433,14 @@ fn write_vault(vault: &mut Vault, d: &CameraDraft) -> Result<(), ImportError> {
             Scan::Normal,
         )
         .map_err(ImportError::Vault)?;
-    let credential_id = id_for(EntryKind::Credential)?;
-    match &d.credential {
-        Some(c) => {
-            let value = Value::Credential(Credentials {
-                username: c.user.clone(),
-                password: c.password.clone(),
-            });
-            vault
-                .set(&credential_id, EntryKind::Credential, &value, Scan::Normal)
-                .map_err(ImportError::Vault)?;
-        }
-        // The file no longer has a login: an entry from an earlier run must not outlive it.
-        None => {
-            vault.rm(&credential_id).map_err(ImportError::Vault)?;
-        }
+    if let Some(c) = &d.credential {
+        let value = Value::Credential(Credentials {
+            username: c.user.clone(),
+            password: c.password.clone(),
+        });
+        vault
+            .set(&credential_id, EntryKind::Credential, &value, Scan::Normal)
+            .map_err(ImportError::Vault)?;
     }
     Ok(())
 }
@@ -453,6 +514,75 @@ mod tests {
             .set_len(limit)
             .unwrap();
         assert_eq!(read_input(&path).unwrap().len(), MAX_INPUT_BYTES);
+    }
+
+    fn drafts(path: &str, user: &str, password: &str) -> Vec<CameraDraft> {
+        let xml = format!(
+            "<objects><cameras><camera id=\"1\" name=\"A\"><settings>\
+             <videosourcestring>rtsp://192.0.2.5{path}</videosourcestring>\
+             <login>{user}</login><password>{password}</password></settings></camera>\
+             </cameras></objects>"
+        );
+        wardenlens_agentdvr::parse(xml.as_bytes()).unwrap().cameras
+    }
+
+    #[test]
+    fn a_path_holding_the_login_is_refused_and_never_shown() {
+        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+        // (path, user, password): every one holds the password or the user.
+        for (path, user, pw) in [
+            ("/live/Fake-pw-1/main", "u-fake", "Fake-pw-1"),
+            ("/a/u-fake/b", "u-fake", "Fake-pw-1"),
+            ("/x_psw=Fake-pw-1", "u-fake", "Fake-pw-1"),
+        ] {
+            let (ready, rows) = screen(drafts(path, user, pw), &model);
+            assert!(ready.is_empty(), "{path}");
+            assert_eq!(rows.len(), 1);
+            let shown = format!("{:?}", rows[0]);
+            assert!(!shown.contains(pw) && !shown.contains(user), "{shown}");
+            assert_eq!(rows[0].path, "-");
+        }
+        // An empty password matches nothing; a path without the login passes.
+        let (ready, _) = screen(drafts("/live/main", "u-fake", ""), &model);
+        assert_eq!(ready.len(), 1);
+        let (ready, _) = screen(drafts("/live/main", "u-fake", "Fake-pw-1"), &model);
+        assert_eq!(ready.len(), 1);
+    }
+
+    #[test]
+    fn the_comparison_also_sees_a_percent_encoded_login() {
+        // Core's path type refuses `%`, so a draft cannot carry one today; the helper is the
+        // guard if that rule changes, and is tested directly.
+        assert_eq!(&**percent_decode("/a%41b%zz%4"), b"/aAb%zz%4");
+        assert!(contains_bytes(&percent_decode("/p%61ss"), b"pass"));
+        assert!(!contains_bytes(b"abc", b""));
+    }
+
+    #[test]
+    fn a_skipped_query_path_shows_only_the_part_before_the_query() {
+        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+        let (ready, rows) = screen(drafts("/s?pin=7731", "u-fake", "Fake-pw-1"), &model);
+        assert!(ready.is_empty());
+        assert_eq!(rows[0].path, "/s");
+        assert_eq!(before_query("/a"), "/a");
+    }
+
+    #[test]
+    fn the_same_file_for_vault_and_index_is_refused() {
+        let toml = r#"
+[api]
+listen = "127.0.0.1:8080"
+[storage]
+hot_root = "/srv/wl/hot"
+archive_root = "/srv/wl/archive"
+[database]
+path = "/srv/wl/state/vault.db"
+[secrets]
+key_file = "/srv/wl/keys/secrets.key"
+"#;
+        let c = Config::from_toml_str(toml).unwrap();
+        assert_eq!(vault_path(&c), c.database_path());
+        assert_eq!(ImportError::SameFile.exit_code(), 2);
     }
 
     #[test]
