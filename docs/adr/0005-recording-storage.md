@@ -437,7 +437,7 @@ the parse step and again as a typed error when a row is read.
 **`api_tokens`** (ADR 0004 section 9; migration 3, ticket #65): `id TEXT NOT NULL UNIQUE CHECK (length(id) = 8)` (8
 characters of lowercase base32), `digest BLOB NOT NULL CHECK (length(digest) = 32)` (SHA-256 of the decoded secret),
 `name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64)`, `created_at_ms INTEGER NOT NULL`, `last_used_at_ms INTEGER` (nullable; written at most once a
-minute per token), `revoked INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))`, `STRICT`. The `id` is the primary
+minute per token, enforced by the store's conditional `UPDATE ... WHERE last_used_at_ms IS NULL OR last_used_at_ms <= now - 60000`, #65), `revoked INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))`, `STRICT`. The `id` is the primary
 lookup key, so the unique constraint creates its index. Rows are never deleted (revoked ids are never reused).
 No roles in v1. The table holds hashes only, so it needs no ADR 0006 encryption.
 

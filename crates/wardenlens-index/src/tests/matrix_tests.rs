@@ -199,7 +199,7 @@ fn is_too_new(e: &IndexError) -> bool {
         e,
         IndexError::SchemaTooNew {
             found: 99,
-            supported: 2
+            supported: 3
         }
     )
 }

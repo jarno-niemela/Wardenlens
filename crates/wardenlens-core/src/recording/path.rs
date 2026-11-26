@@ -40,7 +40,7 @@ const MS_PER_DAY: i64 = 86_400_000;
     clippy::arithmetic_side_effects,
     reason = "inputs are bounded to years 2000-2099, so no intermediate can overflow i64"
 )]
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

@@ -10,6 +10,7 @@ mod segmenter;
 
 pub use crate::camera::CameraId;
 pub use clock::MediaClock;
+pub(crate) use path::civil_from_days;
 pub use path::{RecordingError, RelPath};
 pub use segmenter::{
     Decision, FrameMeta, MAX_FRAGMENT_BYTES, MAX_FRAME_BYTES, PushError, Pushed, SegmentConfig,

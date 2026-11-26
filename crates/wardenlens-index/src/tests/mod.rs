@@ -13,6 +13,7 @@ mod ops_tests;
 mod plan_tests;
 mod rows_tests;
 mod schema_tests;
+mod token_tests;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;

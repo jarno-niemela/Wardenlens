@@ -9,6 +9,7 @@
 pub(crate) mod config;
 pub(crate) mod import;
 pub(crate) mod secrets;
+pub(crate) mod token;
 
 use std::error::Error;
 use std::io::{self, Write};
