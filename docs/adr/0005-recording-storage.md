@@ -488,7 +488,38 @@ depth of history; Phase 2 adds retention by event and age):
    nothing. The recorder keeps retrying on ENOSPC (#57) and the storage endpoint reports `below_floor`. Recording does not stop
    by itself for a floor breach; it stops only when the OS refuses the write.
 
-Bounds: one tick executes at most `max_actions_per_tick` (default **64**) actions; it re-probes after each one. The
+**Segment row cap (owner ruling, 2026-11-26; #160).** The index holds at most **1,000,000 segment rows**
+(`MAX_SEGMENTS`, a fixed generic bound that keeps one plan's memory to tens of MB, SEC-2). It is a retention bound, not
+a safety action: it runs **after** the plan's actions of the tick, each tier pass with a per-tick bound of its own (the
+same `max_actions_per_tick`, a separate counter), so it can never consume the plan's actions (moves, floor and reserve
+deletes). It uses the normal delete protocol of section 7.
+- *Archive available:* hot and archive rows together may not exceed the cap. The oldest deletable archive rows
+  (`ended_at_ms`, then `id`) are deleted first; the hot tier gives only what is left above the archive's row count
+  (`excess - archive_rows`, computed once from the totals). Archive rows that cannot be deleted never cost hot video:
+  the shortfall stays over the cap, is reported (`cap_delete_failed`, `cap_truncated`), and the truncation defence
+  below covers it until the fault clears. The cap is retention, not safety.
+- *Archive unavailable:* only the hot tier's own excess over the cap is deleted. Archive rows are never a reason to
+  delete hot video: it is the only copy and would be moved once the archive returns.
+
+**Oldest deletable first.** Each tier keeps a paging cursor across ticks: a pass resumes after the last row it
+attempted, and wraps to the oldest row at the end of the tier. A row whose delete fails is skipped (and reported as
+`cap_delete_failed`), so any number of undeletable rows cannot hold the cap back, and newer rows may go before an
+older stuck one. Stuck rows are retried when the cursor wraps and, because new rows keep arriving behind the cursor,
+also after 16 ticks for each tick of the cycle that had a failure (so the retries stay rare). A row skipped because
+the archive went away is not a failure and does not move the cursor.
+
+In normal operation no tier then exceeds the cap, so the plan never sees a truncated prefix. **Defence in depth:** if a
+tier still exceeds it (rows added from outside faster than they are evicted), the plan is made from the oldest-first
+prefix, but the executor adds the archive's true byte total (`bytes_by_tier`) to the plan as one stand-in segment newer
+than all others and never executed, so the archive's `room` (free space plus archive video) is never computed from a
+prefix; when the plan would evict the stand-in, the moves that rely on that room wait for the next tick. If the total
+cannot be read the archive counts as unavailable for the archive-driven decisions of that tick (no moves, no archive
+evictions; the planner's floor and reserve hot deletes for an unavailable archive still run, as ENOSPC safety
+outranks a possible move) and an index error is counted. A hot tier cut to its prefix refuses the rolling-buffer hot deletes (their budget would be understated). Both report `segments_truncated`.
+
+Bounds: one tick executes at most `max_actions_per_tick` (default **64**) plan actions (quarantine evictions count
+toward them), plus at most as many row-cap evictions in each of the two cap passes, archive and hot (so at most three
+times the value in all); it re-probes after each one. The
 tick interval is 30 s (#68). Catch-up after downtime takes several ticks (see the example), which is acceptable
 because writing continues meanwhile.
 
@@ -713,7 +744,8 @@ an archive file, a `tier = archive` row, or a `tier = hot` row **whose hot file 
 available" table. It applies only the **archive** `.part` rule. For a key **without a row** it adopts the archive file and **never touches H** (a hot file there may be in the recorder's rename-to-insert window; the equal-size delete and the quarantine of H in the (none, valid, valid) cell apply at start-up only). It **never** touches a hot `.part` file (it may be a
 segment the recorder is writing right now), and it **never adopts a hot-only key** (a hot `.mp4` without a row may be
 in the recorder's rename-to-insert window); those two rules run only at start-up, before the recorders start. It runs
-**on the storage-loop task, serialised with the mover**, so no move is in flight. Required test (#58/#59): the pass
+**on the storage-loop task, serialised with the mover**, so no move is in flight. (On the tick that reports the return, the
+segment row cap of section 6 may still evict the oldest archive rows: that is retention, not part of this pass.) Required test (#58/#59): the pass
 runs while a recorder is mid-segment and mid-rename, and no hot file or hot row is affected.
 
 **Checked against the move crash table (section 7):** every crash row maps to one cell: before M3 and the `.part`
