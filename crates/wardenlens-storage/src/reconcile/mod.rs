@@ -30,7 +30,8 @@
 //!
 //! **Bounds.** The walk is `<root>/<camera>/<day>/<file>`: a directory below a day directory is
 //! not entered, a symlink is never followed, and the entries visited are capped
-//! (`StorageConfig::walk_max_entries`, default 5,000,000). One `(camera, day)` directory and its
+//! (`StorageConfig::walk_max_entries`, default 5,000,000; one day holds at most
+//! `walk_max_dir_rows` rows, default 200,000). One `(camera, day)` directory and its
 //! rows are held in memory at a time. Past the cap the walk stops, the report says `unverified`
 //! for the tiers and carries a health error, and nothing is concluded from the part not seen.
 //!
@@ -43,7 +44,7 @@ mod walk;
 use std::collections::{BTreeMap, HashSet};
 
 use wardenlens_core::camera::CameraId;
-use wardenlens_core::storage::SegmentIndex;
+use wardenlens_core::storage::{SegmentId, SegmentIndex};
 use wardenlens_core::time::UnixMs;
 
 use crate::fs::Fs;
@@ -180,11 +181,15 @@ pub(crate) struct Reconciler<'a, F, I> {
     pub(crate) archive: bool,
     /// Entries the walk may still visit.
     pub(crate) budget: usize,
+    /// Most rows of one `(camera, day)` held in memory.
+    pub(crate) max_dir_rows: usize,
     pub(crate) capped: bool,
     pub(crate) report: ReconcileReport,
     pub(crate) newest: Newest,
     /// The `(camera, day)` directories the walk processed.
     pub(crate) visited: HashSet<(String, String)>,
+    /// The ids of the rows handled through their directory.
+    pub(crate) seen_ids: HashSet<SegmentId>,
     /// Rows handled through their directory (so the orphan-row phase can account for the rest).
     pub(crate) rows_seen: u64,
 }
@@ -196,6 +201,7 @@ impl<'a, F: Fs, I: SegmentIndex> Reconciler<'a, F, I> {
         mode: Mode,
         archive: bool,
         max_entries: usize,
+        max_dir_rows: usize,
     ) -> Self {
         let report = ReconcileReport {
             archive_unavailable: !archive,
@@ -208,10 +214,12 @@ impl<'a, F: Fs, I: SegmentIndex> Reconciler<'a, F, I> {
             mode,
             archive,
             budget: max_entries,
+            max_dir_rows,
             capped: false,
             report,
             newest: Newest::default(),
             visited: HashSet::new(),
+            seen_ids: HashSet::new(),
             rows_seen: 0,
         }
     }

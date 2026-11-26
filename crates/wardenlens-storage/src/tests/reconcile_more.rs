@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rustix::io::Errno;
 use wardenlens_core::mp4box::{MAX_FILE_LEN, MAX_PAYLOAD_LEN};
 use wardenlens_core::storage::Tier;
 use wardenlens_core::time::Timestamp;
@@ -1003,7 +1002,6 @@ fn a_read_error_while_parsing_is_no_conclusion_and_never_quarantines() {
     assert_eq!(out.report.unverified, 1, "{:?}", out.report);
     assert_eq!(out.report.quarantined + out.report.adopted, 0);
     assert!(p.exists());
-    let _ = Errno::IO;
 }
 
 // ---- crash table: every row of section 7's table, built by the real mover ------------------------------
@@ -1348,4 +1346,185 @@ fn the_returned_pass_never_follows_a_symlink_or_touches_anything_outside_the_arc
     assert_eq!(snapshot(&outside), outside_before);
     assert_eq!(snapshot(&env.arch), arch_before);
     assert!(env.rows_of("cam-7").is_empty() && env.rows_of("cam-8").is_empty());
+}
+
+// ---- paging, the row bound, gating counts, the hold (fix round 2) ---------------------------------
+
+/// More rows in one `(camera, day)` than one `list` page (`MAX_LIST_LIMIT`, 1,000), and a row of
+/// the previous day that overlaps the day's start, so `list` returns it too.
+fn crowded_day(env: &Env, tier: Tier, rows: i64) -> Vec<wardenlens_core::storage::SegmentId> {
+    let mut ids = Vec::new();
+    for n in 0..rows {
+        ids.push(env.add("cam-1", -rows + n, 100, tier));
+    }
+    let day_start = T0 - T0.rem_euclid(86_400_000);
+    let first = day_start - 500;
+    let cam: wardenlens_core::camera::CameraId = "cam-1".parse().unwrap();
+    let rec = wardenlens_core::recording::SegmentRecord::new(
+        cam.clone(),
+        wardenlens_core::time::UnixMs::new(first).unwrap(),
+        1000,
+        100,
+        5,
+    );
+    let root = if tier == Tier::Hot {
+        &env.hot
+    } else {
+        &env.arch
+    };
+    put(
+        root,
+        &wardenlens_core::recording::RelPath::new(&cam, rec.started_at_ms).to_string(),
+        &pattern(100),
+    );
+    let mut idx = env.index.clone();
+    ids.push(wardenlens_core::storage::SegmentIndex::insert(&mut idx, &rec, tier).unwrap());
+    ids
+}
+
+#[test]
+fn more_than_one_page_of_hot_rows_in_a_day_is_paged_through_at_start_up() {
+    let env = Env::new();
+    let ids = crowded_day(&env, Tier::Hot, 1001);
+    let rows_before = env.rows_of("cam-1");
+    let before = snapshot(&env.hot);
+    let out = startup(&env);
+    assert_eq!(out.report, ReconcileReport::default());
+    assert_eq!(snapshot(&env.hot), before);
+    assert_eq!(env.rows_of("cam-1"), rows_before);
+    assert_eq!(rows_before.len(), ids.len());
+}
+
+#[test]
+fn more_than_one_page_of_archive_rows_in_a_day_is_paged_through_in_the_returned_pass() {
+    let env = Env::new();
+    unmount(&env);
+    let (mut lp, _) = build(&env, None);
+    lp.set_initial_archive_state(false);
+    let covered = env.tmp.path().join("covered");
+    std::fs::rename(&env.arch, &covered).unwrap();
+    std::fs::create_dir(&env.arch).unwrap();
+    std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    crowded_day(&env, Tier::Archive, 1001);
+    let rows_before = env.rows_of("cam-1");
+    let before = snapshot(&env.arch);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.returned.expect("ran"), ReconcileReport::default());
+    assert_eq!(snapshot(&env.arch), before);
+    assert_eq!(env.rows_of("cam-1"), rows_before);
+}
+
+#[test]
+fn the_per_day_row_bound_is_exact_and_exceeding_it_changes_nothing() {
+    // Six rows in one day: bound 7 and 6 hold them all, 5 and 0 do not.
+    for (bound, capped) in [(7, false), (6, false), (5, true), (0, true)] {
+        let env = Env::new();
+        for n in 0..5 {
+            env.add("cam-1", n, 100, Tier::Hot);
+        }
+        // A row without a file (`missing` when seen) and an orphan file (adopted when seen).
+        let gone = env.row("cam-1", 5, 100, Tier::Hot);
+        let orphan = put(&env.hot, &Env::rel("cam-1", 7), &good());
+        let cfg = env.cfg().with_walk_max_dir_rows(bound);
+        let (mut lp, _) = crate::Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+        let before = snapshot(&env.hot);
+        let r = lp.reconcile_startup().unwrap().report;
+        assert_eq!(r.walk_cap_exceeded, capped, "bound {bound}: {r:?}");
+        assert_eq!(r.health_error(), capped);
+        if capped {
+            assert_eq!(env.tier_of(gone), Some(Tier::Hot), "bound {bound}");
+            assert_eq!(snapshot(&env.hot), before, "bound {bound}: files untouched");
+            assert_eq!(r.adopted + r.missing, 0, "bound {bound}");
+            assert!(orphan.exists());
+            assert!(env.find("cam-1", 7).is_none());
+            assert!(r.unverified > 0);
+        } else {
+            assert_eq!(env.tier_of(gone), None, "bound {bound}");
+            assert_eq!((r.missing, r.adopted), (1, 1), "bound {bound}");
+        }
+    }
+}
+
+#[test]
+fn a_hot_row_out_of_the_returned_passs_scope_adds_nothing_to_its_counts() {
+    let env = Env::new();
+    unmount(&env);
+    // A hot row with a wrong-size hot file, one whose hot name is a FIFO, one with a symlink.
+    env.row("cam-1", 0, 5000, Tier::Hot);
+    put(&env.hot, &Env::rel("cam-1", 0), &pattern(9));
+    env.row("cam-1", 1, 5000, Tier::Hot);
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        env.hot.join(Env::rel("cam-1", 1)),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    env.row("cam-1", 2, 5000, Tier::Hot);
+    std::os::unix::fs::symlink("/nonexistent", env.hot.join(Env::rel("cam-1", 2))).unwrap();
+    let (mut lp, _) = build(&env, None);
+    lp.set_initial_archive_state(false);
+    std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.returned.expect("ran"), ReconcileReport::default());
+}
+
+#[test]
+fn the_row_only_phase_reads_no_row_that_a_directory_already_handled() {
+    let env = Env::new();
+    for n in 0..5 {
+        env.add("cam-1", n, 100, Tier::Hot);
+    }
+    env.row("cam-2", 0, 100, Tier::Hot);
+    env.index.faults.lock().unwrap().gets = 0;
+    let out = startup(&env);
+    assert_eq!(out.report.missing, 1);
+    assert_eq!(
+        env.index.faults.lock().unwrap().gets,
+        1,
+        "only the row of the directory that does not exist is read"
+    );
+}
+
+#[test]
+fn a_returned_pass_that_hit_the_cap_or_an_index_error_keeps_the_hold_and_runs_again() {
+    for index_error in [false, true] {
+        let env = Env::new();
+        unmount(&env);
+        env.add("cam-1", 0, 100, Tier::Hot);
+        let cap = if index_error { 1000 } else { 1 };
+        let cfg = env.cfg().with_walk_max_entries(cap);
+        let (mut lp, _) = crate::Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+        lp.set_initial_archive_state(false);
+        std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+        put(&env.arch, &Env::rel("cam-2", 0), &good());
+        if index_error {
+            env.index.faults.lock().unwrap().list = true;
+        }
+        let mut last_moved = 0;
+        for tick in 1..=3 {
+            let r = lp.tick(late()).unwrap();
+            let pass = r
+                .returned
+                .expect("the pass reruns while it could not finish");
+            assert!(pass.health_error() || pass.walk_cap_exceeded, "{pass:?}");
+            assert!(r.archive_returned, "tick {tick}: the hold stays");
+            last_moved += r.moved;
+            assert_eq!(
+                lp.index_health_error(),
+                index_error && tick == 3,
+                "tick {tick}: the pass's index errors feed the health counter"
+            );
+        }
+        assert_eq!(last_moved, 0, "no move while the hold stays");
+        if index_error {
+            // The index recovers: the pass completes and the hold ends.
+            env.index.faults.lock().unwrap().list = false;
+            let r = lp.tick(late()).unwrap();
+            assert_eq!(r.returned.expect("ran").index_errors, 0);
+            assert!(!lp.index_health_error());
+            assert!(lp.tick(late()).unwrap().moved >= 1);
+        }
+    }
 }

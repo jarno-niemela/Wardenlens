@@ -36,7 +36,7 @@ mod storage_loop;
 )]
 mod tests;
 
-pub use config::{DEFAULT_WALK_ENTRIES, StorageConfig};
+pub use config::{DEFAULT_WALK_DIR_ROWS, DEFAULT_WALK_ENTRIES, StorageConfig};
 pub use error::{ProbeError, StorageError, TickError};
 pub use evict::MAX_QUARANTINE_ENTRIES;
 pub use files::{ReadSeekSource, StorageFiles};

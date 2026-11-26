@@ -17,7 +17,7 @@ use wardenlens_core::storage::{
     VolumeSpace,
 };
 use wardenlens_core::time::{DurationMs, Timestamp, UnixMs};
-use wardenlens_fsutil::{DirEntry, FsError, QuarantineOutcome, RootDir};
+use wardenlens_fsutil::{FsError, Listing, QuarantineOutcome, RootDir};
 use wardenlens_index::Index;
 use wardenlens_storage::{
     ARCHIVE_MARKER, ArchiveProbe, Fs, Opened, PartFile, ProbeError, RealFs, Storage, StorageConfig,
@@ -241,7 +241,7 @@ impl Fs for Spy {
         let r = self.inner.quarantine(tier, comps);
         self.rec(format!("quarantine {} {}", t(tier), comps.join("/")), r)
     }
-    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Vec<DirEntry>, FsError> {
+    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Listing, FsError> {
         self.inner.list_dir(tier, dir, max)
     }
 }

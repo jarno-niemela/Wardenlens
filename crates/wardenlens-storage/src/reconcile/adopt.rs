@@ -8,13 +8,10 @@
 //! was opened with `O_NONBLOCK` and `fstat`ed.
 
 use wardenlens_core::mp4box::{ByteSource, Mp4BoxError, Mp4Summary, summarize};
-use wardenlens_core::storage::MAX_SEGMENT_BYTES;
+use wardenlens_core::storage::{MAX_DURATION_MS, MAX_SEGMENT_BYTES};
 
 use crate::files::ReadSeekSource;
 use crate::fs::Opened;
-
-/// The column's `CHECK` on `duration_ms` (ADR 0005 section 5).
-const MAX_DURATION_MS: u64 = 600_000;
 
 /// What the parser concluded about one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

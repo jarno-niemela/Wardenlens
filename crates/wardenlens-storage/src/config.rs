@@ -9,6 +9,8 @@ use wardenlens_core::storage::Policy;
 const DEFAULT_MAX_ACTIONS: usize = 64;
 /// The default entry cap of the reconciliation walk (ADR 0005 section 9).
 pub const DEFAULT_WALK_ENTRIES: usize = 5_000_000;
+/// The default bound on the rows of one `(camera, day)` the reconciliation holds in memory.
+pub const DEFAULT_WALK_DIR_ROWS: usize = 200_000;
 
 /// What the loop needs to know.
 ///
@@ -41,6 +43,9 @@ pub struct StorageConfig {
     /// the walk stops, the affected tier is reported `unverified` with a health error, and the
     /// service still starts.
     pub walk_max_entries: usize,
+    /// Most rows of one `(camera, day)` the reconciliation loads (default 200,000, SEC-2). A day
+    /// with more is reported like the entry cap: `walk_cap_exceeded`, nothing concluded.
+    pub walk_max_dir_rows: usize,
     /// Accept an archive on the same filesystem as the hot root. **Tests only**: in production
     /// this is the "unmounted disk" case that would fill the SSD, so the field exists only with
     /// the `test-support` feature.
@@ -58,6 +63,7 @@ impl StorageConfig {
             policy,
             max_actions_per_tick: DEFAULT_MAX_ACTIONS,
             walk_max_entries: DEFAULT_WALK_ENTRIES,
+            walk_max_dir_rows: DEFAULT_WALK_DIR_ROWS,
             #[cfg(feature = "test-support")]
             allow_same_filesystem: false,
         }
@@ -74,6 +80,13 @@ impl StorageConfig {
     #[must_use]
     pub const fn with_walk_max_entries(mut self, n: usize) -> Self {
         self.walk_max_entries = n;
+        self
+    }
+
+    /// Set the bound on the rows of one `(camera, day)` the reconciliation loads.
+    #[must_use]
+    pub const fn with_walk_max_dir_rows(mut self, n: usize) -> Self {
+        self.walk_max_dir_rows = n;
         self
     }
 

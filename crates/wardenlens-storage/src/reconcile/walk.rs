@@ -84,8 +84,15 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
         let max = self.budget.min(MAX_DIR_ENTRIES);
         match self.fs.list_dir(tier, dir, max) {
             Ok(v) => {
-                self.budget = self.budget.saturating_sub(v.len());
-                Ok(Listed::Entries(v))
+                // Names that cannot be returned (not UTF-8) were seen: they are charged to the
+                // budget and are not ours, so they are `unknown_left`.
+                self.budget = self
+                    .budget
+                    .saturating_sub(v.entries.len().saturating_add(v.dropped));
+                for _ in 0..v.dropped {
+                    bump(&mut self.report.unknown_left);
+                }
+                Ok(Listed::Entries(v.entries))
             }
             Err(FsError::TooManyEntries) => Err(Capped),
             Err(e) if e.is_not_found() => Ok(Listed::Gone),
@@ -238,19 +245,12 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
         if failed {
             return Ok(());
         }
-        // `.part` files first: an interrupted segment (hot) or move (archive).
-        if self.mode == Mode::Startup {
-            self.delete_parts(Tier::Hot, cam, day, &hot_parts);
-        }
-        if self.archive {
-            self.delete_parts(Tier::Archive, cam, day, &arch_parts);
-        }
         let Some(day_end) = day_ms.checked_add(MS_PER_DAY) else {
             return Ok(());
         };
         let rows = match self
             .index
-            .rows_started_in(camera, day_ms, day_end, MAX_DIR_ENTRIES)
+            .rows_started_in(camera, day_ms, day_end, self.max_dir_rows)
         {
             Ok((_, true)) => return Err(Capped),
             Ok((rows, false)) => rows,
@@ -263,8 +263,16 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
             .rows_seen
             .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
         for row in rows {
+            self.seen_ids.insert(row.id);
             let started = row.record.started_at_ms;
             keys.entry(started).or_default().row = Some(row);
+        }
+        // `.part` files first: an interrupted segment (hot) or move (archive).
+        if self.mode == Mode::Startup {
+            self.delete_parts(Tier::Hot, cam, day, &hot_parts);
+        }
+        if self.archive {
+            self.delete_parts(Tier::Archive, cam, day, &arch_parts);
         }
         let returned = self.mode == Mode::Returned;
         for (started, slot) in keys {
@@ -334,6 +342,10 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
     }
 
     fn row_without_a_directory(&mut self, id: SegmentId) {
+        // Handled through its directory already: no read needed.
+        if self.seen_ids.contains(&id) {
+            return;
+        }
         let row = match self.index.get(id) {
             Ok(Some(row)) => row,
             Ok(None) => return,

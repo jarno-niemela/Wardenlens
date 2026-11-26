@@ -106,14 +106,18 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
         let returned = self.mode == Mode::Returned;
         // The returned pass never looks at H for a key without a row: the recorder may be in
         // the window between its rename and its insert.
-        let h = if returned && row.is_none() {
+        let h = if hot_gate {
+            // Out of scope unless the hot file is missing (ENOENT and nothing else). Looking at
+            // it counts nothing: not a size mismatch, not `unknown_left`, not `unverified`.
+            match self.fs.open_read(Tier::Hot, &rel.comps()) {
+                Err(e) if e.is_not_found() => Some(Seen::Absent),
+                _ => return,
+            }
+        } else if returned && row.is_none() {
             None
         } else {
             Some(self.see(Tier::Hot, rel, row))
         };
-        if hot_gate && !matches!(h, Some(Seen::Absent)) {
-            return;
-        }
         let a = self.archive.then(|| self.see(Tier::Archive, rel, row));
         let observed = |s: &Option<Seen>| s.as_ref().is_none_or(|s| s.kind().is_some());
         if !(observed(&h) && observed(&a)) {

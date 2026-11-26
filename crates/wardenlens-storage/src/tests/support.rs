@@ -401,18 +401,27 @@ impl Env {
             .find(|r| r.record.started_at_ms.as_i64() == t)
     }
 
-    /// Every row of `cam` (any time), oldest first.
+    /// Every row of `cam` (any time), oldest first (paged through).
     pub(crate) fn rows_of(&self, cam: &str) -> Vec<IndexedSegment> {
         let cam_id: CameraId = cam.parse().unwrap();
-        self.index
-            .list(
-                &cam_id,
-                Timestamp::from_unix_millis(T0 - 400 * 86_400_000),
-                Timestamp::from_unix_millis(T0 + 400 * 86_400_000),
-                1000,
-                None,
-            )
-            .unwrap()
-            .items
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .index
+                .list(
+                    &cam_id,
+                    Timestamp::from_unix_millis(T0 - 400 * 86_400_000),
+                    Timestamp::from_unix_millis(T0 + 400 * 86_400_000),
+                    1000,
+                    cursor.as_ref(),
+                )
+                .unwrap();
+            out.extend(page.items);
+            match page.next {
+                Some(c) => cursor = Some(c),
+                None => return out,
+            }
+        }
     }
 }

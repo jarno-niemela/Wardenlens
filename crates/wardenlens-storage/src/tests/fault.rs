@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::io::Errno;
 use wardenlens_core::storage::Tier;
-use wardenlens_fsutil::{DirEntry, FsError, QuarantineOutcome};
+use wardenlens_fsutil::{FsError, Listing, QuarantineOutcome};
 
 use crate::{Fs, Opened, PartFile, RealFs, SourceFile};
 
@@ -215,7 +215,7 @@ impl Fs for FaultFs {
         self.check(Op::Quarantine(tier))?;
         self.inner.quarantine(tier, comps)
     }
-    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Vec<DirEntry>, FsError> {
+    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Listing, FsError> {
         self.check(Op::List(tier))?;
         let mut v = self.inner.list_dir(tier, dir, max)?;
         if self
@@ -224,7 +224,7 @@ impl Fs for FaultFs {
             .unwrap_or_else(PoisonError::into_inner)
             .unknown_kinds
         {
-            for e in &mut v {
+            for e in &mut v.entries {
                 e.kind = wardenlens_fsutil::FileKind::Other;
             }
         }

@@ -242,8 +242,10 @@ fn list<F: Fs>(fs: &F, tier: Tier, dir: &[&str], st: &mut ScanState) -> Vec<DirE
     }
     match fs.list_dir(tier, dir, st.budget) {
         Ok(v) => {
-            st.budget = st.budget.saturating_sub(v.len());
-            v
+            st.budget = st
+                .budget
+                .saturating_sub(v.entries.len().saturating_add(v.dropped));
+            v.entries
         }
         Err(e) => {
             // A missing directory is an empty quarantine; anything else (the bound, EIO, ...)

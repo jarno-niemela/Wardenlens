@@ -295,11 +295,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// the plan still runs.
     ///
     /// **Archive returned.** When any probe sees the archive change from unavailable to
-    /// available, [`TickReport::archive_returned`] is reported and no move runs until the pass of
-    /// ticket #59 had its tick: the loop keeps a *pending* flag that survives `Err` ticks and is
-    /// cleared only by a tick that completes `Ok` (and reports it). While it is pending a tick
-    /// plans no moves and evicts no archive video on behalf of one. The caller runs the pass on
-    /// the tick that reports it, before the next tick.
+    /// available, [`TickReport::archive_returned`] is reported and no move runs until the
+    /// "archive returned" pass (section 9) has run: the loop keeps a *pending* flag that survives
+    /// `Err` ticks. A tick that completes `Ok` with the archive available runs the pass itself,
+    /// after its plan (the result is [`TickReport::returned`]), and clears the flag unless the
+    /// pass hit the walk cap or an index error, in which case it runs again next tick. While the
+    /// flag is pending a tick plans no moves and evicts no archive video on behalf of one.
     ///
     /// # Errors
     /// [`TickError`]: the hot volume or the index cannot be read, or the planner refused its
@@ -345,28 +346,33 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         self.evict_quarantine(&mut current, &mut executed, &mut report);
 
         let result = self.run_plan(now, &mut current, &mut executed, &mut report);
-        // Only index failures count toward the index health (not a planner or probe error).
-        let index_failed = report.index_errors > 0 || matches!(result, Err(TickError::Index));
+        report.archive = current.archive;
+        // The hold survives an `Err` tick; it ends only when the pass has run to completion.
+        report.archive_returned = self.returned_pending;
+        // The pass runs on this task, after the plan's actions, so no move is in flight. With the
+        // archive away again it cannot run, and the next tick that sees it available runs it. A
+        // pass that hit the walk cap or an index error did not finish its work: the hold stays and
+        // the pass runs again next tick.
+        let mut pass_index_errors = false;
+        if result.is_ok() && self.returned_pending && current.archive.is_available() {
+            let pass = self.run_returned_pass();
+            pass_index_errors = pass.index_errors > 0;
+            if !pass.health_error() && !pass.walk_cap_exceeded {
+                self.returned_pending = false;
+            }
+            report.returned = Some(pass);
+        }
+        // Only index failures count toward the index health (not a planner or probe error), the
+        // returned pass's included.
+        let index_failed =
+            report.index_errors > 0 || pass_index_errors || matches!(result, Err(TickError::Index));
         self.index_error_ticks = if index_failed {
             self.index_error_ticks.saturating_add(1)
         } else {
             0
         };
         report.index_health_error = self.index_health_error();
-        report.archive = current.archive;
-        // The flag survives an `Err` tick: it is cleared only by a tick that completes `Ok` and
-        // reports it.
-        report.archive_returned = self.returned_pending;
-        result.map(|()| {
-            // The pass runs on this task, after the plan's actions, so no move is in flight. The
-            // hold on moves ends only once the pass has run: with the archive away again it has
-            // not, and the next tick that sees it available runs it.
-            if self.returned_pending && current.archive.is_available() {
-                report.returned = Some(self.run_returned_pass());
-                self.returned_pending = false;
-            }
-            report
-        })
+        result.map(|()| report)
     }
 
     /// The "archive returned" pass of section 9 (see [`crate::reconcile`]): only keys with an
@@ -380,6 +386,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             Mode::Returned,
             true,
             self.cfg.walk_max_entries,
+            self.cfg.walk_max_dir_rows,
         )
         .run()
         .report
@@ -407,6 +414,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             Mode::Startup,
             p.archive.is_available(),
             self.cfg.walk_max_entries,
+            self.cfg.walk_max_dir_rows,
         )
         .run())
     }
