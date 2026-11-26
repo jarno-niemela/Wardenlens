@@ -111,19 +111,17 @@ impl World {
     }
 
     fn cfg(&self) -> StorageConfig {
-        StorageConfig {
-            hot_root: self.hot.clone(),
-            archive_root: self.arch.clone(),
-            policy: Policy {
+        StorageConfig::new(
+            self.hot.clone(),
+            self.arch.clone(),
+            Policy {
                 hot_min_free: MinFreePercent::new(25).unwrap(),
                 archive_min_free: MinFreePercent::new(25).unwrap(),
                 hot_max_age: DurationMs::from_secs(12 * 3600),
                 emergency_reserve_bytes: 0,
             },
-            max_actions_per_tick: 64,
-            // Two directories of one temporary filesystem: the explicit test switch.
-            allow_same_filesystem: true,
-        }
+        )
+        .with_allow_same_filesystem(true)
     }
 
     fn fake(&self) -> Fake {
