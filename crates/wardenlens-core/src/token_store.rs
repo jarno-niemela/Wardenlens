@@ -203,7 +203,7 @@ pub struct TokenSummary {
     pub revoked: bool,
 }
 
-/// Why [`TokenStore::insert`] failed.
+/// Why [`TokenAdmin::insert`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertError {
     /// A row with this id exists (revoked or not); nothing was written. The caller generates
@@ -227,7 +227,7 @@ impl fmt::Display for InsertError {
 
 impl std::error::Error for InsertError {}
 
-/// What [`TokenStore::revoke`] found.
+/// What [`TokenAdmin::revoke`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeOutcome {
     /// The token was active and is now revoked.
