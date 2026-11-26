@@ -371,6 +371,7 @@ impl Supervisor {
             cancel,
             dropped: dropped.clone(),
             pacer: Pacer::default(),
+            last_frame: None,
         };
         let handle = tokio::spawn(task.run());
         (rx, state_rx, dropped, handle)
@@ -383,6 +384,9 @@ enum Ended {
     Stop,
     /// Reconnect after this failure.
     Failed(FailureKind),
+    /// No frame arrived in time. Like `Failed(Timeout)`, but the silent wait does not count as
+    /// uptime when the state machine judges whether the stream was stable.
+    Idle,
 }
 
 /// The delivery bookkeeping that outlives one frame.
@@ -408,6 +412,8 @@ struct Task<S, M, J> {
     cancel: CancelToken,
     dropped: DroppedFrames,
     pacer: Pacer,
+    /// When the last frame of the current session arrived.
+    last_frame: Option<MonoMs>,
 }
 
 impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
@@ -430,10 +436,32 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
             let failure = match self.session().await {
                 Ended::Stop => return,
                 Ended::Failed(kind) => kind,
+                Ended::Idle => {
+                    self.discount_idle_wait();
+                    FailureKind::Timeout
+                }
             };
             // The stream was dropped inside `session`, before this backoff starts.
             self.apply(Event::Failed(failure));
         }
+    }
+
+    /// The core machine judges a stream's stability up to the moment of the failure. For an idle
+    /// failure that moment is `idle` after the last frame, which is not uptime: move the stream's
+    /// start forward by the silent wait, so stability is judged from the first frame to the last.
+    fn discount_idle_wait(&mut self) {
+        let (ConnectionState::Streaming { since, prior }, Some(last)) =
+            (self.state, self.last_frame)
+        else {
+            return;
+        };
+        let now = self.clock.now();
+        let silent = now.saturating_duration_since(last);
+        let shifted = since.saturating_add(silent).min(now);
+        self.state = ConnectionState::Streaming {
+            since: shifted,
+            prior,
+        };
     }
 
     fn apply(&mut self, event: Event) {
@@ -493,6 +521,7 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
         };
         // Nothing owed or being dropped crosses a reconnect: the new session starts clean and
         // its first frame is a discontinuity.
+        self.last_frame = None;
         self.pacer = Pacer {
             pending_discontinuity: true,
             ..Pacer::default()
@@ -505,11 +534,12 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
                 r = timeout(idle, stream.next_frame()) => r,
             };
             let frame = match item {
-                Err(_) => return Ended::Failed(FailureKind::Timeout),
+                Err(_) | Ok(Err(IngestError::FrameTimeout)) => return Ended::Idle,
                 Ok(Err(e)) => return Ended::Failed(failure_kind(&e)),
                 Ok(Ok(None)) => return Ended::Failed(FailureKind::Other),
                 Ok(Ok(Some(frame))) => frame,
             };
+            self.last_frame = Some(self.clock.now());
             if first {
                 first = false;
                 self.apply(Event::Connected);
@@ -1338,6 +1368,55 @@ mod tests {
         let start = Instant::now();
         r.wait_state(|s| backoff_attempt(s).is_some()).await;
         near(start.elapsed(), MIN_PAUSE);
+        r.cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_capacity_is_clamped_to_its_documented_range() {
+        for (asked, got) in [
+            (usize::MAX, MAX_CHANNEL_CAPACITY),
+            (MAX_CHANNEL_CAPACITY + 1, MAX_CHANNEL_CAPACITY),
+            (MAX_CHANNEL_CAPACITY, MAX_CHANNEL_CAPACITY),
+            (0, 1),
+            (7, 7),
+        ] {
+            let cfg = SupervisorConfig {
+                channel_capacity: asked,
+                ..SupervisorConfig::default()
+            };
+            let r = rig(vec![], cfg);
+            assert_eq!(r.frames.max_capacity(), got, "asked {asked}");
+            r.cancel.cancel();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_wait_is_not_uptime() {
+        // Up 4 s (frames at 0 and 4 s), then silent for the 5 s idle timeout: with min_stable 5 s
+        // the 9 s to detection would look stable; the 4 s first-to-last frame must not.
+        let cfg = SupervisorConfig {
+            idle_timeout: Duration::from_secs(5),
+            min_stable: DurationMs::from_secs(5),
+            ..SupervisorConfig::default()
+        };
+        let session = || {
+            Attempt::Stream(vec![
+                Step::Frame(frame(true)),
+                Step::Sleep(Duration::from_secs(4)),
+                Step::Frame(frame(false)),
+                Step::Silent,
+            ])
+        };
+        let mut r = rig(vec![session(), session(), session()], cfg);
+        let mut last = 0;
+        while last < 3 {
+            let s = timeout(Duration::from_secs(300), r.state.changed()).await;
+            assert!(s.is_ok());
+            if let Some(a) = backoff_attempt(&r.state.borrow()) {
+                assert!(a >= last, "outage reset: {a} after {last}");
+                last = a;
+            }
+        }
         r.cancel.cancel();
     }
 

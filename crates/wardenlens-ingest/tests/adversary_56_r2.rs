@@ -2,7 +2,7 @@
 //!
 //! Every async test runs on tokio's paused clock (TEST-5).
 
-#![allow(dead_code, reason = "shared rig helpers copied from adversary_56.rs")]
+#![expect(dead_code, reason = "shared rig helpers copied from adversary_56.rs")]
 #![expect(
     clippy::unwrap_used,
     reason = "test helpers outside #[test] fns; a panic fails the test"
