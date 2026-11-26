@@ -55,6 +55,11 @@ use crate::session::{FRAME_TIMEOUT, FrameStream, open_stream};
 const MIN_PAUSE: Duration = Duration::from_millis(MIN_PAUSE_MS);
 const MIN_PAUSE_MS: u64 = 100;
 
+/// Largest channel capacity accepted; a bigger one is lowered to it. With the 8 MiB frame cap
+/// this bounds the channel to 8 GiB in the (absurd) worst case, and keeps `spawn` clear of
+/// tokio's own limit, which panics.
+pub const MAX_CHANNEL_CAPACITY: usize = 1024;
+
 /// Default channel capacity, in frames. Worst case memory is this times [`MAX_FRAME_BYTES`]
 /// (typical frames are a small fraction of that); lower it for many cameras.
 ///
@@ -241,13 +246,14 @@ pub struct SupervisorConfig {
     /// Reconnect when no frame arrives for this long. Default [`FRAME_TIMEOUT`] (10 s); at least
     /// 100 ms is used.
     pub idle_timeout: Duration,
-    /// Frames the channel holds. At least 1 is used.
+    /// Frames the channel holds. Clamped to `1..=`[`MAX_CHANNEL_CAPACITY`].
     pub channel_capacity: usize,
     /// Time from the first failure of an outage after which the state is `Degraded`.
     pub budget: DurationMs,
     /// How long a stream must stay up for the backoff to reset.
     pub min_stable: DurationMs,
-    /// How long opening may take. At least 100 ms is used.
+    /// How long opening may take. At least 100 ms is used (the same floor as `idle_timeout`
+    /// and the pause between attempts).
     pub connect_timeout: DurationMs,
 }
 
@@ -343,7 +349,7 @@ impl Supervisor {
         M: MonotonicClock + Send + 'static,
         J: JitterSource + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
+        let (tx, rx) = mpsc::channel(config.channel_capacity.clamp(1, MAX_CHANNEL_CAPACITY));
         let (state_tx, state_rx) = watch::channel(ConnectionState::INITIAL);
         let dropped = DroppedFrames::default();
         let task = Task {
@@ -513,6 +519,8 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
             if !self.deliver(frame) {
                 return Ended::Stop;
             }
+            // An always-ready source must not starve the runtime (cancel included).
+            tokio::task::consume_budget().await;
         }
     }
 
@@ -1217,16 +1225,20 @@ mod tests {
             ],
             cfg,
         );
-        // Nobody reads until both sessions have run: session 2's keyframe finds the channel full.
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        assert_eq!(r.frames.recv().await.unwrap().params, None);
+        // Session 1 ends with the channel full and the params of its last frame owed. Drain it,
+        // so that session 2's keyframe is delivered.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         r.frames.recv().await.unwrap();
-        // Make room; session 1's owed params must not appear on anything session 2 sends.
-        assert_eq!(r.dropped.get(), 2, "the P with params and session 2's K");
+        r.frames.recv().await.unwrap();
+        assert_eq!(r.dropped.get(), 1, "the P with params");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let k = timeout(Duration::from_secs(60), r.frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(k.is_keyframe && k.discontinuity);
+        assert_eq!(k.params, None, "session 1's owed params leaked");
         r.cancel.cancel();
-        while let Some(f) = r.frames.recv().await {
-            assert_eq!(f.params, None);
-        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1251,7 +1263,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(r.frames.recv().await.unwrap().is_keyframe);
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let next = r.frames.recv().await.unwrap();
+        let next = timeout(Duration::from_secs(60), r.frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!next.is_keyframe && next.discontinuity);
         r.cancel.cancel();
     }
@@ -1270,7 +1285,10 @@ mod tests {
         while backoff_attempt(&seen.last().copied().unwrap_or(ConnectionState::INITIAL))
             .is_none_or(|a| a < 4)
         {
-            r.state.changed().await.unwrap();
+            timeout(Duration::from_secs(120), r.state.changed())
+                .await
+                .unwrap()
+                .unwrap();
             seen.push(*r.state.borrow());
         }
         assert!(!seen.iter().any(is_streaming), "{seen:?}");

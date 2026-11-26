@@ -36,6 +36,6 @@ pub use session::{
 };
 pub use sps::{NoReorderReason, ReorderVerdict, SpsError, SpsSummary, parse_sps, sps_reordering};
 pub use supervisor::{
-    CancelToken, DroppedFrames, FrameSource, InstantClock, RetinaSource, SplitMixJitter,
-    StreamSource, Supervisor, SupervisorConfig, failure_kind,
+    CancelToken, DroppedFrames, FrameSource, InstantClock, MAX_CHANNEL_CAPACITY, RetinaSource,
+    SplitMixJitter, StreamSource, Supervisor, SupervisorConfig, failure_kind,
 };
