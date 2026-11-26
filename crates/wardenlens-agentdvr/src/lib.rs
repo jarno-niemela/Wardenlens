@@ -84,7 +84,10 @@
 //! # Limits and hostile input
 //!
 //! At most [`MAX_INPUT_BYTES`] (8 MiB), [`MAX_CAMERAS`] `camera` elements (counting skipped
-//! ones), [`MAX_DEPTH`] nested elements, and [`MAX_FIELD_BYTES`] per source or login field.
+//! ones), [`MAX_DEPTH`] nested elements, and [`MAX_FIELD_BYTES`] per source or login field (a longer
+//! field skips its entry, but its logins are still collected). The collected logins are capped
+//! at [`MAX_LOGINS`] distinct values and [`MAX_LOGIN_BYTES`] bytes; past that the document is
+//! refused with [`ImportError::TooManyLogins`].
 //! DOCTYPE is refused, so no entity is ever defined: only the five predefined entities and
 //! numeric character references are expanded, one level, with no recursion. UTF-8 only (one leading BOM is
 //! accepted; the reader skips it). Comments, processing instructions and CDATA are accepted. No input is echoed in
@@ -114,7 +117,7 @@ use wardenlens_core::camera::{CameraId, Credential, DisplayName, Host, RtspPath}
 use wardenlens_core::text::normalise_display_name;
 
 pub use error::{ImportError, SkipReason};
-pub use logins::Logins;
+pub use logins::{Logins, MAX_LOGIN_BYTES, MAX_LOGIN_WORK, MAX_LOGINS};
 
 /// Longest input accepted, in bytes.
 pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;

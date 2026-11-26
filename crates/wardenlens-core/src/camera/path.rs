@@ -36,6 +36,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use super::CameraError;
 
@@ -91,32 +92,72 @@ fn is_denied(name: &str) -> bool {
     DENIED_PARAMS.iter().any(|d| name.eq_ignore_ascii_case(d))
 }
 
-/// A list name or a candidate with `_` and `-` removed, lowercased, for the multi-word compare.
-fn squashed(name: &str) -> String {
-    name.chars()
-        .filter(|c| !matches!(c, '_' | '-'))
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
+/// The longest denied name once `_` and `-` are removed; a longer tail cannot match.
+const MAX_SQUASHED_LEN: usize = 16;
 
 /// True when the run of `[A-Za-z0-9_-]` at the end of `before_eq` (the text in front of one `=`),
 /// split on `_` and `-`, has a trailing join of pieces on the list (separators removed on both
 /// sides): `name`, `user_name` and `x_user_name` are all tried. So `_password=`, `0_user=`,
 /// `+user_id=`, `x_user_name=` and `(password=` are caught whatever precedes the name, while a
 /// name that merely ends in a listed word inside one piece (`monkey=`, `accounting=`) is not.
-fn tail_denied(before_eq: &str) -> bool {
-    let start = before_eq
-        .bytes()
-        .rposition(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
-        .map_or(0, |i| i.saturating_add(1));
-    let run = before_eq.get(start..).unwrap_or_default();
-    let pieces: Vec<&str> = run.split(['_', '-']).collect();
-    (0..pieces.len()).any(|from| {
-        let joined: String = pieces.get(from..).unwrap_or_default().concat();
+///
+/// Public so a caller that reads a free-form text (not a validated path) finds the same names.
+/// The cost is linear in the trailing run of name characters (`[A-Za-z0-9_-]`) and keeps at most
+/// 16 name bytes: the run is read backwards and the scan stops at the first
+/// other byte, or once the tail is longer than any listed name. Separator runs are walked, not
+/// stored, so it is safe on an 8 MiB text with an `=` at every position.
+#[must_use]
+pub fn ends_with_credential_param_name(before_eq: &str) -> bool {
+    // Lowercased letters and digits of the tail, last first, separators left out.
+    let mut rev = [0_u8; MAX_SQUASHED_LEN];
+    let mut len = 0_usize;
+    let mut checked = 0_usize;
+    for b in before_eq.bytes().rev() {
+        if matches!(b, b'_' | b'-') {
+            // A piece boundary: the tail so far is a join of whole pieces.
+            if len != checked && rev.get(..len).is_some_and(denied_reversed) {
+                return true;
+            }
+            checked = len;
+        } else if b.is_ascii_alphanumeric() {
+            let Some(slot) = rev.get_mut(len) else {
+                return false;
+            };
+            *slot = b.to_ascii_lowercase();
+            len = len.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    // The whole run is a join of pieces too; when nothing was added since the last boundary it
+    // was checked there (or is empty).
+    len != checked && rev.get(..len).is_some_and(denied_reversed)
+}
+
+/// The listed names lowercased, with `_` and `-` removed and the bytes reversed, built once.
+fn denied_reversed_table() -> &'static [Vec<u8>] {
+    static TABLE: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
         DENIED_PARAMS
             .iter()
-            .any(|d| squashed(d) == squashed(&joined))
-    })
+            .map(|d| {
+                d.bytes()
+                    .rev()
+                    .filter(|b| !matches!(b, b'_' | b'-'))
+                    .map(|b| b.to_ascii_lowercase())
+                    .collect()
+            })
+            .collect()
+    });
+    &TABLE
+}
+
+/// True if `rev` (lowercase, last character first) is a listed name with `_` and `-` removed.
+fn denied_reversed(rev: &[u8]) -> bool {
+    denied_reversed_table().iter().any(|d| d.as_slice() == rev)
+}
+
+fn tail_denied(before_eq: &str) -> bool {
+    ends_with_credential_param_name(before_eq)
 }
 
 /// RFC 3986 `pchar` plus `/` and `?`, without `@` and `%`.
@@ -272,6 +313,83 @@ impl FromStr for RtspPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The earlier, allocating implementation, kept as the oracle for the backwards scan.
+    fn reference(before_eq: &str) -> bool {
+        let squash = |n: &str| -> String {
+            n.chars()
+                .filter(|c| !matches!(c, '_' | '-'))
+                .map(|c| c.to_ascii_lowercase())
+                .collect()
+        };
+        let start = before_eq
+            .bytes()
+            .rposition(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+            .map_or(0, |i| i.saturating_add(1));
+        let run = before_eq.get(start..).unwrap_or_default();
+        let pieces: Vec<&str> = run.split(['_', '-']).collect();
+        (0..pieces.len()).any(|from| {
+            let joined: String = pieces.get(from..).unwrap_or_default().concat();
+            DENIED_PARAMS.iter().any(|d| squash(d) == squash(&joined))
+        })
+    }
+
+    #[test]
+    fn the_longest_listed_name_fits_the_scan_buffer() {
+        let longest = DENIED_PARAMS
+            .iter()
+            .map(|d| d.bytes().filter(|b| !matches!(b, b'_' | b'-')).count())
+            .max()
+            .unwrap();
+        assert!(longest <= MAX_SQUASHED_LEN);
+    }
+
+    #[test]
+    fn the_backwards_scan_agrees_with_the_reference_on_every_string_up_to_five_bytes() {
+        // Every string up to length 5 over an alphabet that has a separator, a non-name byte,
+        // letters of `pw`, `user`, `key` and a digit.
+        let alphabet = [
+            '_', '-', '+', 'p', 'w', 'u', 's', 'e', 'r', 'k', 'y', '0', 'A',
+        ];
+        let mut frontier = vec![String::new()];
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for t in &frontier {
+                for c in alphabet {
+                    let mut n = t.clone();
+                    n.push(c);
+                    assert_eq!(ends_with_credential_param_name(&n), reference(&n), "{n:?}");
+                    next.push(n);
+                }
+            }
+            frontier = next;
+        }
+        for d in DENIED_PARAMS {
+            for pre in ["", "x_", "+", "0-", "(", "monkey_"] {
+                let n = format!("{pre}{d}");
+                assert_eq!(ends_with_credential_param_name(&n), reference(&n), "{n:?}");
+            }
+        }
+        for n in [
+            "monkey",
+            "accounting",
+            "x_password",
+            "u_s_e_r",
+            "_",
+            "",
+            "a_b_user_",
+        ] {
+            assert_eq!(ends_with_credential_param_name(n), reference(n), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn the_backwards_scan_is_cheap_on_a_huge_run() {
+        let huge = "a_".repeat(2_000_000);
+        assert!(!ends_with_credential_param_name(&huge));
+        let sep = format!("user{}", "_".repeat(4_000_000));
+        assert!(ends_with_credential_param_name(&sep));
+    }
 
     #[test]
     fn query_is_the_text_after_the_first_question_mark() {

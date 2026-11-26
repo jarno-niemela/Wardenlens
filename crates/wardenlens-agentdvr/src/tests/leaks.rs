@@ -2,7 +2,9 @@
 //! `Display` output, whatever the input (SEC-6). Enumerated over every error variant, every skip
 //! reason, every odd userinfo spelling and every downstream failure.
 
-use crate::{ImportError, MAX_CAMERAS, MAX_DEPTH, MAX_INPUT_BYTES, SkipReason, parse};
+use crate::{
+    ImportError, MAX_CAMERAS, MAX_DEPTH, MAX_INPUT_BYTES, MAX_LOGIN_BYTES, SkipReason, parse,
+};
 
 use super::ALL_SKIPS;
 use super::fixtures::{Cam, doc, esc, wrap};
@@ -105,6 +107,15 @@ fn every_import_error_variant_is_produced_and_clean() {
         "TooManyCameras",
         doc(&vec![ok_cam.clone(); MAX_CAMERAS + 1]).into_bytes(),
     ));
+    cases.push((
+        "TooManyLogins",
+        format!(
+            "<objects><cameras><camera id=\"1\" name=\"A\"><settings><password>{PW}{}</password>\
+             </settings></camera></cameras></objects>",
+            "x".repeat(MAX_LOGIN_BYTES)
+        )
+        .into_bytes(),
+    ));
     cases.push(("NotObjects", format!("<{USER} a=\"{PW}\"/>").into_bytes()));
     cases.push((
         "DuplicateName",
@@ -117,7 +128,7 @@ fn every_import_error_variant_is_produced_and_clean() {
         seen.insert(std::mem::discriminant(e));
         assert_clean(&render(&r), label);
     }
-    // All nine variants were reached (the match forces a new variant to be listed).
+    // Every variant were reached (the match forces a new variant to be listed).
     let variants = [
         ImportError::TooLarge,
         ImportError::NotUtf8,
@@ -126,6 +137,7 @@ fn every_import_error_variant_is_produced_and_clean() {
         ImportError::Malformed { position: 0 },
         ImportError::TooDeep,
         ImportError::TooManyCameras,
+        ImportError::TooManyLogins,
         ImportError::NotObjects,
         ImportError::DuplicateName {
             first: 0,
@@ -141,6 +153,7 @@ fn every_import_error_variant_is_produced_and_clean() {
             | ImportError::Malformed { .. }
             | ImportError::TooDeep
             | ImportError::TooManyCameras
+            | ImportError::TooManyLogins
             | ImportError::NotObjects
             | ImportError::DuplicateName { .. } => {}
         }
