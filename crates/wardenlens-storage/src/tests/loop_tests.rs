@@ -1390,3 +1390,192 @@ fn rolled_forward_and_dropped_hot_rows_leave_the_hot_total() {
     assert_eq!(lp.hot_after_last_tick(), Some(0));
     let _ = (a, keep);
 }
+
+// ---- round 4 -------------------------------------------------------------------------------
+
+fn hot_quarantine_bytes(env: &Env) -> u64 {
+    Env::quarantined(&env.hot)
+        .iter()
+        .map(|c| c.len() as u64)
+        .sum()
+}
+
+#[test]
+fn rolling_buffer_with_a_met_reserve_after_eviction_deletes_nothing_over_several_ticks() {
+    // The reviewer's reproduction: hot 1 MB, 760 kB foreign, 20 x 10 kB hot segments, 3 x 10 kB
+    // of quarantine, no archive. The evicted quarantine alone must be enough.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 760_000]).unwrap();
+    let mut ids: Vec<_> = (0..20)
+        .map(|n| env.add("cam-1", n, 10_000, Tier::Hot))
+        .collect();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..3 {
+        std::fs::write(d.join(format!("00000{i}-000.mp4")), pattern(10_000)).unwrap();
+    }
+    let mut cfg = env.cfg();
+    cfg.policy.emergency_reserve_bytes = 50_000;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    for tick in 0..6_i64 {
+        let q_before = hot_quarantine_bytes(&env);
+        let r = lp.tick(now()).unwrap();
+        let q_after = hot_quarantine_bytes(&env);
+        assert!(
+            r.deleted == 0 || q_after == 0,
+            "tick {tick}: video deleted while {q_after} bytes of quarantine remain: {r:?}"
+        );
+        if tick == 0 {
+            // used 760 + 200 + 30 = 990 kB; free 10 kB; the quarantine (30 kB) brings it to the
+            // 50 kB reserve only with 10 kB more: at most one segment goes, and only after it.
+            assert!(q_before > 0 && q_after == 0, "{r:?}");
+            assert!(r.deleted <= 1, "{r:?}");
+        }
+        ids.push(env.add("cam-1", 100 + tick, 10_000, Tier::Hot));
+    }
+}
+
+#[test]
+fn multi_tick_rolling_buffer_never_deletes_video_before_quarantine_and_never_more_than_needed() {
+    // A deterministic pseudo-random sequence of segment and quarantine sizes.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rnd = |lo: u64, hi: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        lo + x % (hi - lo + 1)
+    };
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 760_000]).unwrap();
+    let reserve = 80_000_u64;
+    let mut cfg = env.cfg();
+    cfg.policy.emergency_reserve_bytes = reserve;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    let mut n = 0_i64;
+    let mut qn = 0_u32;
+    let mut hot_rows: Vec<(wardenlens_core::storage::SegmentId, u64)> = Vec::new();
+    for tick in 0..60 {
+        // The recorder adds segments; some quarantine appears.
+        let mut ingested = 0;
+        for _ in 0..rnd(0, 2) {
+            let size = rnd(5_000, 30_000);
+            hot_rows.push((
+                env.add("cam-1", n, usize::try_from(size).unwrap(), Tier::Hot),
+                size,
+            ));
+            ingested += size;
+            n += 1;
+        }
+        if rnd(0, 3) == 0 {
+            let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+            std::fs::create_dir_all(&d).unwrap();
+            let size = usize::try_from(rnd(5_000, 20_000)).unwrap();
+            std::fs::write(d.join(format!("{qn:06}-000.mp4")), pattern(size)).unwrap();
+            qn += 1;
+        }
+        let free0 = 1_000_000 - super::support::du(&env.hot);
+        let q0 = hot_quarantine_bytes(&env);
+        let r = lp.tick(now()).unwrap();
+        let q1 = hot_quarantine_bytes(&env);
+        let deleted_bytes: u64 = hot_rows
+            .iter()
+            .filter(|(id, _)| env.tier_of(*id).is_none())
+            .map(|(_, b)| *b)
+            .sum();
+        hot_rows.retain(|(id, _)| env.tier_of(*id).is_some());
+        assert!(
+            r.deleted == 0 || q1 == 0,
+            "tick {tick}: video deleted before quarantine: {r:?}"
+        );
+        // At most what the executed plan needed: the reserve shortfall after the eviction, the
+        // ingest of this tick (the budget is an absolute level) and one segment of overshoot.
+        let need = reserve.saturating_sub(free0 + (q0 - q1));
+        assert!(
+            deleted_bytes <= need + ingested + 30_000,
+            "tick {tick}: deleted {deleted_bytes} > need {need} + ingested {ingested} + 30000: {r:?}"
+        );
+    }
+}
+
+#[test]
+fn a_returning_tick_still_deletes_hot_video_the_floor_demands_when_the_archive_is_full() {
+    // The hold hides moves (and the archive evictions they need), not the rolling buffer's hot
+    // deletes: a flapping archive must not halve them.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    env.set_cap("arch", 100_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 600_000]).unwrap();
+    for n in 0..5 {
+        env.add("cam-1", n, 80_000, Tier::Hot);
+    }
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(now()).unwrap();
+    assert!(!r.archive.is_available() && r.deleted >= 1, "{r:?}");
+    for n in 10..14 {
+        env.add("cam-1", n, 80_000, Tier::Hot);
+    }
+    std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert!(r.archive_returned, "{r:?}");
+    assert_eq!(r.moved, 0, "{r:?}");
+    assert!(
+        r.deleted >= 1,
+        "the floor still wins in the returning tick: {r:?}"
+    );
+}
+
+#[test]
+fn a_planted_symlink_or_fifo_twin_never_pins_the_row_of_a_delete() {
+    for kind in ["symlink", "fifo"] {
+        let env = Env::new();
+        let id = env.add("cam-1", 0, 100, Tier::Hot);
+        let twin = env.arch_file("cam-1", 0);
+        std::fs::create_dir_all(twin.parent().unwrap()).unwrap();
+        let target = env.tmp.path().join("target");
+        std::fs::write(&target, b"owner data").unwrap();
+        if kind == "symlink" {
+            std::os::unix::fs::symlink(&target, &twin).unwrap();
+        } else {
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &twin,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                0,
+            )
+            .unwrap();
+        }
+        let (lp, _) = build(&env, None);
+        assert_eq!(lp.delete_now(id, true), crate::Outcome::Deleted, "{kind}");
+        assert_eq!(env.tier_of(id), None, "{kind}");
+        assert!(
+            std::fs::symlink_metadata(&twin).is_ok(),
+            "{kind}: left in place"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"owner data");
+    }
+}
+
+#[test]
+fn quarantine_is_sized_by_allocated_bytes_so_a_sparse_file_is_not_counted() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 700_000]).unwrap();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    // 100 kB apparent, nothing allocated: deleting it frees nothing.
+    let f = std::fs::File::create(d.join("000000-000.mp4")).unwrap();
+    f.set_len(100_000).unwrap();
+    std::fs::write(d.join("000001-000.mp4"), pattern(20_000)).unwrap();
+    // free = 180 kB, floor 250 kB. Counting the apparent 120 kB would reach it (300 kB); the
+    // 20 kB that deleting really frees would not (200 kB), so nothing is evicted.
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.quarantine_evicted, 0, "{r:?}");
+    assert!(d.join("000000-000.mp4").exists() && d.join("000001-000.mp4").exists());
+}

@@ -35,6 +35,8 @@ pub struct Opened {
     pub file: Box<dyn SourceFile>,
     /// Its length.
     pub len: u64,
+    /// Bytes allocated on the volume, at most `len`.
+    pub allocated: u64,
 }
 
 /// The `.part` file being written.
@@ -204,6 +206,7 @@ impl Fs for RealFs {
         Ok(Opened {
             file: Box::new(r.file),
             len: r.len,
+            allocated: r.allocated,
         })
     }
 

@@ -167,6 +167,7 @@ impl Fs for FaultFs {
                 state: Arc::clone(&self.state),
             }),
             len: o.len,
+            allocated: o.allocated,
         })
     }
     fn mkdir(&self, tier: Tier, parent: &[&str], name: &str) -> Result<(), FsError> {

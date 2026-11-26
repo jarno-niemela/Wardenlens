@@ -1,6 +1,6 @@
 //! `StorageLoop::tick`: probe, plan, execute, re-probe after each action, at most N actions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use wardenlens_core::storage::{
@@ -82,8 +82,10 @@ pub struct TickReport {
     pub truncated: bool,
     /// Times the plan was recomputed because the archive state changed mid-tick.
     pub replans: u32,
-    /// The archive changed from unavailable to available on this tick's first probe: the
-    /// "archive returned" pass of section 9 (ticket #59) is due before any move is planned.
+    /// The "archive returned" pass of section 9 (ticket #59) is pending: some probe (this tick's
+    /// or an earlier tick's, including one whose tick failed) saw the archive change from
+    /// unavailable to available and no tick has completed `Ok` since. This tick planned no move.
+    /// It is a pending flag, not an edge: it is reported once, by the first tick that completes.
     pub archive_returned: bool,
     /// The index failed (an error on a segment, or a failed read) on [`INDEX_ERROR_TICKS`]
     /// consecutive ticks. A tick that returns [`TickError::Index`] has no report: read
@@ -375,17 +377,16 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         segments: &[StoredSegment],
         now: Timestamp,
         hot_total: u64,
-        hold_moves: bool,
+        archive_only: bool,
     ) -> Result<wardenlens_core::storage::Plan, TickError> {
         let hot_space = current.hot.map_err(TickError::HotVolume)?;
         let ingested = self
             .hot_after_last_tick
             .map_or(0, |after| hot_total.saturating_sub(after));
-        // A tick that holds every move back plans with the hot video out of sight: the planner
-        // then plans no move and no eviction on behalf of one (an archive below its own floor is
-        // still evicted), and no hot delete (the archive is available here).
+        // `archive_only` plans with the hot video out of sight: the planner then plans no move and
+        // no eviction on behalf of one, only what the archive's own floor needs.
         let visible: Vec<StoredSegment>;
-        let used: &[StoredSegment] = if hold_moves {
+        let used: &[StoredSegment] = if archive_only {
             visible = segments
                 .iter()
                 .filter(|s| s.tier != Tier::Hot)
@@ -409,10 +410,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
 
     /// Bytes of each tier's video that `actions` delete.
     fn delete_bytes(segments: &[StoredSegment], actions: &[Action]) -> (u64, u64) {
+        let by_id: HashMap<SegmentId, &StoredSegment> =
+            segments.iter().map(|s| (s.id, s)).collect();
         let (mut hot, mut arch) = (0_u64, 0_u64);
         for a in actions {
             if let Action::Delete(id) = a
-                && let Some(s) = segments.iter().find(|s| s.id == *id)
+                && let Some(s) = by_id.get(id)
             {
                 match s.tier {
                     Tier::Hot => hot = hot.saturating_add(s.bytes),
@@ -439,7 +442,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         let mut failed: HashSet<(SegmentId, bool)> = HashSet::new();
         let mut replans = 0_u32;
         // Quarantine is evicted for a tier's planned deletes once per tier and tick.
-        let mut quarantine_done = [false; 2];
+        let (mut hot_quarantine_done, mut archive_quarantine_done) = (false, false);
         loop {
             current.hot.map_err(TickError::HotVolume)?;
             let (segments, truncated) = self.load_segments()?;
@@ -450,44 +453,65 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 .try_fold(0_u64, |a, s| a.checked_add(s.bytes))
                 .unwrap_or(u64::MAX);
             let planned_available = current.archive.is_available();
-            let hold = self.returned_pending && planned_available;
-            let planned = self.make_plan(current, &segments, now, hot_total, hold)?;
-            if !hold {
-                self.rolling_budget = planned.rolling_budget;
-                report.hot = Some(planned.hot);
-                report.archive_full = planned.archive == ArchiveStatus::Full;
-            }
+            let planned = self.make_plan(current, &segments, now, hot_total, false)?;
             // From a truncated prefix the rolling buffer's budget is understated: refuse its
             // hot deletes (and say so) rather than delete video on a wrong number.
-            let refuse_hot = truncated && !hold && planned.hot == HotState::RollingBuffer;
+            let refuse_hot = truncated && planned.hot == HotState::RollingBuffer;
+            let by_id: HashMap<SegmentId, Tier> = segments.iter().map(|s| (s.id, s.tier)).collect();
+            // While the "archive returned" pass is pending no move runs, and no archive video is
+            // evicted on behalf of one: only the evictions the archive's own floor needs stay.
+            // Hot deletes stay (the rolling buffer must not be halved by a flapping archive).
+            let hold = self.returned_pending && planned_available;
+            let own_floor: HashSet<SegmentId> = if hold {
+                self.make_plan(current, &segments, now, hot_total, true)?
+                    .actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        Action::Delete(id) => Some(*id),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             let actions: Vec<Action> = planned
                 .actions
                 .iter()
                 .copied()
-                .filter(|a| {
-                    !(refuse_hot
-                        && matches!(a, Action::Delete(id)
-                            if segments.iter().any(|s| s.id == *id && s.tier == Tier::Hot)))
+                .filter(|a| match a {
+                    Action::MoveToArchive(_) => !hold,
+                    Action::Delete(id) => match by_id.get(id) {
+                        Some(Tier::Hot) => !refuse_hot,
+                        _ => !hold || own_floor.contains(id),
+                    },
+                    _ => true,
                 })
                 .collect();
             report.rolling_deletes_refused |= refuse_hot;
             // Quarantine first, whenever the plan deletes a tier's video (any planner state): evict
             // that tier's quarantine, sized to the bytes the plan would delete, then plan again.
+            // This plan is discarded when anything was evicted: nothing of it (budget, state)
+            // is kept, and the replan sees the freed space through the re-probe.
             let (hot_del, arch_del) = Self::delete_bytes(&segments, &actions);
             let mut evicted_any = false;
-            for (i, (tier, need)) in [(Tier::Hot, hot_del), (Tier::Archive, arch_del)]
-                .into_iter()
-                .enumerate()
-            {
-                if need > 0 && !quarantine_done.get(i).copied().unwrap_or(true) {
-                    if let Some(d) = quarantine_done.get_mut(i) {
-                        *d = true;
-                    }
-                    evicted_any |= self.evict_for_deletes(tier, need, current, executed, report);
-                }
+            if hot_del > 0 && !hot_quarantine_done {
+                hot_quarantine_done = true;
+                evicted_any |=
+                    self.evict_for_deletes(Tier::Hot, hot_del, current, executed, report);
+            }
+            if arch_del > 0 && !archive_quarantine_done {
+                archive_quarantine_done = true;
+                evicted_any |=
+                    self.evict_for_deletes(Tier::Archive, arch_del, current, executed, report);
             }
             if evicted_any {
                 continue;
+            }
+            // The plan that is executed: only now are its rolling budget and states kept.
+            if !refuse_hot {
+                self.rolling_budget = planned.rolling_budget;
+                report.hot = Some(planned.hot);
+                report.archive_full = planned.archive == ArchiveStatus::Full;
             }
             let mut hot_left = hot_total;
             let mut replan = false;

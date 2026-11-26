@@ -483,6 +483,10 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
                         continue;
                     }
                     Err(e) if e.is_not_found() => {}
+                    // A symlink (ELOOP) or another non-regular object is not a segment and cannot
+                    // be quarantined: it is left where it is and never pins the row.
+                    Err(FsError::NotRegular) => continue,
+                    Err(e) if e.errno() == Some(Errno::LOOP) => continue,
                     Err(_) => return Outcome::DeleteFailed,
                 }
             }

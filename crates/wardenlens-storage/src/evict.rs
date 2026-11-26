@@ -48,7 +48,7 @@ pub(crate) struct Selection {
 
 /// Every quarantined file of a tier with its length, oldest first.
 #[derive(Debug, Default)]
-pub(crate) struct Sized {
+pub(crate) struct SizedQuarantine {
     pub(crate) files: Vec<(Candidate, u64)>,
     pub(crate) total: u64,
     /// A listing hit the entry bound or failed: some quarantined files were not seen.
@@ -57,18 +57,24 @@ pub(crate) struct Sized {
 
 /// List and size the quarantine of `tier`. The length is that of the descriptor that was opened
 /// (never a path lookup); `open_read` refuses anything that is not a regular file.
-pub(crate) fn scan_sized<F: Fs>(fs: &F, tier: Tier) -> Sized {
+pub(crate) fn scan_sized<F: Fs>(fs: &F, tier: Tier) -> SizedQuarantine {
     let (cands, incomplete) = scan(fs, tier);
-    let mut out = Sized {
+    let mut out = SizedQuarantine {
         incomplete,
-        ..Sized::default()
+        ..SizedQuarantine::default()
     };
     for c in cands {
         let Ok(o) = fs.open_read(tier, &c.comps()) else {
             continue;
         };
-        out.total = out.total.saturating_add(o.len);
-        out.files.push((c, o.len));
+        if o.allocated == 0 {
+            // Deleting it frees nothing (empty or fully sparse): not worth evicting as evidence.
+            continue;
+        }
+        // What deleting the file frees: allocated bytes, not the apparent length (a sparse file
+        // frees little).
+        out.total = out.total.saturating_add(o.allocated);
+        out.files.push((c, o.allocated));
     }
     out
 }

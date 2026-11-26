@@ -35,6 +35,8 @@ pub struct FileStat {
     pub kind: FileKind,
     /// Size in bytes.
     pub size: u64,
+    /// Bytes allocated on the volume (`st_blocks * 512`); less than `size` for a sparse file.
+    pub allocated: u64,
     /// Device number.
     pub dev: u64,
     /// Inode number.
@@ -56,6 +58,7 @@ impl FileStat {
         Self {
             kind,
             size: u64::try_from(st.st_size).unwrap_or(0),
+            allocated: u64::try_from(st.st_blocks).unwrap_or(0).saturating_mul(512),
             dev: st.st_dev,
             ino: st.st_ino,
             uid: st.st_uid,
@@ -87,6 +90,8 @@ pub struct ReadFile {
     pub file: File,
     /// Its length in bytes.
     pub len: u64,
+    /// Bytes allocated on the volume, at most `len` (a sparse file frees less than its length).
+    pub allocated: u64,
 }
 
 /// One entry of a directory listing.
@@ -243,6 +248,7 @@ impl RootDir {
         Ok(ReadFile {
             file: File::from(fd),
             len: st.size,
+            allocated: st.allocated.min(st.size),
         })
     }
 
