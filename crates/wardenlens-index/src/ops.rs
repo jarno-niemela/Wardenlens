@@ -212,28 +212,21 @@ impl SegmentIndex for Index {
             .map_err(IndexError::sqlite("oldest"))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(IndexError::sqlite("oldest"))? {
-            let (raw, id) = row_id(row)?;
-            let stored_tier = tier_from_code(integer(row, 1, raw, "tier")?, raw)?;
-            let bytes =
-                segment_bytes(integer(row, 2, raw, "bytes")?).ok_or(IndexError::CorruptRow {
-                    id: raw,
-                    field: "bytes",
-                })?;
-            let ended = integer(row, 3, raw, "ended_at_ms")?;
-            if !(MIN_ENDED_MS..=MAX_ENDED_MS).contains(&ended) {
-                return Err(IndexError::CorruptRow {
-                    id: raw,
-                    field: "ended_at_ms",
-                });
-            }
-            out.push(StoredSegment {
-                id,
-                tier: stored_tier,
-                bytes,
-                ended_at: Timestamp::from_unix_millis(ended),
-            });
+            out.push(stored_from_row(row)?);
         }
         Ok(out)
+    }
+
+    fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, IndexError> {
+        let mut stmt =
+            sql::prepare(&self.conn, sql::NEWEST).map_err(IndexError::sqlite("newest"))?;
+        let mut rows = stmt
+            .query(params![tier_code(tier)?])
+            .map_err(IndexError::sqlite("newest"))?;
+        rows.next()
+            .map_err(IndexError::sqlite("newest"))?
+            .map(stored_from_row)
+            .transpose()
     }
 
     fn bytes_by_tier(&self) -> Result<TierTotals, IndexError> {
@@ -289,4 +282,27 @@ impl SegmentIndex for Index {
             None => Err(corrupt),
         }
     }
+}
+
+/// A `SELECT id, tier, bytes, ended_at_ms` row as a [`StoredSegment`], every column checked.
+fn stored_from_row(row: &rusqlite::Row<'_>) -> Result<StoredSegment, IndexError> {
+    let (raw, id) = row_id(row)?;
+    let stored_tier = tier_from_code(integer(row, 1, raw, "tier")?, raw)?;
+    let bytes = segment_bytes(integer(row, 2, raw, "bytes")?).ok_or(IndexError::CorruptRow {
+        id: raw,
+        field: "bytes",
+    })?;
+    let ended = integer(row, 3, raw, "ended_at_ms")?;
+    if !(MIN_ENDED_MS..=MAX_ENDED_MS).contains(&ended) {
+        return Err(IndexError::CorruptRow {
+            id: raw,
+            field: "ended_at_ms",
+        });
+    }
+    Ok(StoredSegment {
+        id,
+        tier: stored_tier,
+        bytes,
+        ended_at: Timestamp::from_unix_millis(ended),
+    })
 }

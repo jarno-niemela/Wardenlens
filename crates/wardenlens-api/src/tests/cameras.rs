@@ -47,7 +47,16 @@ fn app_of(dir: FakeDirectory, st: FakeStatus) -> (Router, String) {
     let token = Token::generate().unwrap();
     store.add(&token, false);
     let auth = format!("Bearer {}", token.expose());
-    (build(Arc::new(store), dir, st, LIMITS), auth)
+    (
+        build(
+            Arc::new(store),
+            dir,
+            st,
+            super::FakeStorage::default(),
+            LIMITS,
+        ),
+        auth,
+    )
 }
 
 async fn fetch(app: &Router, path: &str, auth: Option<&str>) -> (StatusCode, String) {
