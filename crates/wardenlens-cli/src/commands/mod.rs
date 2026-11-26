@@ -7,6 +7,8 @@
 //! layout and keeps its own error type and terminal handling.
 
 pub(crate) mod config;
+pub(crate) mod import;
+pub(crate) mod secrets;
 
 use std::error::Error;
 use std::io::{self, Write};
