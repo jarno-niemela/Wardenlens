@@ -398,6 +398,7 @@ fn delete_unlinks_fsyncs_each_directory_and_removes_the_row_last() {
         vec![
             Op::Unlink(Tier::Hot),
             Op::SyncDir(Tier::Hot),
+            Op::Open(Tier::Archive), // the twin's length is checked before it is unlinked
             Op::Unlink(Tier::Archive),
             Op::SyncDir(Tier::Archive)
         ]
@@ -427,7 +428,7 @@ fn delete_never_removes_the_row_before_the_unlink_and_the_directory_fsync() {
     assert_eq!(lp.delete_now(id, true), Outcome::IndexError);
     assert_eq!(
         state.lock().unwrap().log.len(),
-        4,
+        5,
         "all file steps came first"
     );
     assert_eq!(

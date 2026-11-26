@@ -46,52 +46,79 @@ pub(crate) struct Selection {
     pub(crate) goal: u64,
 }
 
-/// Choose what to delete from the quarantine of `tier`, or nothing. Quarantine goes first, as an
-/// order (section 6): reachability is judged on the combined goal, free space plus the whole
-/// quarantine plus the `deletable_bytes` of the tier's indexed segments (which the plan deletes
-/// after). Nothing is selected only when even that total cannot reach the floor (P2: deleting
-/// evidence that cannot restore the goal loses it for nothing). Otherwise the selection is the
-/// shortest oldest-first prefix that reaches the goal, or the whole quarantine when it does not.
+/// Every quarantined file of a tier with its length, oldest first.
+#[derive(Debug, Default)]
+pub(crate) struct Sized {
+    pub(crate) files: Vec<(Candidate, u64)>,
+    pub(crate) total: u64,
+    /// A listing hit the entry bound or failed: some quarantined files were not seen.
+    pub(crate) incomplete: bool,
+}
+
+/// List and size the quarantine of `tier`. The length is that of the descriptor that was opened
+/// (never a path lookup); `open_read` refuses anything that is not a regular file.
+pub(crate) fn scan_sized<F: Fs>(fs: &F, tier: Tier) -> Sized {
+    let (cands, incomplete) = scan(fs, tier);
+    let mut out = Sized {
+        incomplete,
+        ..Sized::default()
+    };
+    for c in cands {
+        let Ok(o) = fs.open_read(tier, &c.comps()) else {
+            continue;
+        };
+        out.total = out.total.saturating_add(o.len);
+        out.files.push((c, o.len));
+    }
+    out
+}
+
+/// The shortest oldest-first prefix of `files` whose lengths reach `need` (all of them when they
+/// do not).
+pub(crate) fn prefix(files: &[(Candidate, u64)], need: u64) -> Vec<Candidate> {
+    let mut freed = 0_u64;
+    let mut out = Vec::new();
+    for (c, len) in files {
+        if freed >= need {
+            break;
+        }
+        freed = freed.saturating_add(*len);
+        out.push(c.clone());
+    }
+    out
+}
+
+/// Choose what to delete from the quarantine of `tier` before the plan runs, or nothing. This is
+/// the case where the plan deletes no video of the tier (a plan that does is handled after it is
+/// made, sized to its deletes): quarantine goes first, as an order (section 6). Reachability is
+/// judged on the combined goal, free space plus the whole quarantine plus the `deletable_bytes`
+/// of the tier's indexed segments. Nothing is selected only when even that total cannot reach the
+/// floor (P2). Otherwise the selection is the shortest oldest-first prefix that reaches the goal,
+/// or the whole quarantine when it does not.
 pub(crate) fn select<F: Fs>(
     fs: &F,
     tier: Tier,
     space: &VolumeSpace,
     floor_percent: u8,
     deletable_bytes: u64,
+    incomplete: &mut bool,
 ) -> Option<Selection> {
     let floor = percent_of(space.capacity_bytes, u64::from(floor_percent))?;
     let target = percent_of(
         space.capacity_bytes,
         u64::from(floor_percent).saturating_add(1),
     )?;
-    let mut sized: Vec<(Candidate, u64)> = Vec::new();
-    let mut total = 0_u64;
-    for c in scan(fs, tier) {
-        // The length of the same descriptor that was opened (never a path lookup).
-        let Ok(o) = fs.open_read(tier, &c.comps()) else {
-            continue;
-        };
-        total = total.saturating_add(o.len);
-        sized.push((c, o.len));
-    }
+    let sized = scan_sized(fs, tier);
+    *incomplete |= sized.incomplete;
     let reachable = space
         .free_bytes
-        .saturating_add(total)
+        .saturating_add(sized.total)
         .saturating_add(deletable_bytes);
     if reachable < floor {
         return None;
     }
     let goal = if reachable >= target { target } else { floor };
-    let need = goal.saturating_sub(space.free_bytes);
-    let mut freed = 0_u64;
-    let mut files = Vec::new();
-    for (c, len) in sized {
-        if freed >= need {
-            break;
-        }
-        freed = freed.saturating_add(len);
-        files.push(c);
-    }
+    let files = prefix(&sized.files, goal.saturating_sub(space.free_bytes));
     if files.is_empty() {
         None
     } else {
@@ -145,11 +172,15 @@ fn parse_name(name: &str) -> Option<(String, u32)> {
 }
 
 /// Scan `<root>/_quarantine/<camera>/<day>/<file>` (depth 3), oldest first. A missing directory
-/// (`ENOENT`) is an empty quarantine; any other listing failure ends the scan with what was seen.
-pub(crate) fn scan<F: Fs>(fs: &F, tier: Tier) -> Vec<Candidate> {
+/// (`ENOENT`) is an empty quarantine. Any other listing failure, or the entry bound, marks the
+/// scan incomplete (returned as `true`): what was seen is still returned.
+pub(crate) fn scan<F: Fs>(fs: &F, tier: Tier) -> (Vec<Candidate>, bool) {
     let mut out = Vec::new();
-    let mut budget = MAX_QUARANTINE_ENTRIES;
-    let cameras = list(fs, tier, &[QUARANTINE_DIR], &mut budget);
+    let mut st = ScanState {
+        budget: MAX_QUARANTINE_ENTRIES,
+        incomplete: false,
+    };
+    let cameras = list(fs, tier, &[QUARANTINE_DIR], &mut st);
     for cam in cameras
         .iter()
         .filter(|e| matches!(e.kind, FileKind::Directory | FileKind::Other))
@@ -157,17 +188,12 @@ pub(crate) fn scan<F: Fs>(fs: &F, tier: Tier) -> Vec<Candidate> {
         if CameraId::from_str(&cam.name).is_err() {
             continue;
         }
-        let days = list(fs, tier, &[QUARANTINE_DIR, &cam.name], &mut budget);
+        let days = list(fs, tier, &[QUARANTINE_DIR, &cam.name], &mut st);
         for day in days
             .iter()
             .filter(|e| matches!(e.kind, FileKind::Directory | FileKind::Other) && is_day(&e.name))
         {
-            let files = list(
-                fs,
-                tier,
-                &[QUARANTINE_DIR, &cam.name, &day.name],
-                &mut budget,
-            );
+            let files = list(fs, tier, &[QUARANTINE_DIR, &cam.name, &day.name], &mut st);
             // `DT_UNKNOWN` (kind `Other`) is not a verdict: the sizing step opens the file and
             // `fstat`s the descriptor, which refuses anything that is not regular.
             for f in files
@@ -187,19 +213,32 @@ pub(crate) fn scan<F: Fs>(fs: &F, tier: Tier) -> Vec<Candidate> {
         }
     }
     out.sort();
-    out
+    (out, st.incomplete)
 }
 
-fn list<F: Fs>(fs: &F, tier: Tier, dir: &[&str], budget: &mut usize) -> Vec<DirEntry> {
-    if *budget == 0 {
+struct ScanState {
+    budget: usize,
+    incomplete: bool,
+}
+
+fn list<F: Fs>(fs: &F, tier: Tier, dir: &[&str], st: &mut ScanState) -> Vec<DirEntry> {
+    if st.budget == 0 {
+        st.incomplete = true;
         return Vec::new();
     }
-    match fs.list_dir(tier, dir, *budget) {
+    match fs.list_dir(tier, dir, st.budget) {
         Ok(v) => {
-            *budget = budget.saturating_sub(v.len());
+            st.budget = st.budget.saturating_sub(v.len());
             v
         }
-        Err(_) => Vec::new(),
+        Err(e) => {
+            // A missing directory is an empty quarantine; anything else (the bound, EIO, ...)
+            // means some files were not seen.
+            if !e.is_not_found() {
+                st.incomplete = true;
+            }
+            Vec::new()
+        }
     }
 }
 

@@ -89,6 +89,12 @@ pub struct TickReport {
     /// consecutive ticks. A tick that returns [`TickError::Index`] has no report: read
     /// [`StorageLoop::index_health_error`] then.
     pub index_health_error: bool,
+    /// A quarantine listing hit the entry bound or failed: some quarantined files were not seen
+    /// (health flag; what was seen was still evicted in order).
+    pub quarantine_incomplete: bool,
+    /// The plan was made from a truncated prefix of the index, so its rolling-buffer deletes of
+    /// hot video were refused (the budget would be computed from an understated total).
+    pub rolling_deletes_refused: bool,
     /// A tier holds more segments than the loop plans from: the plan used the oldest-first prefix
     /// (health warning; moves and floor deletes still run).
     pub segments_truncated: bool,
@@ -108,7 +114,7 @@ pub struct StorageLoop<I, F, U> {
     hot_after_last_tick: Option<u64>,
     index_error_ticks: u32,
     archive_was_available: Option<bool>,
-    returned_this_tick: bool,
+    returned_pending: bool,
     max_segments: usize,
     observer: Box<dyn Observer>,
 }
@@ -178,7 +184,7 @@ impl Storage {
             hot_after_last_tick: None,
             index_error_ticks: 0,
             archive_was_available: None,
-            returned_this_tick: false,
+            returned_pending: false,
             max_segments: MAX_SEGMENTS,
             observer: Box::new(NoObserver),
         };
@@ -215,15 +221,29 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         self.failures
     }
 
+    /// Seed the "was the archive available" state from the start-up probe (ADR 0005 section 9:
+    /// start-up probe, then reconciliation, then the loop). Without it the first probe of the
+    /// loop is never a return; with `false` the first available probe is, and the "archive
+    /// returned" pass is due before any move.
+    pub const fn set_initial_archive_state(&mut self, available: bool) {
+        self.archive_was_available = Some(available);
+    }
+
     /// Probe, plan and execute at most `max_actions_per_tick` actions, probing again after each.
     /// A segment whose action did not succeed is never retried within the tick and the rest of
     /// the plan still runs.
+    ///
+    /// **Archive returned.** When any probe sees the archive change from unavailable to
+    /// available, [`TickReport::archive_returned`] is reported and no move runs until the pass of
+    /// ticket #59 had its tick: the loop keeps a *pending* flag that survives `Err` ticks and is
+    /// cleared only by a tick that completes `Ok` (and reports it). While it is pending a tick
+    /// plans no moves and evicts no archive video on behalf of one. The caller runs the pass on
+    /// the tick that reports it, before the next tick.
     ///
     /// # Errors
     /// [`TickError`]: the hot volume or the index cannot be read, or the planner refused its
     /// input. The next tick starts afresh.
     pub fn tick(&mut self, now: Timestamp) -> Result<TickReport, TickError> {
-        self.returned_this_tick = false;
         // Only the first probe of a tick may clear the move failures.
         let first = self.probe_now(true);
         first.hot.map_err(TickError::HotVolume)?;
@@ -248,6 +268,8 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             archive_returned: false,
             index_health_error: false,
             segments_truncated: false,
+            quarantine_incomplete: false,
+            rolling_deletes_refused: false,
             hot_probe_failed: false,
         };
         let mut executed = 0_usize;
@@ -266,8 +288,13 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         };
         report.index_health_error = self.index_health_error();
         report.archive = current.archive;
-        report.archive_returned = self.returned_this_tick;
-        result.map(|()| report)
+        // The flag survives an `Err` tick: it is cleared only by a tick that completes `Ok` and
+        // reports it.
+        report.archive_returned = self.returned_pending;
+        result.map(|()| {
+            self.returned_pending = false;
+            report
+        })
     }
 
     /// The index failed on [`INDEX_ERROR_TICKS`] consecutive ticks (a health error: the index is
@@ -290,6 +317,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         cap: usize,
     ) -> Result<(Vec<StoredSegment>, bool), TickError> {
         self.load_segments_with(page, cap)
+    }
+
+    /// Test hook: hot video bytes left after the last tick's actions.
+    #[cfg(test)]
+    pub(crate) const fn hot_after_last_tick(&self) -> Option<u64> {
+        self.hot_after_last_tick
     }
 
     /// Test hook: the rolling budget carried to the next tick.
@@ -330,12 +363,70 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         }
         let available = p.archive.is_available();
         if self.archive_was_available == Some(false) && available {
-            self.returned_this_tick = true;
+            self.returned_pending = true;
         }
         self.archive_was_available = Some(available);
         p
     }
 
+    fn make_plan(
+        &self,
+        current: &ProbeResult,
+        segments: &[StoredSegment],
+        now: Timestamp,
+        hot_total: u64,
+        hold_moves: bool,
+    ) -> Result<wardenlens_core::storage::Plan, TickError> {
+        let hot_space = current.hot.map_err(TickError::HotVolume)?;
+        let ingested = self
+            .hot_after_last_tick
+            .map_or(0, |after| hot_total.saturating_sub(after));
+        // A tick that holds every move back plans with the hot video out of sight: the planner
+        // then plans no move and no eviction on behalf of one (an archive below its own floor is
+        // still evicted), and no hot delete (the archive is available here).
+        let visible: Vec<StoredSegment>;
+        let used: &[StoredSegment] = if hold_moves {
+            visible = segments
+                .iter()
+                .filter(|s| s.tier != Tier::Hot)
+                .copied()
+                .collect();
+            &visible
+        } else {
+            segments
+        };
+        plan(&PlanInput {
+            hot: hot_space,
+            archive: archive_state(&current.archive),
+            segments: used,
+            now,
+            policy: self.cfg.policy,
+            ingested_bytes: ingested,
+            rolling_budget: self.rolling_budget,
+        })
+        .map_err(TickError::Plan)
+    }
+
+    /// Bytes of each tier's video that `actions` delete.
+    fn delete_bytes(segments: &[StoredSegment], actions: &[Action]) -> (u64, u64) {
+        let (mut hot, mut arch) = (0_u64, 0_u64);
+        for a in actions {
+            if let Action::Delete(id) = a
+                && let Some(s) = segments.iter().find(|s| s.id == *id)
+            {
+                match s.tier {
+                    Tier::Hot => hot = hot.saturating_add(s.bytes),
+                    _ => arch = arch.saturating_add(s.bytes),
+                }
+            }
+        }
+        (hot, arch)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one loop: plan, quarantine first, execute, re-probe, replan"
+    )]
     fn run_plan(
         &mut self,
         now: Timestamp,
@@ -347,8 +438,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         // forbid the delete that the floor then demands (a different action).
         let mut failed: HashSet<(SegmentId, bool)> = HashSet::new();
         let mut replans = 0_u32;
+        // Quarantine is evicted for a tier's planned deletes once per tier and tick.
+        let mut quarantine_done = [false; 2];
         loop {
-            let hot_space = current.hot.map_err(TickError::HotVolume)?;
+            current.hot.map_err(TickError::HotVolume)?;
             let (segments, truncated) = self.load_segments()?;
             report.segments_truncated |= truncated;
             let hot_total = segments
@@ -356,26 +449,49 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 .filter(|s| s.tier == Tier::Hot)
                 .try_fold(0_u64, |a, s| a.checked_add(s.bytes))
                 .unwrap_or(u64::MAX);
-            let ingested = self
-                .hot_after_last_tick
-                .map_or(0, |after| hot_total.saturating_sub(after));
             let planned_available = current.archive.is_available();
-            let planned = plan(&PlanInput {
-                hot: hot_space,
-                archive: archive_state(&current.archive),
-                segments: &segments,
-                now,
-                policy: self.cfg.policy,
-                ingested_bytes: ingested,
-                rolling_budget: self.rolling_budget,
-            })
-            .map_err(TickError::Plan)?;
-            self.rolling_budget = planned.rolling_budget;
-            report.hot = Some(planned.hot);
-            report.archive_full = planned.archive == ArchiveStatus::Full;
+            let hold = self.returned_pending && planned_available;
+            let planned = self.make_plan(current, &segments, now, hot_total, hold)?;
+            if !hold {
+                self.rolling_budget = planned.rolling_budget;
+                report.hot = Some(planned.hot);
+                report.archive_full = planned.archive == ArchiveStatus::Full;
+            }
+            // From a truncated prefix the rolling buffer's budget is understated: refuse its
+            // hot deletes (and say so) rather than delete video on a wrong number.
+            let refuse_hot = truncated && !hold && planned.hot == HotState::RollingBuffer;
+            let actions: Vec<Action> = planned
+                .actions
+                .iter()
+                .copied()
+                .filter(|a| {
+                    !(refuse_hot
+                        && matches!(a, Action::Delete(id)
+                            if segments.iter().any(|s| s.id == *id && s.tier == Tier::Hot)))
+                })
+                .collect();
+            report.rolling_deletes_refused |= refuse_hot;
+            // Quarantine first, whenever the plan deletes a tier's video (any planner state): evict
+            // that tier's quarantine, sized to the bytes the plan would delete, then plan again.
+            let (hot_del, arch_del) = Self::delete_bytes(&segments, &actions);
+            let mut evicted_any = false;
+            for (i, (tier, need)) in [(Tier::Hot, hot_del), (Tier::Archive, arch_del)]
+                .into_iter()
+                .enumerate()
+            {
+                if need > 0 && !quarantine_done.get(i).copied().unwrap_or(true) {
+                    if let Some(d) = quarantine_done.get_mut(i) {
+                        *d = true;
+                    }
+                    evicted_any |= self.evict_for_deletes(tier, need, current, executed, report);
+                }
+            }
+            if evicted_any {
+                continue;
+            }
             let mut hot_left = hot_total;
             let mut replan = false;
-            for action in &planned.actions {
+            for action in &actions {
                 if *executed >= self.cfg.max_actions_per_tick {
                     report.truncated = true;
                     break;
@@ -388,7 +504,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 if failed.contains(&(id, is_move)) {
                     continue;
                 }
-                if is_move && self.returned_this_tick {
+                if is_move && self.returned_pending {
                     // The archive just came back: the pass of section 9 runs before any move.
                     continue;
                 }
@@ -504,16 +620,21 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         Ok((all, truncated))
     }
 
-    /// Delete quarantined files of a volume that is below its floor, oldest first, before the
-    /// plan deletes any video of that volume (section 6 eviction order). Counts toward the
-    /// per-tick bound, failed attempts included.
+    /// Before the plan: delete quarantined files of a volume below its floor, oldest first, when
+    /// reaching the floor is possible at all (section 6 eviction order; the plan may then need to
+    /// delete less video, or none). Counts toward the per-tick bound, failed attempts included.
     fn evict_quarantine(
         &mut self,
         current: &mut ProbeResult,
         executed: &mut usize,
         report: &mut TickReport,
     ) {
-        let totals = self.index.totals().unwrap_or_default();
+        let Ok(totals) = self.index.totals() else {
+            // Without the true totals the reachability cannot be judged: skip, and count the
+            // index error.
+            report.index_errors = report.index_errors.saturating_add(1);
+            return;
+        };
         for tier in [Tier::Hot, Tier::Archive] {
             let (space, floor, deletable) = match tier {
                 Tier::Hot => (
@@ -534,27 +655,81 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             if !evict::below_floor(&space, floor) {
                 continue;
             }
-            let Some(sel) = evict::select(&self.fs, tier, &space, floor, deletable) else {
+            let Some(sel) = evict::select(
+                &self.fs,
+                tier,
+                &space,
+                floor,
+                deletable,
+                &mut report.quarantine_incomplete,
+            ) else {
                 continue;
             };
-            self.observer.quarantine_eviction(tier, sel.files.len());
-            for c in &sel.files {
-                if *executed >= self.cfg.max_actions_per_tick {
-                    report.truncated = true;
-                    return;
-                }
-                *executed = executed.saturating_add(1);
-                if !self.evict_one(tier, c) {
-                    continue;
-                }
-                report.quarantine_evicted = report.quarantine_evicted.saturating_add(1);
-                *current = self.probe_now(false);
+            self.evict_files(tier, &sel.files, Some(sel.goal), current, executed, report);
+        }
+    }
+
+    /// After a plan that deletes `need` bytes of `tier`'s video: delete that tier's quarantine
+    /// first, oldest first, up to `need` bytes (all of it when that is less). No reachability
+    /// gate: the plan deletes video anyway, so the evidence goes first. Returns whether anything
+    /// was deleted (the caller plans again).
+    fn evict_for_deletes(
+        &mut self,
+        tier: Tier,
+        need: u64,
+        current: &mut ProbeResult,
+        executed: &mut usize,
+        report: &mut TickReport,
+    ) -> bool {
+        let sized = evict::scan_sized(&self.fs, tier);
+        report.quarantine_incomplete |= sized.incomplete;
+        let files = evict::prefix(&sized.files, need);
+        self.evict_files(tier, &files, None, current, executed, report) > 0
+    }
+
+    /// Delete `files` oldest first, stopping early at `goal` free bytes. The observer is told
+    /// before the first deletion, with the number that can actually be attempted within the
+    /// per-tick bound.
+    fn evict_files(
+        &mut self,
+        tier: Tier,
+        files: &[Candidate],
+        goal: Option<u64>,
+        current: &mut ProbeResult,
+        executed: &mut usize,
+        report: &mut TickReport,
+    ) -> usize {
+        if files.is_empty() {
+            return 0;
+        }
+        let room = self.cfg.max_actions_per_tick.saturating_sub(*executed);
+        if room == 0 {
+            report.truncated = true;
+            return 0;
+        }
+        self.observer
+            .quarantine_eviction(tier, files.len().min(room));
+        let mut evicted = 0_usize;
+        for c in files {
+            if *executed >= self.cfg.max_actions_per_tick {
+                report.truncated = true;
+                break;
+            }
+            *executed = executed.saturating_add(1);
+            if !self.evict_one(tier, c) {
+                continue;
+            }
+            evicted = evicted.saturating_add(1);
+            report.quarantine_evicted = report.quarantine_evicted.saturating_add(1);
+            *current = self.probe_now(false);
+            if let Some(goal) = goal {
                 match tier_space(current, tier) {
-                    Some(s) if s.free_bytes < sel.goal => {}
+                    Some(s) if s.free_bytes < goal => {}
                     _ => break,
                 }
             }
         }
+        evicted
     }
 
     fn evict_one(&self, tier: Tier, c: &Candidate) -> bool {

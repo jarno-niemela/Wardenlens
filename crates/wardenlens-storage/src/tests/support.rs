@@ -33,6 +33,7 @@ pub(crate) struct IdxFaults {
     pub(crate) get: bool,
     pub(crate) delete: bool,
     pub(crate) oldest: bool,
+    pub(crate) totals: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +110,7 @@ impl SegmentIndex for TestIndex {
         Ok(self.with(|i| i.oldest(tier, after, n))?)
     }
     fn bytes_by_tier(&self) -> Result<TierTotals, Self::Error> {
+        self.faulty(|f| f.totals)?;
         Ok(self.with(|i| i.bytes_by_tier())?)
     }
     fn latest_started_at(&self, camera: &CameraId) -> Result<Option<UnixMs>, Self::Error> {

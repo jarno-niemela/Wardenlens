@@ -97,12 +97,18 @@ impl Outcome {
         matches!(self, Self::ArchiveFailure(_))
     }
 
-    /// Whether the hot copy of the segment is gone (its bytes left the hot volume).
+    /// Whether the segment's row left the hot tier (moved, rolled forward to the archive,
+    /// dropped or deleted): its bytes no longer count as hot video.
     #[must_use]
     pub(crate) const fn removed_hot_copy(self) -> bool {
         matches!(
             self,
-            Self::Moved | Self::MovedHotLeft | Self::Deleted | Self::SourceQuarantined
+            Self::Moved
+                | Self::MovedHotLeft
+                | Self::Deleted
+                | Self::SourceQuarantined
+                | Self::RolledForward
+                | Self::RowDropped(_)
         )
     }
 
@@ -464,6 +470,22 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
             &[Tier::Hot]
         };
         for &tier in tiers {
+            if tier != row.tier {
+                // The other tier holds at most a twin (a crash between M6 and M9). A twin of the
+                // wrong size is an invalid file: quarantined, never deleted (section 9).
+                match self.fs.open_read(tier, &rel.comps()) {
+                    Ok(o) if o.len == row.record.bytes => drop(o),
+                    Ok(o) => {
+                        drop(o);
+                        if !self.quarantined(tier, &rel) {
+                            return Outcome::DeleteFailed;
+                        }
+                        continue;
+                    }
+                    Err(e) if e.is_not_found() => {}
+                    Err(_) => return Outcome::DeleteFailed,
+                }
+            }
             match self.fs.unlink(tier, &rel.dir(), &rel.name) {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {}

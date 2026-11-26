@@ -589,6 +589,8 @@ fn rolling_budget_is_fed_back_and_cleared_when_the_archive_returns() {
     assert!(!r.archive.is_available());
     assert!(lp.rolling_budget().is_some(), "{r:?}");
     std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert!(r.archive_returned);
     lp.tick(now()).unwrap();
     assert_eq!(
         lp.rolling_budget(),
@@ -1187,4 +1189,204 @@ fn a_quarantine_that_is_needed_is_deleted_before_video_when_the_total_reaches_th
     assert!(!d.join("000000-000.mp4").exists());
     let gone = ids.iter().filter(|id| env.tier_of(**id).is_none()).count();
     assert_eq!(gone, 2, "two segments finish the job: {r:?}");
+}
+
+// ---- round 3 -------------------------------------------------------------------------------
+
+#[test]
+fn rolling_buffer_never_deletes_hot_video_while_a_quarantined_hot_file_exists() {
+    // Hot cap 1 MB, 760 kB of foreign data, 2 x 100 kB segments, 20 kB of quarantine, no archive:
+    // the floor cannot be reached even with everything deleted, so the planner rolls the buffer.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 760_000]).unwrap();
+    let ids: Vec<_> = (0..2)
+        .map(|n| env.add("cam-1", n, SEG, Tier::Hot))
+        .collect();
+    let q = env.hot.join("_quarantine/cam-1/2023-11-12/000000-000.mp4");
+    std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+    std::fs::write(&q, pattern(20_000)).unwrap();
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(
+        r.hot,
+        Some(wardenlens_core::storage::HotState::Unsatisfiable),
+        "{r:?}"
+    );
+    // The recorder adds a segment; the next plan is the rolling buffer.
+    let newer = env.add("cam-1", 2, 10_000, Tier::Hot);
+    let seen_while_quarantined = Arc::new(Mutex::new(false));
+    let (flag, q2) = (Arc::clone(&seen_while_quarantined), q.clone());
+    env.index.faults.lock().unwrap().get_hook = Some(Box::new(move || {
+        // Runs when the first video delete starts: the quarantined file must be gone already.
+        *flag.lock().unwrap() = q2.exists();
+    }));
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.quarantine_evicted, 1, "{r:?}");
+    assert!(!q.exists());
+    assert!(
+        !*seen_while_quarantined.lock().unwrap(),
+        "video went before the quarantine: {r:?}"
+    );
+    let _ = (ids, newer);
+    // And over more ticks: with a new quarantined file each time, no hot row is deleted first.
+    for n in 3..8 {
+        env.add("cam-1", n, 10_000, Tier::Hot);
+        let q = env
+            .hot
+            .join(format!("_quarantine/cam-1/2023-11-13/00000{n}-000.mp4"));
+        std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+        std::fs::write(&q, pattern(5_000)).unwrap();
+        let flag = Arc::new(Mutex::new(false));
+        let (f2, q2) = (Arc::clone(&flag), q.clone());
+        env.index.faults.lock().unwrap().get_hook = Some(Box::new(move || {
+            *f2.lock().unwrap() = q2.exists();
+        }));
+        let r = lp.tick(now()).unwrap();
+        assert!(
+            !*flag.lock().unwrap(),
+            "tick {n}: video deleted while quarantine existed: {r:?}"
+        );
+        env.index.faults.lock().unwrap().get_hook = None;
+    }
+}
+
+#[test]
+fn the_start_up_probe_state_can_be_seeded() {
+    let env = Env::new();
+    env.add("cam-1", 0, 1000, Tier::Hot);
+    let (mut lp, _) = build(&env, None);
+    lp.set_initial_archive_state(false);
+    let r = lp.tick(late()).unwrap();
+    assert!(r.archive_returned, "{r:?}");
+    assert_eq!(r.moved, 0);
+    assert_eq!(lp.tick(late()).unwrap().moved, 1);
+}
+
+#[test]
+fn a_failed_totals_read_skips_quarantine_eviction_and_counts_as_an_index_error() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 600_001]).unwrap();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..10 {
+        std::fs::write(d.join(format!("00000{i}-000.mp4")), pattern(15_000)).unwrap();
+    }
+    env.index.faults.lock().unwrap().totals = true;
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.index_errors, 1, "{r:?}");
+    assert_eq!(r.quarantine_evicted, 0);
+}
+
+#[test]
+fn reachability_uses_the_true_totals_when_the_plan_is_made_from_a_truncated_prefix() {
+    // Hot 1 MB: foreign 600 kB, 4 x 40 kB video, 100 kB quarantine: free 140 kB. Quarantine plus
+    // all video reaches the floor (250 kB); quarantine plus only the 1 loaded segment would not.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 600_000]).unwrap();
+    for n in 0..4 {
+        env.add("cam-1", n, 40_000, Tier::Hot);
+    }
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..10 {
+        std::fs::write(d.join(format!("00000{i}-000.mp4")), pattern(10_000)).unwrap();
+    }
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_segments(1);
+    let r = lp.tick(now()).unwrap();
+    assert!(r.segments_truncated);
+    assert!(r.quarantine_evicted > 0, "{r:?}");
+}
+
+#[test]
+fn a_quarantine_listing_failure_is_reported_not_treated_as_empty() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 800_000]).unwrap();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("000000-000.mp4"), pattern(10_000)).unwrap();
+    env.add("cam-1", 0, 100_000, Tier::Hot);
+    let fault = Fault {
+        sticky: true,
+        errno: rustix::io::Errno::IO,
+        ..Fault::once(Op::List(Tier::Hot), 2)
+    };
+    let (mut lp, _) = build(&env, Some(fault));
+    let r = lp.tick(now()).unwrap();
+    assert!(r.quarantine_incomplete, "{r:?}");
+}
+
+#[test]
+fn delete_quarantines_a_wrong_size_twin_instead_of_unlinking_it() {
+    let env = Env::new();
+    let id = env.add("cam-1", 0, 100, Tier::Hot);
+    let twin = env.arch_file("cam-1", 0);
+    std::fs::create_dir_all(twin.parent().unwrap()).unwrap();
+    std::fs::write(&twin, pattern(7)).unwrap();
+    let (lp, _) = build(&env, None);
+    assert_eq!(lp.delete_now(id, true), crate::Outcome::Deleted);
+    assert!(!twin.exists());
+    assert_eq!(
+        Env::quarantined(&env.arch),
+        vec![pattern(7)],
+        "evidence kept"
+    );
+    // Quarantine refused (bound exhausted or an error): the delete fails and the row stays.
+    let env = Env::new();
+    let id = env.add("cam-1", 0, 100, Tier::Hot);
+    let twin = env.arch_file("cam-1", 0);
+    std::fs::create_dir_all(twin.parent().unwrap()).unwrap();
+    std::fs::write(&twin, pattern(7)).unwrap();
+    let (lp, _) = build(&env, Some(Fault::once(Op::Quarantine(Tier::Archive), 1)));
+    assert_eq!(lp.delete_now(id, true), crate::Outcome::DeleteFailed);
+    assert_eq!(env.tier_of(id), Some(Tier::Hot));
+    assert!(twin.exists());
+}
+
+#[test]
+fn the_observer_hears_the_evictions_that_fit_the_action_bound() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 500_000]).unwrap();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..10 {
+        std::fs::write(d.join(format!("00000{i}-000.mp4")), pattern(40_000)).unwrap();
+    }
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 2;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    lp.set_observer(Box::new(Spy(Arc::clone(&seen))));
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.quarantine_evicted, 2);
+    assert_eq!(*seen.lock().unwrap(), vec![(Tier::Hot, 2)]);
+}
+
+#[test]
+fn rolled_forward_and_dropped_hot_rows_leave_the_hot_total() {
+    let env = Env::new();
+    // A hot row whose file is missing but whose archive copy is valid (rolled forward), and a
+    // hot row with neither (dropped): neither counts as hot video after the tick.
+    let a = env.row("cam-1", 0, 5000, Tier::Hot);
+    let p = env.arch_file("cam-1", 0);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, pattern(5000)).unwrap();
+    env.row("cam-1", 1, 7000, Tier::Hot);
+    let keep = env.add("cam-1", 2, 1000, Tier::Hot);
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(late()).unwrap();
+    assert_eq!(
+        (r.rolled_forward, r.rows_dropped, r.moved),
+        (1, 1, 1),
+        "{r:?}"
+    );
+    assert_eq!(lp.hot_after_last_tick(), Some(0));
+    let _ = (a, keep);
 }
