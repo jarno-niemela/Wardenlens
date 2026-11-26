@@ -35,11 +35,10 @@ fn camera(id: &str, host: &str, sub: Option<&str>) -> Camera {
     )
 }
 
-fn status(state: LinkState, since: i64, kind: Option<FailureKind>) -> LinkStatus {
+fn status(state: LinkState, since: i64) -> LinkStatus {
     LinkStatus {
         state,
         since: Timestamp::from_unix_millis(since),
-        error_kind: kind,
     }
 }
 
@@ -67,7 +66,7 @@ fn two_cameras() -> (Router, String) {
     };
     let st = FakeStatus(HashMap::from([(
         "cam-a".to_owned(),
-        status(LinkState::Streaming, 1_700_000_000_000, None),
+        status(LinkState::Streaming, 1_700_000_000_000),
     )]));
     app_of(dir, st)
 }
@@ -114,50 +113,27 @@ async fn get_returns_one_camera() {
 
 #[tokio::test]
 async fn every_state_maps_to_its_wire_name() {
+    let degraded = |k| LinkState::Degraded(k);
     let cases = [
-        (LinkState::Streaming, "streaming", None, None),
-        (LinkState::Connecting, "connecting", None, None),
-        (LinkState::Backoff, "backoff", None, None),
+        (LinkState::Streaming, "streaming", None),
+        (LinkState::Connecting, "connecting", None),
+        (LinkState::Backoff, "backoff", None),
+        (degraded(FailureKind::Auth), "degraded", Some("auth")),
+        (degraded(FailureKind::Timeout), "degraded", Some("timeout")),
+        (degraded(FailureKind::Refused), "degraded", Some("refused")),
         (
-            LinkState::Degraded,
+            degraded(FailureKind::Protocol),
             "degraded",
-            Some(FailureKind::Auth),
-            Some("auth"),
-        ),
-        (
-            LinkState::Degraded,
-            "degraded",
-            Some(FailureKind::Timeout),
-            Some("timeout"),
-        ),
-        (
-            LinkState::Degraded,
-            "degraded",
-            Some(FailureKind::Refused),
-            Some("refused"),
-        ),
-        (
-            LinkState::Degraded,
-            "degraded",
-            Some(FailureKind::Protocol),
             Some("protocol"),
         ),
-        (
-            LinkState::Degraded,
-            "degraded",
-            Some(FailureKind::Other),
-            Some("other"),
-        ),
+        (degraded(FailureKind::Other), "degraded", Some("other")),
     ];
-    for (state, name, kind, kind_name) in cases {
+    for (state, name, kind_name) in cases {
         let dir = FakeDirectory {
             cameras: vec![camera("cam-a", "192.0.2.10", None)],
             ..FakeDirectory::default()
         };
-        let st = FakeStatus(HashMap::from([(
-            "cam-a".to_owned(),
-            status(state, 5, kind),
-        )]));
+        let st = FakeStatus(HashMap::from([("cam-a".to_owned(), status(state, 5))]));
         let (app, auth) = app_of(dir, st);
         let (_, body) = fetch(&app, "/api/v1/cameras/cam-a", Some(&auth)).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -186,6 +162,8 @@ async fn invalid_id_is_400_and_unknown_is_404() {
         "..",
         "a%2Fb",
         "cam%00",
+        "%FF",
+        "%C3",
         "caf%C3%A9",
         "%20",
         &"a".repeat(33),
@@ -250,6 +228,50 @@ async fn responses_never_contain_credentials() {
         for word in ["password", "credential", "secret", "user", "token"] {
             assert!(!lower.contains(word), "{path}: {word}");
         }
+    }
+}
+
+/// Stream paths are served structurally redacted: every value after `=` is `***`.
+#[tokio::test]
+async fn stream_paths_are_redacted_in_every_response() {
+    let main = RtspPath::new("/cam/realmonitor?channel=1&pin=synthpin-31;k=v").unwrap();
+    let sub = RtspPath::new("/h264/ch1/sub?streamtype=1&tok=synthtok-55").unwrap();
+    let cam = Camera::new(
+        CameraId::new("cam-a").unwrap(),
+        DisplayName::new("Synthetic Cam").unwrap(),
+        ModelRef::new("acme", "model-1").unwrap(),
+        Host::new("192.0.2.10").unwrap(),
+        NonZeroU16::new(554).unwrap(),
+        StreamSet::new(main, Some(sub)),
+    );
+    let dir = FakeDirectory {
+        cameras: vec![cam],
+        ..FakeDirectory::default()
+    };
+    let (app, auth) = app_of(dir, FakeStatus::default());
+    for path in ["/api/v1/cameras", "/api/v1/cameras/cam-a"] {
+        let (_, body) = fetch(&app, path, Some(&auth)).await;
+        assert!(
+            !body.contains("synthpin") && !body.contains("synthtok"),
+            "{body}"
+        );
+        assert!(
+            body.contains("/cam/realmonitor?channel=***&pin=***;k=***"),
+            "{body}"
+        );
+        assert!(
+            body.contains("/h264/ch1/sub?streamtype=***&tok=***"),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn dto_debug_hides_host_name_and_paths() {
+    let dto = crate::cameras::camera_dto(&camera("cam-a", "192.0.2.10", None), None);
+    let shown = format!("{dto:?} {:?}", [&dto]);
+    for secret in ["192.0.2.10", "Synthetic Cam", "/main", "acme"] {
+        assert!(!shown.contains(secret), "{shown}");
     }
 }
 

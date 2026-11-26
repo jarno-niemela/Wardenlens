@@ -178,7 +178,9 @@ and narrows `secrets` to key handling and seal/open; `index` never depends on `v
 - What a token protects: read access to recordings (video of the inside and outside of the home), the camera list and
   storage state. Phase 1 has no mutating API routes (Phase 1 only reads cameras, recordings and storage), so in v1 a
   token confers read access and nothing else. The API never returns camera credentials (SEC-6); a stolen token therefore
-  reveals footage and metadata, not camera passwords.
+  reveals footage and metadata, not camera passwords. Stream paths in responses are structurally redacted: every
+  `name=value` value (split on `/ ? & ;`) is replaced by `***`, because a path's credential-name list can never be
+  complete (`RtspPath::redacted_for_display`, #61).
 - What plain HTTP exposes: anyone who can observe or alter LAN traffic (ARP spoofing, a compromised device on the same
   segment, Wi-Fi with a shared key) can read the video and the metadata in transit and replay the bearer token, and
   can modify responses. It does not expose camera credentials, which are never sent by the API.

@@ -81,6 +81,9 @@ const DENIED_PARAMS: [&str; 36] = [
     "credential",
 ];
 
+/// What [`RtspPath::redacted_for_display`] puts in place of every value.
+pub const REDACTED_VALUE: &str = "***";
+
 /// What `Debug` and `Display` print.
 const REDACTED_PATH: &str = "<redacted-path>";
 
@@ -189,6 +192,41 @@ impl RtspPath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The path with every `name=value` value replaced by [`REDACTED_VALUE`], for showing to
+    /// people and API clients. The text is split on `/`, `?`, `&` and `;`; in each piece
+    /// containing `=`, everything after the first `=` becomes `***` (also an empty value, so
+    /// neither length nor emptiness shows). Pieces without `=` and all separators are kept.
+    ///
+    /// This is structural: it does not depend on the credential name list, which can never be
+    /// complete, so a credential in any `key=value` spelling is never shown. A secret carried in
+    /// a bare segment (no `=`) is not detectable and is kept.
+    #[must_use]
+    pub fn redacted_for_display(&self) -> String {
+        let mut out = String::with_capacity(self.0.len());
+        let mut piece = String::new();
+        let flush = |piece: &mut String, out: &mut String| {
+            match piece.split_once('=') {
+                Some((key, _)) => {
+                    out.push_str(key);
+                    out.push('=');
+                    out.push_str(REDACTED_VALUE);
+                }
+                None => out.push_str(piece),
+            }
+            piece.clear();
+        };
+        for c in self.0.chars() {
+            if matches!(c, '/' | '?' | '&' | ';') {
+                flush(&mut piece, &mut out);
+                out.push(c);
+            } else {
+                piece.push(c);
+            }
+        }
+        flush(&mut piece, &mut out);
+        out
     }
 
     /// The query string: the text after the first `?`, `None` when there is no `?`. `/a?` has
@@ -550,7 +588,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn redaction_replaces_every_value_and_keeps_the_rest() {
+        for (input, want) in [
+            ("/", "/"),
+            ("/main", "/main"),
+            ("/live?pin=abc", "/live?pin=***"),
+            ("/live?pin=", "/live?pin=***"),
+            ("/live?a=1&b=2;c=3", "/live?a=***&b=***;c=***"),
+            (
+                "/cam/realmonitor?channel=1&subtype=0",
+                "/cam/realmonitor?channel=***&subtype=***",
+            ),
+            (
+                "/k1=a&k2=b&channel=1&stream=0.sdp",
+                "/k1=***&k2=***&channel=***&stream=***",
+            ),
+            ("/a;k=v/b", "/a;k=***/b"),
+            ("/a?x=1=2&y", "/a?x=***&y"),
+            ("/a?b?c=d", "/a?b?c=***"),
+            ("/a?q=x,y=z", "/a?q=***"),
+        ] {
+            assert_eq!(
+                RtspPath::new(input).unwrap().redacted_for_display(),
+                want,
+                "{input}"
+            );
+        }
+    }
+
     proptest::proptest! {
+        /// Values drawn from an alphabet the rest of the path never uses cannot survive.
+        #[test]
+        fn redaction_leaves_no_value_bytes(
+            segs in proptest::collection::vec(("zz[a-z0-9]{0,4}", "[A-Z]{1,8}", 0_u8..4), 1..6)
+        ) {
+            let mut text = String::from("/zzbase");
+            for (k, v, sep) in &segs {
+                text.push([ '/', '?', '&', ';' ][usize::from(*sep)]);
+                text.push_str(k);
+                text.push('=');
+                text.push_str(v);
+            }
+            if let Ok(p) = RtspPath::new(&text) {
+                let shown = p.redacted_for_display();
+                proptest::prop_assert!(!shown.bytes().any(|b| b.is_ascii_uppercase()), "{shown}");
+                proptest::prop_assert!(shown.matches("=***").count() >= segs.len());
+            }
+        }
+
+        /// Over any accepted path: same pieces, every `=` piece becomes `key=***`, others stay.
+        #[test]
+        fn redaction_is_structural_for_any_accepted_path(s in "/[a-z0-9=&;?/,.:_-]{0,80}") {
+            if let Ok(p) = RtspPath::new(&s) {
+                let shown = p.redacted_for_display();
+                let seps = ['/', '?', '&', ';'];
+                let orig: Vec<&str> = s.split(seps).collect();
+                let out: Vec<&str> = shown.split(seps).collect();
+                proptest::prop_assert_eq!(orig.len(), out.len());
+                for (o, r) in orig.iter().zip(&out) {
+                    if let Some((k, _)) = o.split_once('=') {
+                        proptest::prop_assert_eq!(*r, format!("{k}=***"));
+                    } else {
+                        proptest::prop_assert_eq!(o, r);
+                    }
+                }
+            }
+        }
         #[test]
         fn arbitrary_input_never_panics_and_accepted_is_clean(s in "\\PC{0,600}") {
             if let Ok(p) = RtspPath::new(&s) {

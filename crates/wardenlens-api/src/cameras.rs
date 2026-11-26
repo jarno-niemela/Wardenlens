@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use serde::Serialize;
 use utoipa::ToSchema;
 use wardenlens_core::camera::{
-    Camera, CameraDirectory, CameraId, CameraStatus, LinkState, LinkStatus,
+    Camera, CameraDirectory, CameraId, CameraStatus, LinkState, LinkStatus, RtspPath,
 };
 use wardenlens_core::connection::FailureKind;
 
@@ -45,10 +45,26 @@ pub(crate) struct ConnectionDto {
     state: ConnectionStateDto,
     /// When the camera entered `state`, in UTC Unix milliseconds.
     since: i64,
-    /// Kind of the most recent failure while degraded: `timeout`, `refused`, `auth`,
-    /// `protocol` or `other`. Never remote error text.
+    /// Kind of the most recent failure; present only while `state` is `degraded`. Never
+    /// remote error text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_kind: Option<&'static str>,
+    error_kind: Option<FailureKindDto>,
+}
+
+/// Why the last connection attempt failed.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FailureKindDto {
+    /// Connect or read timed out.
+    Timeout,
+    /// The peer refused or reset the connection.
+    Refused,
+    /// Credentials were rejected.
+    Auth,
+    /// The peer spoke something unexpected.
+    Protocol,
+    /// Anything else.
+    Other,
 }
 
 /// Catalogue model of a camera.
@@ -58,7 +74,9 @@ pub(crate) struct ModelDto {
     model: String,
 }
 
-/// RTSP paths (without host or credentials).
+/// RTSP paths, structurally redacted: in every `name=value` pair (split on `/`, `?`, `&` and
+/// `;`) the value is replaced by `***`, whatever the name, so a credential can never be served
+/// whatever it is called. Paths and names are kept; the real path stays inside the server.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct StreamsDto {
     main: String,
@@ -66,8 +84,8 @@ pub(crate) struct StreamsDto {
     sub: Option<String>,
 }
 
-/// One camera. Carries no credential of any kind.
-#[derive(Debug, Serialize, ToSchema)]
+/// One camera. Carries no credential of any kind. `Debug` hides the host, name and paths.
+#[derive(Serialize, ToSchema)]
 pub(crate) struct CameraDto {
     id: String,
     display_name: String,
@@ -78,37 +96,54 @@ pub(crate) struct CameraDto {
     connection: Option<ConnectionDto>,
 }
 
+impl std::fmt::Debug for CameraDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CameraDto")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Response of the list endpoint.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct CameraList {
     cameras: Vec<CameraDto>,
 }
 
-fn kind_code(kind: FailureKind) -> &'static str {
+impl std::fmt::Debug for CameraList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CameraList")
+            .field("cameras", &self.cameras.len())
+            .finish()
+    }
+}
+
+fn failure_kind_dto(kind: FailureKind) -> FailureKindDto {
     match kind {
-        FailureKind::Timeout => "timeout",
-        FailureKind::Refused => "refused",
-        FailureKind::Auth => "auth",
-        FailureKind::Protocol => "protocol",
+        FailureKind::Timeout => FailureKindDto::Timeout,
+        FailureKind::Refused => FailureKindDto::Refused,
+        FailureKind::Auth => FailureKindDto::Auth,
+        FailureKind::Protocol => FailureKindDto::Protocol,
         // `FailureKind` is non-exhaustive: a kind added later is reported as `other`.
-        _ => "other",
+        _ => FailureKindDto::Other,
     }
 }
 
 fn connection_dto(status: LinkStatus) -> ConnectionDto {
+    let (state, error_kind) = match status.state {
+        LinkState::Streaming => (ConnectionStateDto::Streaming, None),
+        LinkState::Connecting => (ConnectionStateDto::Connecting, None),
+        LinkState::Backoff => (ConnectionStateDto::Backoff, None),
+        LinkState::Degraded(kind) => (ConnectionStateDto::Degraded, Some(failure_kind_dto(kind))),
+    };
     ConnectionDto {
-        state: match status.state {
-            LinkState::Streaming => ConnectionStateDto::Streaming,
-            LinkState::Connecting => ConnectionStateDto::Connecting,
-            LinkState::Backoff => ConnectionStateDto::Backoff,
-            LinkState::Degraded => ConnectionStateDto::Degraded,
-        },
+        state,
         since: status.since.as_unix_millis(),
-        error_kind: status.error_kind.map(kind_code),
+        error_kind,
     }
 }
 
-fn camera_dto(camera: &Camera, status: Option<LinkStatus>) -> CameraDto {
+pub(crate) fn camera_dto(camera: &Camera, status: Option<LinkStatus>) -> CameraDto {
     CameraDto {
         id: camera.id().as_str().to_owned(),
         display_name: camera.name().expose().to_owned(),
@@ -118,8 +153,12 @@ fn camera_dto(camera: &Camera, status: Option<LinkStatus>) -> CameraDto {
         },
         host: camera.host().expose(),
         streams: StreamsDto {
-            main: camera.streams().main.as_str().to_owned(),
-            sub: camera.streams().sub.as_ref().map(|p| p.as_str().to_owned()),
+            main: camera.streams().main.redacted_for_display(),
+            sub: camera
+                .streams()
+                .sub
+                .as_ref()
+                .map(RtspPath::redacted_for_display),
         },
         connection: status.map(connection_dto),
     }
