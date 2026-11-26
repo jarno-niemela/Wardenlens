@@ -27,4 +27,4 @@ pub use quarantine::{
     MAX_QUARANTINE_SUFFIX, QUARANTINE_DIR, QuarantineOutcome, quarantine, quarantine_with_bound,
 };
 pub use regular_file::{is_symlink_refusal, open_regular_nofollow};
-pub use root::{FileKind, FileStat, ReadFile, RootDir, VolumeStat};
+pub use root::{DirEntry, FileKind, FileStat, ReadFile, RootDir, VolumeStat};
