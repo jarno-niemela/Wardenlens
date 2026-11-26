@@ -1554,3 +1554,30 @@ fn an_unfinished_returned_pass_keeps_the_hold_is_backed_off_and_raises_a_health_
         }
     }
 }
+
+#[test]
+fn a_new_return_resets_the_back_off_of_an_earlier_one() {
+    let env = Env::new();
+    unmount(&env);
+    env.add("cam-1", 0, 100, Tier::Hot);
+    let cfg = env.cfg().with_walk_max_entries(1);
+    let (mut lp, _) = crate::Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_initial_archive_state(false);
+    std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    put(&env.arch, &Env::rel("cam-2", 0), &good());
+    for _ in 0..crate::RETURNED_PASS_TRIES {
+        assert!(lp.tick(late()).unwrap().returned.is_some());
+    }
+    assert!(lp.returned_pass_unfinished());
+    assert!(lp.tick(late()).unwrap().returned.is_none(), "backed off");
+    // The archive goes away and returns: a new return, a fresh count, the pass runs at once.
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    assert!(lp.tick(late()).unwrap().returned.is_none());
+    std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    let r = lp.tick(late()).unwrap();
+    assert!(r.returned.is_some(), "not backed off after a new return");
+    assert!(
+        !lp.returned_pass_unfinished(),
+        "one unfinished pass of the new return"
+    );
+}

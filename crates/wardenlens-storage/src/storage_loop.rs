@@ -324,8 +324,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// "archive returned" pass (section 9) has run: the loop keeps a *pending* flag that survives
     /// `Err` ticks. A tick that completes `Ok` with the archive available runs the pass itself,
     /// after its plan (the result is [`TickReport::returned`]), and clears the flag unless the
-    /// pass hit the walk cap or an index error, in which case it runs again next tick. While the
-    /// flag is pending a tick plans no moves and evicts no archive video on behalf of one.
+    /// pass hit the walk cap or an index error, in which case it runs again next tick. After
+    /// [`RETURNED_PASS_TRIES`] unfinished passes in a row it runs only after
+    /// [`RETURNED_PASS_BACKOFF_TICKS`] idle ticks and [`TickReport::returned_pass_unfinished`]
+    /// is raised. While the flag is pending a tick plans no moves and evicts no archive video
+    /// on behalf of one; once a pass has been unfinished, the hot side is also planned as if the
+    /// archive were unavailable (the floor and the emergency reserve deletes run).
     ///
     /// # Errors
     /// [`TickError`]: the hot volume or the index cannot be read, or the planner refused its
@@ -550,6 +554,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         let available = p.archive.is_available();
         if self.archive_was_available == Some(false) && available {
             self.returned_pending = true;
+            // A new return starts afresh: no back-off carried over from an earlier one.
+            self.returned_unfinished = 0;
+            self.returned_wait = 0;
         }
         self.archive_was_available = Some(available);
         p
@@ -591,7 +598,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // too: the recorder keeps writing, and a reserve that only a rolling buffer keeps
             // would let the volume run down to the plain floor and below between ticks.
             // Unreachable goals fall to the planner's own rules (nothing is deleted for them).
-            if let Some(p) = Self::reserve_percent(hot_space.capacity_bytes, policy) {
+            if let Some(p) = reserve_percent(hot_space.capacity_bytes, policy) {
                 policy.hot_min_free = policy.hot_min_free.max(p);
             }
         }
@@ -609,23 +616,6 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             rolling_budget: self.rolling_budget,
         })
         .map_err(TickError::Plan)
-    }
-
-    /// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
-    /// accepted floor), or `None` for no reserve.
-    fn reserve_percent(
-        capacity: u64,
-        policy: Policy,
-    ) -> Option<wardenlens_core::storage::MinFreePercent> {
-        let reserve = policy.emergency_reserve_bytes;
-        if reserve == 0 || capacity == 0 {
-            return None;
-        }
-        let pct = u128::from(reserve)
-            .checked_mul(100)?
-            .div_ceil(u128::from(capacity));
-        let pct = u8::try_from(pct.min(u128::from(MinFreePercent::MAX))).ok()?;
-        MinFreePercent::new(pct).ok()
     }
 
     /// Bytes of each tier's video that `actions` delete.
@@ -704,11 +694,14 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 } else {
                     (Cow::Borrowed(&segments[..]), None, false)
                 };
-            // While the "archive returned" pass is pending, the hot side is planned as if the
-            // archive were unavailable (the degraded path): the floor and reserve deletes of the
-            // hot tier still run, so a pass that never finishes cannot starve the hot volume
-            // (never ENOSPC). No move runs and no archive video is evicted: the archive is not
-            // trusted until the pass has run.
+            // The loaded rows and their tiers: every executed id must be one of them (the
+            // `with_unseen_archive` stand-in, or any unloaded id, is never executed).
+            let by_id: HashMap<SegmentId, Tier> = segments.iter().map(|s| (s.id, s.tier)).collect();
+            // While the "archive returned" pass is pending no move runs and no archive video is
+            // evicted on behalf of one (only the archive's own floor evictions stay). The hot side
+            // keeps its plain plan until a pass has been unfinished; then it is planned as if the
+            // archive were unavailable (below), so a pass that never finishes cannot starve the
+            // hot volume (never ENOSPC).
             let hold = self.returned_pending && planned_available;
             // A hold that has outlived a pass that could not finish no longer waits: the hot side
             // is planned as if the archive were unavailable (the floor and reserve deletes run, so
@@ -743,7 +736,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 )?
                 .actions
                 .iter()
-                .filter(|a| matches!(a, Action::Delete(_)))
+                // Exactly like the plan's actions: a loaded row of the archive, never the
+                // stand-in for the unseen rows or any other unloaded id.
+                .filter(|a| {
+                    matches!(a, Action::Delete(id) if by_id.get(id).is_some_and(|t| *t != Tier::Hot))
+                })
                 .copied()
                 .collect()
             } else {
@@ -760,7 +757,6 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // unavailable, so its floor and reserve hot deletes run (ENOSPC safety outranks a
             // possible move); they are not refused.
             let refuse_hot = truncated.hot && planned.hot == HotState::RollingBuffer;
-            let by_id: HashMap<SegmentId, Tier> = segments.iter().map(|s| (s.id, s.tier)).collect();
             let held_plan: Vec<Action> = planned
                 .actions
                 .iter()
@@ -1291,5 +1287,49 @@ fn tier_space(p: &ProbeResult, tier: Tier) -> Option<VolumeSpace> {
             ArchiveProbe::Available(s) => Some(s),
             _ => None,
         },
+    }
+}
+
+/// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
+/// accepted floor), or `None` for no reserve.
+fn reserve_percent(
+    capacity: u64,
+    policy: Policy,
+) -> Option<wardenlens_core::storage::MinFreePercent> {
+    let reserve = policy.emergency_reserve_bytes;
+    if reserve == 0 || capacity == 0 {
+        return None;
+    }
+    let pct = u128::from(reserve)
+        .checked_mul(100)?
+        .div_ceil(u128::from(capacity));
+    let pct = u8::try_from(pct.min(u128::from(MinFreePercent::MAX))).ok()?;
+    MinFreePercent::new(pct).ok()
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+
+    fn pol(reserve: u64) -> Policy {
+        Policy {
+            emergency_reserve_bytes: reserve,
+            ..Policy::default()
+        }
+    }
+    fn pct(capacity: u64, reserve: u64) -> Option<u8> {
+        reserve_percent(capacity, pol(reserve)).map(MinFreePercent::get)
+    }
+
+    #[test]
+    fn reserve_percent_covers_zero_rounding_and_the_cap() {
+        assert_eq!(pct(1000, 0), None, "no reserve");
+        assert_eq!(pct(0, 100), None, "zero capacity");
+        assert_eq!(pct(1000, 100), Some(10), "a whole percent");
+        assert_eq!(pct(1000, 101), Some(11), "rounds up");
+        assert_eq!(pct(1000, 1), Some(1), "a tiny reserve is one percent");
+        assert_eq!(pct(1000, 900), Some(90), "the cap exactly");
+        assert_eq!(pct(1000, 901), Some(90), "capped at the largest floor");
+        assert_eq!(pct(1000, u64::MAX), Some(90), "no overflow");
     }
 }
