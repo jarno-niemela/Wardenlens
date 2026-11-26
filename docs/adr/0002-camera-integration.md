@@ -302,3 +302,11 @@ Option 2.
     else (curl config on a pipe, ONVIF envelope on stdin, jq stdin, Baichuan via environment) keeps secrets
     off argv, and all output goes through `redact`. Phase 1 uses `retina` in-process, so no credentials
     reach a child process.
+12. **Accepted risk: unbounded access-unit assembly in `retina` (#55).** `retina` 0.4.22 joins the RTP packets of one
+    video frame without a size limit. `wardenlens-ingest` caps a frame (8 MiB) only after retina hands it over, and
+    bounds the RTSP response size (256 KiB), not the assembly. A compromised camera can therefore make one session
+    hold memory in proportion to what it sends before the frame timeout. The deadline is per `next_frame` call and
+    all traffic counts against it, so a frame that never completes ends in `FrameTimeout` after `FRAME_TIMEOUT`
+    (10 s, configurable). The bound per stream is the camera's link rate times that timeout (for example 100 Mbit/s
+    for 10 s is about 125 MB). Accepted for Phase 1: the cameras are on the LAN and the bound is finite. Follow-up
+    #155 (an upstream limit, a fork or a memory watchdog).
