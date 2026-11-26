@@ -107,8 +107,10 @@ mod source;
 mod tests;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::num::NonZeroU16;
 
+use secrecy::zeroize::Zeroizing;
 use wardenlens_core::camera::{CameraId, Credential, DisplayName, Host, RtspPath};
 use wardenlens_core::text::normalise_display_name;
 
@@ -155,6 +157,59 @@ pub struct Skipped {
     pub reason: SkipReason,
 }
 
+/// The user and password texts of every `camera` entry read, skipped ones included: the login
+/// fields (after XML decoding) and the source URL's userinfo (after percent-decoding), at most
+/// four values per entry. For a caller that must keep these values out of anything it writes
+/// (for example a path that repeats another camera's password). Zeroised on drop; `Debug` shows
+/// only the count.
+#[derive(Clone, Default)]
+pub struct Logins(Vec<Zeroizing<String>>);
+
+impl Logins {
+    /// The values, in document order. Sensitive: never print them.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|s| s.as_str())
+    }
+
+    /// How many values.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True if there are none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn push(&mut self, value: Zeroizing<String>) {
+        if !value.is_empty() {
+            self.0.push(value);
+        }
+    }
+}
+
+impl fmt::Debug for Logins {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Logins([redacted; {}])", self.0.len())
+    }
+}
+
+/// Collects the logins of one raw entry before it is validated (and possibly skipped).
+fn collect_logins(raw: &document::RawCamera, out: &mut Logins) {
+    for slot in [&raw.login, &raw.password] {
+        if let Some(text) = slot.text.as_ref().filter(|t| !t.trim().is_empty()) {
+            out.push(text.clone());
+        }
+    }
+    if let Some(source) = &raw.source.text {
+        for v in source::userinfo_values(source) {
+            out.push(v);
+        }
+    }
+}
+
 /// The result of a successful parse: every `camera` element is in exactly one of the two lists.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -163,6 +218,8 @@ pub struct Import {
     pub cameras: Vec<CameraDraft>,
     /// The entries that were not importable, in document order.
     pub skipped: Vec<Skipped>,
+    /// The logins of every entry read, skipped ones too (redacting `Debug`).
+    pub logins: Logins,
 }
 
 /// Parses an `AgentDVR` `objects.xml`.
@@ -182,6 +239,7 @@ pub fn parse(input: &[u8]) -> Result<Import, ImportError> {
     // Normalised name to the position of the camera that has it.
     let mut names: BTreeMap<String, usize> = BTreeMap::new();
     for raw in raws {
+        collect_logins(&raw, &mut import.logins);
         let (position, agent_id) = (raw.position, raw.agent_id);
         let pending = match build(raw) {
             Ok(p) => p,

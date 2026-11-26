@@ -30,8 +30,8 @@
 //! * The registry stores model `agentdvr/imported`, which is in no catalogue, so a path with a query
 //!   string is skipped (`path has a query string`): the registry accepts a query only for a model
 //!   whose catalogue entry lists it (SEC-10). The check runs in a dry run too, so both agree.
-//! * A path that contains any user or password of the file (any camera's, since sites share
-//!   passwords; ASCII-case-insensitive, also percent-decoded) is skipped and its path is not
+//! * A path that contains any user or password the parser read (any camera's, since sites share
+//!   passwords, and the logins of skipped entries too; ASCII-case-insensitive) is skipped and its path is not
 //!   shown, so a login hidden in a path never reaches the registry or the output. A very short
 //!   login (one character) matches many paths and over-refuses; that is fail-safe.
 //! * Output (stdout) is a table of id, host, path and status. The host identifies the site: the
@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::{ExposeSecret, SecretString};
-use wardenlens_agentdvr::{CameraDraft, MAX_INPUT_BYTES, SkipReason, Skipped};
+use secrecy::SecretString;
+use wardenlens_agentdvr::{CameraDraft, Logins, MAX_INPUT_BYTES, SkipReason, Skipped};
 use wardenlens_core::camera::{CameraError, ModelRef, RtspPath, StreamSet};
 use wardenlens_core::catalogue::query_allowed;
 use wardenlens_core::config::Config;
@@ -201,7 +201,7 @@ fn agentdvr(ctx: &Context<'_>, file: &Path, dry_run: bool) -> Result<(), ImportE
     let parsed = wardenlens_agentdvr::parse(&bytes).map_err(ImportError::Parse)?;
     drop(bytes);
     let model = ModelRef::new(MODEL.0, MODEL.1).map_err(ImportError::Camera)?;
-    let (ready, mut rows) = screen(parsed.cameras, &model);
+    let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &model);
     rows.extend(parsed.skipped.iter().map(skipped_row));
     if dry_run {
         rows.extend(ready.iter().map(|d| row(d, Status::WouldImport)));
@@ -250,16 +250,19 @@ fn read_input(path: &Path) -> Result<Zeroizing<Vec<u8>>, ImportError> {
 
 /// Splits the drafts into those that can be written and the rows of those that cannot.
 ///
-/// A draft is refused when its path carries its own login (the password or the user, compared
-/// case-sensitively with the path as written and percent-decoded): the registry would hold it in
-/// plaintext. Such a row shows `-` for the path, and a query path that is skipped shows only the
+/// A draft is refused when its path contains any login of the file (any user or password the
+/// parser read, skipped entries included, compared ASCII-case-insensitively with the path as
+/// written and, defensively, percent-decoded): the registry would hold it in plaintext. Such a row
+/// shows `-` for the path, and a query path that is skipped shows only the
 /// part before `?`, so no refused path ever reaches the output.
-fn screen(drafts: Vec<CameraDraft>, model: &ModelRef) -> (Vec<CameraDraft>, Vec<Row>) {
+fn screen(
+    drafts: Vec<CameraDraft>,
+    logins: &Logins,
+    model: &ModelRef,
+) -> (Vec<CameraDraft>, Vec<Row>) {
     let mut ready = Vec::new();
     let mut rows = Vec::new();
-    // The logins of every camera in the file: sites share passwords, so a path is checked
-    // against all of them, not only its own camera's.
-    let logins = collect_logins(&drafts);
+    let logins = lowered_logins(logins);
     for d in drafts {
         if path_holds_login(&d.path, &logins) {
             let mut r = row(
@@ -315,14 +318,12 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every non-empty user and password of the parse, zeroised on drop.
-fn collect_logins(drafts: &[CameraDraft]) -> Vec<Zeroizing<Vec<u8>>> {
-    drafts
+/// Every non-empty user and password the parser read (skipped entries included), ASCII-lowercased
+/// for the comparison, zeroised on drop.
+fn lowered_logins(logins: &Logins) -> Vec<Zeroizing<Vec<u8>>> {
+    logins
         .iter()
-        .filter_map(|d| d.credential.as_ref())
-        .flat_map(|c| [c.user.as_bytes(), c.password.expose_secret().as_bytes()])
-        .filter(|b| !b.is_empty())
-        .map(|b| Zeroizing::new(b.to_ascii_lowercase()))
+        .map(|l| Zeroizing::new(l.to_ascii_lowercase().into_bytes()))
         .collect()
 }
 
@@ -533,14 +534,18 @@ mod tests {
         assert_eq!(read_input(&path).unwrap().len(), MAX_INPUT_BYTES);
     }
 
-    fn drafts(path: &str, user: &str, password: &str) -> Vec<CameraDraft> {
+    fn drafts(path: &str, user: &str, password: &str) -> wardenlens_agentdvr::Import {
         let xml = format!(
             "<objects><cameras><camera id=\"1\" name=\"A\"><settings>\
              <videosourcestring>rtsp://192.0.2.5{path}</videosourcestring>\
              <login>{user}</login><password>{password}</password></settings></camera>\
              </cameras></objects>"
         );
-        wardenlens_agentdvr::parse(xml.as_bytes()).unwrap().cameras
+        wardenlens_agentdvr::parse(xml.as_bytes()).unwrap()
+    }
+
+    fn screen_all(i: wardenlens_agentdvr::Import, m: &ModelRef) -> (Vec<CameraDraft>, Vec<Row>) {
+        screen(i.cameras, &i.logins, m)
     }
 
     #[test]
@@ -552,7 +557,7 @@ mod tests {
             ("/a/u-fake/b", "u-fake", "Fake-pw-1"),
             ("/x_zzq=Fake-pw-1", "u-fake", "Fake-pw-1"),
         ] {
-            let (ready, rows) = screen(drafts(path, user, pw), &model);
+            let (ready, rows) = screen_all(drafts(path, user, pw), &model);
             assert!(ready.is_empty(), "{path}");
             assert_eq!(rows.len(), 1);
             let shown = format!("{:?}", rows[0]);
@@ -560,9 +565,9 @@ mod tests {
             assert_eq!(rows[0].path, "-");
         }
         // An empty password matches nothing; a path without the login passes.
-        let (ready, _) = screen(drafts("/live/main", "u-fake", ""), &model);
+        let (ready, _) = screen_all(drafts("/live/main", "u-fake", ""), &model);
         assert_eq!(ready.len(), 1);
-        let (ready, _) = screen(drafts("/live/main", "u-fake", "Fake-pw-1"), &model);
+        let (ready, _) = screen_all(drafts("/live/main", "u-fake", "Fake-pw-1"), &model);
         assert_eq!(ready.len(), 1);
     }
 
@@ -576,10 +581,7 @@ mod tests {
             </videosourcestring></settings></camera>\
             <camera id=\"3\" name=\"C\"><settings><videosourcestring>rtsp://192.0.2.7/ok\
             </videosourcestring></settings></camera></cameras></objects>";
-        let (ready, rows) = screen(
-            wardenlens_agentdvr::parse(xml.as_bytes()).unwrap().cameras,
-            &model,
-        );
+        let (ready, rows) = screen_all(wardenlens_agentdvr::parse(xml.as_bytes()).unwrap(), &model);
         let ids: Vec<_> = ready.iter().map(|d| d.id.to_string()).collect();
         assert_eq!(ids, ["agentdvr-1", "agentdvr-3"]);
         assert_eq!(rows.len(), 1);
@@ -599,7 +601,7 @@ mod tests {
     #[test]
     fn a_skipped_query_path_shows_only_the_part_before_the_query() {
         let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
-        let (ready, rows) = screen(drafts("/s?pin=7731", "u-fake", "Fake-pw-1"), &model);
+        let (ready, rows) = screen_all(drafts("/s?pin=7731", "u-fake", "Fake-pw-1"), &model);
         assert!(ready.is_empty());
         assert_eq!(rows[0].path, "/s");
         assert_eq!(before_query("/a"), "/a");

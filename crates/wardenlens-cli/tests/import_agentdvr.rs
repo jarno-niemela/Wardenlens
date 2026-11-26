@@ -512,3 +512,28 @@ fn a_database_named_vault_db_is_refused_up_front_even_in_a_dry_run() {
         "only the input was written"
     );
 }
+
+/// An unlisted carrier (no deny-list name, no query) holding another camera's password: only the
+/// import's own comparison can stop it, so this exercises `screen()` end to end.
+#[test]
+fn an_unlisted_carrier_of_another_cameras_password_is_refused_end_to_end() {
+    let site = Site::new();
+    site.init_key();
+    for carrier in [
+        format!("/live/{PASSWORD}/main"),
+        format!("/ch0_zzq={PASSWORD}"),
+    ] {
+        let body = [
+            cam(1, "Cam One", "192.0.2.1", "/stream1", USER, PASSWORD),
+            cam(2, "Cam Two", "192.0.2.2", &carrier, "", ""),
+        ]
+        .concat();
+        let out = site.import(&site.xml(&body), &[]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        no_secrets(&out);
+        assert!(!contains(&site.state_bytes(), PASSWORD), "{carrier}");
+        let stdout = text(&out.stdout);
+        assert!(stdout.contains("path contains the login"), "{stdout}");
+        assert!(stdout.contains("agentdvr-1"));
+    }
+}
