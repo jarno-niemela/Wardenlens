@@ -2,7 +2,7 @@
 //!
 //! Every async test runs on tokio's paused clock (TEST-5).
 
-#![allow(
+#![expect(
     dead_code,
     reason = "shared rig helpers copied from adversary_56_r3.rs"
 )]
