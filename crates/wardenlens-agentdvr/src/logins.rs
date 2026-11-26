@@ -38,7 +38,19 @@ pub const MAX_LOGIN_BYTES: usize = 1024 * 1024;
 
 /// One value; ordered and borrowed as its text so a lookup needs no copy.
 #[derive(Clone)]
-struct Secret(Zeroizing<String>);
+pub(crate) struct Secret(Zeroizing<String>);
+
+impl Secret {
+    pub(crate) fn new(text: &str) -> Self {
+        Self(Zeroizing::new(text.to_owned()))
+    }
+}
+
+impl std::hash::Hash for Secret {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_str().hash(state);
+    }
+}
 
 impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {

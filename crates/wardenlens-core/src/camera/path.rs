@@ -99,9 +99,10 @@ const MAX_SQUASHED_LEN: usize = 16;
 /// name that merely ends in a listed word inside one piece (`monkey=`, `accounting=`) is not.
 ///
 /// Public so a caller that reads a free-form text (not a validated path) finds the same names.
-/// The cost is linear in the length of the name found, never in the length of `before_eq`: the
-/// run is read backwards and the scan stops once the tail is longer than any listed name, so it
-/// is safe on an 8 MiB text with an `=` at every position.
+/// The cost is linear in the trailing run of name characters (`[A-Za-z0-9_-]`) and keeps at most
+/// [`MAX_SQUASHED_LEN`] name bytes: the run is read backwards and the scan stops at the first
+/// other byte, or once the tail is longer than any listed name. Separator runs are walked, not
+/// stored, so it is safe on an 8 MiB text with an `=` at every position.
 #[must_use]
 pub fn ends_with_credential_param_name(before_eq: &str) -> bool {
     // Lowercased letters and digits of the tail, last first, separators left out.

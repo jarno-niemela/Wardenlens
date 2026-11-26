@@ -175,6 +175,34 @@ fn text_below_a_login_element_is_collected() {
     ));
     assert!(has(&got, "pw-nest"));
     assert!(has(&got, "u-nest"));
+    // The direct text alone (what the entry uses) is collected too.
+    assert!(has(&got, "u"));
+}
+
+#[test]
+fn direct_text_is_collected_for_password_login_and_source_shapes() {
+    let got = logins_of(&cam(
+        1,
+        "rtsp://us-s:pw-s@192.0.2.1/<b>x</b>",
+        "<login>us-l<i>-c</i>tail</login><password>pw-<b>c</b>direct</password>",
+    ));
+    for want in ["us-ltail", "us-l-ctail", "pw-direct", "pw-cdirect", "pw-s"] {
+        assert!(has(&got, want), "{want:?} missing");
+    }
+}
+
+#[test]
+fn duplicate_heavy_fields_finish() {
+    // A field of `pw=` x 800 repeated to fill the input, and a `u:` + `@` x 1400 source repeated.
+    let pw = format!("<password>{}</password>", "pw=".repeat(800));
+    let pws = pw.repeat(1500);
+    let src = format!("rtsp://u:{}h/s", "@".repeat(1400));
+    let srcs = format!("<videosourcestring>{src}</videosourcestring>").repeat(1500);
+    let body = format!("<camera id=\"1\" name=\"A\"><settings>{pws}{srcs}</settings></camera>");
+    let doc = xml(&body);
+    assert!(doc.len() < MAX_INPUT_BYTES);
+    let import = parse(doc.as_bytes()).unwrap();
+    assert!(import.logins.len() > 1000);
 }
 
 #[test]

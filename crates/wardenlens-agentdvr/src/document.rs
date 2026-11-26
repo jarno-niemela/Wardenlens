@@ -8,12 +8,14 @@
 //! three, at any depth below them, is also collected whole for the logins (see `Logins`).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use secrecy::zeroize::Zeroizing;
 
+use crate::logins::Secret;
 use crate::{ImportError, Logins, MAX_CAMERAS, MAX_DEPTH, MAX_FIELD_BYTES};
 
 /// One text field of `settings`, with what is needed to tell a repeat or an over-long value.
@@ -84,6 +86,12 @@ struct Walker {
     /// long must still be known.
     /// `Some` between the start and the end of one of the three fields.
     collect: Option<Zeroizing<String>>,
+    /// The field's direct text only (what the slot keeps), uncut: a child element's text is not
+    /// in it, so a text the entry uses is collected even when the all-depth text differs.
+    direct: Zeroizing<String>,
+    /// Texts already turned into candidates, so a repeated text costs one pass.
+    seen_fields: HashSet<Secret>,
+    seen_sources: HashSet<Secret>,
     root_seen: bool,
     root_done: bool,
 }
@@ -98,6 +106,9 @@ impl Walker {
             text: Zeroizing::default(),
             text_too_long: false,
             collect: None,
+            direct: Zeroizing::default(),
+            seen_fields: HashSet::new(),
+            seen_sources: HashSet::new(),
             root_seen: false,
             root_done: false,
         }
@@ -177,6 +188,7 @@ impl Walker {
                 self.text = Zeroizing::default();
                 self.text_too_long = false;
                 self.collect = Some(Zeroizing::default());
+                self.direct = Zeroizing::default();
             }
             _ => {}
         }
@@ -197,9 +209,20 @@ impl Walker {
             let collected = self.collect.take().unwrap_or_default();
             // Every occurrence, before the slot keeps only one: a repeated element is skipped
             // later, but its text must still be known. The whole text, not the truncated slot.
-            match f {
-                Field::Source => self.logins.add_source(&collected)?,
-                Field::Login | Field::Password => self.logins.add_field(&collected)?,
+            let direct = std::mem::take(&mut self.direct);
+            for t in [&collected, &direct] {
+                let seen = match f {
+                    Field::Source => &mut self.seen_sources,
+                    Field::Login | Field::Password => &mut self.seen_fields,
+                };
+                if t.is_empty() || seen.contains(t.as_str()) {
+                    continue;
+                }
+                seen.insert(Secret::new(t));
+                match f {
+                    Field::Source => self.logins.add_source(t)?,
+                    Field::Login | Field::Password => self.logins.add_field(t)?,
+                }
             }
             if let Some(c) = self.current_camera() {
                 let slot = slot_of(c, f);
@@ -222,6 +245,7 @@ impl Walker {
             .last()
             .is_some_and(|n| matches!(n, Node::Field(_)))
         {
+            push_zeroizing(&mut self.direct, piece);
             if self.text.len().saturating_add(piece.len()) > MAX_FIELD_BYTES {
                 self.text_too_long = true;
             } else {

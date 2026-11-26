@@ -339,7 +339,8 @@ fn path_holds_login(path: &RtspPath, logins: &[Zeroizing<Vec<u8>>]) -> bool {
     let written = Zeroizing::new(path.as_str().to_ascii_lowercase().into_bytes());
     let decoded = Zeroizing::new(percent_decode(path.as_str()).to_ascii_lowercase());
     // The parser caps the distinct logins (`MAX_LOGINS`) and a path is at most `MAX_PATH_LEN`
-    // bytes, so this is bounded: logins x paths x path length.
+    // bytes, so this is bounded: at most `MAX_LOGINS` logins, each of at most `MAX_PATH_LEN` bytes,
+    // against each path of at most `MAX_PATH_LEN` bytes, for at most 256 paths.
     logins
         .iter()
         .any(|l| contains_bytes(&written, l) || contains_bytes(&decoded, l))
