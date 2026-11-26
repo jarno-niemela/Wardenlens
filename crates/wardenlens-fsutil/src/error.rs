@@ -19,6 +19,9 @@ pub enum FsError {
     /// The opened object is not a regular file.
     #[error("not a regular file")]
     NotRegular,
+    /// A directory holds more entries than the caller allows (a bound, SEC-2).
+    #[error("directory holds too many entries")]
+    TooManyEntries,
     /// The file grants group or other access.
     #[error("file mode {mode:o} grants group or other access")]
     InsecureMode {

@@ -2220,6 +2220,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardenlens-storage"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "wardenlens-core",
+ "wardenlens-fsutil",
+ "wardenlens-index",
+ "wardenlens-storage",
+]
+
+[[package]]
 name = "wardenlens-vault"
 version = "0.1.0"
 dependencies = [
