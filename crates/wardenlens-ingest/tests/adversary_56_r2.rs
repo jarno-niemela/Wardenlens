@@ -321,9 +321,14 @@ async fn min_stable_is_inclusive_at_the_exact_boundary() {
         let mut r = rig(
             vec![
                 fail_open(),
+                // Round 5 ruling: stability is judged from the first frame to the last frame, so
+                // a second frame `up_ms` after the first sets the interval; the silence before
+                // the EOF does not count.
                 Attempt::Stream(vec![
                     Step::Frame(mk(1, true, Some(1), true)),
                     Step::Sleep(Duration::from_millis(up_ms)),
+                    Step::Frame(mk(2, false, None, false)),
+                    Step::Sleep(Duration::from_millis(500)),
                     Step::Eof,
                 ]),
             ],

@@ -382,11 +382,9 @@ impl Supervisor {
 enum Ended {
     /// Stop the whole task.
     Stop,
-    /// Reconnect after this failure.
+    /// Reconnect after this failure (EOF, error or idle timeout). The silence before the failure
+    /// is discounted from the stream's uptime (`Task::discount_silence`).
     Failed(FailureKind),
-    /// No frame arrived in time. Like `Failed(Timeout)`, but the silent wait does not count as
-    /// uptime when the state machine judges whether the stream was stable.
-    Idle,
 }
 
 /// The delivery bookkeeping that outlives one frame.
@@ -436,20 +434,19 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
             let failure = match self.session().await {
                 Ended::Stop => return,
                 Ended::Failed(kind) => kind,
-                Ended::Idle => {
-                    self.discount_idle_wait();
-                    FailureKind::Timeout
-                }
             };
+            self.discount_silence();
             // The stream was dropped inside `session`, before this backoff starts.
             self.apply(Event::Failed(failure));
         }
     }
 
-    /// The core machine judges a stream's stability up to the moment of the failure. For an idle
-    /// failure that moment is `idle` after the last frame, which is not uptime: move the stream's
-    /// start forward by the silent wait, so stability is judged from the first frame to the last.
-    fn discount_idle_wait(&mut self) {
+    /// The core machine judges a stream's stability up to the moment of the failure. However the
+    /// session ended (idle timeout, EOF or an error), the time since its last frame is silence,
+    /// not uptime (a hung camera can sit silent up to `idle` before an EOF or reset): move the
+    /// stream's start forward by that silence, so stability is judged from the first frame to the
+    /// last. Only the stability judgement moves; the backoff stays anchored at detection.
+    fn discount_silence(&mut self) {
         let (ConnectionState::Streaming { since, prior }, Some(last)) =
             (self.state, self.last_frame)
         else {
@@ -534,7 +531,7 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
                 r = timeout(idle, stream.next_frame()) => r,
             };
             let frame = match item {
-                Err(_) | Ok(Err(IngestError::FrameTimeout)) => return Ended::Idle,
+                Err(_) => return Ended::Failed(FailureKind::Timeout),
                 Ok(Err(e)) => return Ended::Failed(failure_kind(&e)),
                 Ok(Ok(None)) => return Ended::Failed(FailureKind::Other),
                 Ok(Ok(Some(frame))) => frame,
@@ -1368,6 +1365,40 @@ mod tests {
         let start = Instant::now();
         r.wait_state(|s| backoff_attempt(s).is_some()).await;
         near(start.elapsed(), MIN_PAUSE);
+        r.cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_reported_frame_timeout_is_not_uptime_either() {
+        let cfg = SupervisorConfig {
+            idle_timeout: Duration::from_secs(5),
+            min_stable: DurationMs::from_secs(5),
+            ..SupervisorConfig::default()
+        };
+        let session = || {
+            Attempt::Stream(vec![
+                Step::Frame(frame(true)),
+                Step::Sleep(Duration::from_secs(4)),
+                Step::Frame(frame(false)),
+                Step::Sleep(Duration::from_secs(5)),
+                Step::Err(IngestError::FrameTimeout),
+            ])
+        };
+        let mut r = rig(vec![session(), session(), session()], cfg);
+        let mut attempts: Vec<u32> = Vec::new();
+        let mut was_backoff = false;
+        while attempts.len() < 3 {
+            let s = timeout(Duration::from_secs(300), r.state.changed()).await;
+            assert!(s.is_ok());
+            let now = backoff_attempt(&r.state.borrow());
+            if let Some(a) = now
+                && !was_backoff
+            {
+                attempts.push(a);
+            }
+            was_backoff = now.is_some();
+        }
+        assert_eq!(attempts, [1, 2, 3]);
         r.cancel.cancel();
     }
 
