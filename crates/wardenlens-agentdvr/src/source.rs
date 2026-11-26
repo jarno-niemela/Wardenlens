@@ -12,7 +12,9 @@
 use std::num::NonZeroU16;
 
 use secrecy::zeroize::Zeroizing;
-use wardenlens_core::camera::{CameraError, DEFAULT_RTSP_PORT, Host, RtspPath};
+use wardenlens_core::camera::{
+    CameraError, DEFAULT_RTSP_PORT, Host, RtspPath, ends_with_credential_param_name,
+};
 
 use crate::SkipReason;
 
@@ -138,29 +140,73 @@ fn userinfo_of(ui: &str) -> Option<RawUserinfo> {
     })
 }
 
-/// Lenient login candidates of a source text, with or without a scheme (see `Logins`): the part
-/// before the LAST `@` of everything after `://` (or of the whole text), not cut at a `/` or `?`,
-/// split at the first `:` into user and password; each part raw, and percent-decoded when that is
-/// valid UTF-8. Also the same for the authority-bounded userinfo, which is the true split of a
-/// well-formed URL that has a `@` further on.
-pub(crate) fn userinfo_candidates(raw: &str) -> Vec<Zeroizing<String>> {
+/// Calls `emit` with every lenient login candidate of a source text, with or without a scheme
+/// (see `Logins`), each raw and percent-decoded when that is valid UTF-8:
+///
+/// * for **every** `@` of everything after `://` (or of the whole text), not cut at a `/` or
+///   `?`: the userinfo before it, split at its first `:` into user and password. A real `@` may
+///   be anywhere after an unencoded `/` or `@` in the password, so no split is guessed;
+/// * the value of every credential-named `name=value` parameter anywhere in the text (core's
+///   list), up to the next `&` and up to the next of `& / ? # @ ;`.
+///
+/// The first error of `emit` stops the walk and is returned. Work is bounded by what `emit`
+/// accepts: every `@` yields a new, longer password, so an `emit` that refuses beyond a limit
+/// (as `Logins` does) ends the walk after a bounded number of splits.
+pub(crate) fn for_each_candidate<E>(
+    raw: &str,
+    emit: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
     let s = raw.trim_matches(|c: char| c.is_ascii_whitespace());
     let rest = s.split_once("://").map_or(s, |(_, r)| r);
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = rest.split_at_checked(end).map_or(rest, |(a, _)| a);
-    let mut out = Vec::new();
-    for scope in [rest, authority] {
-        let Some(at) = scope.rfind('@') else { continue };
-        let userinfo = scope.split_at_checked(at).map_or("", |(u, _)| u);
-        let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-        for part in [user, password] {
-            out.push(Zeroizing::new(part.to_owned()));
-            if let Ok(decoded) = decode(part) {
-                out.push(decoded);
+    emit_both(rest_user(rest), emit)?;
+    let colon = rest.find(':');
+    for (at, _) in rest.match_indices('@') {
+        let userinfo = rest.get(..at).unwrap_or_default();
+        match colon {
+            // The first `:` is inside the userinfo: the user is fixed (emitted once above).
+            Some(c) if c < at => {
+                let password = rest.get(c.saturating_add(1)..at).unwrap_or_default();
+                emit_both(password, emit)?;
             }
+            // No `:` before this `@`: the whole userinfo is the user, with an empty password.
+            _ => emit_both(userinfo, emit)?,
         }
     }
-    out
+    for (eq, _) in s.match_indices('=') {
+        if !ends_with_credential_param_name(s.get(..eq).unwrap_or_default()) {
+            continue;
+        }
+        let value = s.get(eq.saturating_add(1)..).unwrap_or_default();
+        let to_amp = value
+            .find('&')
+            .map_or(value, |i| value.get(..i).unwrap_or(value));
+        let to_delim = to_amp
+            .find(['/', '?', '#', '@', ';'])
+            .map_or(to_amp, |i| to_amp.get(..i).unwrap_or(to_amp));
+        emit_both(to_amp, emit)?;
+        emit_both(to_delim, emit)?;
+    }
+    Ok(())
+}
+
+/// The user of `rest`: the text before its first `:`, when a `@` follows that colon. (A `:` with
+/// no `@` after it is not a userinfo; the per-`@` loop covers every `@` before the colon.)
+fn rest_user(rest: &str) -> &str {
+    match rest.split_once(':') {
+        Some((user, after)) if after.contains('@') => user,
+        _ => "",
+    }
+}
+
+/// `part` as written, then percent-decoded when that differs and is valid UTF-8.
+fn emit_both<E>(part: &str, emit: &mut impl FnMut(&str) -> Result<(), E>) -> Result<(), E> {
+    emit(part)?;
+    if part.contains('%')
+        && let Ok(decoded) = decode(part)
+    {
+        emit(&decoded)?;
+    }
+    Ok(())
 }
 
 /// Percent-decoding; a `%` not followed by two hex digits stays literal. Invalid UTF-8 is

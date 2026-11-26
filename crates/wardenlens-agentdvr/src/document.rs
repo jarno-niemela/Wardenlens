@@ -4,7 +4,8 @@
 //! most [`MAX_DEPTH`] small enums. DOCTYPE is refused, so no entity is ever defined; entity
 //! references are resolved here (the five predefined ones and numeric character references,
 //! nothing else), so nothing can expand. Only text inside `videosourcestring`, `login` and
-//! `password` under `objects/cameras/camera/settings` is kept.
+//! `password` under `objects/cameras/camera/settings` is kept in the entry; the text of those
+//! three, at any depth below them, is also collected whole for the logins (see `Logins`).
 
 use std::borrow::Cow;
 
@@ -78,6 +79,11 @@ struct Walker {
     logins: Logins,
     text: Zeroizing<String>,
     text_too_long: bool,
+    /// Every text piece of the field being read, any depth below it, bounded only by the input.
+    /// Independent of `MAX_FIELD_BYTES`: the logins of a field the camera entry rejects as too
+    /// long must still be known.
+    /// `Some` between the start and the end of one of the three fields.
+    collect: Option<Zeroizing<String>>,
     root_seen: bool,
     root_done: bool,
 }
@@ -91,6 +97,7 @@ impl Walker {
             logins: Logins::default(),
             text: Zeroizing::default(),
             text_too_long: false,
+            collect: None,
             root_seen: false,
             root_done: false,
         }
@@ -169,6 +176,7 @@ impl Walker {
                 }
                 self.text = Zeroizing::default();
                 self.text_too_long = false;
+                self.collect = Some(Zeroizing::default());
             }
             _ => {}
         }
@@ -179,16 +187,19 @@ impl Walker {
         Ok(Ok(()))
     }
 
-    fn end(&mut self) {
-        let Some(node) = self.stack.pop() else { return };
+    fn end(&mut self) -> Result<(), ImportError> {
+        let Some(node) = self.stack.pop() else {
+            return Ok(());
+        };
         if let Node::Field(f) = node {
             let text = std::mem::take(&mut self.text);
             let too_long = std::mem::take(&mut self.text_too_long);
+            let collected = self.collect.take().unwrap_or_default();
             // Every occurrence, before the slot keeps only one: a repeated element is skipped
-            // later, but its text must still be known.
+            // later, but its text must still be known. The whole text, not the truncated slot.
             match f {
-                Field::Source => self.logins.add_source(&text),
-                Field::Login | Field::Password => self.logins.add_field(&text),
+                Field::Source => self.logins.add_source(&collected)?,
+                Field::Login | Field::Password => self.logins.add_field(&collected)?,
             }
             if let Some(c) = self.current_camera() {
                 let slot = slot_of(c, f);
@@ -199,9 +210,13 @@ impl Walker {
         if self.stack.is_empty() {
             self.root_done = true;
         }
+        Ok(())
     }
 
     fn push_text(&mut self, piece: &str) {
+        if let Some(collect) = self.collect.as_mut() {
+            push_zeroizing(collect, piece);
+        }
         if self
             .stack
             .last()
@@ -214,6 +229,19 @@ impl Walker {
             }
         }
     }
+}
+
+/// Appends to a secret buffer without leaving an unzeroised copy behind when it grows: the old
+/// buffer is a `Zeroizing` that is wiped on drop, where a plain `String` would free it as is.
+fn push_zeroizing(buf: &mut Zeroizing<String>, piece: &str) {
+    let needed = buf.len().saturating_add(piece.len());
+    if needed > buf.capacity() {
+        let capacity = needed.max(buf.capacity().saturating_mul(2)).max(64);
+        let mut bigger = Zeroizing::new(String::with_capacity(capacity));
+        bigger.push_str(buf);
+        *buf = bigger;
+    }
+    buf.push_str(piece);
 }
 
 /// The attribute value with entities resolved (the five predefined ones and character
@@ -263,7 +291,7 @@ pub(crate) fn read(text: &str) -> Result<(Vec<RawCamera>, Logins), ImportError> 
                 Ok(Err(e)) => return Err(e),
                 Err(()) => return Err(malformed(&reader)),
             },
-            Event::End(_) => w.end(),
+            Event::End(_) => w.end()?,
             Event::Text(t) => {
                 let s = t.xml10_content();
                 if w.stack.is_empty() && !s.trim().is_empty() {

@@ -34,6 +34,8 @@
 //!   passwords, and the logins of skipped entries too; ASCII-case-insensitive) is skipped and its path is not
 //!   shown, so a login hidden in a path never reaches the registry or the output. A very short
 //!   login (one character) matches many paths and over-refuses; that is fail-safe.
+//! * The parser bounds the logins it collects (distinct values and bytes); a file with more is
+//!   refused whole (`the objects file was refused`), so the screen's cost is bounded.
 //! * Only the path is screened. The host is not: it is a site identifier the table prints by design,
 //!   and a host that equals a login is not a leak path into the registry (which stores no host).
 //! * Output (stdout) is a table of id, host, path and status. The host identifies the site: the
@@ -47,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
 use wardenlens_agentdvr::{CameraDraft, Logins, MAX_INPUT_BYTES, SkipReason, Skipped};
-use wardenlens_core::camera::{CameraError, ModelRef, RtspPath, StreamSet};
+use wardenlens_core::camera::{CameraError, MAX_PATH_LEN, ModelRef, RtspPath, StreamSet};
 use wardenlens_core::catalogue::query_allowed;
 use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
@@ -323,8 +325,10 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 /// Every non-empty user and password the parser read (skipped entries included), ASCII-lowercased
 /// for the comparison, zeroised on drop.
 fn lowered_logins(logins: &Logins) -> Vec<Zeroizing<Vec<u8>>> {
+    // A value longer than any path cannot be inside one, so it never costs a comparison.
     logins
         .iter()
+        .filter(|l| l.len() <= MAX_PATH_LEN)
         .map(|l| Zeroizing::new(l.to_ascii_lowercase().into_bytes()))
         .collect()
 }
@@ -334,6 +338,8 @@ fn lowered_logins(logins: &Logins) -> Vec<Zeroizing<Vec<u8>>> {
 fn path_holds_login(path: &RtspPath, logins: &[Zeroizing<Vec<u8>>]) -> bool {
     let written = Zeroizing::new(path.as_str().to_ascii_lowercase().into_bytes());
     let decoded = Zeroizing::new(percent_decode(path.as_str()).to_ascii_lowercase());
+    // The parser caps the distinct logins (`MAX_LOGINS`) and a path is at most `MAX_PATH_LEN`
+    // bytes, so this is bounded: logins x paths x path length.
     logins
         .iter()
         .any(|l| contains_bytes(&written, l) || contains_bytes(&decoded, l))

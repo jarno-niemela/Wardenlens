@@ -32,6 +32,11 @@ pub enum ImportError {
     /// More than [`crate::MAX_CAMERAS`] `camera` elements.
     #[error("the document has more cameras than the limit")]
     TooManyCameras,
+    /// The document holds more distinct login values (users, passwords, credential parameters)
+    /// than [`crate::MAX_LOGINS`], or more than [`crate::MAX_LOGIN_BYTES`] bytes of them. The
+    /// whole document is refused: a login that is not collected could leak into a path.
+    #[error("the document holds more login values than the limit")]
+    TooManyLogins,
     /// The document is well formed but its root element is not `objects`, or it has none.
     #[error("the document is not an AgentDVR objects file")]
     NotObjects,
