@@ -52,7 +52,8 @@ use crate::session::{FRAME_TIMEOUT, FrameStream, open_stream};
 
 /// Shortest idle timeout and reconnect pause the supervisor accepts. A smaller configured value
 /// is raised to it, so a zero cannot turn the reconnect loop into a busy loop.
-const MIN_PAUSE: Duration = Duration::from_millis(100);
+const MIN_PAUSE: Duration = Duration::from_millis(MIN_PAUSE_MS);
+const MIN_PAUSE_MS: u64 = 100;
 
 /// Default channel capacity, in frames. Worst case memory is this times [`MAX_FRAME_BYTES`]
 /// (typical frames are a small fraction of that); lower it for many cameras.
@@ -246,7 +247,7 @@ pub struct SupervisorConfig {
     pub budget: DurationMs,
     /// How long a stream must stay up for the backoff to reset.
     pub min_stable: DurationMs,
-    /// How long opening may take.
+    /// How long opening may take. At least 100 ms is used.
     pub connect_timeout: DurationMs,
 }
 
@@ -290,6 +291,11 @@ impl Supervisor {
     /// ends, closing both channels and dropping any open stream, when `cancel` is cancelled
     /// (within one poll, so well inside a second) or when the frame receiver is dropped.
     /// `clock` times the state machine, `backoff` spaces reconnects and `jitter` randomizes them.
+    ///
+    /// The task is detached; use [`Supervisor::spawn_joinable`] to await its teardown.
+    ///
+    /// # Panics
+    /// Panics if called outside a tokio runtime (it uses `tokio::spawn`).
     #[must_use]
     pub fn spawn<S, M, J>(
         source: S,
@@ -308,6 +314,35 @@ impl Supervisor {
         M: MonotonicClock + Send + 'static,
         J: JitterSource + Send + 'static,
     {
+        let (frames, state, dropped, _task) =
+            Self::spawn_joinable(source, clock, backoff, jitter, config, cancel);
+        (frames, state, dropped)
+    }
+
+    /// Like [`Supervisor::spawn`], and also returns the task's handle: after cancelling, awaiting
+    /// it returns once the stream is dropped and the task has ended.
+    ///
+    /// # Panics
+    /// Panics if called outside a tokio runtime (it uses `tokio::spawn`).
+    #[must_use]
+    pub fn spawn_joinable<S, M, J>(
+        source: S,
+        clock: M,
+        backoff: Backoff,
+        jitter: J,
+        config: SupervisorConfig,
+        cancel: CancelToken,
+    ) -> (
+        mpsc::Receiver<Frame>,
+        watch::Receiver<ConnectionState>,
+        DroppedFrames,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        S: StreamSource,
+        M: MonotonicClock + Send + 'static,
+        J: JitterSource + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let (state_tx, state_rx) = watch::channel(ConnectionState::INITIAL);
         let dropped = DroppedFrames::default();
@@ -319,7 +354,9 @@ impl Supervisor {
                 backoff,
                 budget: config.budget,
                 min_stable: config.min_stable,
-                connect_timeout: config.connect_timeout,
+                connect_timeout: config
+                    .connect_timeout
+                    .max(DurationMs::from_millis(MIN_PAUSE_MS)),
             },
             idle: config.idle_timeout.max(MIN_PAUSE),
             tx,
@@ -329,8 +366,8 @@ impl Supervisor {
             dropped: dropped.clone(),
             pacer: Pacer::default(),
         };
-        tokio::spawn(task.run());
-        (rx, state_rx, dropped)
+        let handle = tokio::spawn(task.run());
+        (rx, state_rx, dropped, handle)
     }
 }
 
@@ -448,7 +485,12 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
             Ok(Err(e)) => return Ended::Failed(failure_kind(&e)),
             Ok(Ok(stream)) => stream,
         };
-        self.pacer.pending_discontinuity = true;
+        // Nothing owed or being dropped crosses a reconnect: the new session starts clean and
+        // its first frame is a discontinuity.
+        self.pacer = Pacer {
+            pending_discontinuity: true,
+            ..Pacer::default()
+        };
         let mut first = true;
         loop {
             let item = tokio::select! {
@@ -786,10 +828,8 @@ mod tests {
             cfg,
         );
         // After the long stream the outage ends: the failure starts a new one, attempt 0 -> 1.
-        let s = r
-            .wait_state(|s| backoff_attempt(s).is_some_and(|a| a >= 3))
+        r.wait_state(|s| backoff_attempt(s).is_some_and(|a| a >= 3))
             .await;
-        let _ = s;
         // Drain to the point after the long stream.
         let mut seen = Vec::new();
         while seen.len() < 3 {
@@ -1155,6 +1195,132 @@ mod tests {
             assert_eq!(last_error_kind, want);
             r.cancel.cancel();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owed_params_and_the_keyframe_wait_do_not_cross_a_reconnect() {
+        let cfg = SupervisorConfig {
+            channel_capacity: 2,
+            ..SupervisorConfig::default()
+        };
+        let mut p1 = frame(false);
+        p1.params = Some(params(1));
+        let mut r = rig(
+            vec![
+                Attempt::Stream(vec![
+                    Step::Frame(frame(true)),
+                    Step::Frame(frame(false)),
+                    Step::Frame(p1), // dropped: full, owes params(1)
+                    Step::Eof,
+                ]),
+                Attempt::Stream(vec![Step::Frame(frame(true)), Step::Silent]),
+            ],
+            cfg,
+        );
+        // Nobody reads until both sessions have run: session 2's keyframe finds the channel full.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(r.frames.recv().await.unwrap().params, None);
+        r.frames.recv().await.unwrap();
+        // Make room; session 1's owed params must not appear on anything session 2 sends.
+        assert_eq!(r.dropped.get(), 2, "the P with params and session 2's K");
+        r.cancel.cancel();
+        while let Some(f) = r.frames.recv().await {
+            assert_eq!(f.params, None);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_keyframe_wait_ends_with_its_session() {
+        let cfg = SupervisorConfig {
+            channel_capacity: 1,
+            ..SupervisorConfig::default()
+        };
+        let mut r = rig(
+            vec![
+                Attempt::Stream(vec![
+                    Step::Frame(frame(true)),
+                    Step::Frame(frame(false)), // dropped: full, now waiting for a keyframe
+                    Step::Eof,
+                ]),
+                // A new session whose first frame is not a keyframe is still delivered.
+                Attempt::Stream(vec![Step::Frame(frame(false)), Step::Silent]),
+            ],
+            cfg,
+        );
+        // Session 1 ends (and sits in backoff) with the channel full; free it, then session 2 runs.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(r.frames.recv().await.unwrap().is_keyframe);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let next = r.frames.recv().await.unwrap();
+        assert!(!next.is_keyframe && next.discontinuity);
+        r.cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_is_the_first_frame_not_the_open() {
+        // min_stable (2 s) is shorter than the idle timeout (5 s): if an open counted as
+        // Connected, the silent session would look stable and reset the backoff.
+        let cfg = SupervisorConfig {
+            idle_timeout: Duration::from_secs(5),
+            min_stable: DurationMs::from_secs(2),
+            ..SupervisorConfig::default()
+        };
+        let mut r = rig(vec![Attempt::Stream(vec![Step::Silent])], cfg);
+        let mut seen = Vec::new();
+        while backoff_attempt(&seen.last().copied().unwrap_or(ConnectionState::INITIAL))
+            .is_none_or(|a| a < 4)
+        {
+            r.state.changed().await.unwrap();
+            seen.push(*r.state.borrow());
+        }
+        assert!(!seen.iter().any(is_streaming), "{seen:?}");
+        let attempts: Vec<u32> = seen.iter().filter_map(backoff_attempt).collect();
+        assert!(attempts.windows(2).all(|w| w[1] >= w[0]), "{attempts:?}");
+        assert_eq!(attempts.last().copied(), Some(4));
+        let opens = r.opens();
+        let gaps: Vec<Duration> = opens.windows(2).map(|w| w[1] - w[0]).collect();
+        // Silent session: idle timeout, then the delay for attempt 1 (the outage continues).
+        near(gaps[0], Duration::from_secs(5) + expected_delay(0));
+        near(gaps[1], expected_delay(1));
+        r.cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_task_handle_completes_after_cancel() {
+        let shared = Arc::new(Shared::default());
+        let cancel = CancelToken::new();
+        let (mut frames, _state, _d, handle) = Supervisor::spawn_joinable(
+            Fake {
+                script: vec![Attempt::Stream(vec![
+                    Step::Frame(frame(true)),
+                    Step::Silent,
+                ])]
+                .into(),
+                shared: Arc::clone(&shared),
+            },
+            InstantClock::new(),
+            Backoff::DEFAULT,
+            Fixed0,
+            SupervisorConfig::default(),
+            cancel.clone(),
+        );
+        frames.recv().await.unwrap();
+        cancel.cancel();
+        assert!(timeout(Duration::from_secs(1), handle).await.is_ok());
+        assert_eq!(shared.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_connect_timeout_is_raised() {
+        let cfg = SupervisorConfig {
+            connect_timeout: DurationMs::from_millis(0),
+            ..SupervisorConfig::default()
+        };
+        let mut r = rig(vec![Attempt::OpenHangs], cfg);
+        let start = Instant::now();
+        r.wait_state(|s| backoff_attempt(s).is_some()).await;
+        near(start.elapsed(), MIN_PAUSE);
+        r.cancel.cancel();
     }
 
     #[tokio::test(start_paused = true)]
