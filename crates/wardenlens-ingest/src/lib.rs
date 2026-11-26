@@ -3,7 +3,8 @@
 //! [`open_stream`] connects with `retina` over TCP interleaved transport and returns a
 //! [`FrameStream`]. Each [`Frame`] carries the RTP timestamp, the arrival time from the injected
 //! `Clock`, the SPS/PPS when they are new, and a discontinuity flag (ADR 0005, the #55 row).
-//! Reconnecting is the caller's job (a later task); this crate ends the stream on an error.
+//! A [`FrameStream`] ends on its first error; [`Supervisor`] reopens it with backoff and reports the
+//! [`wardenlens_core::connection::ConnectionState`].
 //!
 //! The retina-to-[`Frame`] mapping is the pure [`FrameMapper`]. [`sps_reordering`] and
 //! [`contains_b_slice`] answer ADR 0005 open risk 1 (does a stream reorder frames?) for the
@@ -21,6 +22,7 @@ mod error;
 mod frame;
 mod session;
 pub mod sps;
+mod supervisor;
 #[cfg(test)]
 mod testsupport;
 
@@ -33,3 +35,7 @@ pub use session::{
     FRAME_TIMEOUT, FrameStream, OPEN_TIMEOUT, StreamInfo, open_stream, select_video_stream,
 };
 pub use sps::{NoReorderReason, ReorderVerdict, SpsError, SpsSummary, parse_sps, sps_reordering};
+pub use supervisor::{
+    CancelToken, DroppedFrames, FrameSource, InstantClock, RetinaSource, SplitMixJitter,
+    StreamSource, Supervisor, SupervisorConfig, failure_kind,
+};
