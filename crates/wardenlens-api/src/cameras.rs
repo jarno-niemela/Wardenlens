@@ -74,9 +74,10 @@ pub(crate) struct ModelDto {
     model: String,
 }
 
-/// RTSP paths, structurally redacted: in every `name=value` pair (split on `/`, `?`, `&` and
-/// `;`) the value is replaced by `***`, whatever the name, so a credential can never be served
-/// whatever it is called. Paths and names are kept; the real path stays inside the server.
+/// RTSP paths, structurally redacted, whatever a parameter is called. In the query (after
+/// the first `?`) every `name=value` is cut at the next `&` and the value replaced by `***`;
+/// in the path part, the rest of any `/` segment after an `=` is replaced by `***`. Names and
+/// plain segments are kept; the real path stays inside the server.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct StreamsDto {
     main: String,

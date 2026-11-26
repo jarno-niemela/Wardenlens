@@ -113,9 +113,9 @@ async fn send(
 const SECRET: &str = "synthsecret77";
 
 /// The ticket: "Never expose credentials". `RtspPath`'s own docs say its credential-name
-/// denylist "can never be complete" and that only redaction of `Debug`/`Display` makes up for
-/// it. The API now serves `RtspPath::as_str` verbatim, so every spelling the list misses is
-/// served to API clients. Each row is a credential carried in a path `RtspPath` accepts.
+/// denylist "can never be complete". The API therefore serves only
+/// `RtspPath::redacted_for_display`, never `as_str`, so a spelling the list misses is still
+/// hidden. Each row is a credential carried in a path `RtspPath` accepts.
 #[tokio::test]
 async fn stream_paths_never_carry_a_credential_value_to_clients() {
     let forms = [

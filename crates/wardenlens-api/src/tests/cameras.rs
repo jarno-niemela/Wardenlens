@@ -256,7 +256,7 @@ async fn stream_paths_are_redacted_in_every_response() {
             "{body}"
         );
         assert!(
-            body.contains("/cam/realmonitor?channel=***&pin=***;k=***"),
+            body.contains("/cam/realmonitor?channel=***&pin=***"),
             "{body}"
         );
         assert!(

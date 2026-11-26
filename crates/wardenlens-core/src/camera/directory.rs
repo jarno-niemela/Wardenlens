@@ -58,6 +58,15 @@ pub enum LinkState {
     Degraded(FailureKind),
 }
 
+impl LinkState {
+    /// Whether `other` is the same coarse state. `Degraded` compares equal whatever its
+    /// failure kind: a changed kind alone is not a new state.
+    #[must_use]
+    pub fn same_coarse(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
 /// The live state of one camera connection, with a wall-clock `since`.
 ///
 /// Only a failure *kind* is ever kept, never remote error text.
@@ -65,13 +74,14 @@ pub enum LinkState {
 /// # The `since` rule
 /// `since` is the wall-clock time at which the adapter saw the coarse [`LinkState`] begin (the
 /// state machine's own clock is monotonic and cannot be shown to clients). The adapter must keep
-/// it unchanged while the coarse state stays the same, for example across repeated failures in
-/// `Degraded`.
+/// it unchanged while the coarse state stays the same ([`LinkState::same_coarse`]), for example
+/// across repeated failures in `Degraded` with a different kind.
 ///
 /// A background retry while degraded is `ConnectionState::Connecting` carrying an outage with
 /// `degraded_since`, and the failure kind is no longer in that value. [`LinkStatus::from_state`]
 /// therefore reports `Connecting` for it, as it is, and the adapter records a new `since`. A
-/// client sees `degraded`, `connecting`, `degraded` over a retry cycle.
+/// client sees `degraded`, `connecting`, `degraded` over a retry cycle. (#68 should consider
+/// exposing when the outage started, which would let a client see one continuous outage.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkStatus {
     /// Where the connection is.
@@ -115,6 +125,25 @@ mod tests {
             start: MonoMs::from_millis(1),
             degraded_since: None,
         }
+    }
+
+    #[test]
+    fn same_coarse_ignores_the_failure_kind_only() {
+        let all = [
+            LinkState::Streaming,
+            LinkState::Connecting,
+            LinkState::Backoff,
+            LinkState::Degraded(FailureKind::Auth),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a.same_coarse(b), i == j, "{a:?} {b:?}");
+            }
+        }
+        assert!(
+            LinkState::Degraded(FailureKind::Auth)
+                .same_coarse(&LinkState::Degraded(FailureKind::Timeout))
+        );
     }
 
     #[test]

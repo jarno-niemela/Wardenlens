@@ -144,6 +144,26 @@ fn allowed(b: u8) -> bool {
         )
 }
 
+/// Splits `text` on `sep` and keeps each piece up to its first `=`, then `=***` in place of the
+/// rest of the piece. Pieces without `=` and the separators are kept.
+fn redact_pieces(text: &str, sep: char) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, piece) in text.split(sep).enumerate() {
+        if i > 0 {
+            out.push(sep);
+        }
+        match piece.split_once('=') {
+            Some((key, _)) => {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(REDACTED_VALUE);
+            }
+            None => out.push_str(piece),
+        }
+    }
+    out
+}
+
 /// A validated RTSP path. `Debug` and `Display` print `<redacted-path>` (a path can carry a
 /// credential in a spelling the list misses); use [`RtspPath::as_str`] for the RTSP client.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -195,37 +215,30 @@ impl RtspPath {
     }
 
     /// The path with every `name=value` value replaced by [`REDACTED_VALUE`], for showing to
-    /// people and API clients. The text is split on `/`, `?`, `&` and `;`; in each piece
-    /// containing `=`, everything after the first `=` becomes `***` (also an empty value, so
-    /// neither length nor emptiness shows). Pieces without `=` and all separators are kept.
+    /// people and API clients.
+    ///
+    /// * **Query** (after the first `?`): split on `&` only. In each piece with `=`, the key
+    ///   (text before the first `=`) is kept and everything after that `=`, up to the next `&`
+    ///   or the end, becomes `***`. `/`, `?`, `;`, `,` and `=` inside a value are part of it.
+    /// * **Path part** (before the first `?`): split on `/`. In a segment with `=`, the text
+    ///   before the first `=` is kept and the rest of the segment becomes `***`. That hides
+    ///   `;b=...`, `&password=...` and `_`-joined forms inside one segment, and over-redacts.
+    /// * An empty value is `***` too, so neither length nor emptiness shows. Pieces and
+    ///   segments without `=` stay as they are.
     ///
     /// This is structural: it does not depend on the credential name list, which can never be
-    /// complete, so a credential in any `key=value` spelling is never shown. A secret carried in
-    /// a bare segment (no `=`) is not detectable and is kept.
+    /// complete. A secret in a bare segment (no `=`) cannot be detected and is kept.
     #[must_use]
     pub fn redacted_for_display(&self) -> String {
-        let mut out = String::with_capacity(self.0.len());
-        let mut piece = String::new();
-        let flush = |piece: &mut String, out: &mut String| {
-            match piece.split_once('=') {
-                Some((key, _)) => {
-                    out.push_str(key);
-                    out.push('=');
-                    out.push_str(REDACTED_VALUE);
-                }
-                None => out.push_str(piece),
-            }
-            piece.clear();
+        let (path, query) = match self.0.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (self.0.as_str(), None),
         };
-        for c in self.0.chars() {
-            if matches!(c, '/' | '?' | '&' | ';') {
-                flush(&mut piece, &mut out);
-                out.push(c);
-            } else {
-                piece.push(c);
-            }
+        let mut out = redact_pieces(path, '/');
+        if let Some(q) = query {
+            out.push('?');
+            out.push_str(&redact_pieces(q, '&'));
         }
-        flush(&mut piece, &mut out);
         out
     }
 
@@ -595,19 +608,20 @@ mod tests {
             ("/main", "/main"),
             ("/live?pin=abc", "/live?pin=***"),
             ("/live?pin=", "/live?pin=***"),
-            ("/live?a=1&b=2;c=3", "/live?a=***&b=***;c=***"),
+            ("/live?a=1&b=2;c=3", "/live?a=***&b=***"),
             (
                 "/cam/realmonitor?channel=1&subtype=0",
                 "/cam/realmonitor?channel=***&subtype=***",
             ),
-            (
-                "/k1=a&k2=b&channel=1&stream=0.sdp",
-                "/k1=***&k2=***&channel=***&stream=***",
-            ),
+            ("/k1=a&k2=b&channel=1&stream=0.sdp", "/k1=***"),
             ("/a;k=v/b", "/a;k=***/b"),
+            ("/a;b=v&zz=x_c=d/q", "/a;b=***/q"),
+            ("/x=1/y=2?k=1/2?3;4,5=6&z", "/x=***/y=***?k=***&z"),
             ("/a?x=1=2&y", "/a?x=***&y"),
             ("/a?b?c=d", "/a?b?c=***"),
             ("/a?q=x,y=z", "/a?q=***"),
+            ("/a?sig=AB/CD;EF&n=1", "/a?sig=***&n=***"),
+            ("/a?=x", "/a?=***"),
         ] {
             assert_eq!(
                 RtspPath::new(input).unwrap().redacted_for_display(),
@@ -617,44 +631,94 @@ mod tests {
         }
     }
 
-    proptest::proptest! {
-        /// Values drawn from an alphabet the rest of the path never uses cannot survive.
-        #[test]
-        fn redaction_leaves_no_value_bytes(
-            segs in proptest::collection::vec(("zz[a-z0-9]{0,4}", "[A-Z]{1,8}", 0_u8..4), 1..6)
-        ) {
-            let mut text = String::from("/zzbase");
-            for (k, v, sep) in &segs {
-                text.push([ '/', '?', '&', ';' ][usize::from(*sep)]);
-                text.push_str(k);
+    /// A path built from parts, with its expected redaction built from the same parts (an oracle
+    /// that never parses the path). Values use only upper case, digits and punctuation, keys only
+    /// lower case, so a value byte can never come from a key.
+    fn build_case(
+        segs: &[(String, Option<String>)],
+        query: Option<&[(String, Option<String>)]>,
+    ) -> (String, String, Vec<String>) {
+        let (mut text, mut want) = (String::from("/zzroot"), String::from("/zzroot"));
+        let mut values = Vec::new();
+        for (k, v) in segs {
+            text.push('/');
+            want.push('/');
+            text.push_str(k);
+            want.push_str(k);
+            if let Some(v) = v {
                 text.push('=');
                 text.push_str(v);
-            }
-            if let Ok(p) = RtspPath::new(&text) {
-                let shown = p.redacted_for_display();
-                proptest::prop_assert!(!shown.bytes().any(|b| b.is_ascii_uppercase()), "{shown}");
-                proptest::prop_assert!(shown.matches("=***").count() >= segs.len());
+                want.push_str("=***");
+                values.push(v.clone());
             }
         }
-
-        /// Over any accepted path: same pieces, every `=` piece becomes `key=***`, others stay.
-        #[test]
-        fn redaction_is_structural_for_any_accepted_path(s in "/[a-z0-9=&;?/,.:_-]{0,80}") {
-            if let Ok(p) = RtspPath::new(&s) {
-                let shown = p.redacted_for_display();
-                let seps = ['/', '?', '&', ';'];
-                let orig: Vec<&str> = s.split(seps).collect();
-                let out: Vec<&str> = shown.split(seps).collect();
-                proptest::prop_assert_eq!(orig.len(), out.len());
-                for (o, r) in orig.iter().zip(&out) {
-                    if let Some((k, _)) = o.split_once('=') {
-                        proptest::prop_assert_eq!(*r, format!("{k}=***"));
-                    } else {
-                        proptest::prop_assert_eq!(o, r);
-                    }
+        if let Some(pairs) = query {
+            text.push('?');
+            want.push('?');
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    text.push('&');
+                    want.push('&');
+                }
+                text.push_str(k);
+                want.push_str(k);
+                if let Some(v) = v {
+                    text.push('=');
+                    text.push_str(v);
+                    want.push_str("=***");
+                    values.push(v.clone());
                 }
             }
         }
+        (text, want, values)
+    }
+
+    fn has_window_of(haystack: &str, value: &str, n: usize) -> bool {
+        let chars: Vec<char> = value.chars().collect();
+        // Windows with `*` are skipped: the redaction marker itself is made of them.
+        chars
+            .windows(n)
+            .filter(|w| !w.contains(&'*'))
+            .any(|w| haystack.contains(&w.iter().collect::<String>()))
+    }
+
+    proptest::proptest! {
+        /// Path values may hold `; , : =` and `&`; query values also `/` and `?`.
+        #[test]
+        fn redaction_matches_independent_oracle(
+            segs in proptest::collection::vec(
+                ("zz[a-z]{0,3}", proptest::option::of("[A-Z0-9;,:=&!$'*+()_.~-]{0,10}")), 0..4),
+            query in proptest::option::of(proptest::collection::vec(
+                ("zz[a-z]{0,3}", proptest::option::of("[A-Z0-9;,:=/?!$'*+()_.~-]{0,10}")), 0..4)),
+        ) {
+            let (text, want, values) = build_case(&segs, query.as_deref());
+            // Rejected by the credential list (an upper-case value can spell a listed name).
+            if let Ok(p) = RtspPath::new(&text) {
+                let shown = p.redacted_for_display();
+                proptest::prop_assert_eq!(&shown, &want, "{}", text);
+                for v in &values {
+                    proptest::prop_assert!(!has_window_of(&shown, v, 3), "{} -> {}", text, shown);
+                }
+            }
+        }
+
+        /// Query-only, the whole accepted value alphabet except `&`: nothing of a value survives.
+        #[test]
+        fn redaction_leaves_no_value_bytes(
+            pairs in proptest::collection::vec(
+                ("zz[a-z]{0,3}", "[A-Z0-9;,:=/?!$'*+()_.~-]{1,12}"), 1..5)
+        ) {
+            let query: Vec<_> = pairs.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+            let (text, _, values) = build_case(&[], Some(&query));
+            if let Ok(p) = RtspPath::new(&text) {
+                let shown = p.redacted_for_display();
+                proptest::prop_assert!(!shown.bytes().any(|b| b.is_ascii_uppercase() || b.is_ascii_digit()), "{} -> {}", text, shown);
+                for v in &values {
+                    proptest::prop_assert!(!has_window_of(&shown, v, 3), "{} -> {}", text, shown);
+                }
+            }
+        }
+
         #[test]
         fn arbitrary_input_never_panics_and_accepted_is_clean(s in "\\PC{0,600}") {
             if let Ok(p) = RtspPath::new(&s) {
