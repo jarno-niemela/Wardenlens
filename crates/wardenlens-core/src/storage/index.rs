@@ -33,6 +33,10 @@ pub const MAX_OLDEST: usize = 10_000;
 /// rows that `insert` accepted.
 pub const MAX_SEGMENT_BYTES: u64 = 1 << 36;
 
+/// The schema's `CHECK` on `duration_ms` (600 s; the recorder's real maximum is 120 s). One value
+/// for the index's row validation and the adoption parser's bound.
+pub const MAX_DURATION_MS: u64 = 600_000;
+
 /// An opaque position in a listing.
 ///
 /// A client gets it from [`SegmentPage::next`] and hands it back unchanged. Treat the text as

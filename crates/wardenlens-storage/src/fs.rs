@@ -7,15 +7,16 @@
 //! is always the one of the latest successful probe ([`ArchiveSlot`]).
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::io::Errno;
 use wardenlens_core::storage::Tier;
-use wardenlens_fsutil::{DirEntry, FsError, QuarantineOutcome, RootDir};
+use wardenlens_fsutil::{FsError, Listing, QuarantineOutcome, RootDir};
 
-/// A file opened for reading (the M1 descriptor, an archive copy being verified).
-pub trait SourceFile: Read + Send {
+/// A file opened for reading (the M1 descriptor, an archive copy being verified, a file the
+/// reconciliation adopts). `Seek` lets the `core::mp4box` walk skip `mdat` payloads.
+pub trait SourceFile: Read + Seek + Send {
     /// `fsync` the file (it was opened read-only; `fsync` does not need write access).
     ///
     /// # Errors
@@ -112,11 +113,12 @@ pub trait Fs {
     /// # Errors
     /// The failure.
     fn quarantine(&self, tier: Tier, comps: &[&str]) -> Result<QuarantineOutcome, FsError>;
-    /// List the directory `dir` (at most `max` entries).
+    /// List the directory `dir` (at most `max` entries; names that cannot be returned are counted
+    /// in [`Listing::dropped`] and against `max`).
     ///
     /// # Errors
     /// The failure, or more than `max` entries.
-    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Vec<DirEntry>, FsError>;
+    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Listing, FsError>;
 }
 
 /// The archive handle of the latest successful probe, shared by the probe (writer), the mover and
@@ -246,7 +248,7 @@ impl Fs for RealFs {
         wardenlens_fsutil::quarantine(&*self.root(tier)?, comps)
     }
 
-    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Vec<DirEntry>, FsError> {
+    fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Listing, FsError> {
         self.dir(tier, dir)?.list(max)
     }
 }

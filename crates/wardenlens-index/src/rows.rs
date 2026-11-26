@@ -12,7 +12,7 @@ use wardenlens_core::time::UnixMs;
 use crate::error::IndexError;
 
 /// The schema's bound on `duration_ms` (the real maximum is 120 s; 600 s is the `CHECK`).
-pub(crate) const MAX_DURATION_MS: i64 = 600_000;
+pub(crate) const MAX_DURATION_MS: i64 = wardenlens_core::storage::MAX_DURATION_MS.cast_signed();
 
 /// The smallest and largest `ended_at_ms` the schema allows: the start bounds plus one
 /// millisecond of duration, and plus the longest duration.
