@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aho_corasick::AhoCorasick;
 use secrecy::SecretString;
 use wardenlens_agentdvr::{CameraDraft, Logins, MAX_INPUT_BYTES, SkipReason, Skipped};
 use wardenlens_core::camera::{CameraError, MAX_PATH_LEN, ModelRef, RtspPath, StreamSet};
@@ -126,6 +127,9 @@ pub(crate) enum ImportError {
     /// The clock is outside 2000 to 2099.
     #[error("the system clock is outside the supported range")]
     Clock,
+    /// The login screen could not be built, so no path can be vetted: nothing is written.
+    #[error("the login screen could not be built; nothing was imported")]
+    Screen,
     /// Writing the table failed.
     #[error("cannot write to stdout")]
     Output(#[source] io::Error),
@@ -205,7 +209,7 @@ fn agentdvr(ctx: &Context<'_>, file: &Path, dry_run: bool) -> Result<(), ImportE
     let parsed = wardenlens_agentdvr::parse(&bytes).map_err(ImportError::Parse)?;
     drop(bytes);
     let model = ModelRef::new(MODEL.0, MODEL.1).map_err(ImportError::Camera)?;
-    let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &model);
+    let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &model)?;
     rows.extend(parsed.skipped.iter().map(skipped_row));
     if dry_run {
         rows.extend(ready.iter().map(|d| row(d, Status::WouldImport)));
@@ -259,27 +263,48 @@ fn read_input(path: &Path) -> Result<Zeroizing<Vec<u8>>, ImportError> {
 /// written and, defensively, percent-decoded): the registry would hold it in plaintext. Such a row
 /// shows `-` for the path, and a query path that is skipped shows only the
 /// part before `?`, so no refused path ever reaches the output.
+///
+/// # Errors
+/// [`ImportError::Screen`] when the search cannot be built: never "no match".
 fn screen(
     drafts: Vec<CameraDraft>,
     logins: &Logins,
     model: &ModelRef,
-) -> (Vec<CameraDraft>, Vec<Row>) {
-    let (ready, rows, _) = screen_counted(drafts, logins, model);
-    (ready, rows)
+) -> Result<(Vec<CameraDraft>, Vec<Row>), ImportError> {
+    let (ready, rows, _) = screen_with(drafts, logins, model, build_matcher)?;
+    Ok((ready, rows))
 }
 
-/// [`screen`], also returning the window starts compared (see `MAX_SCREEN_WORK`).
-fn screen_counted(
+/// The matcher over `patterns` (already ASCII-lowercased, none empty): ASCII-case-insensitive,
+/// one automaton for all of them.
+fn build_matcher(patterns: &[Zeroizing<Vec<u8>>]) -> Result<AhoCorasick, ImportError> {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(patterns.iter().map(|p| p.as_slice()))
+        .map_err(|_| ImportError::Screen)
+}
+
+/// [`screen`] with the matcher builder given, also returning the path bytes scanned (see
+/// `MAX_SCREEN_WORK`). A builder that fails fails the whole screen.
+fn screen_with(
     drafts: Vec<CameraDraft>,
     logins: &Logins,
     model: &ModelRef,
-) -> (Vec<CameraDraft>, Vec<Row>, u64) {
+    build: impl FnOnce(&[Zeroizing<Vec<u8>>]) -> Result<AhoCorasick, ImportError>,
+) -> Result<(Vec<CameraDraft>, Vec<Row>, u64), ImportError> {
     let mut work = 0_u64;
     let mut ready = Vec::new();
     let mut rows = Vec::new();
     let logins = lowered_logins(logins);
+    // One automaton over every login, built once (cost linear in the login bytes, at most
+    // `MAX_LOGIN_BYTES`); no login at all needs none.
+    let matcher = if logins.is_empty() {
+        None
+    } else {
+        Some(build(&logins)?)
+    };
     for d in drafts {
-        if path_holds_login(&d.path, &logins, &mut work) {
+        if path_holds_login(&d.path, matcher.as_ref(), &mut work) {
             let mut r = row(
                 &d,
                 Status::Skipped("path contains the login (path not shown)".to_owned()),
@@ -299,7 +324,7 @@ fn screen_counted(
             rows.push(r);
         }
     }
-    (ready, rows, work)
+    Ok((ready, rows, work))
 }
 
 /// The part of a path before its query string.
@@ -329,23 +354,12 @@ fn percent_decode(s: &str) -> Zeroizing<Vec<u8>> {
     out
 }
 
-/// True if `needle` is inside `hay`. Each window start is one unit of `work`; a window is
-/// compared whole only when its first and last bytes match, so a mismatch costs two byte
-/// compares.
-fn contains_bytes(hay: &[u8], needle: &[u8], work: &mut u64) -> bool {
-    let (Some(first), Some(last)) = (needle.first(), needle.last()) else {
-        return false;
-    };
-    hay.windows(needle.len()).any(|w| {
-        *work = work.saturating_add(1);
-        w.first() == Some(first) && w.last() == Some(last) && w == needle
-    })
-}
-
-/// The most window starts the screen compares: logins x (written + decoded) x paths x window
-/// starts per path. Documents the bound; the parser's caps make it hold.
+/// The most path bytes the screen scans: at most 256 paths of at most `MAX_PATH_LEN` bytes, each
+/// scanned as written and (only when it differs) percent-decoded. One search per path, so the
+/// cost is the path length whatever the number or length of the logins; building the automaton
+/// is separate and linear in the login bytes (at most `MAX_LOGIN_BYTES`).
 #[cfg(test)]
-const MAX_SCREEN_WORK: u64 = 4096 * 2 * 256 * 512;
+const MAX_SCREEN_WORK: u64 = 256 * 2 * 512;
 
 /// Every non-empty user and password the parser read (skipped entries included), ASCII-lowercased
 /// for the comparison, zeroised on drop.
@@ -358,19 +372,19 @@ fn lowered_logins(logins: &Logins) -> Vec<Zeroizing<Vec<u8>>> {
         .collect()
 }
 
-/// True if the path holds any of `logins` (already ASCII-lowercased), compared
-/// ASCII-case-insensitively, as written or percent-decoded.
-fn path_holds_login(path: &RtspPath, logins: &[Zeroizing<Vec<u8>>], work: &mut u64) -> bool {
-    let written = Zeroizing::new(path.as_str().to_ascii_lowercase().into_bytes());
-    let decoded = Zeroizing::new(percent_decode(path.as_str()).to_ascii_lowercase());
-    // The parser caps the distinct logins (`MAX_LOGINS`) and a path is at most `MAX_PATH_LEN`
-    // bytes, so this is bounded: at most `MAX_LOGINS` logins, each of at most `MAX_PATH_LEN` bytes,
-    // against each of at most 256 paths of at most `MAX_PATH_LEN` bytes, as written and decoded:
-    // at most `MAX_SCREEN_WORK` window starts, each costing two byte compares unless both ends
-    // match.
-    logins
-        .iter()
-        .any(|l| contains_bytes(&written, l, work) || contains_bytes(&decoded, l, work))
+/// True if the path holds any login (`matcher` is built over them), compared
+/// ASCII-case-insensitively, as written or percent-decoded. Every byte fed to the search is one
+/// unit of `work`. (Core refuses `%` in a path, so the decoded text equals the written one and is
+/// skipped; the check stays for a path type that ever allows it.)
+fn path_holds_login(path: &RtspPath, matcher: Option<&AhoCorasick>, work: &mut u64) -> bool {
+    let Some(matcher) = matcher else { return false };
+    let written = path.as_str().as_bytes();
+    let decoded = percent_decode(path.as_str());
+    let mut scan = |hay: &[u8]| {
+        *work = work.saturating_add(u64::try_from(hay.len()).unwrap_or(u64::MAX));
+        matcher.is_match(hay)
+    };
+    scan(written) || (decoded.as_slice() != written && scan(&decoded))
 }
 
 fn row(d: &CameraDraft, status: Status) -> Row {
@@ -581,17 +595,16 @@ mod tests {
     }
 
     fn screen_all(i: wardenlens_agentdvr::Import, m: &ModelRef) -> (Vec<CameraDraft>, Vec<Row>) {
-        screen(i.cameras, &i.logins, m)
+        screen(i.cameras, &i.logins, m).unwrap()
     }
 
-    #[test]
-    fn the_screen_work_is_the_window_count_and_within_the_documented_bound() {
-        // 8 importable paths of 512 bytes, 64 distinct 255-byte logins held by a skipped carrier
-        // camera and in no path: every window of every path (written and decoded) is compared.
-        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+    /// The ends-match shape: 255 paths of 512 bytes, and 4096 distinct 255-byte logins that are
+    /// held by a skipped carrier camera, start and end with `a`, and are in no path. It was the
+    /// worst case of the per-login window scan; the multi-pattern search does not care.
+    fn ends_match_import() -> wardenlens_agentdvr::Import {
         let path = "a".repeat(511);
-        let head = "a".repeat(252);
-        let cams: Vec<String> = (1..=8_u32)
+        let head = "a".repeat(251);
+        let cams: Vec<String> = (1..=255_u32)
             .map(|i| {
                 format!(
                     "<camera id=\"{i}\" name=\"Cam {i}\"><settings><videosourcestring>\
@@ -599,22 +612,52 @@ mod tests {
                 )
             })
             .collect();
-        let cams = cams.concat();
-        let pws: Vec<String> = (0..64_u32)
-            .map(|i| format!("<password>{head}b{i:02}</password>"))
+        let alphabet: Vec<char> = "bcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
+        let pws: Vec<String> = (0..4096_usize)
+            .map(|n| {
+                let (x, y, z) = (
+                    alphabet[n / 1225 % 35],
+                    alphabet[n / 35 % 35],
+                    alphabet[n % 35],
+                );
+                format!("<password>{head}{x}{y}{z}a</password>")
+            })
             .collect();
-        let pws = pws.concat();
-        let body = format!(
-            "{cams}<camera id=\"99\" name=\"Carrier\"><settings>\
-             <videosourcestring>rtsp://192.0.2.9/s</videosourcestring>{pws}</settings></camera>"
+        let xml = format!(
+            "<objects><cameras>{}<camera id=\"999\" name=\"Carrier\"><settings>\
+             <videosourcestring>rtsp://192.0.2.9/s</videosourcestring>{}</settings></camera>\
+             </cameras></objects>",
+            cams.concat(),
+            pws.concat()
         );
-        let xml = format!("<objects><cameras>{body}</cameras></objects>");
-        let parsed = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
-        let (ready, _, work) = screen_counted(parsed.cameras, &parsed.logins, &model);
-        assert_eq!(ready.len(), 8);
-        // 512-byte path, 255-byte login: 258 window starts, two variants, 8 paths, 64 logins.
-        assert_eq!(work, 258 * 2 * 8 * 64);
+        wardenlens_agentdvr::parse(xml.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn the_screen_work_is_the_path_bytes_scanned_in_the_ends_match_worst_case() {
+        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+        let parsed = ends_match_import();
+        assert_eq!(parsed.logins.len(), 4096);
+        let (ready, _, work) =
+            screen_with(parsed.cameras, &parsed.logins, &model, build_matcher).unwrap();
+        assert_eq!(ready.len(), 255);
+        // One pass over each 512-byte path (the decoded text equals the written one, so it is
+        // not scanned again); independent of the 4096 logins.
+        assert_eq!(work, 255 * 512);
         assert!(work <= MAX_SCREEN_WORK);
+    }
+
+    #[test]
+    fn a_matcher_that_cannot_be_built_fails_the_screen_closed() {
+        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+        let i = drafts("/live/Fake-pw-1/main", "u-fake", "Fake-pw-1");
+        let r = screen_with(i.cameras, &i.logins, &model, |_| Err(ImportError::Screen));
+        assert!(matches!(r, Err(ImportError::Screen)));
+        // With no login there is nothing to build, so a failing builder is never asked.
+        let i = drafts("/live/main", "", "");
+        let (ready, _, _) =
+            screen_with(i.cameras, &i.logins, &model, |_| Err(ImportError::Screen)).unwrap();
+        assert_eq!(ready.len(), 1);
     }
 
     #[test]
@@ -663,8 +706,10 @@ mod tests {
         // Core's path type refuses `%`, so a draft cannot carry one today; the helper is the
         // guard if that rule changes, and is tested directly.
         assert_eq!(&**percent_decode("/a%41b%zz%4"), b"/aAb%zz%4");
-        assert!(contains_bytes(&percent_decode("/p%61ss"), b"pass", &mut 0));
-        assert!(!contains_bytes(b"abc", b"", &mut 0));
+        // A path that were to carry the encoded login is caught through the decoded scan.
+        let m = build_matcher(&[Zeroizing::new(b"pass".to_vec())]).unwrap();
+        assert!(m.is_match(&**percent_decode("/p%61ss")));
+        assert!(m.is_match(b"/PASS"));
     }
 
     #[test]

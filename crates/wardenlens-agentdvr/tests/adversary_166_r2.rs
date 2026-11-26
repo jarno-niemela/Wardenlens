@@ -46,7 +46,7 @@ fn distinct_at_sources_doc() -> String {
 }
 
 #[test]
-fn many_distinct_sources_with_duplicate_candidates_parse_in_bounded_time() {
+fn many_distinct_sources_with_duplicate_candidates_are_refused_by_the_work_budget() {
     let doc = distinct_at_sources_doc();
     assert!(doc.len() <= MAX_INPUT_BYTES);
     let r = parse(doc.as_bytes());
@@ -71,14 +71,14 @@ fn param_doc(pw: &str) -> String {
 }
 
 #[test]
-fn many_distinct_short_param_sources_parse_in_bounded_time() {
+fn many_distinct_short_param_sources_are_refused_by_the_work_budget() {
     let doc = param_doc(&"p=".repeat(1000));
     let r = parse(doc.as_bytes());
     assert_eq!(r.unwrap_err(), ImportError::TooManyLogins);
 }
 
 #[test]
-fn many_distinct_param_sources_with_duplicate_candidates_parse_in_bounded_time() {
+fn many_distinct_param_sources_with_duplicate_candidates_are_refused_by_the_work_budget() {
     let pw = "pw=".repeat(800);
     let mut fields = String::new();
     let mut i = 0_u32;

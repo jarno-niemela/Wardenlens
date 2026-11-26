@@ -42,8 +42,13 @@ pub const MAX_LOGIN_BYTES: usize = 1024 * 1024;
 /// 8 MiB input limit times this constant bounds the parse; past it the document is refused.
 pub const MAX_LOGIN_WORK: usize = 16 * crate::MAX_INPUT_BYTES;
 
-/// Work charged per byte of a source text for the candidate scans.
-const SCAN_FACTOR: usize = 8;
+/// Work charged per byte of a source text for the candidate scans of `for_each_candidate`. The
+/// passes it counts (each at most one pass over the text): the whitespace trim, the `://` split,
+/// the first `:` search, the user split and its `@` check, the `@` walk, the `=` walk, the
+/// credential-name check before each `=` (each byte is in at most one such run), the cached `&`
+/// search and the cached delimiter search: 10, charged as 12 for headroom. The candidates cut
+/// from the text are charged separately, as they are offered.
+const SCAN_FACTOR: usize = 12;
 
 /// One value; ordered and borrowed as its text so a lookup needs no copy.
 #[derive(Clone)]
