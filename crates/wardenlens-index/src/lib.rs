@@ -22,6 +22,7 @@ mod open;
 mod ops;
 mod rows;
 mod sql;
+mod tokens;
 
 use std::fmt;
 use std::path::Path;
@@ -32,6 +33,7 @@ use wardenlens_fsutil::{FileLock, PrivateFile};
 pub use cameras::{CameraRecord, MAX_CAMERAS, StoredCamera};
 pub use error::{CursorFault, IndexError};
 pub use open::BUSY_TIMEOUT;
+pub use tokens::{TOUCH_INTERVAL_MS, TokenIndex};
 
 /// An open index. Holds the connection and, until it is dropped, the descriptor whose identity
 /// was checked at open (so the inode cannot be recycled under the comparison).

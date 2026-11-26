@@ -11,7 +11,11 @@ use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::get;
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
-use wardenlens_core::token_store::{TokenId, TokenRecord, TokenStore, TokenStoreError};
+use wardenlens_core::time::UnixMs;
+use wardenlens_core::token_store::{
+    InsertError, NewToken, RevokeOutcome, TokenId, TokenRecord, TokenStore, TokenStoreError,
+    TokenSummary,
+};
 
 use super::{LIMITS, Limits, build, with_layers};
 use crate::token::Token;
@@ -48,6 +52,30 @@ impl TokenStore for FakeStore {
                 .map_err(|_| TokenStoreError)
         };
         std::future::ready(out)
+    }
+
+    // The middleware only reads (`find`); the rest of the port is the CLI's and the index's.
+    fn insert(&self, _token: &NewToken) -> impl Future<Output = Result<(), InsertError>> + Send {
+        std::future::ready(Err(InsertError::Store(TokenStoreError)))
+    }
+
+    fn list(&self) -> impl Future<Output = Result<Vec<TokenSummary>, TokenStoreError>> + Send {
+        std::future::ready(Err(TokenStoreError))
+    }
+
+    fn revoke(
+        &self,
+        _id: &TokenId,
+    ) -> impl Future<Output = Result<RevokeOutcome, TokenStoreError>> + Send {
+        std::future::ready(Err(TokenStoreError))
+    }
+
+    fn touch_last_used(
+        &self,
+        _id: &TokenId,
+        _now: UnixMs,
+    ) -> impl Future<Output = Result<bool, TokenStoreError>> + Send {
+        std::future::ready(Err(TokenStoreError))
     }
 }
 

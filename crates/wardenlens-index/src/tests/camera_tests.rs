@@ -1188,7 +1188,7 @@ fn the_cameras_table_is_exactly_the_adr_columns_and_has_no_foreign_key() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 fn code_of(file: &str) -> String {

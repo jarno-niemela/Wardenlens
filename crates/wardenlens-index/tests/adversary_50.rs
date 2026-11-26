@@ -111,14 +111,14 @@ fn sidecar(p: &Path, suffix: &str) -> PathBuf {
     n.into()
 }
 
-/// A version-1 index as the previous release wrote it: the v2 file minus the cameras table.
+/// A version-1 index as the first release wrote it: the current file minus the cameras and token tables.
 fn make_v1(f: &Fx) {
     let mut idx = Index::open(&f.path).unwrap();
     idx.insert(&seg("cam1", T0), Tier::Hot).unwrap();
     idx.insert(&seg("cam2", T0), Tier::Hot).unwrap();
     drop(idx);
     let c = raw(&f.path);
-    c.execute_batch("DROP TABLE cameras; PRAGMA user_version = 1;")
+    c.execute_batch("DROP TABLE api_tokens; DROP TABLE cameras; PRAGMA user_version = 1;")
         .unwrap();
     drop(c);
     assert!(!sidecar(&f.path, "-wal").exists());
@@ -144,7 +144,7 @@ fn a_version_1_index_migrates_to_2_keeping_segments_which_are_then_orphans() {
     let v: i64 = raw(&f.path)
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 2);
+    assert_eq!(v, 3);
 }
 
 #[test]
