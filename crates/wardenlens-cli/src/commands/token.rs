@@ -77,19 +77,34 @@ pub(crate) enum TokenError {
     #[error("cannot write to stdout")]
     Output(#[source] io::Error),
     /// `create` could not write its token to stdout and could not revoke it either: the token
-    /// may still be active, but nobody has its secret. Names the id (never the secret).
+    /// may still be active, but nobody has its secret. Names the id (never the secret). The
+    /// error source is the output failure; why the revoke failed is `revoke`, shown in the
+    /// message.
     #[error(
-        "cannot write to stdout, and token {id} could not be revoked; run `wardenlens token revoke {id}`"
+        "cannot write to stdout, and token {id} could not be revoked ({revoke}); run `wardenlens token revoke {id}`"
     )]
     OutputUnrevoked {
         id: String,
         #[source]
         source: io::Error,
+        revoke: RevokeFailure,
     },
-    /// `create` needs stdout to deliver the token and it is closed (seen as `/dev/null`),
-    /// read-only or `/dev/null`; nothing was created.
+    /// `create` needs stdout to deliver the token and it is unusable for that: not open for
+    /// writing (a read-only descriptor), or `/dev/null`, which is also what the Rust runtime turns
+    /// a closed fd 1 into; nothing was created.
     #[error("stdout is not open for writing (or is /dev/null); nothing was created")]
     StdoutClosed,
+}
+
+/// Why the revoke after a failed delivery did not revoke.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RevokeFailure {
+    /// The store failed.
+    #[error("the token store failed: {0}")]
+    Index(#[source] IndexError),
+    /// The store has no row with the id that was just inserted.
+    #[error("the token row is missing")]
+    Missing,
 }
 
 impl TokenError {
@@ -222,12 +237,7 @@ fn create(
     err: &mut impl Write,
 ) -> Result<(), TokenError> {
     let token = store_new_token(index, name, now()?, generate)?;
-    deliver(&token, out, |id| {
-        matches!(
-            index.revoke_token(id),
-            Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked)
-        )
-    })?;
+    deliver(&token, out, |id| revoke_undelivered(index, *id))?;
     // The token has been delivered (written and flushed). From here nothing may fail the
     // command: a script that saw a failure exit would discard a token that is valid. The hint
     // is best-effort; the id is public and the secret is not repeated.
@@ -240,23 +250,36 @@ fn create(
     Ok(())
 }
 
+/// Revokes a token that could not be delivered; `Revoked` and `AlreadyRevoked` are success, an
+/// unknown id is [`RevokeFailure::Missing`].
+fn revoke_undelivered(index: &mut Index, id: TokenId) -> Result<(), RevokeFailure> {
+    match index.revoke_token(&id) {
+        Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked) => Ok(()),
+        Ok(RevokeOutcome::NotFound) => Err(RevokeFailure::Missing),
+        Err(e) => Err(RevokeFailure::Index(e)),
+    }
+}
+
 /// Writes the token line to `out` and flushes. On a write or flush failure nobody has the
 /// secret, so `revoke` is called: if it reports success the error is [`TokenError::Output`],
 /// otherwise [`TokenError::OutputUnrevoked`].
 fn deliver(
     token: &Token,
     out: &mut impl Write,
-    revoke: impl FnOnce(&TokenId) -> bool,
+    revoke: impl FnOnce(&TokenId) -> Result<(), RevokeFailure>,
 ) -> Result<(), TokenError> {
     let shown = Zeroizing::new(token.expose());
     let printed = writeln!(out, "{}", shown.as_str()).and_then(|()| out.flush());
     match printed {
         Ok(()) => Ok(()),
-        Err(source) if revoke(token.id()) => Err(TokenError::Output(source)),
-        Err(source) => Err(TokenError::OutputUnrevoked {
-            id: token.id().to_string(),
-            source,
-        }),
+        Err(source) => match revoke(token.id()) {
+            Ok(()) => Err(TokenError::Output(source)),
+            Err(revoke) => Err(TokenError::OutputUnrevoked {
+                id: token.id().to_string(),
+                source,
+                revoke,
+            }),
+        },
     }
 }
 
@@ -509,22 +532,45 @@ mod tests {
     }
 
     #[test]
+    fn revoking_an_undelivered_token_maps_every_outcome() {
+        let (_d, mut index) = open();
+        let made = store_new_token(&mut index, &name("a"), at(T0), Token::generate).unwrap();
+        assert!(revoke_undelivered(&mut index, *made.id()).is_ok());
+        assert!(
+            revoke_undelivered(&mut index, *made.id()).is_ok(),
+            "already revoked"
+        );
+        let unknown = TokenId::parse("zzzzzzzz").unwrap();
+        assert!(matches!(
+            revoke_undelivered(&mut index, unknown),
+            Err(RevokeFailure::Missing)
+        ));
+        let e = TokenError::OutputUnrevoked {
+            id: "zzzzzzzz".to_owned(),
+            source: io::Error::from(io::ErrorKind::BrokenPipe),
+            revoke: RevokeFailure::Missing,
+        };
+        assert!(e.to_string().contains("the token row is missing"));
+    }
+
+    #[test]
     fn deliver_revokes_once_on_failure_and_never_on_success() {
         let t = token("aaaaaaaa", 'B');
         for (out_ok, revoke_ok) in [(true, true), (false, true), (false, false)] {
+            let failure = || RevokeFailure::Index(IndexError::Busy { op: "revoke token" });
             let mut calls = 0_u32;
             let mut seen = None;
             let result = if out_ok {
                 deliver(&t, &mut Vec::new(), |id| {
                     calls += 1;
                     seen = Some(*id);
-                    revoke_ok
+                    if revoke_ok { Ok(()) } else { Err(failure()) }
                 })
             } else {
                 deliver(&t, &mut Broken, |id| {
                     calls += 1;
                     seen = Some(*id);
-                    revoke_ok
+                    if revoke_ok { Ok(()) } else { Err(failure()) }
                 })
             };
             match (out_ok, revoke_ok) {
@@ -545,7 +591,22 @@ mod tests {
                     assert!(msg.contains("wardenlens token revoke aaaaaaaa"), "{msg}");
                     let secret = t.expose().splitn(3, '_').nth(2).unwrap().to_owned();
                     assert!(!msg.contains(&secret) && !format!("{e:?}").contains(&secret));
-                    assert!(matches!(e, TokenError::OutputUnrevoked { .. }));
+                    // The revoke failure's cause is kept, and it is not the output error's.
+                    assert!(msg.contains("database is busy"), "{msg}");
+                    assert!(
+                        matches!(
+                            e,
+                            TokenError::OutputUnrevoked {
+                                revoke: RevokeFailure::Index(IndexError::Busy { .. }),
+                                ..
+                            }
+                        ),
+                        "{e:?}"
+                    );
+                    assert!(
+                        std::error::Error::source(&e)
+                            .is_some_and(<dyn std::error::Error>::is::<io::Error>)
+                    );
                 }
             }
         }
