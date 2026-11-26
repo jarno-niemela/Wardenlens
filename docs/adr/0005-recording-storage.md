@@ -490,13 +490,21 @@ depth of history; Phase 2 adds retention by event and age):
 
 **Segment row cap (owner ruling, 2026-11-26; #160).** The index holds at most **1,000,000 segment rows**
 (`MAX_SEGMENTS`, a fixed generic bound that keeps one plan's memory to tens of MB, SEC-2). It is a retention bound, not
-a safety action: it runs **after** the plan's actions of the tick, with a per-tick bound of its own (the same
-`max_actions_per_tick`, a separate counter), so it can never consume the plan's actions (moves, floor and reserve
-deletes). It uses the normal delete protocol of section 7 A row whose delete fails is skipped and the cap continues with the next oldest; the failed ids are remembered across ticks (bounded, oldest forgotten first), paged past, and reported as a health flag (`cap_delete_failed`), so one undeletable row never disables the cap.
-- *Archive available:* hot and archive rows together may not exceed the cap. The oldest archive rows (`ended_at_ms`,
-  then `id`) are deleted first; once none remain, the oldest hot rows, in the same tick.
+a safety action: it runs **after** the plan's actions of the tick, each tier pass with a per-tick bound of its own (the
+same `max_actions_per_tick`, a separate counter), so it can never consume the plan's actions (moves, floor and reserve
+deletes). It uses the normal delete protocol of section 7.
+- *Archive available:* hot and archive rows together may not exceed the cap. The oldest deletable archive rows
+  (`ended_at_ms`, then `id`) are deleted first. What the archive cannot supply (no deletable row left, or its whole
+  bound spent on rows that cannot be deleted) is taken from the oldest deletable hot rows in the same tick; a pass
+  that is merely behind leaves the rest for the next tick.
 - *Archive unavailable:* only the hot tier's own excess over the cap is deleted. Archive rows are never a reason to
   delete hot video: it is the only copy and would be moved once the archive returns.
+
+**Oldest deletable first.** Each tier keeps a paging cursor across ticks: a pass resumes after the last row it
+attempted, and wraps to the oldest row at the end of the tier. A row whose delete fails is skipped (and reported as
+`cap_delete_failed`), so any number of undeletable rows cannot hold the cap back, and newer rows may go before an older
+stuck one. A stuck row is retried when the cursor wraps, and from the oldest again on the first tick on which the cap
+is caught up. A row skipped because the archive went away is not a failure and does not move the cursor.
 
 In normal operation no tier then exceeds the cap, so the plan never sees a truncated prefix. **Defence in depth:** if a
 tier still exceeds it (rows added from outside faster than they are evicted), the plan is made from the oldest-first
@@ -504,12 +512,12 @@ prefix, but the executor adds the archive's true byte total (`bytes_by_tier`) to
 than all others and never executed, so the archive's `room` (free space plus archive video) is never computed from a
 prefix; when the plan would evict the stand-in, the moves that rely on that room wait for the next tick. If the total
 cannot be read the archive counts as unavailable for the archive-driven decisions of that tick (no moves, no archive
-evictions; the planner's floor and reserve hot deletes for an unavailable archive still run, as ENOSPC safety outranks a possible move) and an index error is counted. A hot tier cut to its prefix
-refuses the rolling-buffer hot deletes (their budget would be understated). Both report `segments_truncated`.
+evictions; the planner's floor and reserve hot deletes for an unavailable archive still run, as ENOSPC safety
+outranks a possible move) and an index error is counted. A hot tier cut to its prefix refuses the rolling-buffer hot deletes (their budget would be understated). Both report `segments_truncated`.
 
 Bounds: one tick executes at most `max_actions_per_tick` (default **64**) plan actions (quarantine evictions count
-toward them), plus at most as many row-cap evictions on the cap's own bound (so at most twice the value); it re-probes
-after each one. The
+toward them), plus at most as many row-cap evictions in each of the two cap passes, archive and hot (so at most three
+times the value in all); it re-probes after each one. The
 tick interval is 30 s (#68). Catch-up after downtime takes several ticks (see the example), which is acceptable
 because writing continues meanwhile.
 

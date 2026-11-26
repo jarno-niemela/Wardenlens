@@ -1,5 +1,6 @@
 mod adversary_160;
 mod adversary_160_r2;
+mod adversary_160_r3;
 mod adversary_r5;
 mod cells;
 mod fault;

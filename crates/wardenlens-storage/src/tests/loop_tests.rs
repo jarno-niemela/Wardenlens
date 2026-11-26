@@ -1846,9 +1846,8 @@ fn a_failed_cap_delete_is_skipped_and_the_cap_continues() {
 }
 
 #[test]
-fn failed_cap_ids_are_remembered_across_ticks_and_bounded() {
-    // The oldest row is pinned for good (a sticky fault on its unlink would also hit the others:
-    // a directory planted over its file does it for that row alone).
+fn the_cap_resumes_after_a_stuck_row_and_does_not_flag_a_clean_tick() {
+    // The oldest of 4 archive rows is pinned for good (a directory planted over its file).
     let env = Env::new();
     for n in 0..4 {
         env.add("cam-2", n, 1000, Tier::Archive);
@@ -1862,16 +1861,80 @@ fn failed_cap_ids_are_remembered_across_ticks_and_bounded() {
     let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
     lp.set_max_rows(2);
     let r = lp.tick(now()).unwrap();
-    assert!(r.cap_delete_failed, "{r:?}");
-    // Bound 2: one failed attempt plus one deletion.
+    // Bound 2: the stuck row fails, the next one goes, then the bound is spent.
+    assert!(r.cap_delete_failed && r.cap_truncated, "{r:?}");
     assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert_eq!(lp.cap_failed_len(), 1, "the cursor is carried over");
     let r = lp.tick(now()).unwrap();
-    // The pinned row is paged past without an attempt: both actions go to deletions.
+    // The cursor is past the stuck row: no attempt on it, so no failure either.
     assert_eq!(r.delete_failed, 0, "{r:?}");
+    assert!(!r.cap_delete_failed, "{r:?}");
     assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
-    assert!(r.cap_delete_failed, "{r:?}");
     assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 2);
-    assert!(lp.cap_failed_len() <= 8);
+    assert_eq!(lp.cap_failed_len(), 0, "a clean tick clears the cursor");
+}
+
+#[test]
+fn the_cap_cursor_attempts_a_new_row_every_tick_and_wraps_to_retry_stuck_rows() {
+    // Six pinned rows, one attempt per tick, everything over the cap.
+    let env = Env::new();
+    let ids: Vec<_> = (0..6)
+        .map(|n| {
+            let id = env.add("cam-2", n, 1000, Tier::Archive);
+            let pinned = env.arch_file("cam-2", n);
+            std::fs::remove_file(&pinned).unwrap();
+            std::fs::create_dir(&pinned).unwrap();
+            std::fs::write(pinned.join("x"), b"x").unwrap();
+            id
+        })
+        .collect();
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 1;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_rows(0);
+    for t in 0..3 {
+        let r = lp.tick(now()).unwrap();
+        assert_eq!(r.delete_failed, 1, "tick {t}: {r:?}");
+        assert!(r.cap_delete_failed, "tick {t}: {r:?}");
+    }
+    // The fourth tick attempts the fourth row (not the first again): freeing it is enough.
+    std::fs::remove_dir_all(env.arch_file("cam-2", 3)).unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert_eq!(env.tier_of(ids[3]), None);
+    for t in 4..6 {
+        let r = lp.tick(now()).unwrap();
+        assert_eq!(r.delete_failed, 1, "tick {t}: {r:?}");
+    }
+    // The cursor reached the end: the next pass wraps to the oldest, whose fault has cleared.
+    std::fs::remove_dir_all(env.arch_file("cam-2", 0)).unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert_eq!(
+        env.tier_of(ids[0]),
+        None,
+        "the stuck row is retried after the wrap"
+    );
+}
+
+#[test]
+fn an_archive_that_goes_away_mid_pass_stops_the_cap_without_a_failure_or_a_cursor() {
+    let env = Env::new();
+    for n in 0..6 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    let (mut lp, _) = Storage::open(env.cfg(), env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_rows(2);
+    let marker = env.arch.join(ARCHIVE_MARKER);
+    let gone = marker.clone();
+    env.index.faults.lock().unwrap().get_hook = Some(Box::new(move || {
+        std::fs::remove_file(&gone).unwrap();
+    }));
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert!(!r.cap_delete_failed, "{r:?}");
+    assert_eq!(r.skipped, 1, "{r:?}");
+    assert_eq!(lp.cap_failed_len(), 0);
 }
 
 #[test]
@@ -2072,23 +2135,47 @@ fn persistent_totals_failures_on_a_truncated_archive_keep_the_hot_floor_over_man
 }
 
 #[test]
-fn the_remembered_failed_cap_ids_are_bounded_at_four_times_the_action_bound() {
-    // Six rows pinned by planted directories, one attempt per tick: the memory holds 4 ids.
+fn a_pass_at_the_end_of_the_tier_wraps_to_the_oldest_rows_in_the_same_tick() {
+    // Four pinned rows, three attempts per tick, one row over the cap: tick 1 fails on the first
+    // three and leaves the cursor on the third.
     let env = Env::new();
-    for n in 0..6 {
-        env.add("cam-2", n, 1000, Tier::Archive);
-        let pinned = env.arch_file("cam-2", n);
-        std::fs::remove_file(&pinned).unwrap();
-        std::fs::create_dir(&pinned).unwrap();
-        std::fs::write(pinned.join("x"), b"x").unwrap();
-    }
+    let ids: Vec<_> = (0..4)
+        .map(|n| {
+            let id = env.add("cam-2", n, 1000, Tier::Archive);
+            let pinned = env.arch_file("cam-2", n);
+            std::fs::remove_file(&pinned).unwrap();
+            std::fs::create_dir(&pinned).unwrap();
+            std::fs::write(pinned.join("x"), b"x").unwrap();
+            id
+        })
+        .collect();
     let mut cfg = env.cfg();
-    cfg.max_actions_per_tick = 1;
+    cfg.max_actions_per_tick = 3;
     let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
-    lp.set_max_rows(0);
-    for t in 0..6 {
-        let r = lp.tick(now()).unwrap();
-        assert!(r.cap_delete_failed, "tick {t}: {r:?}");
+    lp.set_max_rows(3);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.delete_failed, 3, "{r:?}");
+    // The oldest row's fault has cleared. Tick 2 starts after the third row, fails on the fourth
+    // (the end of the tier), and wraps to the oldest in the same tick.
+    std::fs::remove_dir_all(env.arch_file("cam-2", 0)).unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert_eq!(env.tier_of(ids[0]), None);
+}
+
+#[test]
+fn only_a_failed_delete_is_a_cap_failure_an_index_error_is_not() {
+    let env = Env::new();
+    for n in 0..4 {
+        env.add("cam-2", n, 1000, Tier::Archive);
     }
-    assert_eq!(lp.cap_failed_len(), 4);
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_rows(1);
+    // `get` fails after the plan: every cap delete ends in an index error.
+    let faults = Arc::clone(&env.index.faults);
+    env.index.faults.lock().unwrap().get = true;
+    let r = lp.tick(now()).unwrap();
+    faults.lock().unwrap().get = false;
+    assert!(r.index_errors >= 1 && r.rows_evicted_over_cap == 0, "{r:?}");
+    assert!(!r.cap_delete_failed, "{r:?}");
 }
