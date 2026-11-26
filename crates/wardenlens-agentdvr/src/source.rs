@@ -149,9 +149,11 @@ fn userinfo_of(ui: &str) -> Option<RawUserinfo> {
 /// * the value of every credential-named `name=value` parameter anywhere in the text (core's
 ///   list), up to the next `&` and up to the next of `& / ? # @ ;`.
 ///
-/// The first error of `emit` stops the walk and is returned. Work is bounded by what `emit`
-/// accepts: every `@` yields a new, longer password, so an `emit` that refuses beyond a limit
-/// (as `Logins` does) ends the walk after a bounded number of splits.
+/// The first error of `emit` stops the walk and is returned. The scans here are a constant
+/// number of passes over `raw` (the delimiter search is one forward pass); what is not bounded by
+/// that is the candidates, and the caller bounds those: every candidate is passed to `emit`, so an
+/// `emit` that charges the bytes it is offered (as `Logins` does, duplicates included) and
+/// refuses past a budget ends the walk after work linear in the input.
 pub(crate) fn for_each_candidate<E>(
     raw: &str,
     emit: &mut impl FnMut(&str) -> Result<(), E>,
@@ -172,17 +174,26 @@ pub(crate) fn for_each_candidate<E>(
             _ => emit_both(userinfo, emit)?,
         }
     }
+    // One forward pass: the next `&` and the next other delimiter at or after each `=` are
+    // cached, and a cache that is still ahead of the `=` is reused, so every byte is scanned at
+    // most once per kind whatever the number of `=`.
+    let (mut next_amp, mut next_delim) = (0_usize, 0_usize);
     for (eq, _) in s.match_indices('=') {
         if !ends_with_credential_param_name(s.get(..eq).unwrap_or_default()) {
             continue;
         }
-        let value = s.get(eq.saturating_add(1)..).unwrap_or_default();
-        let to_amp = value
-            .find('&')
-            .map_or(value, |i| value.get(..i).unwrap_or(value));
-        let to_delim = to_amp
-            .find(['/', '?', '#', '@', ';'])
-            .map_or(to_amp, |i| to_amp.get(..i).unwrap_or(to_amp));
+        let from = eq.saturating_add(1);
+        let tail = s.get(from..).unwrap_or_default();
+        if next_amp < from {
+            next_amp = tail.find('&').map_or(s.len(), |i| from.saturating_add(i));
+        }
+        if next_delim < from {
+            next_delim = tail
+                .find(['&', '/', '?', '#', '@', ';'])
+                .map_or(s.len(), |i| from.saturating_add(i));
+        }
+        let to_amp = s.get(from..next_amp).unwrap_or_default();
+        let to_delim = s.get(from..next_delim).unwrap_or_default();
         emit_both(to_amp, emit)?;
         emit_both(to_delim, emit)?;
     }

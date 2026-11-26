@@ -264,11 +264,22 @@ fn screen(
     logins: &Logins,
     model: &ModelRef,
 ) -> (Vec<CameraDraft>, Vec<Row>) {
+    let (ready, rows, _) = screen_counted(drafts, logins, model);
+    (ready, rows)
+}
+
+/// [`screen`], also returning the window starts compared (see `MAX_SCREEN_WORK`).
+fn screen_counted(
+    drafts: Vec<CameraDraft>,
+    logins: &Logins,
+    model: &ModelRef,
+) -> (Vec<CameraDraft>, Vec<Row>, u64) {
+    let mut work = 0_u64;
     let mut ready = Vec::new();
     let mut rows = Vec::new();
     let logins = lowered_logins(logins);
     for d in drafts {
-        if path_holds_login(&d.path, &logins) {
+        if path_holds_login(&d.path, &logins, &mut work) {
             let mut r = row(
                 &d,
                 Status::Skipped("path contains the login (path not shown)".to_owned()),
@@ -288,7 +299,7 @@ fn screen(
             rows.push(r);
         }
     }
-    (ready, rows)
+    (ready, rows, work)
 }
 
 /// The part of a path before its query string.
@@ -318,9 +329,23 @@ fn percent_decode(s: &str) -> Zeroizing<Vec<u8>> {
     out
 }
 
-fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+/// True if `needle` is inside `hay`. Each window start is one unit of `work`; a window is
+/// compared whole only when its first and last bytes match, so a mismatch costs two byte
+/// compares.
+fn contains_bytes(hay: &[u8], needle: &[u8], work: &mut u64) -> bool {
+    let (Some(first), Some(last)) = (needle.first(), needle.last()) else {
+        return false;
+    };
+    hay.windows(needle.len()).any(|w| {
+        *work = work.saturating_add(1);
+        w.first() == Some(first) && w.last() == Some(last) && w == needle
+    })
 }
+
+/// The most window starts the screen compares: logins x (written + decoded) x paths x window
+/// starts per path. Documents the bound; the parser's caps make it hold.
+#[cfg(test)]
+const MAX_SCREEN_WORK: u64 = 4096 * 2 * 256 * 512;
 
 /// Every non-empty user and password the parser read (skipped entries included), ASCII-lowercased
 /// for the comparison, zeroised on drop.
@@ -335,15 +360,17 @@ fn lowered_logins(logins: &Logins) -> Vec<Zeroizing<Vec<u8>>> {
 
 /// True if the path holds any of `logins` (already ASCII-lowercased), compared
 /// ASCII-case-insensitively, as written or percent-decoded.
-fn path_holds_login(path: &RtspPath, logins: &[Zeroizing<Vec<u8>>]) -> bool {
+fn path_holds_login(path: &RtspPath, logins: &[Zeroizing<Vec<u8>>], work: &mut u64) -> bool {
     let written = Zeroizing::new(path.as_str().to_ascii_lowercase().into_bytes());
     let decoded = Zeroizing::new(percent_decode(path.as_str()).to_ascii_lowercase());
     // The parser caps the distinct logins (`MAX_LOGINS`) and a path is at most `MAX_PATH_LEN`
     // bytes, so this is bounded: at most `MAX_LOGINS` logins, each of at most `MAX_PATH_LEN` bytes,
-    // against each path of at most `MAX_PATH_LEN` bytes, for at most 256 paths.
+    // against each of at most 256 paths of at most `MAX_PATH_LEN` bytes, as written and decoded:
+    // at most `MAX_SCREEN_WORK` window starts, each costing two byte compares unless both ends
+    // match.
     logins
         .iter()
-        .any(|l| contains_bytes(&written, l) || contains_bytes(&decoded, l))
+        .any(|l| contains_bytes(&written, l, work) || contains_bytes(&decoded, l, work))
 }
 
 fn row(d: &CameraDraft, status: Status) -> Row {
@@ -558,6 +585,39 @@ mod tests {
     }
 
     #[test]
+    fn the_screen_work_is_the_window_count_and_within_the_documented_bound() {
+        // 8 importable paths of 512 bytes, 64 distinct 255-byte logins held by a skipped carrier
+        // camera and in no path: every window of every path (written and decoded) is compared.
+        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
+        let path = "a".repeat(511);
+        let head = "a".repeat(252);
+        let cams: Vec<String> = (1..=8_u32)
+            .map(|i| {
+                format!(
+                    "<camera id=\"{i}\" name=\"Cam {i}\"><settings><videosourcestring>\
+                     rtsp://192.0.2.1/{path}</videosourcestring></settings></camera>"
+                )
+            })
+            .collect();
+        let cams = cams.concat();
+        let pws: Vec<String> = (0..64_u32)
+            .map(|i| format!("<password>{head}b{i:02}</password>"))
+            .collect();
+        let pws = pws.concat();
+        let body = format!(
+            "{cams}<camera id=\"99\" name=\"Carrier\"><settings>\
+             <videosourcestring>rtsp://192.0.2.9/s</videosourcestring>{pws}</settings></camera>"
+        );
+        let xml = format!("<objects><cameras>{body}</cameras></objects>");
+        let parsed = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
+        let (ready, _, work) = screen_counted(parsed.cameras, &parsed.logins, &model);
+        assert_eq!(ready.len(), 8);
+        // 512-byte path, 255-byte login: 258 window starts, two variants, 8 paths, 64 logins.
+        assert_eq!(work, 258 * 2 * 8 * 64);
+        assert!(work <= MAX_SCREEN_WORK);
+    }
+
+    #[test]
     fn a_path_holding_the_login_is_refused_and_never_shown() {
         let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
         // (path, user, password): every one holds the password or the user.
@@ -603,8 +663,8 @@ mod tests {
         // Core's path type refuses `%`, so a draft cannot carry one today; the helper is the
         // guard if that rule changes, and is tested directly.
         assert_eq!(&**percent_decode("/a%41b%zz%4"), b"/aAb%zz%4");
-        assert!(contains_bytes(&percent_decode("/p%61ss"), b"pass"));
-        assert!(!contains_bytes(b"abc", b""));
+        assert!(contains_bytes(&percent_decode("/p%61ss"), b"pass", &mut 0));
+        assert!(!contains_bytes(b"abc", b"", &mut 0));
     }
 
     #[test]

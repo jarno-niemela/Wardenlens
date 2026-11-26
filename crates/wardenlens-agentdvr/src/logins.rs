@@ -18,7 +18,8 @@
 //! an extra one only over-refuses. Values empty after trimming are left out.
 //!
 //! The set is bounded: duplicates count once, and more than [`MAX_LOGINS`] distinct values, or
-//! more than [`MAX_LOGIN_BYTES`] bytes of them, refuses the whole document with
+//! more than [`MAX_LOGIN_BYTES`] bytes of them, or more than [`MAX_LOGIN_WORK`] bytes of work (every candidate
+//! offered, duplicates included, and the scans), refuses the whole document with
 //! [`ImportError::TooManyLogins`]. Nothing is dropped silently. The order is not significant.
 
 use std::borrow::Borrow;
@@ -35,6 +36,14 @@ pub const MAX_LOGINS: usize = 4096;
 
 /// Most bytes all the distinct login values may hold together.
 pub const MAX_LOGIN_BYTES: usize = 1024 * 1024;
+
+/// Most work, in bytes, one document may cost the login collection: every candidate byte offered
+/// (duplicates included) plus the bytes scanned per text, at a small constant factor each. The
+/// 8 MiB input limit times this constant bounds the parse; past it the document is refused.
+pub const MAX_LOGIN_WORK: usize = 16 * crate::MAX_INPUT_BYTES;
+
+/// Work charged per byte of a source text for the candidate scans.
+const SCAN_FACTOR: usize = 8;
 
 /// One value; ordered and borrowed as its text so a lookup needs no copy.
 #[derive(Clone)]
@@ -79,6 +88,7 @@ impl Borrow<str> for Secret {
 pub struct Logins {
     set: BTreeSet<Secret>,
     bytes: usize,
+    work: usize,
 }
 
 impl Logins {
@@ -99,9 +109,25 @@ impl Logins {
         self.set.is_empty()
     }
 
+    /// Charges `n` bytes of work; past [`MAX_LOGIN_WORK`] the document is refused.
+    pub(crate) fn charge(&mut self, n: usize) -> Result<(), ImportError> {
+        self.work = self.work.saturating_add(n);
+        if self.work > MAX_LOGIN_WORK {
+            return Err(ImportError::TooManyLogins);
+        }
+        Ok(())
+    }
+
+    /// The work charged so far, in bytes.
+    #[must_use]
+    pub fn work(&self) -> usize {
+        self.work
+    }
+
     /// Adds one value unless it is blank or already there. The length is checked before
-    /// anything is copied.
+    /// anything is copied. Every offered byte is charged, a duplicate or a blank too.
     fn push(&mut self, value: &str) -> Result<(), ImportError> {
+        self.charge(value.len().max(1))?;
         if value.trim().is_empty() || self.set.contains(value) {
             return Ok(());
         }
@@ -130,6 +156,9 @@ impl Logins {
 
     /// A `videosourcestring` field ended with `text`.
     pub(crate) fn add_source(&mut self, text: &str) -> Result<(), ImportError> {
+        // The scans of `for_each_candidate` (`@`, `:`, `=` and the name checks): at most
+        // `SCAN_FACTOR` passes over the text.
+        self.charge(text.len().saturating_mul(SCAN_FACTOR))?;
         for_each_candidate(text, &mut |v| self.push_text(v))
     }
 }

@@ -215,6 +215,8 @@ impl Walker {
                     Field::Source => &mut self.seen_sources,
                     Field::Login | Field::Password => &mut self.seen_fields,
                 };
+                // Hashing the text is a pass over it, seen or not.
+                self.logins.charge(t.len())?;
                 if t.is_empty() || seen.contains(t.as_str()) {
                     continue;
                 }

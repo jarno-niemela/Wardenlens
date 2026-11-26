@@ -117,7 +117,7 @@ use wardenlens_core::camera::{CameraId, Credential, DisplayName, Host, RtspPath}
 use wardenlens_core::text::normalise_display_name;
 
 pub use error::{ImportError, SkipReason};
-pub use logins::{Logins, MAX_LOGIN_BYTES, MAX_LOGINS};
+pub use logins::{Logins, MAX_LOGIN_BYTES, MAX_LOGIN_WORK, MAX_LOGINS};
 
 /// Longest input accepted, in bytes.
 pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
