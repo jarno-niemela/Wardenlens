@@ -1566,6 +1566,10 @@ fn a_planted_symlink_or_fifo_twin_never_pins_the_row_of_a_delete() {
 }
 
 #[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "a skipped precondition must say why, in the test output"
+)]
 fn quarantine_is_sized_by_allocated_bytes_so_a_sparse_file_is_not_counted() {
     let env = Env::new();
     env.set_cap("hot", 1_000_000);
@@ -1581,6 +1585,10 @@ fn quarantine_is_sized_by_allocated_bytes_so_a_sparse_file_is_not_counted() {
         &std::fs::metadata(d.join("000000-000.mp4")).unwrap(),
     );
     if blocks != 0 {
+        eprintln!(
+            "skipping: the temporary filesystem allocated {blocks} blocks for a sparse file, \
+             so the sparse-file premise does not hold here"
+        );
         return;
     }
     std::fs::write(d.join("000001-000.mp4"), pattern(20_000)).unwrap();
@@ -1627,8 +1635,8 @@ fn rolling_second_tick(env: &Env, cap: Option<usize>) -> crate::TickReport {
 #[test]
 fn archive_only_truncation_does_not_refuse_the_hot_rolling_buffer_deletes() {
     let env = truncation_world(3);
-    // Cap 3: the archive's three rows fit... hot has 3 rows too; cap 2 cuts only the archive?
-    // Hot holds 3 rows (2 + the new one), the archive 3: use per-tier counts to cut one tier.
+    // After the first tick hot holds 3 rows (2 + the new one) and the archive 3: cap 5 cuts
+    // neither tier.
     let r = rolling_second_tick(&env, Some(5));
     assert!(!r.segments_truncated, "{r:?}");
     assert_eq!(
@@ -1686,5 +1694,172 @@ fn a_twin_open_error_fails_the_delete_before_anything_is_unlinked() {
         );
         assert_eq!(env.tier_of(id), Some(Tier::Hot));
         assert_eq!(count(&state, Op::Unlink(Tier::Hot)), 0);
+    }
+}
+
+#[test]
+fn a_twin_directory_planted_as_a_regular_file_never_pins_the_delete_and_is_counted() {
+    // ENOTDIR on the twin open: like NotRegular or ELOOP, never DeleteFailed.
+    for (row_tier, twin_root_is_arch) in [(Tier::Hot, true), (Tier::Archive, false)] {
+        let env = Env::new();
+        let id = env.add("cam-1", 0, 100, row_tier);
+        let rel = Env::rel("cam-1", 0);
+        let first = rel.split('/').next().unwrap();
+        let twin_root = if twin_root_is_arch {
+            &env.arch
+        } else {
+            &env.hot
+        };
+        std::fs::write(twin_root.join(first), b"planted").unwrap();
+        let (lp, _) = build(&env, None);
+        assert_eq!(
+            lp.delete_now(id, true),
+            crate::Outcome::DeletedTwinLeft,
+            "{row_tier:?}"
+        );
+        assert_eq!(env.tier_of(id), None);
+        assert_eq!(
+            std::fs::read(twin_root.join(first)).unwrap(),
+            b"planted",
+            "the planted object is left alone"
+        );
+    }
+}
+
+// ---- ticket #160: the segment row cap and the truncated archive ---------------------------
+
+fn cap_tick(env: &Env, max_rows: usize, actions: usize) -> crate::TickReport {
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = actions;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_rows(max_rows);
+    lp.tick(now()).unwrap()
+}
+
+#[test]
+fn rows_above_the_cap_are_evicted_oldest_archive_first_across_ticks_and_nothing_else() {
+    let env = Env::new();
+    let arch: Vec<_> = (0..8)
+        .map(|n| env.add("cam-2", n, 1000, Tier::Archive))
+        .collect();
+    let hot: Vec<_> = (20..22)
+        .map(|n| env.add("cam-1", n, 1000, Tier::Hot))
+        .collect();
+    // 10 rows, cap 6: 4 above it, 2 per tick.
+    let r = cap_tick(&env, 6, 2);
+    assert_eq!(r.rows_evicted_over_cap, 2, "{r:?}");
+    assert_eq!(env.tier_of(arch[0]), None);
+    assert_eq!(env.tier_of(arch[1]), None);
+    assert!(!env.arch_file("cam-2", 0).exists() && !env.arch_file("cam-2", 1).exists());
+    assert_eq!(
+        env.tier_of(arch[2]),
+        Some(Tier::Archive),
+        "only the excess goes"
+    );
+    let r = cap_tick(&env, 6, 2);
+    assert_eq!(r.rows_evicted_over_cap, 2, "{r:?}");
+    assert_eq!(env.tier_of(arch[2]), None);
+    assert_eq!(env.tier_of(arch[3]), None);
+    // At the cap: a tick touches no row.
+    let r = cap_tick(&env, 6, 2);
+    assert_eq!(r.rows_evicted_over_cap, 0, "{r:?}");
+    for id in &arch[4..] {
+        assert_eq!(env.tier_of(*id), Some(Tier::Archive));
+    }
+    for id in hot {
+        assert_eq!(env.tier_of(id), Some(Tier::Hot));
+    }
+}
+
+#[test]
+fn rows_at_or_under_the_cap_are_never_touched() {
+    let env = Env::new();
+    for n in 0..4 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    env.add("cam-1", 20, 1000, Tier::Hot);
+    let r = cap_tick(&env, 5, 64);
+    assert_eq!((r.rows_evicted_over_cap, r.deleted), (0, 0), "{r:?}");
+    let r = cap_tick(&env, 100, 64);
+    assert_eq!((r.rows_evicted_over_cap, r.deleted), (0, 0), "{r:?}");
+}
+
+#[test]
+fn hot_rows_are_evicted_when_there_is_no_archive_or_no_archive_rows() {
+    // Archive unavailable, with archive rows: the hot tier pays, the archive rows are untouched.
+    let env = Env::new();
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    let arch = env.row("cam-2", 0, 1000, Tier::Archive);
+    let hot: Vec<_> = (20..25)
+        .map(|n| env.add("cam-1", n, 1000, Tier::Hot))
+        .collect();
+    let r = cap_tick(&env, 4, 64);
+    assert_eq!(r.rows_evicted_over_cap, 2, "{r:?}");
+    assert_eq!(env.tier_of(hot[0]), None);
+    assert_eq!(env.tier_of(hot[1]), None);
+    assert!(!env.hot_file("cam-1", 20).exists());
+    assert_eq!(env.tier_of(hot[2]), Some(Tier::Hot));
+    assert_eq!(env.tier_of(arch), Some(Tier::Archive));
+    // Archive available but without rows.
+    let env = Env::new();
+    let hot: Vec<_> = (20..24)
+        .map(|n| env.add("cam-1", n, 1000, Tier::Hot))
+        .collect();
+    let r = cap_tick(&env, 3, 64);
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert_eq!(env.tier_of(hot[0]), None);
+    assert_eq!(env.tier_of(hot[1]), Some(Tier::Hot));
+}
+
+#[test]
+fn a_failing_cap_eviction_is_not_retried_and_counts_toward_the_tick_bound() {
+    let env = Env::new();
+    for n in 0..5 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    let fault = Fault {
+        errno: rustix::io::Errno::IO,
+        ..Fault::once(Op::Unlink(Tier::Archive), 1)
+    };
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 2;
+    let state = Arc::new(Mutex::new(super::fault::State {
+        fault: Some(fault),
+        ..super::fault::State::default()
+    }));
+    let (mut lp, _) = Storage::open_with(cfg, env.index.clone(), env.usage.clone(), |r| {
+        super::fault::FaultFs::new(r, state)
+    })
+    .unwrap();
+    lp.set_max_rows(2);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.delete_failed, 1, "{r:?}");
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert!(r.truncated, "{r:?}");
+}
+
+#[test]
+fn archive_full_is_reported_while_the_hot_deletes_are_refused() {
+    // Hot 1 MB: 800 kB foreign, 3 x 50 kB video (free 50 kB; even deleting all video stays below
+    // the 250 kB floor): the rolling buffer, with a 100 kB reserve. The archive (60 kB) cannot
+    // take a 50 kB segment above its 15 kB floor: full. Hot cut to its prefix: the deletes are
+    // refused, and the full archive is still reported.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    env.set_cap("arch", 60_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 800_000]).unwrap();
+    let hot: Vec<_> = (0..3)
+        .map(|n| env.add("cam-1", n, 50_000, Tier::Hot))
+        .collect();
+    let mut cfg = env.cfg();
+    cfg.policy.emergency_reserve_bytes = 100_000;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_segments(2);
+    let r = lp.tick(now()).unwrap();
+    assert!(r.segments_truncated && r.rolling_deletes_refused, "{r:?}");
+    assert!(r.archive_full, "{r:?}");
+    assert_eq!(r.deleted, 0, "{r:?}");
+    for id in hot {
+        assert_eq!(env.tier_of(id), Some(Tier::Hot));
     }
 }

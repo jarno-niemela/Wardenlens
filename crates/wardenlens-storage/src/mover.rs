@@ -455,6 +455,15 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
 
     /// Delete segment `id`: unlink the hot copy, then the archive copy (when the archive is
     /// available), fsync each parent directory, then remove the row.
+    ///
+    /// **The twin check runs first**, before anything is unlinked, so an error there never
+    /// leaves an unlinked file behind a kept row. The twin is the file of the same row on the
+    /// other tier (when that tier is in play): a missing one is nothing to delete; one of the
+    /// wrong size is quarantined and left alone (a failure to quarantine is `DeleteFailed`); a
+    /// non-regular object (`NotRegular`), a symlink (`ELOOP`) or a regular file planted where a
+    /// directory of the twin's path should be (`ENOTDIR`) is not a segment: it is left alone,
+    /// counted as [`Outcome::DeletedTwinLeft`], and never pins the row. Any other error is
+    /// `DeleteFailed` and nothing was unlinked.
     pub(crate) fn delete_segment(&self, id: SegmentId, archive_available: bool) -> Outcome {
         let row = match self.index.get(id) {
             Err(_) => return Outcome::IndexError,
@@ -500,7 +509,9 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
                     twin_left = true;
                     skip_other = true;
                 }
-                Err(e) if e.errno() == Some(Errno::LOOP) => {
+                // A regular file where a directory of the twin's path should be (ENOTDIR) is the
+                // same: a planted object, not a segment.
+                Err(e) if matches!(e.errno(), Some(Errno::LOOP | Errno::NOTDIR)) => {
                     twin_left = true;
                     skip_other = true;
                 }

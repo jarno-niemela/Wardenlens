@@ -488,6 +488,17 @@ depth of history; Phase 2 adds retention by event and age):
    nothing. The recorder keeps retrying on ENOSPC (#57) and the storage endpoint reports `below_floor`. Recording does not stop
    by itself for a floor breach; it stops only when the OS refuses the write.
 
+**Segment row cap (owner ruling, 2026-11-26; #160).** The index holds at most **1,000,000 segment rows**, hot and
+archive together (`MAX_SEGMENTS`, a fixed generic bound that keeps one plan's memory to tens of MB, SEC-2). It is a
+retention bound like the floors: at the start of every tick, while the rows exceed it, the executor deletes the oldest
+rows (`ended_at_ms`, then `id`) with the normal delete protocol of section 7, **archive first**, and hot rows only when
+the archive is unavailable or holds no rows, within `max_actions_per_tick`. In normal operation no tier then ever
+exceeds the cap, so the plan never sees a truncated prefix. **Defence in depth:** if a tier still exceeds it (rows added
+from outside faster than they are evicted), the plan is made from the oldest-first prefix, but the executor adds the
+archive's true byte total (`bytes_by_tier`) to the plan as one stand-in segment newer than all others and never
+executed, so the archive's `room` (free space plus archive video) is never computed from a prefix. A hot tier cut to its prefix refuses
+the rolling-buffer hot deletes (their budget would be understated) and the tick reports `segments_truncated`.
+
 Bounds: one tick executes at most `max_actions_per_tick` (default **64**) actions; it re-probes after each one. The
 tick interval is 30 s (#68). Catch-up after downtime takes several ticks (see the example), which is acceptable
 because writing continues meanwhile.
