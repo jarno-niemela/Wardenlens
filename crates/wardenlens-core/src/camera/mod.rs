@@ -16,6 +16,7 @@
 //! present, IPv6 hosts bracketed. The URL type redacts itself when formatted.
 
 mod credential;
+mod directory;
 mod error;
 mod host;
 mod id;
@@ -26,6 +27,7 @@ mod path;
 
 pub use crate::catalogue::StreamRole;
 pub use credential::{Credential, CredentialRule, CredentialSource, MAX_CREDENTIAL_PART_LEN};
+pub use directory::{CameraDirectory, CameraStatus, DirectoryError, LinkState, LinkStatus};
 pub use error::CameraError;
 pub use host::{Host, MAX_HOST_LEN};
 pub use id::{CameraId, MAX_CAMERA_ID_LEN};

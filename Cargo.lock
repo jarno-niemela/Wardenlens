@@ -2092,6 +2092,7 @@ dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
  "http-body-util",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.1",
