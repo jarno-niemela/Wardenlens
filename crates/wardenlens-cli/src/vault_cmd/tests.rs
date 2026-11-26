@@ -130,7 +130,9 @@ fn parse(args: &[&str]) -> VaultCommand {
     full.extend_from_slice(args);
     match <Cli as clap::Parser>::try_parse_from(full).unwrap().command {
         Some(Command::Vault(c)) => c,
-        None | Some(Command::Config(_) | Command::Import(_) | Command::Secrets(_)) => {
+        None
+        | Some(Command::Config(_) | Command::Import(_) | Command::Secrets(_) | Command::Token(_)) =>
+        {
             panic!("no vault command")
         }
     }

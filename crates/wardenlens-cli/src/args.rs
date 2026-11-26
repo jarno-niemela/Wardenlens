@@ -47,6 +47,31 @@ pub(crate) enum Command {
     /// Manage the service key file named by `secrets.key_file` in the config.
     #[command(subcommand)]
     Secrets(SecretsCommand),
+    /// Manage the API tokens in the index named by `database.path`.
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+/// `wardenlens token ...`
+#[derive(Debug, Subcommand)]
+pub(crate) enum TokenCommand {
+    /// Create a token and print it once on stdout (`wl_<id>_<secret>`).
+    ///
+    /// Only its id, a SHA-256 of the secret, the name and the creation time are stored; the secret
+    /// cannot be shown again. Never logged.
+    Create {
+        /// A label, 1 to 64 bytes, no control characters.
+        #[arg(long)]
+        name: String,
+    },
+    /// List the tokens: id, name, created, last used, revoked. Never a secret or a hash.
+    List,
+    /// Revoke a token by id. The row stays (the id is never reused); the token stops working.
+    /// Exits 1 for an unknown id.
+    Revoke {
+        /// The 8-character token id (shown by `create` and `list`).
+        id: String,
+    },
 }
 
 /// `wardenlens import ...`

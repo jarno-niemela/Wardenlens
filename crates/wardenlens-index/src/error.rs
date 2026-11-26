@@ -227,6 +227,22 @@ pub enum IndexError {
         /// The limit.
         max: usize,
     },
+    /// A token with this id exists (active or revoked); nothing was written. Ids are never reused.
+    #[error("a token with this id already exists")]
+    TokenIdTaken,
+    /// The token table holds the most rows it accepts.
+    #[error("the token table is full ({max} tokens)")]
+    TooManyTokens {
+        /// The limit.
+        max: usize,
+    },
+    /// A stored token row violates the schema's bounds (a file edited outside SQLite). It names
+    /// the column only, never the token (SEC-6).
+    #[error("stored token row is invalid: {field}")]
+    CorruptTokenRow {
+        /// The offending column.
+        field: &'static str,
+    },
     /// No segment with this id.
     #[error("segment {0} not found")]
     NotFound(u64),

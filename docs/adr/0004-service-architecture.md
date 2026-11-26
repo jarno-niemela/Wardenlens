@@ -250,15 +250,16 @@ scanners and humans recognise it. Example shape (fake): `wl_abcdefgh_` followed 
 SHA-256 digest and performs the constant-time comparison (including the dummy-digest path). The cli (#65) reuses that
 module for `token create`; no other crate hashes or compares tokens, so the format and the verification logic have
 exactly one implementation. Core's `TokenStore` is **plain data access** and knows nothing about hashing:
-`find(&TokenId) -> Option<TokenRecord { digest: [u8; 32], revoked }>`, plus `insert`, `list`, `revoke` and
-`touch_last_used`. The index implements it with SQL only.
+`find(&TokenId) -> Option<TokenRecord { digest: [u8; 32], revoked }>` and nothing else (the API's verifier depends on
+this lookup only). Token management is a second core trait, `TokenAdmin`: `insert`, `list`, `revoke` and
+`touch_last_used`. The index implements both with SQL only.
 
 **Generation and storage.** Tokens are created only locally by the operator with `wardenlens token create --name
 <label>` (#65), which prints the token **once** on stdout. The index stores `{id, name, digest = sha256(decoded secret
 bytes), created_at, last_used_at, revoked}`. The `id` column is `UNIQUE`; `token create` regenerates the id on a
 collision, and a revoked id is never reused. There is **no role column in v1**: Phase 1 has no mutating API routes, so a
 role would protect nothing (CHG-3). Roles are introduced together with the first mutating route (a scheme change at that
-point means a schema change, accepted). The `TokenStore` trait is defined in **core**, the index crate implements it
+point means a schema change, accepted). The `TokenStore` and `TokenAdmin` traits are defined in **core**, the index crate implements them
 and the api crate consumes it through generics (see section 1), so api never depends on index. The plaintext token is
 never stored or logged. Because the secret has 256 bits of entropy, a fast hash (SHA-256, RustCrypto `sha2`) is
 sufficient: there is nothing to brute-force, so a slow password hash (argon2) would only cost CPU on every request. A
@@ -399,7 +400,7 @@ below carry an "Amended by ADR 0004" section that matches it.
 | #61 (cameras endpoints) | read-only, no roles; handlers take core traits through generics, never `dyn` |
 | #62 (recordings endpoints) | owns body streaming and its limits: `ConcurrencyLimit` and the request timeout do not cover a streamed body, so a per-download idle or write timeout is required and new crates are recorded in the PR |
 | #64 (cli skeleton) | tracing-subscriber keeps the `json` feature behind `--log-format` (`json` or `text`) |
-| #65 (token CLI) | `token create`, `list`, `revoke` use `wardenlens-api::token`; the index implements `TokenStore` as plain data access with a `UNIQUE` id column; `token create` retries on id collision; `token revoke <id>` sets `revoked`, never deletes; no roles |
+| #65 (token CLI) | `token create`, `list`, `revoke` use `wardenlens-api::token`; the index implements `TokenStore` (`find`) and `TokenAdmin` (`insert`, `list`, `revoke`, `touch_last_used`) as plain data access with a `UNIQUE` id column; `token create` retries on id collision; `token revoke <id>` sets `revoked`, never deletes; no roles |
 | #68 (`wardenlens serve`) | the hand-written accept loop and connection semaphore, `header_read_timeout` 10 s with `TokioTimer`, idle timeout, graceful shutdown, raised `RLIMIT_NOFILE`; the integration test with 300 stuck connections; uses `api.listen` and core's `TokenStore` |
 | #69 (Docker and compose) | `wardenlens health` probe subcommand as the healthcheck (no `curl` in the image); `ulimits.nofile`; `api.allow_unspecified_bind` only on the bridge network; `network_mode: host` implies a specific LAN `api.listen`; documented in `docs/deploy.md` |
 

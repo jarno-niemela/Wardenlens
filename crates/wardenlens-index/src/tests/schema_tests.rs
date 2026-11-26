@@ -162,7 +162,7 @@ fn the_reference_schema_is_built_from_the_migrations() {
     assert_eq!(v0[0].1, "index_meta");
     let (_f, idx) = open_new();
     assert_eq!(
-        reference_schema(MIGRATIONS, 2).unwrap(),
+        reference_schema(MIGRATIONS, 3).unwrap(),
         schema_rows(&idx.conn).unwrap()
     );
 }

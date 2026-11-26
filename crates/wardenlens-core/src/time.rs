@@ -151,6 +151,22 @@ impl From<UnixMs> for Timestamp {
     }
 }
 
+impl UnixMs {
+    /// The instant as `YYYY-MM-DDTHH:MM:SSZ` (UTC, whole seconds, truncated), for people.
+    #[must_use]
+    pub fn to_utc_text(self) -> String {
+        const MS_PER_DAY: i64 = 86_400_000;
+        let (year, month, day) = crate::recording::civil_from_days(self.0.div_euclid(MS_PER_DAY));
+        let secs = self.0.rem_euclid(MS_PER_DAY).div_euclid(1000);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            secs.div_euclid(3600),
+            secs.rem_euclid(3600).div_euclid(60),
+            secs.rem_euclid(60)
+        )
+    }
+}
+
 impl fmt::Display for UnixMs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ms", self.0)
@@ -194,6 +210,20 @@ pub trait MonotonicClock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utc_text_is_correct_at_the_edges_and_truncates_milliseconds() {
+        for (ms, want) in [
+            (946_684_800_000, "2000-01-01T00:00:00Z"),
+            (951_782_400_000, "2000-02-29T00:00:00Z"),
+            (1_700_000_000_000, "2023-11-14T22:13:20Z"),
+            (1_700_000_000_999, "2023-11-14T22:13:20Z"),
+            (1_709_251_199_000, "2024-02-29T23:59:59Z"),
+            (4_102_444_799_999, "2099-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(UnixMs::new(ms).unwrap().to_utc_text(), want, "{ms}");
+        }
+    }
+
     use super::*;
     use core::cell::Cell;
     use proptest::prelude::*;

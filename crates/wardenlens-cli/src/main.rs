@@ -76,6 +76,15 @@ fn main() -> ExitCode {
             };
             commands::secrets::execute(&cmd, &ctx)
         }
+        Some(Command::Token(cmd)) => {
+            logging::init(format, &env);
+            let ctx = commands::Context {
+                env: &env,
+                config_flag: cli.config.as_deref(),
+                log_format: format,
+            };
+            commands::token::execute(&cmd, &ctx)
+        }
         Some(Command::Vault(cmd)) => {
             // `--config` and `--log-format` are global for the grammar, but the vault has fixed
             // paths (ADR 0006) and does not log: a flag that would be ignored is refused, as it

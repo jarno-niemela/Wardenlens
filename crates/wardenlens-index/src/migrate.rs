@@ -26,6 +26,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("../migrations/002_cameras.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/003_api_tokens.sql"),
+    },
 ];
 
 /// The newest version `migrations` reaches.

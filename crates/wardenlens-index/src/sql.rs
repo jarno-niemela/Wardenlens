@@ -111,6 +111,40 @@ pub(crate) const ORPHAN_CAMERAS: ReadSql = ReadSql(
     WHERE c.id IS NULL ORDER BY s.camera_id LIMIT ?1",
 );
 
+// The API tokens (ticket #65). Plain data access: nothing here hashes or compares a secret.
+
+pub(crate) const TOKEN_EXISTS: ReadSql = ReadSql("SELECT count(*) FROM api_tokens WHERE id = ?1");
+
+pub(crate) const TOKEN_COUNT: ReadSql = ReadSql("SELECT count(*) FROM api_tokens");
+
+/// ?1 id, ?2 digest, ?3 name, ?4 created at.
+pub(crate) const INSERT_TOKEN: &str = "INSERT INTO api_tokens \
+    (id, digest, name, created_at_ms) VALUES (?1, ?2, ?3, ?4)";
+
+pub(crate) const FIND_TOKEN: ReadSql =
+    ReadSql("SELECT digest, revoked FROM api_tokens WHERE id = ?1");
+
+/// ?1 the row count to fetch. `rowid` is insertion order.
+pub(crate) const LIST_TOKENS: ReadSql = ReadSql(
+    "SELECT id, name, created_at_ms, last_used_at_ms, revoked FROM api_tokens \
+    ORDER BY rowid LIMIT ?1",
+);
+
+/// ?1 id. Only an active token changes.
+pub(crate) const REVOKE_TOKEN: &str =
+    "UPDATE api_tokens SET revoked = 1 WHERE id = ?1 AND revoked = 0";
+
+/// ?1 id, ?2 now, ?3 the latest `last_used_at_ms` that still counts as old enough
+/// (`now - TOUCH_INTERVAL_MS`). The rate limit lives in this predicate.
+pub(crate) const TOUCH_TOKEN: &str = "UPDATE api_tokens SET last_used_at_ms = ?2 \
+    WHERE id = ?1 AND (last_used_at_ms IS NULL OR last_used_at_ms <= ?3)";
+
+/// Same predicate as [`TOUCH_TOKEN`] as a read, so a token used a moment ago takes no write lock.
+pub(crate) const TOKEN_TOUCH_DUE: ReadSql = ReadSql(
+    "SELECT count(*) FROM api_tokens \
+    WHERE id = ?1 AND (last_used_at_ms IS NULL OR last_used_at_ms <= ?2)",
+);
+
 // Open and migration statements.
 pub(crate) const GET_APP_ID: ReadSql = ReadSql("PRAGMA application_id");
 pub(crate) const USER_VERSION: ReadSql = ReadSql("PRAGMA user_version");

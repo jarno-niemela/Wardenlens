@@ -2123,6 +2123,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wardenlens-agentdvr",
+ "wardenlens-api",
  "wardenlens-core",
  "wardenlens-fsutil",
  "wardenlens-index",
