@@ -101,6 +101,7 @@ mod credential;
 mod document;
 mod error;
 mod identity;
+mod logins;
 mod source;
 
 #[cfg(test)]
@@ -113,6 +114,7 @@ use wardenlens_core::camera::{CameraId, Credential, DisplayName, Host, RtspPath}
 use wardenlens_core::text::normalise_display_name;
 
 pub use error::{ImportError, SkipReason};
+pub use logins::Logins;
 
 /// Longest input accepted, in bytes.
 pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -163,6 +165,8 @@ pub struct Import {
     pub cameras: Vec<CameraDraft>,
     /// The entries that were not importable, in document order.
     pub skipped: Vec<Skipped>,
+    /// The logins of every entry read, skipped ones too (redacting `Debug`).
+    pub logins: Logins,
 }
 
 /// Parses an `AgentDVR` `objects.xml`.
@@ -176,8 +180,11 @@ pub fn parse(input: &[u8]) -> Result<Import, ImportError> {
         return Err(ImportError::TooLarge);
     }
     let text = std::str::from_utf8(input).map_err(|_| ImportError::NotUtf8)?;
-    let raws = document::read(text)?;
-    let mut import = Import::default();
+    let (raws, logins) = document::read(text)?;
+    let mut import = Import {
+        logins,
+        ..Import::default()
+    };
     let mut ids = identity::IdAllocator::default();
     // Normalised name to the position of the camera that has it.
     let mut names: BTreeMap<String, usize> = BTreeMap::new();

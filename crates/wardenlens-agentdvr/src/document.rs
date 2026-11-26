@@ -13,7 +13,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use secrecy::zeroize::Zeroizing;
 
-use crate::{ImportError, MAX_CAMERAS, MAX_DEPTH, MAX_FIELD_BYTES};
+use crate::{ImportError, Logins, MAX_CAMERAS, MAX_DEPTH, MAX_FIELD_BYTES};
 
 /// One text field of `settings`, with what is needed to tell a repeat or an over-long value.
 #[derive(Default)]
@@ -75,6 +75,7 @@ struct Walker {
     stack: Vec<Node>,
     cameras: Vec<RawCamera>,
     camera_count: usize,
+    logins: Logins,
     text: Zeroizing<String>,
     text_too_long: bool,
     root_seen: bool,
@@ -87,6 +88,7 @@ impl Walker {
             stack: Vec::new(),
             cameras: Vec::new(),
             camera_count: 0,
+            logins: Logins::default(),
             text: Zeroizing::default(),
             text_too_long: false,
             root_seen: false,
@@ -182,6 +184,12 @@ impl Walker {
         if let Node::Field(f) = node {
             let text = std::mem::take(&mut self.text);
             let too_long = std::mem::take(&mut self.text_too_long);
+            // Every occurrence, before the slot keeps only one: a repeated element is skipped
+            // later, but its text must still be known.
+            match f {
+                Field::Source => self.logins.add_source(&text),
+                Field::Login | Field::Password => self.logins.add_field(&text),
+            }
             if let Some(c) = self.current_camera() {
                 let slot = slot_of(c, f);
                 slot.too_long |= too_long;
@@ -234,7 +242,7 @@ fn slot_of(c: &mut RawCamera, f: Field) -> &mut Slot {
 }
 
 /// Reads the cameras of `text` (UTF-8, BOM already removed).
-pub(crate) fn read(text: &str) -> Result<Vec<RawCamera>, ImportError> {
+pub(crate) fn read(text: &str) -> Result<(Vec<RawCamera>, Logins), ImportError> {
     let mut reader = Reader::from_str(text);
     reader.config_mut().expand_empty_elements = true;
     let mut w = Walker::new();
@@ -307,7 +315,7 @@ pub(crate) fn read(text: &str) -> Result<Vec<RawCamera>, ImportError> {
                 if !w.root_seen {
                     return Err(ImportError::NotObjects);
                 }
-                return Ok(w.cameras);
+                return Ok((w.cameras, w.logins));
             }
         }
     }

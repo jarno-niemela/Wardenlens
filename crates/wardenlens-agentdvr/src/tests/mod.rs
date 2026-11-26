@@ -10,6 +10,7 @@ mod fields;
 mod fixtures;
 mod identity;
 mod leaks;
+mod logins;
 mod props;
 mod source;
 

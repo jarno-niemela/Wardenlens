@@ -41,6 +41,38 @@ pub(crate) enum Command {
     /// Inspect the service config file.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Import cameras from another system into the registry and the service vault.
+    #[command(subcommand)]
+    Import(ImportCommand),
+    /// Manage the service key file named by `secrets.key_file` in the config.
+    #[command(subcommand)]
+    Secrets(SecretsCommand),
+}
+
+/// `wardenlens import ...`
+#[derive(Debug, Subcommand)]
+pub(crate) enum ImportCommand {
+    /// Import the cameras of an `AgentDVR` `objects.xml`.
+    ///
+    /// Each camera is registered in the index named by `database.path`; its host, display name
+    /// and login are sealed into the vault next to it with the key file `secrets.key_file`. Prints
+    /// id, host, path and status per camera, never a login. Re-running updates the same ids.
+    /// Refuses a file over 8 MiB and warns if it is world-readable (the file is never changed).
+    Agentdvr {
+        /// The `objects.xml` to read.
+        file: PathBuf,
+        /// Parse and print what would be done; write nothing (the key file is not read).
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// `wardenlens secrets ...`
+#[derive(Debug, Subcommand)]
+pub(crate) enum SecretsCommand {
+    /// Create the key file named by `secrets.key_file` from the OS random generator, mode 0600.
+    /// An existing file is never overwritten.
+    Init,
 }
 
 /// `wardenlens config ...`

@@ -20,8 +20,10 @@ thiserror = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "std"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+wardenlens-agentdvr = { path = "../wardenlens-agentdvr" }
 wardenlens-core.workspace = true
 wardenlens-fsutil = { path = "../wardenlens-fsutil" }
+wardenlens-index = { path = "../wardenlens-index" }
 wardenlens-secrets = { path = "../wardenlens-secrets" }
 wardenlens-vault = { path = "../wardenlens-vault" }
 zeroize = "1"

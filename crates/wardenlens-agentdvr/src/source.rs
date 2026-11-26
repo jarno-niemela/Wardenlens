@@ -138,6 +138,31 @@ fn userinfo_of(ui: &str) -> Option<RawUserinfo> {
     })
 }
 
+/// Lenient login candidates of a source text, with or without a scheme (see `Logins`): the part
+/// before the LAST `@` of everything after `://` (or of the whole text), not cut at a `/` or `?`,
+/// split at the first `:` into user and password; each part raw, and percent-decoded when that is
+/// valid UTF-8. Also the same for the authority-bounded userinfo, which is the true split of a
+/// well-formed URL that has a `@` further on.
+pub(crate) fn userinfo_candidates(raw: &str) -> Vec<Zeroizing<String>> {
+    let s = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    let rest = s.split_once("://").map_or(s, |(_, r)| r);
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = rest.split_at_checked(end).map_or(rest, |(a, _)| a);
+    let mut out = Vec::new();
+    for scope in [rest, authority] {
+        let Some(at) = scope.rfind('@') else { continue };
+        let userinfo = scope.split_at_checked(at).map_or("", |(u, _)| u);
+        let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+        for part in [user, password] {
+            out.push(Zeroizing::new(part.to_owned()));
+            if let Ok(decoded) = decode(part) {
+                out.push(decoded);
+            }
+        }
+    }
+    out
+}
+
 /// Percent-decoding; a `%` not followed by two hex digits stays literal. Invalid UTF-8 is
 /// refused. Every buffer is zeroised on drop.
 fn decode(s: &str) -> Result<Zeroizing<String>, SkipReason> {
