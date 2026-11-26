@@ -920,6 +920,94 @@ async fn a_finished_download_frees_its_slot() {
     }
 }
 
+/// Opens that panic for one id and serve the rest from memory.
+struct PanickyFiles(wardenlens_core::storage::MemorySegmentFiles);
+
+impl SegmentFiles for PanickyFiles {
+    type Handle = <wardenlens_core::storage::MemorySegmentFiles as SegmentFiles>::Handle;
+
+    fn open_segment(&self, id: SegmentId) -> Result<OpenedSegment<Self::Handle>, SegmentOpenError> {
+        assert!(id.as_u64() != 66, "open panicked");
+        self.0.open_segment(id)
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_open_is_500_and_frees_its_slot() {
+    let inner = wardenlens_core::storage::MemorySegmentFiles::new();
+    inner.insert(SegmentId::new(1), Tier::Hot, b"ok");
+    let store = FakeStore::default();
+    let token = Token::generate().unwrap();
+    store.add(&token, false);
+    let app = build(
+        Arc::new(store),
+        FakeDirectory::default(),
+        FakeStatus::default(),
+        FakeStorage::default(),
+        FakeLister::default(),
+        PanickyFiles(inner),
+        Limits {
+            max_downloads: 1,
+            ..LIMITS
+        },
+    );
+    let auth = format!("Bearer {}", token.expose());
+    let get = |id: u64| {
+        let req = Request::builder()
+            .uri(format!("/api/v1/recordings/{id}/file"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req)
+    };
+    for _ in 0..3 {
+        let resp = get(66).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_string(resp).await, r#"{"error":"internal_error"}"#);
+        // The single slot is free again, so the next download is served, not refused.
+        let resp = get(1).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(bytes_of(resp).await, b"ok");
+        wait_for_slot(&get).await;
+    }
+}
+
+/// The pump releases its permit a moment after the last byte; waits until a request is served.
+async fn wait_for_slot<F, Fut>(get: &F)
+where
+    F: Fn(u64) -> Fut,
+    Fut: Future<Output = Result<Response<Body>, std::convert::Infallible>>,
+{
+    for _ in 0..10_000 {
+        let resp = get(1).await.unwrap();
+        if resp.status() == StatusCode::OK {
+            let _ = bytes_of(resp).await;
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the slot was never freed");
+}
+
+#[tokio::test]
+async fn any_if_range_gets_the_full_file() {
+    let e = env();
+    e.files.put(1, Tier::Hot, b"0123456789");
+    for validator in ["\"x\"", "Wed, 21 Oct 2015 07:28:00 GMT", ""] {
+        let req = Request::builder()
+            .uri("/api/v1/recordings/1/file")
+            .header(header::AUTHORIZATION, &e.auth)
+            .header(header::RANGE, "bytes=2-3")
+            .header(header::IF_RANGE, validator)
+            .body(Body::empty())
+            .unwrap();
+        let resp = e.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{validator:?}");
+        assert_eq!(header_str(resp.headers(), header::CONTENT_RANGE), None);
+        assert_eq!(bytes_of(resp).await, b"0123456789");
+    }
+}
+
 // ---- documentation and structure --------------------------------------------------------------
 
 #[tokio::test]

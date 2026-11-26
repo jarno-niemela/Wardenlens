@@ -2,8 +2,14 @@
 //! [`SegmentIndex::list`](super::SegmentIndex::list) (ticket #62).
 //!
 //! The index itself is a synchronous, mutable port (SQLite). The API never holds it: it takes this
-//! read port as a generic, and the composition root adapts the index to it. The contract of the
-//! listing (the half-open overlap range, the order, the page size) is that of `SegmentIndex::list`.
+//! read port as a generic, and the composition root adapts the index to it.
+//!
+//! An adapter over the synchronous index must run each call on the blocking pool (SQLite blocks) and
+//! must map a cursor refusal to [`SegmentListError::InvalidCursor`], not `Failed`, or a client
+//! error becomes a `500`.
+//!
+//! The contract of the listing (the half-open overlap range, the order, the page size) is that of
+//! `SegmentIndex::list`.
 
 use std::future::Future;
 

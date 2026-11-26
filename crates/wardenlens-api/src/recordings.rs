@@ -28,6 +28,8 @@
 //! - A **multi-range** request (a comma), a unit other than `bytes`, more than one `Range`
 //!   header, or a syntactically invalid spec (`5-3`, `abc`, `-`) is **ignored**: the answer is the
 //!   full `200` (RFC 9110 section 14.2 lets a server do this).
+//! - Any `If-Range` header makes the `Range` ignored (full `200`): no `ETag` or `Last-Modified` is
+//!   issued, so no validator can match (RFC 9110 section 13.1.5).
 //! - The id is a canonical decimal (digits only, no sign, no leading zero, at most `i64::MAX`);
 //!   anything else is `400`.
 //! - Errors from the port: not found `404`, archive unavailable `503`, I/O `500`. At the download
@@ -43,6 +45,11 @@
 //! in the kernel cannot be interrupted and is not covered. At most [`MAX_DOWNLOADS`] downloads
 //! run at once; each holds its permit until the pump ends. The open handle survives a move of the
 //! segment to the other tier (POSIX semantics).
+//!
+//! The permit is taken before the open and moves into the blocking open, so a blocked open counts
+//! against the cap even if the client hangs up. Residual: a reader that takes one chunk per idle
+//! period is never cut and can hold a slot for the whole file; the cap of [`MAX_DOWNLOADS`]
+//! bounds the impact.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::pin::Pin;
@@ -54,7 +61,8 @@ use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
-    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE, RETRY_AFTER,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_RANGE, RANGE,
+    RETRY_AFTER,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -119,6 +127,7 @@ pub(crate) enum TierDto {
 pub(crate) struct SegmentDto {
     /// The segment id; the file is at `/api/v1/recordings/{id}/file`.
     id: u64,
+    /// The camera that recorded the segment.
     camera: String,
     /// Start, in UTC Unix milliseconds.
     started_at: i64,
@@ -128,6 +137,7 @@ pub(crate) struct SegmentDto {
     duration: u64,
     /// File size in bytes.
     bytes: u64,
+    /// The volume the segment was on when listed; it can move later.
     tier: TierDto,
 }
 
@@ -453,19 +463,32 @@ where
     let Ok(permit) = Arc::clone(&ports.downloads).try_acquire_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, [(RETRY_AFTER, "1")]).into_response();
     };
-    // `open_segment` does file-system calls, so it runs on the blocking pool.
+    // `open_segment` does file-system calls, so it runs on the blocking pool. The permit moves
+    // into the closure: a blocked open keeps counting against the cap even when the client hangs
+    // up and this future is dropped, and the permit is released only when the blocking work has
+    // really ended (on a panic, by unwinding).
     let files = Arc::clone(&ports.files);
-    let opened = match tokio::task::spawn_blocking(move || files.open_segment(id)).await {
-        Ok(Ok(opened)) => opened,
-        Ok(Err(SegmentOpenError::NotFound)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(SegmentOpenError::ArchiveUnavailable)) => {
+    let (permit, opened) = match tokio::task::spawn_blocking(move || {
+        let opened = files.open_segment(id);
+        (permit, opened)
+    })
+    .await
+    {
+        Ok((permit, Ok(opened))) => (permit, opened),
+        Ok((_, Err(SegmentOpenError::NotFound))) => return StatusCode::NOT_FOUND.into_response(),
+        Ok((_, Err(SegmentOpenError::ArchiveUnavailable))) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         // `Io`, a variant added later, or a panicked task: the same bare 500, no detail.
-        Ok(Err(_)) | Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok((_, Err(_))) | Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let len = opened.len();
-    let (status, start, count, content_range) = match choose_range(&headers, len) {
+    let choice = if headers.contains_key(IF_RANGE) {
+        RangeChoice::Full
+    } else {
+        choose_range(&headers, len)
+    };
+    let (status, start, count, content_range) = match choice {
         RangeChoice::Full => (StatusCode::OK, 0, len, None),
         RangeChoice::Slice { start, end } => (
             StatusCode::PARTIAL_CONTENT,
