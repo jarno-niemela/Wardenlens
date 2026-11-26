@@ -277,7 +277,7 @@ row above.
 - **Backups: the protection is conditional.** The database and the key are separate files, but the dev key
   (`~/.config`) and the dev database (`~/.local/share`) are both under `$HOME`, so a whole-home or whole-disk backup
   holds both and then gives no protection. **The key path must be excluded from backups** (#69 documents this for the
-  service key, #76 for the dev key) and the key is kept in the password manager instead (`vault key export`, below).
+  service key, #76 for the dev key: `docs/DEV_VAULT.md`) and the key is kept in the password manager instead (`vault key export`, below).
 - **Permission checks (refuse, do not warn).** `KeyFile::load` refuses a file that is not a regular file (symlinks are
   refused, `O_NOFOLLOW` plus `fstat` on our own opened descriptor, not a path check followed by an open), not owned by the
   current user, readable or writable by group or others (`mode & 0o077 != 0`), or not exactly 32 bytes. The same
@@ -723,6 +723,16 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   map (section 7) and those raw bytes are replaced. **When a hit cannot be mapped exactly** (a view character that came
   from several raw characters and lies partly inside the hit, or a joined-view match spanning a line break), `redact`
   replaces **the whole raw line** (or lines) the hit touches, never a guessed sub-range.
+  **As built (#76), which narrows the paragraph above.** The filter must stream in bounded memory (a spike pipes a
+  30-minute `ffmpeg` log through it), and a line is unbounded, so the view-and-offset-map design with a whole-line
+  fallback was not built. `redact` matches the **literal renderings** of each value (the raw value, the percent forms,
+  base64 at three alignments, hex, the XML escape, the squeezed forms, the text forms of a host, IP or MAC, and for a
+  credential the `user:password@` URL prefix), ignoring ASCII case, in a streaming Aho-Corasick pass that keeps
+  `longest needle - 1` bytes across reads. It does not apply the decoded, JSON-unescaped or joined views, so a value
+  that only appears JSON-escaped (`\u2013`) or split over a line break is not replaced; `vault scan` still finds those.
+  Every match, overlapping or touching ones merged, becomes the fixed `[REDACTED]`: no entry id and no length. Exit 0
+  done, 1 an input or output error (what was written is redacted), 2 the vault or key unusable (nothing is read or
+  written). Entries that are too short to match (`unscannable`) are listed by id on stderr and not replaced.
 - **RTSP URLs on argv (accepted spike-only exception).** The `ffmpeg`/`ffprobe` spikes pass an RTSP URL with credentials
   on argv (ADR 0002). That stays an accepted exception **for the spikes only**; the product uses `retina` with
   in-process credentials (below) and never puts a credential in a URL or on argv.

@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Shared helpers for the S1 camera spike. Source this file; do not execute it.
-# Credentials are read from the secret file at runtime and never printed.
+# Hosts and credentials come from the Wardenlens vault (ADR 0006, #76) through `wardenlens vault get`: the
+# entry id is on argv, the value is read from the command's stdout into a shell variable and never printed.
+# Output that may contain a vault value goes through `redact` (`wardenlens vault redact`, exact match).
+# The legacy secret JSON and inventory TOML are read only by `wardenlens vault import-legacy`, never here.
 # shellcheck shell=bash
 
-SECRET_FILE="${WARDENLENS_SECRET_FILE:-$HOME/.config/wardenlens/agentdvr-cameras.secret.json}"
+# The binary: `wardenlens` on PATH, or WARDENLENS_BIN (a path, for a build that is not installed).
+wl() { command "${WARDENLENS_BIN:-wardenlens}" "$@"; }
 
-# cam_field <name> <jq-field>  -> prints the raw field value; fails (non-zero) if the camera or the
-# field is missing or the camera name occurs more than once, so a missing value can never become the literal string "null".
-cam_field() {
-  jq -ej --arg n "$1" --arg f "$2" '[.[] | select(.name==$n)] | if length != 1 then error("camera not found or duplicated") else .[0] | .[$f] | select(. != null) | tostring end' "$SECRET_FILE"
+# vault_value <entry-id> [field] -> prints the value with no trailing text. Fails (non-zero, nothing printed) if the
+# vault, the key or the entry is missing. A failure is never turned into an empty or literal "null" value.
+vault_value() { # <id> [username|password]
+  if [[ -n "${2:-}" ]]; then wl vault get "$1" --field "$2"; else wl vault get "$1"; fi
 }
 
-# Camera inventory (hosts) lives outside the repo; the path is configurable.
-CAMERAS_FILE="${WARDENLENS_CAMERAS:-$HOME/.config/wardenlens/cameras.local.toml}"
-
-# cam_id <secret-file-name> -> inventory id.
+# cam_id <name-or-id> -> inventory id. The old AgentDVR display names are still accepted; anything that already
+# looks like an inventory id (lower case, digits, hyphen) is used as it is.
 cam_id() {
   case "$1" in
     IPC-BO) echo reolink-1 ;;
@@ -22,29 +24,27 @@ cam_id() {
     XR) echo xr ;;
     C110) echo tapo ;;
     HDIPC) echo hdipc ;;
-    *) echo "unknown camera" >&2; return 1 ;;
+    *)
+      if [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]; then echo "$1"; else echo "unknown camera" >&2; return 1; fi ;;
   esac
 }
 
-# cam_toml <name> <key> -> value from the inventory (empty if absent).
-cam_toml() {
-  python3 -I -c '
-import sys, tomllib
-d = tomllib.load(open(sys.argv[1], "rb"))
-print(d["cameras"][sys.argv[2]].get(sys.argv[3], ""))' "$CAMERAS_FILE" "$(cam_id "$1")" "$2"
+# cam_host <name> -> bare host from the vault (entry cam:<id>:host).
+cam_host() {
+  local id
+  id="$(cam_id "$1")" || return 1
+  vault_value "cam:$id:host"
 }
 
-# cam_host <name> -> bare host from the inventory.
-cam_host() { cam_toml "$1" host; }
-
-# cam_onvif_url <name> -> ONVIF device service URL (port from inventory, else from the secret file).
+# cam_onvif_url <name> -> ONVIF device service URL. The port is public configuration, not a vault value: it is
+# ONVIF_PORT if set, else the optional vault entry cam:<id>:onvif_port (set it with `vault set --kind other`), else none.
 cam_onvif_url() {
-  local port
-  port="$(cam_toml "$1" onvif_port)"
-  if [[ -z "$port" ]]; then
-    port="$(cam_field "$1" onvif 2>/dev/null | sed -nE 's#^https?://[^:/]+:([0-9]+)/.*#\1#p' || true)"
-  fi
-  printf 'http://%s%s/onvif/device_service' "$(cam_host "$1")" "${port:+:$port}"
+  local port="${ONVIF_PORT:-}" id host
+  id="$(cam_id "$1")" || return 1
+  if [[ -z "$port" ]]; then port="$(vault_value "cam:$id:onvif_port" 2>/dev/null || true)"; fi
+  [[ -z "$port" || $port =~ ^[0-9]{1,5}$ ]] || { echo "onvif port is not a number" >&2; return 1; }
+  host="$(cam_host "$1")" && [[ -n "$host" ]] || { echo "no host for camera: $1" >&2; return 1; }
+  printf 'http://%s%s/onvif/device_service' "$host" "${port:+:$port}"
 }
 
 # pullpoint_ok <addr> <origin> -> 0 only if <addr> is an http(s) URL on exactly the host of <origin> (any port, no
@@ -63,21 +63,25 @@ pullpoint_ok() {
   [[ $rest =~ $port_re ]]
 }
 
-# cam_creds <name> -> sets CAM_USER and CAM_PASS (shell variables only).
+# cam_creds <name> -> sets CAM_USER and CAM_PASS (shell variables only), from the vault entry cam:<id>:credential.
 cam_creds() {
+  local id
   CAM_USER="" CAM_PASS=""
+  id="$(cam_id "$1")" || { echo "unknown camera: $1" >&2; return 1; }
   # A trailing "x" sentinel keeps trailing newlines, which $(...) would otherwise strip silently.
-  CAM_USER="$(cam_field "$1" login && printf x)" || { echo "unknown camera or missing login: $1" >&2; return 1; }
+  CAM_USER="$(vault_value "cam:$id:credential" username && printf x)" || { echo "no credential in the vault for camera: $1" >&2; CAM_USER=""; return 1; }
   CAM_USER="${CAM_USER%x}"
-  # A camera without a password is allowed (empty), but an unknown camera is not (caught above).
-  CAM_PASS="$(cam_field "$1" password 2>/dev/null && printf x)" && CAM_PASS="${CAM_PASS%x}" || CAM_PASS=""
+  # A credential entry has both fields (the password may be empty); a failure here is a failure, not "".
+  CAM_PASS="$(vault_value "cam:$id:credential" password && printf x)" || { echo "no password in the vault for camera: $1" >&2; CAM_USER="" CAM_PASS=""; return 1; }
+  CAM_PASS="${CAM_PASS%x}"
 }
 
 # uri_enc <string> -> percent-encoded string. The value goes to jq on stdin, never on argv.
 uri_enc() { printf '%s' "$1" | jq -rRs '@uri'; }
 
 # rtsp_url <name> <path> -> full URL including credentials. Never print this;
-# pass it only to a tool, and print redact()ed output.
+# pass it only to a tool, and print redact()ed output. The URL is on the ffmpeg/ffprobe argv: the accepted
+# spike-only exception of ADR 0002 (those tools take the credentials nowhere else).
 rtsp_url() {
   local host
   cam_creds "$1" || return 1
@@ -85,27 +89,22 @@ rtsp_url() {
   printf 'rtsp://%s:%s@%s:554%s' "$(uri_enc "$CAM_USER")" "$(uri_enc "$CAM_PASS")" "$host" "$2"
 }
 
-# redact: stdin filter. Masks URL userinfo (up to the last "@" of the token, case-insensitive scheme,
-# scheme kept), IPv4/IPv6 addresses, MAC addresses and serial/hardware-id values.
+# redact: stdin filter, `wardenlens vault redact`: every value in the vault (in the percent, base64, hex and URL
+# userinfo renderings the leak scan knows) becomes [REDACTED]. Fails closed: if the binary or the vault is missing
+# or unusable nothing is written and the exit status is non-zero, so unredacted output never reaches a log.
+# Only vault values are masked; add what must not appear (a serial number, a MAC) to the vault.
 redact() {
-  local h='[0-9A-Fa-f]{1,4}'
-  sed -uE \
-    -e 's#(rtsps?|https?)://[^ ]*@#\1://***@#Ig' \
-    -e 's#[0-9]{1,3}(\.[0-9]{1,3}){3}#<host>#g' \
-    -e 's#([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}#<mac>#g' \
-    -e "s#(^|[^0-9A-Za-z_:])($h:){7}$h#\1<ip6>#g" \
-    -e "s#(^|[^0-9A-Za-z_:])($h:){1,7}:($h(:$h){0,6})?#\1<ip6>#g" \
-    -e "s#(^|[^0-9A-Za-z_:])::$h(:$h){0,6}#\1<ip6>#g" \
-    -e 's#(<[A-Za-z0-9_:]*(serial[ _]?number|hardware[ _]?id)[^<>]*>)[^<]+#\1<redacted>#Ig' \
-    -e "s#((serial[ _]?number|hardware[ _]?id)[\"']? *[:=] *[\"']?)[^\"', }&<]+#\1<redacted>#Ig"
+  wl vault redact || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
-# Vendor RTSP paths (main|sub) by camera name; the name list is the secret file's.
+# Vendor RTSP paths (main|sub) by camera; accepts a display name or an inventory id.
 rtsp_path() { # <name> <main|sub>
-  case "$1" in
-    IPC-BO*) [[ $2 == main ]] && echo /h264Preview_01_main || echo /h264Preview_01_sub ;;
-    XR) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
-    C110) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
-    HDIPC) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
+  local id
+  id="$(cam_id "$1")" || return 1
+  case "$id" in
+    reolink-*) [[ $2 == main ]] && echo /h264Preview_01_main || echo /h264Preview_01_sub ;;
+    xr) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
+    tapo) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
+    hdipc) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
   esac
 }

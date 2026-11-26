@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,7 @@ struct Fake {
     stdout: StdoutKind,
     prompts: VecDeque<Vec<u8>>,
     piped: Vec<u8>,
+    drip: Drip,
     out: Vec<u8>,
     err: Vec<u8>,
 }
@@ -36,6 +37,7 @@ impl Fake {
             stdout: StdoutKind::Pipe,
             prompts: VecDeque::new(),
             piped: Vec::new(),
+            drip: Drip::default(),
             out: Vec::new(),
             err: Vec::new(),
         }
@@ -54,6 +56,16 @@ impl Fake {
         self
     }
 
+    /// Stdin for a streaming command, handed out `n` bytes per read.
+    fn with_stream(mut self, bytes: &[u8], n: usize) -> Self {
+        self.drip = Drip {
+            data: bytes.to_vec(),
+            pos: 0,
+            n,
+        };
+        self
+    }
+
     fn with_prompts(mut self, lines: &[&str]) -> Self {
         self.prompts = lines.iter().map(|l| l.as_bytes().to_vec()).collect();
         self
@@ -65,6 +77,24 @@ impl Fake {
 
     fn err(&self) -> String {
         String::from_utf8(self.err.clone()).unwrap()
+    }
+}
+
+/// A reader that returns at most `n` bytes per call.
+#[derive(Default)]
+struct Drip {
+    data: Vec<u8>,
+    pos: usize,
+    n: usize,
+}
+
+impl Read for Drip {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let rest = self.data.get(self.pos..).unwrap_or_default();
+        let k = rest.len().min(self.n.max(1)).min(buf.len());
+        buf[..k].copy_from_slice(&rest[..k]);
+        self.pos = self.pos.saturating_add(k);
+        Ok(k)
     }
 }
 
@@ -88,6 +118,9 @@ impl Terminal for Fake {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "too long"));
         }
         Ok(Zeroizing::new(std::mem::take(&mut self.piped)))
+    }
+    fn stream(&mut self) -> (&mut dyn Read, &mut dyn Write) {
+        (&mut self.drip, &mut self.out)
     }
     fn out(&mut self) -> &mut dyn Write {
         &mut self.out
@@ -1668,6 +1701,12 @@ impl Write for Fails {
     }
 }
 
+impl Read for Fails {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other("closed"))
+    }
+}
+
 impl Terminal for Broken {
     fn stdin_is_tty(&self) -> bool {
         false
@@ -1680,6 +1719,9 @@ impl Terminal for Broken {
     }
     fn read_piped(&mut self, _: usize) -> io::Result<Zeroizing<Vec<u8>>> {
         Ok(Zeroizing::new(Vec::new()))
+    }
+    fn stream(&mut self) -> (&mut dyn Read, &mut dyn Write) {
+        (&mut self.1, &mut self.0)
     }
     fn out(&mut self) -> &mut dyn Write {
         &mut self.0
@@ -1735,3 +1777,5 @@ fn an_output_error_exits_two_not_one() {
     let e = super::scan::run(&scan_args(&f), &h.paths(), &mut Broken(Fails, Fails)).unwrap_err();
     assert_eq!(e.exit_code(), 2, "{e:?}");
 }
+
+mod redact;

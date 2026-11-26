@@ -13,44 +13,33 @@ ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
-export HOME="$fx/home"; mkdir -p "$HOME"   # the real ~/.config is never read
-# secret <json-array> : (re)write the fake secret file
-secret() { printf '%s' "$1" >"$fx/secret.json"; }
+export HOME="$fx/home"; mkdir -p "$HOME"   # the real ~/.config and ~/.local/share are never read
+# shellcheck source=vault_stub.sh
+source "$here/tests/vault_stub.sh"
+# secret <json-array of {name,login,password}>: (re)write the stub vault's credential entries.
+secret() {
+  no_entries; printf '[]' >"$VAULT_STUB/.redact"
+  local n u pw
+  n=$(jq 'length' <<<"$1")
+  for ((i = 0; i < n; i++)); do
+    # jq -j and a sentinel keep a trailing newline in the value.
+    u="$(jq -j ".[$i].login // \"\"" <<<"$1"; printf x)"; pw="$(jq -j ".[$i].password // \"\"" <<<"$1"; printf x)"
+    cred "$(jq -r ".[$i].name" <<<"$1")" "${u%x}" "${pw%x}"
+  done
+  for c in IPC-BO "IPC-BO (2)" XR C110 HDIPC; do hosts_for "$c"; done
+}
+hosts_for() { case "$1" in IPC-BO) host "$1" 10.0.0.1 ;; "IPC-BO (2)") host "$1" 10.0.0.2 ;; XR) host "$1" "127.0.0.1:${PORT:-1}" ;; C110) host "$1" 10.0.0.4 ;; HDIPC) host "$1" "${HDIPC_HOST:-10.0.0.5}" ;; esac; }
 secret '[{"name":"XR","login":"admin","password":"x"},{"name":"C110","login":"admin","password":"x"},
  {"name":"HDIPC","login":"admin","password":"x"}]'
-cat >"$fx/cameras.toml" <<'T'
-[cameras.reolink-1]
-host = "10.0.0.1"
-[cameras.reolink-2]
-host = "10.0.0.2"
-[cameras.xr]
-host = "127.0.0.1:PORT"
-[cameras.tapo]
-host = "10.0.0.4"
-onvif_port = 2020
-[cameras.hdipc]
-host = "10.0.0.5"
-onvif_port = 8000
-T
-export WARDENLENS_SECRET_FILE="$fx/secret.json" WARDENLENS_CAMERAS="$fx/cameras.toml"
-mkdir -p "$fx/bin"; export PATH="$fx/bin:$PATH"
 # shellcheck source=../lib.sh
 source "$here/lib.sh"
 
 # ============================== redact ==============================
 R() { printf '%s\n' "$1" | redact; }
-r=$(R 'RTSPS://admin:s3cr3t@cam.lan/x'); check "redact: upper-case RTSPS masked, scheme kept" '[[ $r != *s3cr3t* && $r == RTSPS://***@* ]]'
-r=$(R 'HtTpS://u:s3cr3t@h/'); check "redact: mixed-case HtTpS masked" '[[ $r != *s3cr3t* ]]'
-r=$(R 'rtsp://admin:a/b@c@cam.lan:554/x tail'); check "redact: raw '/' and '@' in password masked up to last @" '[[ $r != *a/b* && $r != *c@* && $r == *cam.lan:554/x\ tail ]]'
-r=$(R '"url":"rtsp://admin:s3cr3t@cam.lan/x"'); check "redact: quoted URL masked" '[[ $r != *s3cr3t* ]]'
-r=$(R 'a AA-BB-CC-DD-EE-FF b 0a:1b:2c:3d:4e:5f c'); check "redact: MAC upper/dash and lower/colon" '[[ $r != *AA-BB* && $r != *0a:1b* && $r == "a <mac> b <mac> c" ]]'
-for v6 in '2001:db8::1' '::1' 'FD00::ABCD:5' '2001:0db8:0000:0000:0000:ff00:0042:8329' '[2001:db8:85a3::8a2e:370:7334]:80' '::ffff:10.0.0.1'; do
-  r=$(R "x $v6 y"); check "redact: IPv6 $v6 masked" '[[ $r != *db8* && $r != *abcd* && $r != *ABCD* && $r != *8329* && $r != *7334* && $r != *ffff* && $r != *::1* ]]'
-done
-r=$(R '<tt:HardwareId>HW-77</tt:HardwareId> <SerialNumber xmlns="urn:x">SN-11</SerialNumber> serialNumber: "SN-22" SERIALNUMBER=SN-33')
-check "redact: HardwareId/SerialNumber (ns attr, Debug, upper-case) masked" '[[ $r != *HW-77* && $r != *SN-11* && $r != *SN-22* && $r != *SN-33* ]]'
-r=$(R 'serial_number: "SN-44"'); check "redact: snake_case serial_number masked (Rust Debug output)" '[[ $r != *SN-44* ]]'
-# No over-redaction of ordinary log text.
+secret '[{"name":"XR","login":"admin","password":"s3cr3t-pw"}]'
+redact_add "admin:s3cr3t-pw@"; redact_add "aa:bb:cc:dd:ee:ff"; redact_add "fd00::5"
+r=$(R 'RTSPS://admin:s3cr3t-pw@cam.lan/x'); check "redact: userinfo removed" '[[ $r != *s3cr3t* ]]'
+r=$(R 'a aa:bb:cc:dd:ee:ff b fd00::5 c'); check "redact: vault MAC and IPv6 removed" '[[ $r == "a [REDACTED] b [REDACTED] c" ]]'
 for txt in 'frame=  250 fps= 25 q=-1.0 size=N/A time=00:00:10.00 bitrate=N/A speed=1.0x' \
   '[rtsp @ 0x55d4c3a0b2c0] method DESCRIBE failed: 401 Unauthorized' \
   'see http://cam.lan/onvif/device_service and mail ops@example.org' \
@@ -59,21 +48,27 @@ for txt in 'frame=  250 fps= 25 q=-1.0 size=N/A time=00:00:10.00 bitrate=N/A spe
   r=$(R "$txt"); check "redact: leaves ordinary text intact: $txt" '[[ $r == "$txt" ]]'
 done
 
-# ============================== cam_field / cam_creds / rtsp_url ==============================
-secret '[{"name":"XR","login":null,"password":"p"},{"name":"C110","login":"","password":null},
- {"name":"HDIPC","login":"a","password":"p1"},{"name":"HDIPC","login":"b","password":"p2"}]'
-check "cam_creds: explicit null login is an error" '! cam_creds XR 2>/dev/null'
+# ============================== cam_creds / rtsp_url ==============================
+secret '[{"name":"XR","login":"","password":"p"},{"name":"C110","login":"","password":""}]'
 cam_creds C110 2>/dev/null; rc=$?
-check "cam_creds: empty login + null password -> ok, empty strings" '[[ $rc == 0 && -z $CAM_USER && -z $CAM_PASS ]]'
-cam_creds HDIPC 2>/dev/null; rc=$?
-check "cam_creds: duplicate camera entries are an error, not a multi-line user" '[[ $rc != 0 || $CAM_USER != *$'"'"'\n'"'"'* ]]'
-check "cam_creds: missing secret file is an error" '! (SECRET_FILE=/nonexistent; cam_creds C110) 2>/dev/null'
+check "cam_creds: empty login and password entries -> ok, empty strings" '[[ $rc == 0 && -z $CAM_USER && -z $CAM_PASS ]]'
 secret '[{"name":"C110","login":"admin","password":"p"}]'
 # Callers use url="$(rtsp_url ...)" under set -e; errexit is not inherited by command substitution.
 o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url XR /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
-check "rtsp_url in \$(...): camera missing from secret file aborts the caller (no credential-less URL)" '[[ $rc != 0 && $o != *URL=* ]]'
+check "rtsp_url in \$(...): camera missing from the vault aborts the caller (no credential-less URL)" '[[ $rc != 0 && $o != *URL=* ]]'
 o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url NOPE /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
 check "rtsp_url in \$(...): unknown camera aborts the caller" '[[ $rc != 0 && $o != *URL=* ]]'
+secret '[{"name":"XR","login":"a","password":"p"}]'; rm "$VAULT_STUB/cam_xr_host"
+o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url XR /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
+check "rtsp_url: no host entry aborts the caller" '[[ $rc != 0 && $o != *URL=* ]]'
+
+# ============================== cam_onvif_url ==============================
+secret '[{"name":"C110","login":"a","password":"p"}]'
+check "cam_onvif_url: no port configured -> default port" '[[ $(cam_onvif_url C110) == http://10.0.0.4/onvif/device_service ]]'
+vault_put cam:tapo:onvif_port 2020
+check "cam_onvif_url: port from the vault entry" '[[ $(cam_onvif_url C110) == http://10.0.0.4:2020/onvif/device_service ]]'
+check "cam_onvif_url: ONVIF_PORT overrides" '[[ $(ONVIF_PORT=8000 cam_onvif_url C110) == http://10.0.0.4:8000/onvif/device_service ]]'
+check "cam_onvif_url: a non-numeric port is refused" '! ONVIF_PORT="80/../x" cam_onvif_url C110 2>/dev/null'
 
 # ============================== dahua.sh ==============================
 # Capture what curl parsed from -K: swap --digest for --basic and decode Basic auth at a local server.
@@ -81,7 +76,7 @@ real_curl=$(command -v curl)
 printf '#!/usr/bin/env bash\na=(); for x in "$@"; do [[ $x == --digest ]] && x=--basic; a+=("$x"); done\necho called >>%q\nexec %q "${a[@]}"\n' \
   "$fx/curl.called" "$real_curl" >"$fx/bin/curl"; chmod +x "$fx/bin/curl"
 port=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-sed -i "s/PORT/$port/" "$fx/cameras.toml"
+PORT=$port
 serve() {
   python3 -I -c '
 import socket,base64,sys
@@ -143,6 +138,7 @@ esac
 S
 chmod +x "$fx/s1/onvif.sh"
 secret '[{"name":"HDIPC","login":"admin","password":"p"},{"name":"C110","login":"admin","password":"p"}]'
+ONVIF_PORT=8000; export ONVIF_PORT; redact_add "aa:bb:cc:dd:ee:ff"; redact_add "fd00::5"
 pull() { # <cam> <addr> -> 0 if the address was followed
   : >"$fx/pp.log"; PP_LOG="$fx/pp.log" PP_ADDR="$2" timeout 10 "$fx/s1/onvif_pull.sh" "$1" 1 >"$fx/pp.out" 2>&1
   [[ -s $fx/pp.log ]]
@@ -161,7 +157,7 @@ done
 pull HDIPC http://10.0.0.5:8000/onvif/pp
 check "onvif_pull: control chars stripped from camera text" '! grep -q $'"'"'\x1b'"'"' "$fx/pp.out" && ! grep -q $'"'"'\x07'"'"' "$fx/pp.out"'
 check "onvif_pull: MAC / IPv6 in event text are masked" '! grep -qE "aa:bb:cc|fd00::5" "$fx/pp.out"'
-sed -i 's/^host = "10.0.0.5"/host = "[fd00::5]"/' "$fx/cameras.toml"
+HDIPC_HOST="[fd00::5]"; hosts_for HDIPC
 check "onvif_pull: IPv6 camera, same origin is followed" 'pull HDIPC "http://[fd00::5]:8000/onvif/pp"'
 check "onvif_pull: IPv6 camera, other host refused" '! pull HDIPC "http://[fd00::6]:8000/onvif/pp"'
 
