@@ -19,6 +19,7 @@ use wardenlens_core::camera::{
     LinkStatus, ModelRef, RtspPath, StreamSet,
 };
 use wardenlens_core::connection::FailureKind;
+use wardenlens_core::storage::{StorageSnapshot, StorageStatus, StorageStatusError};
 use wardenlens_core::token_store::{TokenId, TokenRecord, TokenStore, TokenStoreError};
 
 #[derive(Default)]
@@ -53,6 +54,15 @@ impl CameraDirectory for Dir {
     }
 }
 
+/// The storage port is not under test here.
+struct NoStorage;
+
+impl StorageStatus for NoStorage {
+    fn snapshot(&self) -> impl Future<Output = Result<StorageSnapshot, StorageStatusError>> + Send {
+        std::future::ready(Ok(StorageSnapshot::initial()))
+    }
+}
+
 #[derive(Default)]
 struct St(HashMap<String, LinkStatus>);
 
@@ -73,7 +83,7 @@ fn app(dir: Dir, st: St) -> (Router, String) {
         },
     );
     (
-        router(Arc::new(store), dir, st),
+        router(Arc::new(store), dir, st, NoStorage),
         format!("Bearer {}", token.expose()),
     )
 }

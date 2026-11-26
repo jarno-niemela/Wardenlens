@@ -7,6 +7,7 @@
 mod files;
 mod index;
 mod plan;
+mod status;
 mod types;
 
 #[cfg(test)]
@@ -31,6 +32,10 @@ pub use index::{
 };
 pub use plan::{
     Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,
+};
+pub use status::{
+    ArchiveCondition, ArchiveUnavailableCause, StorageSnapshot, StorageStatus, StorageStatusError,
+    TickErrorKind, TierStatus, VolumeStatus, free_percent,
 };
 pub use types::{
     ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, MinFreePercent, MinFreePercentError, Policy,

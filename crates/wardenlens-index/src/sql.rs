@@ -62,6 +62,12 @@ pub(crate) const OLDEST: ReadSql = ReadSql(
     WHERE tier = ?1 AND (ended_at_ms, id) > (?2, ?3) ORDER BY ended_at_ms, id LIMIT ?4",
 );
 
+/// ?1 tier. The last row of [`OLDEST`]'s order.
+pub(crate) const NEWEST: ReadSql = ReadSql(
+    "SELECT id, tier, bytes, ended_at_ms FROM segments \
+    WHERE tier = ?1 ORDER BY ended_at_ms DESC, id DESC LIMIT 1",
+);
+
 pub(crate) const BYTES_BY_TIER: ReadSql = ReadSql(
     "SELECT tier, SUM(bytes), COUNT(*), MIN(bytes), MAX(bytes) FROM segments GROUP BY tier",
 );

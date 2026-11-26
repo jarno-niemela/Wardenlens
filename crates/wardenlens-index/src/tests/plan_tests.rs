@@ -87,6 +87,18 @@ fn oldest_searches_the_tier_end_index_without_a_sort() {
 }
 
 #[test]
+fn newest_searches_the_tier_end_index_without_a_sort() {
+    let (_f, idx) = populated();
+    let p = plan(&idx, sql::NEWEST, &[&0_i64]);
+    assert!(
+        p.iter()
+            .any(|l| l.contains("INDEX segments_tier_end (tier=?)")),
+        "{p:?}"
+    );
+    no_scan_or_sort(&p);
+}
+
+#[test]
 fn bytes_by_tier_scans_the_covering_index() {
     let (_f, idx) = populated();
     let p = plan(&idx, sql::BYTES_BY_TIER, &[]);

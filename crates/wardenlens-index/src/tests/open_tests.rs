@@ -691,3 +691,178 @@ fn a_hard_linked_main_file_is_refused_untouched_whether_empty_or_in_use() {
     }
     drop(idx);
 }
+
+// ---- #175: a concurrent last close deletes the sidecars while we classify -------------------
+
+use crate::open::{MAX_CLASSIFY_ATTEMPTS, Stage};
+
+fn open_hooked(f: &Fixture, mut hook: impl FnMut(Stage)) -> Result<Index, IndexError> {
+    Index::open_with_hooks(
+        &f.path,
+        crate::migrate::MIGRATIONS,
+        || {},
+        crate::open::BUSY_TIMEOUT,
+        &mut hook,
+    )
+}
+
+fn row_count(idx: &Index, camera: &str) -> usize {
+    use wardenlens_core::storage::SegmentIndex;
+    idx.list(&cam(camera), ts(0), ts(i64::MAX), 1000, None)
+        .unwrap()
+        .items
+        .len()
+}
+
+/// An index with a live `-wal` holding three rows, still open.
+fn live_index_with_wal() -> (Fixture, Index) {
+    let (f, mut idx) = open_new();
+    for k in 0..3 {
+        idx.insert(&rec("c", BASE + k * 10_000, 1000, 10, 1), Tier::Hot)
+            .unwrap();
+    }
+    assert!(std::fs::metadata(sidecar(&f, "-wal")).unwrap().len() > 0);
+    (f, idx)
+}
+
+#[test]
+fn a_last_close_between_the_sidecar_read_and_the_open_is_reread_and_the_open_succeeds() {
+    let (f, idx) = live_index_with_wal();
+    let mut live = Some(idx);
+    let mut calls = Vec::new();
+    let opened = open_hooked(&f, |stage| {
+        calls.push(stage);
+        if stage == Stage::AfterRead(0) {
+            // The last connection closes: checkpoint, then `-wal` and `-shm` are deleted.
+            drop(live.take());
+            assert!(!sidecar(&f, "-wal").exists());
+        }
+    })
+    .unwrap();
+    assert_eq!(row_count(&opened, "c"), 3, "the checkpoint kept every row");
+    assert_eq!(
+        calls,
+        [
+            Stage::BeforeRead(0),
+            Stage::AfterRead(0),
+            Stage::BeforeRead(1),
+            Stage::AfterRead(1)
+        ],
+        "exactly one retry"
+    );
+}
+
+#[test]
+fn a_wal_removed_by_hand_between_read_and_open_is_reread_too() {
+    // The literal window of #175: `-wal` and `-shm` deleted between the read and the open.
+    let (f, idx) = live_index_with_wal();
+    let mut live = Some(idx);
+    let opened = open_hooked(&f, |stage| {
+        if stage == Stage::AfterRead(0) {
+            drop(live.take());
+            // Put the settled state back, then delete again, as the closer does.
+            std::fs::write(sidecar(&f, "-wal"), b"").unwrap();
+            chmod(&sidecar(&f, "-wal"), 0o600);
+            std::fs::remove_file(sidecar(&f, "-wal")).unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(row_count(&opened, "c"), 3);
+}
+
+#[test]
+fn sidecars_that_keep_changing_end_in_a_typed_error_after_the_bound() {
+    let (f, idx) = live_index_with_wal();
+    let wal = std::fs::read(sidecar(&f, "-wal")).unwrap();
+    drop(idx);
+    let main_before = std::fs::read(&f.path).unwrap();
+    let mut reads = 0;
+    let err = open_hooked(&f, |stage| match stage {
+        Stage::BeforeRead(_) => {
+            reads += 1;
+            write_private(&sidecar(&f, "-wal"), &wal);
+        }
+        Stage::AfterRead(_) => std::fs::remove_file(sidecar(&f, "-wal")).unwrap(),
+    })
+    .unwrap_err();
+    assert!(matches!(err, IndexError::SidecarsChanging), "{err:?}");
+    assert_eq!(reads, MAX_CLASSIFY_ATTEMPTS);
+    assert_eq!(main_before, std::fs::read(&f.path).unwrap());
+    assert!(f.path.exists(), "an existing index is never discarded");
+}
+
+#[test]
+fn a_stray_pair_seen_across_a_close_is_reclassified_not_refused() {
+    // An empty `-journal` next to an index is a stray sidecar; if it is gone by the time the
+    // refusal is made, that verdict described a state that no longer exists.
+    let (f, idx) = open_new();
+    drop(idx);
+    write_private(&sidecar(&f, "-journal"), b"");
+    let opened = open_hooked(&f, |stage| {
+        if stage == Stage::AfterRead(0) {
+            std::fs::remove_file(sidecar(&f, "-journal")).unwrap();
+        }
+    });
+    assert!(opened.is_ok(), "{:?}", opened.err());
+}
+
+#[test]
+fn a_refusal_with_unchanged_sidecars_is_final_and_not_retried() {
+    let (f, idx) = open_new();
+    drop(idx);
+    write_private(&sidecar(&f, "-journal"), b"");
+    let mut reads = 0;
+    let err = open_hooked(&f, |stage| {
+        if matches!(stage, Stage::BeforeRead(_)) {
+            reads += 1;
+        }
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, IndexError::StraySidecar { suffix: "-journal" }),
+        "{err:?}"
+    );
+    assert_eq!(reads, 1);
+    assert!(sidecar(&f, "-journal").exists());
+}
+
+#[test]
+fn a_file_populated_by_another_opener_is_not_discarded_by_a_refusal() {
+    // We create the empty file, then another opener populates it (here: a copy of a real index)
+    // and a refusal reaches `discard_if_created`. A populated index must never be unlinked.
+    let donor = open_new();
+    let donor_bytes = {
+        let (f, idx) = donor;
+        drop(idx);
+        std::fs::read(&f.path).unwrap()
+    };
+    let f = fixture();
+    let err = open_hooked(&f, |stage| {
+        if stage == Stage::BeforeRead(0) {
+            // Populate our inode in place, and leave an empty `-journal`: refused as stray.
+            std::fs::write(&f.path, &donor_bytes).unwrap();
+            write_private(&sidecar(&f, "-journal"), b"");
+        }
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, IndexError::StraySidecar { suffix: "-journal" }),
+        "{err:?}"
+    );
+    assert_eq!(donor_bytes, std::fs::read(&f.path).unwrap());
+}
+
+#[test]
+fn a_file_replaced_after_creation_is_not_discarded_by_a_refusal() {
+    let f = fixture();
+    write_private(&sidecar(&f, "-journal"), b"");
+    let err = open_hooked(&f, |stage| {
+        if stage == Stage::BeforeRead(0) {
+            std::fs::rename(&f.path, f.path.with_extension("old")).unwrap();
+            write_private(&f.path, b"");
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(err, IndexError::StraySidecar { .. }), "{err:?}");
+    assert!(f.path.exists(), "the file now at the path is not ours");
+}

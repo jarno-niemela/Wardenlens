@@ -8,6 +8,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::io::Errno;
@@ -174,11 +175,23 @@ impl ArchiveSlot {
 pub struct RealFs {
     hot: Arc<RootDir>,
     archive: Arc<ArchiveSlot>,
+    quarantined: Arc<AtomicU64>,
 }
 
 impl RealFs {
-    pub(crate) fn new(hot: Arc<RootDir>, archive: Arc<ArchiveSlot>) -> Self {
-        Self { hot, archive }
+    /// `quarantined` is bumped on every file this `Fs` moves into a quarantine: the one choke
+    /// point every quarantine (move, delete, source, reconciliation) goes through, so the status
+    /// count cannot miss a site.
+    pub(crate) fn new(
+        hot: Arc<RootDir>,
+        archive: Arc<ArchiveSlot>,
+        quarantined: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            hot,
+            archive,
+            quarantined,
+        }
     }
 
     fn root(&self, tier: Tier) -> Result<Arc<RootDir>, FsError> {
@@ -245,7 +258,16 @@ impl Fs for RealFs {
     }
 
     fn quarantine(&self, tier: Tier, comps: &[&str]) -> Result<QuarantineOutcome, FsError> {
-        wardenlens_fsutil::quarantine(&*self.root(tier)?, comps)
+        let outcome = wardenlens_fsutil::quarantine(&*self.root(tier)?, comps)?;
+        // `Exhausted` left the file in place: nothing was quarantined.
+        if matches!(outcome, QuarantineOutcome::Moved { .. }) {
+            let _ = self
+                .quarantined
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_add(1))
+                });
+        }
+        Ok(outcome)
     }
 
     fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Listing, FsError> {

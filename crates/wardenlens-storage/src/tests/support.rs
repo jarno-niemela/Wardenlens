@@ -33,6 +33,7 @@ pub(crate) struct IdxFaults {
     pub(crate) get: bool,
     pub(crate) delete: bool,
     pub(crate) oldest: bool,
+    pub(crate) newest: bool,
     pub(crate) totals: bool,
     /// The next `n` inserts fail.
     pub(crate) insert_failures: u32,
@@ -131,6 +132,10 @@ impl SegmentIndex for TestIndex {
     ) -> Result<Vec<StoredSegment>, Self::Error> {
         self.faulty(|f| f.oldest)?;
         Ok(self.with(|i| i.oldest(tier, after, n))?)
+    }
+    fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, Self::Error> {
+        self.faulty(|f| f.newest)?;
+        Ok(self.with(|i| i.newest(tier))?)
     }
     fn bytes_by_tier(&self) -> Result<TierTotals, Self::Error> {
         self.faulty(|f| f.totals)?;

@@ -14,6 +14,7 @@ use tower::ServiceExt as _;
 use wardenlens_core::camera::{
     Camera, CameraDirectory, CameraId, CameraStatus, Credential, DirectoryError, LinkStatus,
 };
+use wardenlens_core::storage::{StorageSnapshot, StorageStatus, StorageStatusError};
 use wardenlens_core::token_store::{TokenId, TokenRecord, TokenStore, TokenStoreError};
 
 use super::{LIMITS, Limits, build, with_layers};
@@ -94,6 +95,31 @@ impl CameraStatus for FakeStatus {
     }
 }
 
+/// Synthetic storage status: a fixed snapshot, or a failure.
+struct FakeStorage {
+    snapshot: StorageSnapshot,
+    fail: bool,
+}
+
+impl Default for FakeStorage {
+    fn default() -> Self {
+        Self {
+            snapshot: StorageSnapshot::initial(),
+            fail: false,
+        }
+    }
+}
+
+impl StorageStatus for FakeStorage {
+    fn snapshot(&self) -> impl Future<Output = Result<StorageSnapshot, StorageStatusError>> + Send {
+        std::future::ready(if self.fail {
+            Err(StorageStatusError)
+        } else {
+            Ok(self.snapshot)
+        })
+    }
+}
+
 fn app_with(store: FakeStore) -> (Router, Token) {
     let token = Token::generate().unwrap();
     store.add(&token, false);
@@ -102,6 +128,7 @@ fn app_with(store: FakeStore) -> (Router, Token) {
             Arc::new(store),
             FakeDirectory::default(),
             FakeStatus::default(),
+            FakeStorage::default(),
             LIMITS,
         ),
         token,
@@ -175,7 +202,8 @@ async fn openapi_lists_every_route_and_declares_bearer_scheme() {
             "/api/v1/cameras",
             "/api/v1/cameras/{id}",
             "/api/v1/health",
-            "/api/v1/openapi.json"
+            "/api/v1/openapi.json",
+            "/api/v1/storage"
         ]
     );
     let scheme = &doc["components"]["securitySchemes"]["bearer"];
@@ -195,6 +223,7 @@ async fn all_authentication_failures_look_identical() {
         Arc::new(store),
         FakeDirectory::default(),
         FakeStatus::default(),
+        FakeStorage::default(),
         LIMITS,
     );
     let unknown = Token::generate().unwrap();
@@ -591,3 +620,4 @@ async fn undocumented_path_is_never_served() {
 
 mod adversary;
 mod cameras;
+mod storage;
