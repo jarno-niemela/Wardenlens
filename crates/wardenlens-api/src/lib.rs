@@ -3,7 +3,7 @@
 //!
 //! This crate builds a [`axum::Router`] and does not bind sockets or serve it; the
 //! composition root does that. It talks to storage only through the
-//! [`TokenStore`], [`CameraDirectory`] and [`CameraStatus`] traits from `wardenlens-core`,
+//! [`TokenStore`], [`CameraDirectory`], [`CameraStatus`] and [`StorageStatus`] traits from `wardenlens-core`,
 //! taken as generics.
 //!
 //! # Middleware order
@@ -31,6 +31,7 @@ mod auth;
 mod cameras;
 mod error;
 mod routes;
+mod storage;
 pub mod token;
 
 use std::sync::Arc;
@@ -55,6 +56,7 @@ use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use wardenlens_core::camera::{CameraDirectory, CameraStatus};
+use wardenlens_core::storage::StorageStatus;
 use wardenlens_core::token_store::TokenStore;
 
 use crate::auth::{AuthState, require_token};
@@ -165,11 +167,12 @@ fn with_layers(router: Router, limits: Limits) -> Router {
     Router::new().fallback_service(service)
 }
 
-fn build<S, D, C>(store: Arc<S>, directory: D, status: C, limits: Limits) -> Router
+fn build<S, D, C, T>(store: Arc<S>, directory: D, status: C, storage: T, limits: Limits) -> Router
 where
     S: TokenStore + Send + Sync + 'static,
     D: CameraDirectory + Send + Sync + 'static,
     C: CameraStatus + Send + Sync + 'static,
+    T: StorageStatus + Send + Sync + 'static,
 {
     let ports = Arc::new(CameraPorts { directory, status });
     let auth = Arc::new(AuthState::new(store));
@@ -183,8 +186,12 @@ where
         .routes(routes!(cameras::list_cameras))
         .routes(routes!(cameras::get_camera))
         .with_state(ports);
+    let storage = OpenApiRouter::<Arc<T>>::new()
+        .routes(routes!(storage::get_storage))
+        .with_state(Arc::new(storage));
     let protected = OpenApiRouter::new()
         .merge(cameras)
+        .merge(storage)
         .routes(routes!(routes::openapi_json))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(auth, require_token::<S>));
@@ -199,14 +206,16 @@ where
 ///
 /// `GET /api/v1/health` is open; every other route, and any unknown path, needs
 /// `Authorization: Bearer <token>` checked against `store`. The camera routes read
-/// `directory` and `status`; the API never sees a credential or a vault.
-pub fn router<S, D, C>(store: Arc<S>, directory: D, status: C) -> Router
+/// `directory` and `status`, the storage route reads `storage`; the API never sees a credential
+/// or a vault.
+pub fn router<S, D, C, T>(store: Arc<S>, directory: D, status: C, storage: T) -> Router
 where
     S: TokenStore + Send + Sync + 'static,
     D: CameraDirectory + Send + Sync + 'static,
     C: CameraStatus + Send + Sync + 'static,
+    T: StorageStatus + Send + Sync + 'static,
 {
-    build(store, directory, status, LIMITS)
+    build(store, directory, status, storage, LIMITS)
 }
 
 #[cfg(test)]

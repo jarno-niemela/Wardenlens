@@ -106,6 +106,10 @@ impl<I: SegmentIndex> SharedIndex<I> {
         self.with(|i| i.bytes_by_tier()).map_err(|_| IndexFault)
     }
 
+    pub(crate) fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, IndexFault> {
+        self.with(|i| i.newest(tier)).map_err(|_| IndexFault)
+    }
+
     pub(crate) fn oldest(
         &self,
         tier: Tier,

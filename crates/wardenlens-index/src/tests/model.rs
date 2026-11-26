@@ -204,6 +204,20 @@ impl SegmentIndex for Model {
             .collect())
     }
 
+    fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, ModelError> {
+        Ok(self
+            .rows
+            .iter()
+            .filter(|r| r.tier == tier)
+            .max_by_key(|r| (ended(&r.record), r.id))
+            .map(|r| StoredSegment {
+                id: r.id,
+                tier: r.tier,
+                bytes: r.record.bytes,
+                ended_at: Timestamp::from_unix_millis(ended(&r.record)),
+            }))
+    }
+
     fn bytes_by_tier(&self) -> Result<TierTotals, ModelError> {
         let mut t = TierTotals::default();
         for r in &self.rows {

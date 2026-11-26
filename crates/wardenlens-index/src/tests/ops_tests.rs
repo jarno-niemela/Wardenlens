@@ -546,6 +546,29 @@ fn oldest_orders_by_end_then_id_and_filters_tier() {
 }
 
 #[test]
+fn newest_is_the_last_of_oldest_per_tier_and_none_when_empty() {
+    let (_f, mut idx) = open_new();
+    assert_eq!(idx.newest(Tier::Hot).unwrap(), None, "empty tier");
+    let a = ins(&mut idx, "cam1", BASE + 100, 50); // ends 150
+    let b = ins(&mut idx, "cam2", BASE, 150); // ends 150, larger id: the newest
+    let _c = ins(&mut idx, "cam1", BASE, 10); // ends 10
+    let d = idx
+        .insert(&rec("cam1", BASE + 5000, 10, 7, 1), Tier::Archive)
+        .unwrap();
+    let hot = idx.newest(Tier::Hot).unwrap().unwrap();
+    assert_eq!(hot.id, b, "ties on the end time go to the larger id");
+    assert_ne!(hot.id, a);
+    assert_eq!(hot.ended_at, ts(BASE + 150));
+    assert_eq!(
+        idx.newest(Tier::Hot).unwrap(),
+        idx.oldest(Tier::Hot, None, 10).unwrap().pop(),
+        "newest is the last of the oldest-first listing"
+    );
+    let arch = idx.newest(Tier::Archive).unwrap().unwrap();
+    assert_eq!((arch.id, arch.bytes, arch.tier), (d, 7, Tier::Archive));
+}
+
+#[test]
 fn bytes_by_tier_sums_and_zero_fills() {
     let (_f, mut idx) = open_new();
     assert_eq!(idx.bytes_by_tier().unwrap(), TierTotals::default());

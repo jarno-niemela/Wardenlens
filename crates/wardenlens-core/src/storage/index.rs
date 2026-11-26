@@ -180,6 +180,13 @@ pub trait SegmentIndex {
         n: usize,
     ) -> Result<Vec<StoredSegment>, Self::Error>;
 
+    /// The newest segment of `tier` by `(ended_at, id)`, the last of what [`oldest`](Self::oldest)
+    /// would list; `None` for an empty tier. For the status endpoint (ticket #63).
+    ///
+    /// # Errors
+    /// The adapter's error.
+    fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, Self::Error>;
+
     /// Bytes and segment counts per tier.
     ///
     /// # Errors
