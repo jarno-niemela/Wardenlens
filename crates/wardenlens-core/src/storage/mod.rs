@@ -26,8 +26,8 @@ mod tests;
 pub use files::{MemoryHandle, MemorySegmentFiles};
 pub use files::{OpenedSegment, SegmentFiles, SegmentOpenError};
 pub use index::{
-    IndexedSegment, MAX_LIST_LIMIT, MAX_OLDEST, MAX_SEGMENT_BYTES, SegmentCursor, SegmentIndex,
-    SegmentPage, TierTotals, TierUsage,
+    IndexedSegment, MAX_DURATION_MS, MAX_LIST_LIMIT, MAX_OLDEST, MAX_SEGMENT_BYTES, SegmentCursor,
+    SegmentIndex, SegmentPage, TierTotals, TierUsage,
 };
 pub use plan::{
     Action, ArchiveStatus, HotState, OverflowQuantity, Plan, PlanError, PlanInput, plan,

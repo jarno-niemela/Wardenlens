@@ -105,6 +105,17 @@ pub struct DirEntry {
     pub kind: FileKind,
 }
 
+/// The result of [`RootDir::list`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct Listing {
+    /// The entries with a usable name.
+    pub entries: Vec<DirEntry>,
+    /// Entries seen but not returned: names that are not UTF-8 or not a valid single component.
+    /// They still count against the caller's bound.
+    pub dropped: usize,
+}
+
 /// An owned directory descriptor. Children are opened with `openat2`
 /// (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`); mutations take exactly one path component.
 #[derive(Debug)]
@@ -274,14 +285,16 @@ impl RootDir {
         Ok(File::from(fd))
     }
 
-    /// List this directory: at most `max` entries (`.` and `..` excluded); names that are not
-    /// UTF-8 or not a valid single component are skipped.
+    /// List this directory: at most `max` entries (`.` and `..` excluded). Names that are not
+    /// UTF-8 or not a valid single component are not returned but are counted, both against
+    /// `max` and in [`Listing::dropped`].
     ///
     /// # Errors
     /// The directory cannot be read, or it holds more than `max` entries ([`FsError::TooManyEntries`]).
-    pub fn list(&self, max: usize) -> Result<Vec<DirEntry>, FsError> {
+    pub fn list(&self, max: usize) -> Result<Listing, FsError> {
         let mut dir = rustix::fs::Dir::read_from(&self.fd).map_err(FsError::io("read dir"))?;
         let mut out = Vec::new();
+        let mut dropped: usize = 0;
         let mut seen: usize = 0;
         while let Some(entry) = dir.read() {
             let entry = entry.map_err(FsError::io("read dir"))?;
@@ -293,12 +306,13 @@ impl RootDir {
             if seen > max {
                 return Err(FsError::TooManyEntries);
             }
-            let Ok(name) = std::str::from_utf8(raw) else {
+            let Some(name) = std::str::from_utf8(raw)
+                .ok()
+                .filter(|n| component(n).is_ok())
+            else {
+                dropped = dropped.saturating_add(1);
                 continue;
             };
-            if component(name).is_err() {
-                continue;
-            }
             let kind = match entry.file_type() {
                 FileType::RegularFile => FileKind::Regular,
                 FileType::Directory => FileKind::Directory,
@@ -310,7 +324,10 @@ impl RootDir {
                 kind,
             });
         }
-        Ok(out)
+        Ok(Listing {
+            entries: out,
+            dropped,
+        })
     }
 
     /// Check that the entry named by `comps` is a regular file, without opening it for reading:
@@ -407,6 +424,7 @@ impl RootDir {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
     fn setup() -> (tempfile::TempDir, RootDir) {
@@ -673,7 +691,7 @@ mod tests {
         std::fs::write(d.path().join("a"), b"x").unwrap();
         std::fs::create_dir(d.path().join("b")).unwrap();
         symlink(d.path().join("a"), d.path().join("c")).unwrap();
-        let mut got = root.list(10).unwrap();
+        let mut got = root.list(10).unwrap().entries;
         got.sort_by(|x, y| x.name.cmp(&y.name));
         let kinds: Vec<_> = got.iter().map(|e| (e.name.as_str(), e.kind)).collect();
         assert_eq!(
@@ -688,6 +706,18 @@ mod tests {
             root.list(2).unwrap_err().to_string(),
             FsError::TooManyEntries.to_string()
         );
-        assert_eq!(root.list(3).unwrap().len(), 3);
+        assert_eq!(root.list(3).unwrap().entries.len(), 3);
+        // A name that is not UTF-8 is counted (against the bound and as dropped), not returned.
+        std::fs::write(
+            d.path().join(std::ffi::OsStr::from_bytes(b"\xff-odd")),
+            b"x",
+        )
+        .unwrap();
+        let l = root.list(4).unwrap();
+        assert_eq!((l.entries.len(), l.dropped), (3, 1));
+        assert!(
+            root.list(3).is_err(),
+            "the dropped name counts against the bound"
+        );
     }
 }

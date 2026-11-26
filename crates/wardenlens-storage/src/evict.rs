@@ -32,6 +32,14 @@ impl Candidate {
         [QUARANTINE_DIR, &self.camera, &self.day]
     }
 
+    /// The segment key `(camera, started_at)` of this quarantined file, when its name parses as a
+    /// canonical segment path (the recorder's seed must not collide with it).
+    pub(crate) fn key(&self) -> Option<(String, wardenlens_core::time::UnixMs)> {
+        let text = format!("{}/{}/{}.mp4", self.camera, self.day, self.time);
+        let path = wardenlens_core::recording::RelPath::from_str(&text).ok()?;
+        Some((self.camera.clone(), path.started_at()))
+    }
+
     fn comps(&self) -> [&str; 4] {
         [QUARANTINE_DIR, &self.camera, &self.day, &self.name]
     }
@@ -234,8 +242,10 @@ fn list<F: Fs>(fs: &F, tier: Tier, dir: &[&str], st: &mut ScanState) -> Vec<DirE
     }
     match fs.list_dir(tier, dir, st.budget) {
         Ok(v) => {
-            st.budget = st.budget.saturating_sub(v.len());
-            v
+            st.budget = st
+                .budget
+                .saturating_sub(v.entries.len().saturating_add(v.dropped));
+            v.entries
         }
         Err(e) => {
             // A missing directory is an empty quarantine; anything else (the bound, EIO, ...)

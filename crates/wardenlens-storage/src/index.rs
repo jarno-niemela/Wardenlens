@@ -3,11 +3,12 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use wardenlens_core::recording::RelPath;
+use wardenlens_core::camera::CameraId;
+use wardenlens_core::recording::{RelPath, SegmentRecord};
 use wardenlens_core::storage::{
-    IndexedSegment, SegmentId, SegmentIndex, StoredSegment, Tier, TierTotals,
+    IndexedSegment, MAX_LIST_LIMIT, SegmentId, SegmentIndex, StoredSegment, Tier, TierTotals,
 };
-use wardenlens_core::time::Timestamp;
+use wardenlens_core::time::{Timestamp, UnixMs};
 
 /// An index call failed. The cause is dropped on purpose: it can carry row data (SEC-6), and the
 /// loop's reaction does not depend on it.
@@ -54,6 +55,53 @@ impl<I: SegmentIndex> SharedIndex<I> {
         self.with(|i| i.delete(id)).map_err(|_| IndexFault)
     }
 
+    /// Add a row (reconciliation adopts a file that has none).
+    pub(crate) fn insert(
+        &self,
+        record: &SegmentRecord,
+        tier: Tier,
+    ) -> Result<SegmentId, IndexFault> {
+        self.with(|i| i.insert(record, tier))
+            .map_err(|_| IndexFault)
+    }
+
+    /// The rows of `camera` that start in `[from_ms, to_ms)`, paged through the port, at most
+    /// `max_rows` of them. The flag says the range held more (the rows are then a prefix).
+    pub(crate) fn rows_started_in(
+        &self,
+        camera: &CameraId,
+        from_ms: i64,
+        to_ms: i64,
+        max_rows: usize,
+    ) -> Result<(Vec<IndexedSegment>, bool), IndexFault> {
+        let (from, to) = (
+            Timestamp::from_unix_millis(from_ms),
+            Timestamp::from_unix_millis(to_ms),
+        );
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .with(|i| i.list(camera, from, to, MAX_LIST_LIMIT, cursor.as_ref()))
+                .map_err(|_| IndexFault)?;
+            for row in page.items {
+                // `list` returns every segment that overlaps the range; one that started
+                // earlier belongs to the previous day's directory.
+                if row.record.started_at_ms.as_i64() < from_ms {
+                    continue;
+                }
+                if out.len() >= max_rows {
+                    return Ok((out, true));
+                }
+                out.push(row);
+            }
+            match page.next {
+                Some(c) => cursor = Some(c),
+                None => return Ok((out, false)),
+            }
+        }
+    }
+
     pub(crate) fn totals(&self) -> Result<TierTotals, IndexFault> {
         self.with(|i| i.bytes_by_tier()).map_err(|_| IndexFault)
     }
@@ -73,6 +121,8 @@ impl<I: SegmentIndex> SharedIndex<I> {
 /// camera: SEC-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rel {
+    pub(crate) camera_id: CameraId,
+    pub(crate) started: UnixMs,
     pub(crate) camera: String,
     pub(crate) day: String,
     pub(crate) name: String,
@@ -80,12 +130,19 @@ pub(crate) struct Rel {
 
 impl Rel {
     pub(crate) fn of(row: &IndexedSegment) -> Option<Self> {
-        let text = RelPath::new(&row.record.camera, row.record.started_at_ms).to_string();
+        Self::from_key(&row.record.camera, row.record.started_at_ms)
+    }
+
+    /// The path of the key `(camera, started_at)`.
+    pub(crate) fn from_key(camera_id: &CameraId, started_at: UnixMs) -> Option<Self> {
+        let text = RelPath::new(camera_id, started_at).to_string();
         let mut it = text.split('/');
         let (camera, day, name, None) = (it.next()?, it.next()?, it.next()?, it.next()) else {
             return None;
         };
         Some(Self {
+            camera_id: camera_id.clone(),
+            started: started_at,
             camera: camera.to_owned(),
             day: day.to_owned(),
             name: name.to_owned(),

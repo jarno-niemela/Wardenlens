@@ -34,6 +34,13 @@ pub(crate) struct IdxFaults {
     pub(crate) delete: bool,
     pub(crate) oldest: bool,
     pub(crate) totals: bool,
+    /// The next `n` inserts fail.
+    pub(crate) insert_failures: u32,
+    /// Inserts attempted (failed ones included).
+    pub(crate) inserts: u32,
+    pub(crate) list: bool,
+    /// Every `(from, to)` window `list` was called with.
+    pub(crate) list_ranges: Vec<(i64, i64)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +74,14 @@ impl TestIndex {
 impl SegmentIndex for TestIndex {
     type Error = TestIdxError;
     fn insert(&mut self, record: &SegmentRecord, tier: Tier) -> Result<SegmentId, Self::Error> {
+        {
+            let mut f = self.faults.lock().unwrap_or_else(PoisonError::into_inner);
+            f.inserts += 1;
+            if f.insert_failures > 0 {
+                f.insert_failures -= 1;
+                return Err(TestIdxError::Injected);
+            }
+        }
         Ok(self.with(|i| i.insert(record, tier))?)
     }
     fn get(&self, id: SegmentId) -> Result<Option<IndexedSegment>, Self::Error> {
@@ -90,6 +105,14 @@ impl SegmentIndex for TestIndex {
         limit: usize,
         cursor: Option<&SegmentCursor>,
     ) -> Result<SegmentPage, Self::Error> {
+        {
+            let mut f = self.faults.lock().unwrap_or_else(PoisonError::into_inner);
+            f.list_ranges
+                .push((from.as_unix_millis(), to.as_unix_millis()));
+            if f.list {
+                return Err(TestIdxError::Injected);
+            }
+        }
         Ok(self.with(|i| i.list(camera, from, to, limit, cursor))?)
     }
     fn set_tier(&mut self, id: SegmentId, tier: Tier) -> Result<(), Self::Error> {
@@ -301,4 +324,104 @@ pub(crate) fn pattern(n: usize) -> Vec<u8> {
 
 pub(crate) fn now() -> Timestamp {
     Timestamp::from_unix_millis(T0 + 3_600_000)
+}
+
+// ---- reconciliation fixtures ------------------------------------------------------------------
+
+fn bx(fourcc: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(payload.len() + 8).unwrap();
+    let mut v = size.to_be_bytes().to_vec();
+    v.extend_from_slice(&fourcc);
+    v.extend_from_slice(payload);
+    v
+}
+
+/// A well-formed fragmented MP4 as our writer lays it out: `ftyp`, a `moov` with one track whose
+/// `mdhd` timescale is 90,000, then one `moof` + `mdat` pair per entry of `fragments`, each entry
+/// being the sample durations (in ticks) of that fragment.
+pub(crate) fn mp4(fragments: &[&[u32]]) -> Vec<u8> {
+    let mut mdhd = vec![0_u8; 12];
+    mdhd.extend_from_slice(&90_000_u32.to_be_bytes());
+    mdhd.extend_from_slice(&[0; 4]);
+    let moov = bx(*b"moov", &bx(*b"trak", &bx(*b"mdia", &bx(*b"mdhd", &mdhd))));
+    let mut out = bx(*b"ftyp", b"isom\0\0\0\0isom");
+    out.extend_from_slice(&moov);
+    for durations in fragments {
+        let mut trun = 0x0000_0701_u32.to_be_bytes().to_vec();
+        trun.extend_from_slice(&u32::try_from(durations.len()).unwrap().to_be_bytes());
+        trun.extend_from_slice(&0_i32.to_be_bytes());
+        for d in *durations {
+            trun.extend_from_slice(&d.to_be_bytes());
+            trun.extend_from_slice(&100_u32.to_be_bytes());
+            trun.extend_from_slice(&0x0101_0000_u32.to_be_bytes());
+        }
+        let mut tfhd = 0_u32.to_be_bytes().to_vec();
+        tfhd.extend_from_slice(&1_u32.to_be_bytes());
+        let traf = bx(
+            *b"traf",
+            &[bx(*b"tfhd", &tfhd), bx(*b"trun", &trun)].concat(),
+        );
+        let frag_head = bx(*b"moof", &[bx(*b"mfhd", &[0; 8]), traf].concat());
+        out.extend_from_slice(&frag_head);
+        out.extend_from_slice(&bx(*b"mdat", &[0xAB; 40]));
+    }
+    out
+}
+
+/// The segment every cell test uses: 3 samples of 3,000 ticks = 100 ms (9,000 ticks exactly).
+pub(crate) fn good() -> Vec<u8> {
+    mp4(&[&[3000, 3000, 3000]])
+}
+
+/// Write `bytes` at `rel` below `root`, creating the directories.
+pub(crate) fn put(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, bytes).unwrap();
+    p
+}
+
+impl Env {
+    /// The row of key `n` of `cam`, if any.
+    pub(crate) fn find(&self, cam: &str, n: i64) -> Option<IndexedSegment> {
+        let cam_id: CameraId = cam.parse().unwrap();
+        let t = T0 + n * 60_000;
+        let page = self
+            .index
+            .list(
+                &cam_id,
+                Timestamp::from_unix_millis(t),
+                Timestamp::from_unix_millis(t + 1),
+                10,
+                None,
+            )
+            .unwrap();
+        page.items
+            .into_iter()
+            .find(|r| r.record.started_at_ms.as_i64() == t)
+    }
+
+    /// Every row of `cam` (any time), oldest first (paged through).
+    pub(crate) fn rows_of(&self, cam: &str) -> Vec<IndexedSegment> {
+        let cam_id: CameraId = cam.parse().unwrap();
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .index
+                .list(
+                    &cam_id,
+                    Timestamp::from_unix_millis(T0 - 400 * 86_400_000),
+                    Timestamp::from_unix_millis(T0 + 400 * 86_400_000),
+                    1000,
+                    cursor.as_ref(),
+                )
+                .unwrap();
+            out.extend(page.items);
+            match page.next {
+                Some(c) => cursor = Some(c),
+                None => return out,
+            }
+        }
+    }
 }
