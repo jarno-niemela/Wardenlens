@@ -100,7 +100,7 @@ const MAX_SQUASHED_LEN: usize = 16;
 ///
 /// Public so a caller that reads a free-form text (not a validated path) finds the same names.
 /// The cost is linear in the trailing run of name characters (`[A-Za-z0-9_-]`) and keeps at most
-/// [`MAX_SQUASHED_LEN`] name bytes: the run is read backwards and the scan stops at the first
+/// 16 name bytes: the run is read backwards and the scan stops at the first
 /// other byte, or once the tail is longer than any listed name. Separator runs are walked, not
 /// stored, so it is safe on an 8 MiB text with an `=` at every position.
 #[must_use]
