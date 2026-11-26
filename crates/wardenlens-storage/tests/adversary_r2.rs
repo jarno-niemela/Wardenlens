@@ -120,6 +120,9 @@ impl SegmentIndex for Flaky {
         }
         wrap(self.inner.oldest(tier, after, n))
     }
+    fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, Busy> {
+        wrap(self.inner.newest(tier))
+    }
     fn bytes_by_tier(&self) -> Result<TierTotals, Busy> {
         wrap(self.inner.bytes_by_tier())
     }

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use wardenlens_core::storage::{
     Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, MinFreePercent, PlanInput, Policy,
-    SegmentId, SegmentIndex, StoredSegment, Tier, VolumeSpace, plan,
+    SegmentId, SegmentIndex, StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace,
+    plan,
 };
 use wardenlens_core::time::Timestamp;
 use wardenlens_fsutil::RootDir;
@@ -20,6 +21,7 @@ use crate::index::SharedIndex;
 use crate::mover::{Mover, Outcome, Skip};
 use crate::probe::{ArchiveProbe, Probe, ProbeResult, VolumeUsage};
 use crate::reconcile::{Mode, ReconcileReport, Reconciled, Reconciler};
+use crate::status::{self, TierRows};
 
 /// The cap on segment rows (SEC-2; ADR 0005 section 6). It bounds the memory of one plan (about
 /// 40 MB per tier) and is enforced as a retention bound, after the plan's actions and with its
@@ -170,6 +172,10 @@ pub struct StorageLoop<I, F, U> {
     cap_cycle_ticks: u32,
     cap_cycle_failures: u32,
     observer: Box<dyn Observer>,
+    /// What the API reads (ticket #63): rebuilt after every tick.
+    snapshot: StorageSnapshot,
+    /// The rows of both tiers as last read; kept when the index cannot be read.
+    rows: (TierRows, TierRows),
 }
 
 /// How one plan treats the archive.
@@ -271,6 +277,8 @@ impl Storage {
             cap_cycle_ticks: 0,
             cap_cycle_failures: 0,
             observer: Box::new(NoObserver),
+            snapshot: StorageSnapshot::initial(),
+            rows: (TierRows::default(), TierRows::default()),
         };
         Ok((looper, files))
     }
@@ -338,7 +346,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     pub fn tick(&mut self, now: Timestamp) -> Result<TickReport, TickError> {
         // Only the first probe of a tick may clear the move failures.
         let first = self.probe_now(true);
-        first.hot.map_err(TickError::HotVolume)?;
+        self.count_breaches(&first);
+        if let Err(e) = first.hot {
+            let e = TickError::HotVolume(e);
+            self.record_tick(now, &first, None, Some(status::error_kind(&e)));
+            return Err(e);
+        }
         let mut report = TickReport {
             archive: first.archive,
             archive_full: false,
@@ -418,7 +431,72 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             0
         };
         report.index_health_error = self.index_health_error();
+        let kind = result.as_ref().err().map(status::error_kind);
+        self.record_tick(now, &current, Some(&report), kind);
         result.map(|()| report)
+    }
+
+    /// The snapshot of the latest tick (or of the start, before the first): the volumes of its last
+    /// probe, the rows, the archive condition, the counts since start and the floor breaches.
+    /// Publish it after every tick.
+    #[must_use]
+    pub const fn snapshot(&self) -> StorageSnapshot {
+        self.snapshot
+    }
+
+    /// One more breach per volume the first probe of a tick found under its floor (saturating).
+    fn count_breaches(&mut self, first: &ProbeResult) {
+        let n = status::breaches(
+            first.hot.ok(),
+            self.cfg.policy.hot_min_free,
+            &first.archive,
+            self.cfg.policy.archive_min_free,
+        );
+        self.snapshot.floor_breaches_total = self.snapshot.floor_breaches_total.saturating_add(n);
+    }
+
+    /// Rebuild the snapshot after a tick. `report` is `None` when the tick failed before it had
+    /// one. The index is read again here; when that fails the rows of the last good read stay and
+    /// the error kind is `index` unless the tick had its own.
+    fn record_tick(
+        &mut self,
+        now: Timestamp,
+        probe: &ProbeResult,
+        report: Option<&TickReport>,
+        error: Option<TickErrorKind>,
+    ) {
+        let mut error = error;
+        match status::read_rows(&self.index) {
+            Some(rows) => self.rows = rows,
+            None => error = error.or(Some(TickErrorKind::Index)),
+        }
+        let policy = self.cfg.policy;
+        let full = report.is_some_and(|r| r.archive_full);
+        let archive_space = match probe.archive {
+            ArchiveProbe::Available(space) => Some(space),
+            _ => None,
+        };
+        if let Some(r) = report {
+            let unverified = r
+                .unverified
+                .saturating_add(r.returned.as_ref().map_or(0, |p| p.unverified));
+            let quarantined = r
+                .source_quarantined
+                .saturating_add(r.returned.as_ref().map_or(0, |p| p.quarantined));
+            self.add_counts(unverified, quarantined);
+        }
+        let s = &mut self.snapshot;
+        s.hot = status::tier_status(probe.hot.ok(), policy.hot_min_free, &self.rows.0);
+        s.archive = status::tier_status(archive_space, policy.archive_min_free, &self.rows.1);
+        s.archive_condition = status::archive_condition(&probe.archive, full);
+        s.last_tick = Some(now);
+        s.last_error = error;
+    }
+
+    fn add_counts(&mut self, unverified: u32, quarantined: u32) {
+        let s = &mut self.snapshot;
+        s.unverified_total = s.unverified_total.saturating_add(u64::from(unverified));
+        s.quarantined_total = s.quarantined_total.saturating_add(u64::from(quarantined));
     }
 
     /// The "archive returned" pass of section 9 (see [`crate::reconcile`]): only keys with an
@@ -454,7 +532,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     pub fn reconcile_startup(&mut self) -> Result<Reconciled, TickError> {
         let p = self.probe_now(true);
         p.hot.map_err(TickError::HotVolume)?;
-        Ok(Reconciler::new(
+        let done = Reconciler::new(
             &self.fs,
             &self.index,
             Mode::Startup,
@@ -462,7 +540,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             self.cfg.walk_max_entries,
             self.cfg.walk_max_dir_rows,
         )
-        .run())
+        .run();
+        self.add_counts(done.report.unverified, done.report.quarantined);
+        Ok(done)
     }
 
     /// The "archive returned" pass could not finish [`RETURNED_PASS_TRIES`] times in a row (the
@@ -509,6 +589,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     ) -> Result<(Vec<StoredSegment>, bool), TickError> {
         self.load_segments_with(page, cap)
             .map(|(v, t)| (v, t.any()))
+    }
+
+    /// Test hook: start the breach counter at `n`.
+    #[cfg(test)]
+    pub(crate) const fn set_breaches_for_test(&mut self, n: u64) {
+        self.snapshot.floor_breaches_total = n;
     }
 
     /// Test hook: hot video bytes left after the last tick's actions.

@@ -25,6 +25,7 @@ mod index;
 mod mover;
 mod probe;
 mod reconcile;
+mod status;
 mod storage_loop;
 
 #[cfg(test)]

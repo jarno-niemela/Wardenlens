@@ -132,6 +132,10 @@ impl SegmentIndex for TestIndex {
         self.faulty(|f| f.oldest)?;
         Ok(self.with(|i| i.oldest(tier, after, n))?)
     }
+    fn newest(&self, tier: Tier) -> Result<Option<StoredSegment>, Self::Error> {
+        self.faulty(|f| f.oldest)?;
+        Ok(self.with(|i| i.newest(tier))?)
+    }
     fn bytes_by_tier(&self) -> Result<TierTotals, Self::Error> {
         self.faulty(|f| f.totals)?;
         Ok(self.with(|i| i.bytes_by_tier())?)

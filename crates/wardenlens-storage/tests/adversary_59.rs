@@ -78,6 +78,9 @@ impl SegmentIndex for Shared {
     ) -> Result<Vec<StoredSegment>, IndexError> {
         self.with(|i| i.oldest(t, a, n))
     }
+    fn newest(&self, t: Tier) -> Result<Option<StoredSegment>, IndexError> {
+        self.with(|i| i.newest(t))
+    }
     fn bytes_by_tier(&self) -> Result<TierTotals, IndexError> {
         self.with(|i| i.bytes_by_tier())
     }

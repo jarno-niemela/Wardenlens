@@ -60,6 +60,7 @@ fn tokens() -> Vec<ReadSql> {
         sql::LIST,
         sql::TIER_OF,
         sql::OLDEST,
+        sql::NEWEST,
         sql::BYTES_BY_TIER,
         sql::LATEST_START,
         sql::GET_CAMERA,
