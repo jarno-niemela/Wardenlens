@@ -761,7 +761,8 @@ unavailable (section 6, case 2), with the emergency reserve acting as a floor, s
 and a pass that never finishes cannot fill the hot volume (**never ENOSPC**); still no move. After 3 unfinished
 passes in a row the pass is rerun only after 16 idle ticks (the walk is not repeated every tick) and a persistent health
 error (`returned_pass_unfinished`) is raised until a pass finishes; the pass's index errors count toward the index
-health. A tick that finds the archive away again does not run the pass and keeps the hold.
+health. A tick that finds the archive away again does not run the pass and keeps the hold. A new return (a flap) runs the
+pass at once, but the unfinished state, the health error and the degraded hot plan stay until a pass finishes.
 
 **Checked against the move crash table (section 7):** every crash row maps to one cell: before M3 and the `.part`
 rows to (hot, valid, none); after M6 and M7 to (hot, valid, valid) or (hot, valid, none); after M8 to (archive, valid,

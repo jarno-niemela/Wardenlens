@@ -1495,7 +1495,7 @@ fn the_row_only_phase_reads_no_row_that_a_directory_already_handled() {
 }
 
 /// Round 3: an unfinished pass keeps the hold and runs again, but only `RETURNED_PASS_TRIES`
-/// times in a row at full rate; then every `RETURNED_PASS_BACKOFF_TICKS` ticks, with a persistent
+/// times in a row at full rate; then after `RETURNED_PASS_BACKOFF_TICKS` (16) idle ticks, with a persistent
 /// health error until a pass finishes (the earlier "every tick" rule is replaced).
 #[test]
 fn an_unfinished_returned_pass_keeps_the_hold_is_backed_off_and_raises_a_health_error() {
@@ -1556,7 +1556,7 @@ fn an_unfinished_returned_pass_keeps_the_hold_is_backed_off_and_raises_a_health_
 }
 
 #[test]
-fn a_new_return_resets_the_back_off_of_an_earlier_one() {
+fn a_new_return_runs_the_pass_at_once_but_keeps_the_unfinished_state() {
     let env = Env::new();
     unmount(&env);
     env.add("cam-1", 0, 100, Tier::Hot);
@@ -1570,14 +1570,18 @@ fn a_new_return_resets_the_back_off_of_an_earlier_one() {
     }
     assert!(lp.returned_pass_unfinished());
     assert!(lp.tick(late()).unwrap().returned.is_none(), "backed off");
-    // The archive goes away and returns: a new return, a fresh count, the pass runs at once.
+    // The archive goes away and returns: a new return runs the pass at once (the wait resets),
+    // but the unfinished state is sticky: only a finished pass clears it.
     std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
     assert!(lp.tick(late()).unwrap().returned.is_none());
     std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
     let r = lp.tick(late()).unwrap();
-    assert!(r.returned.is_some(), "not backed off after a new return");
     assert!(
-        !lp.returned_pass_unfinished(),
-        "one unfinished pass of the new return"
+        r.returned.is_some(),
+        "the pass runs at once after a new return"
+    );
+    assert!(
+        lp.returned_pass_unfinished(),
+        "the health error persists until a pass finishes"
     );
 }

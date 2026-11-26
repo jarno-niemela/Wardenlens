@@ -37,7 +37,8 @@ const CAP_RETRY_TICKS: u32 = 16;
 pub const INDEX_ERROR_TICKS: u32 = 3;
 /// Unfinished "archive returned" passes in a row after which the pass is backed off.
 pub const RETURNED_PASS_TRIES: u32 = 3;
-/// Ticks between two attempts of a backed-off "archive returned" pass.
+/// Idle ticks between two attempts of a backed-off "archive returned" pass (it reruns after 16
+/// idle ticks).
 pub const RETURNED_PASS_BACKOFF_TICKS: u32 = 16;
 /// Most times one tick re-plans because the archive state changed under it.
 pub const MAX_REPLANS: u32 = 2;
@@ -383,8 +384,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         // archive away again it cannot run, and the next tick that sees it available runs it. A
         // pass that hit the walk cap or an index error did not finish its work: the hold stays
         // and the pass runs again, but after [`RETURNED_PASS_TRIES`] unfinished passes in a row
-        // only every [`RETURNED_PASS_BACKOFF_TICKS`] ticks (the walk is not repeated every tick),
-        // with a persistent health error until one finishes.
+        // only after [`RETURNED_PASS_BACKOFF_TICKS`] idle ticks (the walk is not repeated every
+        // tick), with a persistent health error until one finishes. A new return runs the pass at
+        // once but does not clear that unfinished state; only a finished pass does.
         let mut pass_index_errors = false;
         if result.is_ok() && self.returned_pending && current.archive.is_available() {
             let due = self.returned_unfinished < RETURNED_PASS_TRIES
@@ -554,9 +556,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         let available = p.archive.is_available();
         if self.archive_was_available == Some(false) && available {
             self.returned_pending = true;
-            // A new return starts afresh: no back-off carried over from an earlier one.
-            self.returned_unfinished = 0;
-            self.returned_wait = 0;
+            // A new return runs the pass at once: only the wait is reset (made due). The count of
+            // unfinished passes is sticky (it drives the health error and the degraded hot plan)
+            // and only a finished pass clears it.
+            self.returned_wait = RETURNED_PASS_BACKOFF_TICKS;
         }
         self.archive_was_available = Some(available);
         p
