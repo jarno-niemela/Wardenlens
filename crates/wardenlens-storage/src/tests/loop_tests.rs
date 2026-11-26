@@ -149,6 +149,13 @@ fn start_unmounted_then_mount_while_running_keeps_every_archive_row_and_moves_la
     std::fs::rename(&env.arch, &covered).unwrap();
     std::fs::create_dir(&env.arch).unwrap();
     std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    // The mounted disk holds the archived segments (#59: the "archive returned" pass concludes
+    // "missing" from an observable archive, so a disk without them would lose those rows).
+    for n in 0..5 {
+        let p = env.arch_file("cam-2", n);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, pattern(SEG)).unwrap();
+    }
     let r = lp.tick(late()).unwrap();
     assert!(r.archive.is_available());
     assert!(

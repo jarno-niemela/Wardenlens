@@ -3,7 +3,7 @@
 //! would (the cleanup of the mover cannot run either).
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::io::Errno;
@@ -125,6 +125,12 @@ impl Read for FaultSource {
             return Err(io::Error::from_raw_os_error(f.errno.raw_os_error()));
         }
         self.inner.read(buf)
+    }
+}
+
+impl Seek for FaultSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 

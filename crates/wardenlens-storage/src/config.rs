@@ -7,6 +7,8 @@ use wardenlens_core::storage::Policy;
 
 /// The default for `max_actions_per_tick`.
 const DEFAULT_MAX_ACTIONS: usize = 64;
+/// The default entry cap of the reconciliation walk (ADR 0005 section 9).
+pub const DEFAULT_WALK_ENTRIES: usize = 5_000_000;
 
 /// What the loop needs to know.
 ///
@@ -35,6 +37,10 @@ pub struct StorageConfig {
     /// Most actions one tick executes (default 64 in the service config), so a tick cannot starve
     /// the recorder.
     pub max_actions_per_tick: usize,
+    /// Most directory entries the reconciliation walk visits (default 5,000,000, SEC-2). Past it
+    /// the walk stops, the affected tier is reported `unverified` with a health error, and the
+    /// service still starts.
+    pub walk_max_entries: usize,
     /// Accept an archive on the same filesystem as the hot root. **Tests only**: in production
     /// this is the "unmounted disk" case that would fill the SSD, so the field exists only with
     /// the `test-support` feature.
@@ -51,6 +57,7 @@ impl StorageConfig {
             archive_root,
             policy,
             max_actions_per_tick: DEFAULT_MAX_ACTIONS,
+            walk_max_entries: DEFAULT_WALK_ENTRIES,
             #[cfg(feature = "test-support")]
             allow_same_filesystem: false,
         }
@@ -60,6 +67,13 @@ impl StorageConfig {
     #[must_use]
     pub const fn with_max_actions_per_tick(mut self, n: usize) -> Self {
         self.max_actions_per_tick = n;
+        self
+    }
+
+    /// Set the entry cap of the reconciliation walk.
+    #[must_use]
+    pub const fn with_walk_max_entries(mut self, n: usize) -> Self {
+        self.walk_max_entries = n;
         self
     }
 

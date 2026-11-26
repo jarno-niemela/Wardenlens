@@ -19,6 +19,7 @@ use crate::fs::{ArchiveSlot, Fs, RealFs};
 use crate::index::SharedIndex;
 use crate::mover::{Mover, Outcome, Skip};
 use crate::probe::{ArchiveProbe, Probe, ProbeResult, VolumeUsage};
+use crate::reconcile::{Mode, ReconcileReport, Reconciled, Reconciler};
 
 /// The cap on segment rows (SEC-2; ADR 0005 section 6). It bounds the memory of one plan (about
 /// 40 MB per tier) and is enforced as a retention bound, after the plan's actions and with its
@@ -124,6 +125,15 @@ pub struct TickReport {
     pub rows_evicted_over_cap: u32,
     /// The hot volume could not be probed after an action; the tick stopped.
     pub hot_probe_failed: bool,
+    /// The "archive returned" pass of section 9 ran at the end of this tick (it is due on the
+    /// tick that reports `archive_returned`, and clears the hold on moves). Its scope is strictly
+    /// limited because the recorders are running: only keys with an archive file, a
+    /// `tier = archive` row or a `tier = hot` row whose hot file is missing; only the archive
+    /// `.part` rule; never a hot `.part`, never a hot-only key, and for a key without a row never
+    /// the hot file. `None` on every other
+    /// tick, and on the returning tick when the archive was away again at its end (the hold
+    /// stays until a tick that can run the pass).
+    pub returned: Option<ReconcileReport>,
 }
 
 /// Probes, plans and executes. One per process, on one task; it is the only writer of `tier`.
@@ -326,6 +336,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             quarantine_incomplete: false,
             rolling_deletes_refused: false,
             hot_probe_failed: false,
+            returned: None,
         };
         let mut executed = 0_usize;
         let mut current = first;
@@ -347,9 +358,57 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         // reports it.
         report.archive_returned = self.returned_pending;
         result.map(|()| {
-            self.returned_pending = false;
+            // The pass runs on this task, after the plan's actions, so no move is in flight. The
+            // hold on moves ends only once the pass has run: with the archive away again it has
+            // not, and the next tick that sees it available runs it.
+            if self.returned_pending && current.archive.is_available() {
+                report.returned = Some(self.run_returned_pass());
+                self.returned_pending = false;
+            }
             report
         })
+    }
+
+    /// The "archive returned" pass of section 9 (see [`crate::reconcile`]): only keys with an
+    /// archive file, a `tier = archive` row or a `tier = hot` row whose hot file is missing;
+    /// only the archive `.part` rule; never a hot `.part`, never a hot-only key, and for a key
+    /// without a row never the hot file.
+    fn run_returned_pass(&self) -> ReconcileReport {
+        Reconciler::new(
+            &self.fs,
+            &self.index,
+            Mode::Returned,
+            true,
+            self.cfg.walk_max_entries,
+        )
+        .run()
+        .report
+    }
+
+    /// The start-up reconciliation of section 9: probe both volumes, then walk the roots and
+    /// apply the per-key decision table. Run it once, after the index is open and before the
+    /// recorders and [`tick`](Self::tick) start. With the archive unavailable it concludes nothing
+    /// from an absent archive file: every archive row and file stays, and the report says so
+    /// (the "archive returned" pass resolves them when the archive comes back; this call seeds the
+    /// loop so that the first available probe counts as that return).
+    ///
+    /// The result holds counts (never a name) and the newest key seen per camera, for the
+    /// recorder's seed. An entry cap that was exceeded is reported (`walk_cap_exceeded`), not an
+    /// error: the service starts anyway.
+    ///
+    /// # Errors
+    /// [`TickError::HotVolume`] when the hot volume cannot be probed.
+    pub fn reconcile_startup(&mut self) -> Result<Reconciled, TickError> {
+        let p = self.probe_now(true);
+        p.hot.map_err(TickError::HotVolume)?;
+        Ok(Reconciler::new(
+            &self.fs,
+            &self.index,
+            Mode::Startup,
+            p.archive.is_available(),
+            self.cfg.walk_max_entries,
+        )
+        .run())
     }
 
     /// The index failed on [`INDEX_ERROR_TICKS`] consecutive ticks (a health error: the index is

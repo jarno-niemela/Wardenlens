@@ -7,15 +7,16 @@
 //! is always the one of the latest successful probe ([`ArchiveSlot`]).
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::io::Errno;
 use wardenlens_core::storage::Tier;
 use wardenlens_fsutil::{DirEntry, FsError, QuarantineOutcome, RootDir};
 
-/// A file opened for reading (the M1 descriptor, an archive copy being verified).
-pub trait SourceFile: Read + Send {
+/// A file opened for reading (the M1 descriptor, an archive copy being verified, a file the
+/// reconciliation adopts). `Seek` lets the `core::mp4box` walk skip `mdat` payloads.
+pub trait SourceFile: Read + Seek + Send {
     /// `fsync` the file (it was opened read-only; `fsync` does not need write access).
     ///
     /// # Errors

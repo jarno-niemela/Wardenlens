@@ -11,8 +11,10 @@
 //!
 //! Errors and reports carry counts and states only: never a path, a camera id or a time (SEC-6).
 //!
-//! Not here: the reconciliation after a crash and the "archive returned" pass of section 9
-//! (ticket #59); [`TickReport::archive_returned`] says when that pass is due.
+//! Reconciliation (ticket #59, section 9): [`StorageLoop::reconcile_startup`] runs the per-key
+//! decision table over the index and both roots after the volume probe, and the loop runs the
+//! "archive returned" pass itself on the tick that reports [`TickReport::archive_returned`]; the
+//! hold on moves ends when the pass has run. [`ReconcileReport`] lists every count a pass can produce.
 
 mod config;
 mod error;
@@ -22,6 +24,7 @@ mod fs;
 mod index;
 mod mover;
 mod probe;
+mod reconcile;
 mod storage_loop;
 
 #[cfg(test)]
@@ -33,7 +36,7 @@ mod storage_loop;
 )]
 mod tests;
 
-pub use config::StorageConfig;
+pub use config::{DEFAULT_WALK_ENTRIES, StorageConfig};
 pub use error::{ProbeError, StorageError, TickError};
 pub use evict::MAX_QUARANTINE_ENTRIES;
 pub use files::{ReadSeekSource, StorageFiles};
@@ -44,6 +47,7 @@ pub use probe::{
     ARCHIVE_MARKER, ArchiveProbe, MAX_MOVE_FAILURES, PROBE_FILE, StatvfsUsage, UnavailableCause,
     VolumeUsage, space_from_stat,
 };
+pub use reconcile::{Newest, ReconcileReport, Reconciled};
 pub use storage_loop::{
     Built, INDEX_ERROR_TICKS, MAX_REPLANS, MAX_SEGMENTS, Observer, Storage, StorageLoop, TickReport,
 };
