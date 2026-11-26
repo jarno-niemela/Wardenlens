@@ -37,11 +37,12 @@ pub use config::StorageConfig;
 pub use error::{ProbeError, StorageError, TickError};
 pub use evict::MAX_QUARANTINE_ENTRIES;
 pub use files::{ReadSeekSource, StorageFiles};
-pub use fs::{ArchiveSlot, Fs, Opened, PartFile, RealFs, SourceFile};
-pub use mover::{COPY_CHUNK, Dropped, Outcome, Skip, Stage};
+pub use fs::{Fs, Opened, PartFile, RealFs, SourceFile};
+#[cfg(test)]
+pub(crate) use mover::{COPY_CHUNK, Dropped, Outcome, Skip, Stage};
 pub use probe::{
-    ARCHIVE_MARKER, ArchiveProbe, MAX_MOVE_FAILURES, PROBE_FILE, Probe, ProbeResult, StatvfsUsage,
-    UnavailableCause, VolumeUsage, space_from_stat,
+    ARCHIVE_MARKER, ArchiveProbe, MAX_MOVE_FAILURES, PROBE_FILE, StatvfsUsage, UnavailableCause,
+    VolumeUsage, space_from_stat,
 };
 pub use storage_loop::{
     Built, INDEX_ERROR_TICKS, MAX_REPLANS, MAX_SEGMENTS, Observer, Storage, StorageLoop, TickReport,

@@ -1536,6 +1536,7 @@ dependencies = [
  "wardenlens-core",
  "wardenlens-fsutil",
  "wardenlens-index",
+ "wardenlens-storage",
 ]
 
 [[package]]

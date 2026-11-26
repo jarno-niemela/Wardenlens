@@ -121,7 +121,7 @@ pub trait Fs {
 /// the [`SegmentFiles`](wardenlens_core::storage::SegmentFiles) implementation (readers). `None`
 /// while the archive is unavailable: a failed probe keeps no handle.
 #[derive(Debug, Default)]
-pub struct ArchiveSlot {
+pub(crate) struct ArchiveSlot {
     inner: Mutex<Option<Held>>,
 }
 
@@ -136,7 +136,7 @@ impl ArchiveSlot {
     /// The current handle, if the archive is available. An operation holds its `Arc` for its own
     /// duration, so a swap never changes the target in the middle of one.
     #[must_use]
-    pub fn get(&self) -> Option<Arc<RootDir>> {
+    pub(crate) fn get(&self) -> Option<Arc<RootDir>> {
         self.lock().as_ref().map(|h| Arc::clone(&h.root))
     }
 

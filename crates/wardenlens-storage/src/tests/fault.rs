@@ -61,6 +61,8 @@ pub(crate) struct State {
     pub(crate) counts: HashMap<Op, u32>,
     pub(crate) fired: bool,
     pub(crate) log: Vec<Op>,
+    /// `list_dir` reports every entry as kind `Other` (a filesystem that gives `DT_UNKNOWN`).
+    pub(crate) unknown_kinds: bool,
 }
 
 pub(crate) type Shared = Arc<Mutex<State>>;
@@ -208,6 +210,17 @@ impl Fs for FaultFs {
     }
     fn list_dir(&self, tier: Tier, dir: &[&str], max: usize) -> Result<Vec<DirEntry>, FsError> {
         self.check(Op::List(tier))?;
-        self.inner.list_dir(tier, dir, max)
+        let mut v = self.inner.list_dir(tier, dir, max)?;
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unknown_kinds
+        {
+            for e in &mut v {
+                e.kind = wardenlens_fsutil::FileKind::Other;
+            }
+        }
+        Ok(v)
     }
 }

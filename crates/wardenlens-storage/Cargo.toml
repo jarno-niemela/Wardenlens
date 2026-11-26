@@ -7,6 +7,11 @@ rust-version.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+# `StorageConfig::allow_same_filesystem`: two directories of one filesystem as hot and archive.
+# Never enable it in a production build.
+test-support = []
+
 [dependencies]
 rustix = { workspace = true }
 thiserror = { workspace = true }
@@ -14,6 +19,8 @@ wardenlens-core = { workspace = true }
 wardenlens-fsutil = { path = "../wardenlens-fsutil" }
 
 [dev-dependencies]
+# The tests (unit and integration) build the loop with the test-only switch.
+wardenlens-storage = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 # Tests run the loop against the real SQLite index; it is not a runtime edge (ADR 0005 section 11).
 wardenlens-index = { path = "../wardenlens-index" }

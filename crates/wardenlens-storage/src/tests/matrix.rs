@@ -342,3 +342,30 @@ fn a_hot_file_that_ends_early_is_a_source_problem_not_the_archives() {
     assert_eq!(Env::quarantined(&env.hot), vec![pattern(5000)]);
     assert!(!env.arch_file("cam-1", 0).exists());
 }
+
+#[test]
+fn eexist_at_m6_with_an_exhausted_quarantine_bound_is_unverified_and_not_counted() {
+    // Amendment: an EEXIST at M6 never counts toward the three failures; when the 1,000 bound is
+    // used up the stale file stays in place and the segment is `unverified`.
+    let env = Env::new();
+    let id = env.add("cam-1", 0, 5000, Tier::Hot);
+    let a = env.arch_file("cam-1", 0);
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::write(&a, b"partial").unwrap();
+    let rel = Env::rel("cam-1", 0);
+    let q = env.arch.join("_quarantine").join(&rel);
+    std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+    let name = q.file_name().unwrap().to_str().unwrap().to_owned();
+    std::fs::write(&q, b"q").unwrap();
+    for i in 1..=1000 {
+        std::fs::write(q.parent().unwrap().join(format!("{name}.{i}")), b"q").unwrap();
+    }
+    let (lp, _) = build(&env, None);
+    assert_eq!(lp.move_now(id, true), Outcome::Unverified);
+    assert_eq!(std::fs::read(&a).unwrap(), b"partial", "left in place");
+    assert!(
+        !a.with_extension("mp4.part").exists(),
+        "the .part is dropped"
+    );
+    assert_eq!(env.tier_of(id), Some(Tier::Hot));
+}

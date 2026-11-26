@@ -4,7 +4,9 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use wardenlens_core::recording::RelPath;
-use wardenlens_core::storage::{IndexedSegment, SegmentId, SegmentIndex, StoredSegment, Tier};
+use wardenlens_core::storage::{
+    IndexedSegment, SegmentId, SegmentIndex, StoredSegment, Tier, TierTotals,
+};
 use wardenlens_core::time::Timestamp;
 
 /// An index call failed. The cause is dropped on purpose: it can carry row data (SEC-6), and the
@@ -50,6 +52,10 @@ impl<I: SegmentIndex> SharedIndex<I> {
 
     pub(crate) fn delete(&self, id: SegmentId) -> Result<(), IndexFault> {
         self.with(|i| i.delete(id)).map_err(|_| IndexFault)
+    }
+
+    pub(crate) fn totals(&self) -> Result<TierTotals, IndexFault> {
+        self.with(|i| i.bytes_by_tier()).map_err(|_| IndexFault)
     }
 
     pub(crate) fn oldest(

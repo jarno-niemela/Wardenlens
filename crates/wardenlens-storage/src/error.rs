@@ -38,9 +38,6 @@ pub enum TickError {
     /// The index could not be read.
     #[error("the index could not be read")]
     Index,
-    /// More segments than the loop is willing to hold in memory (SEC-2).
-    #[error("the index holds more segments than the loop accepts")]
-    TooManySegments,
     /// The planner refused its input.
     #[error("planner: {0}")]
     Plan(PlanError),

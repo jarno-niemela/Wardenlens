@@ -19,7 +19,8 @@ use crate::index::SharedIndex;
 use crate::mover::{Mover, Outcome};
 use crate::probe::{ArchiveProbe, Probe, ProbeResult, VolumeUsage};
 
-/// Most segments the loop holds in memory for one plan (SEC-2): about 40 MB.
+/// Most segments per tier the loop holds in memory for one plan (SEC-2): about 40 MB for both.
+/// Above it the plan is made from the oldest-first prefix and the report says so.
 pub const MAX_SEGMENTS: usize = 1_000_000;
 /// Consecutive ticks with an index error after which the report carries a health error.
 pub const INDEX_ERROR_TICKS: u32 = 3;
@@ -84,8 +85,13 @@ pub struct TickReport {
     /// The archive changed from unavailable to available on this tick's first probe: the
     /// "archive returned" pass of section 9 (ticket #59) is due before any move is planned.
     pub archive_returned: bool,
-    /// The index failed on [`INDEX_ERROR_TICKS`] consecutive ticks.
+    /// The index failed (an error on a segment, or a failed read) on [`INDEX_ERROR_TICKS`]
+    /// consecutive ticks. A tick that returns [`TickError::Index`] has no report: read
+    /// [`StorageLoop::index_health_error`] then.
     pub index_health_error: bool,
+    /// A tier holds more segments than the loop plans from: the plan used the oldest-first prefix
+    /// (health warning; moves and floor deletes still run).
+    pub segments_truncated: bool,
     /// The hot volume could not be probed after an action; the tick stopped.
     pub hot_probe_failed: bool,
 }
@@ -101,7 +107,9 @@ pub struct StorageLoop<I, F, U> {
     rolling_budget: Option<u64>,
     hot_after_last_tick: Option<u64>,
     index_error_ticks: u32,
-    archive_was_available: bool,
+    archive_was_available: Option<bool>,
+    returned_this_tick: bool,
+    max_segments: usize,
     observer: Box<dyn Observer>,
 }
 
@@ -156,7 +164,7 @@ impl Storage {
             Arc::clone(&hot),
             &cfg.archive_root,
             Arc::clone(&slot),
-            cfg.allow_same_filesystem,
+            allow_same(&cfg),
         );
         let fs = wrap(RealFs::new(hot, slot));
         let looper = StorageLoop {
@@ -169,11 +177,23 @@ impl Storage {
             rolling_budget: None,
             hot_after_last_tick: None,
             index_error_ticks: 0,
-            archive_was_available: false,
+            archive_was_available: None,
+            returned_this_tick: false,
+            max_segments: MAX_SEGMENTS,
             observer: Box::new(NoObserver),
         };
         Ok((looper, files))
     }
+}
+
+#[cfg(feature = "test-support")]
+const fn allow_same(cfg: &StorageConfig) -> bool {
+    cfg.allow_same_filesystem
+}
+
+#[cfg(not(feature = "test-support"))]
+const fn allow_same(_cfg: &StorageConfig) -> bool {
+    false
 }
 
 fn archive_state(p: &ArchiveProbe) -> ArchiveState {
@@ -203,9 +223,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// [`TickError`]: the hot volume or the index cannot be read, or the planner refused its
     /// input. The next tick starts afresh.
     pub fn tick(&mut self, now: Timestamp) -> Result<TickReport, TickError> {
-        let first = self.probe.run(&self.usage, self.failures);
+        self.returned_this_tick = false;
+        // Only the first probe of a tick may clear the move failures.
+        let first = self.probe_now(true);
         first.hot.map_err(TickError::HotVolume)?;
-        self.note_probe(&first);
         let mut report = TickReport {
             archive: first.archive,
             archive_full: false,
@@ -224,11 +245,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             skipped: 0,
             truncated: false,
             replans: 0,
-            archive_returned: first.archive.is_available() && !self.archive_was_available,
+            archive_returned: false,
             index_health_error: false,
+            segments_truncated: false,
             hot_probe_failed: false,
         };
-        self.archive_was_available = first.archive.is_available();
         let mut executed = 0_usize;
         let mut current = first;
 
@@ -236,14 +257,30 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         self.evict_quarantine(&mut current, &mut executed, &mut report);
 
         let result = self.run_plan(now, &mut current, &mut executed, &mut report);
-        self.index_error_ticks = if report.index_errors > 0 || result.is_err() {
+        // Only index failures count toward the index health (not a planner or probe error).
+        let index_failed = report.index_errors > 0 || matches!(result, Err(TickError::Index));
+        self.index_error_ticks = if index_failed {
             self.index_error_ticks.saturating_add(1)
         } else {
             0
         };
-        report.index_health_error = self.index_error_ticks >= INDEX_ERROR_TICKS;
+        report.index_health_error = self.index_health_error();
         report.archive = current.archive;
+        report.archive_returned = self.returned_this_tick;
         result.map(|()| report)
+    }
+
+    /// The index failed on [`INDEX_ERROR_TICKS`] consecutive ticks (a health error: the index is
+    /// the problem, not the archive).
+    #[must_use]
+    pub const fn index_health_error(&self) -> bool {
+        self.index_error_ticks >= INDEX_ERROR_TICKS
+    }
+
+    /// Set the most segments per tier one plan is made from.
+    #[cfg(test)]
+    pub(crate) const fn set_max_segments(&mut self, n: usize) {
+        self.max_segments = n;
     }
 
     #[cfg(test)]
@@ -251,7 +288,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         &self,
         page: usize,
         cap: usize,
-    ) -> Result<Vec<StoredSegment>, TickError> {
+    ) -> Result<(Vec<StoredSegment>, bool), TickError> {
         self.load_segments_with(page, cap)
     }
 
@@ -264,7 +301,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// Test hook: one move, bypassing the plan.
     #[cfg(test)]
     pub(crate) fn move_now(&self, id: SegmentId, archive_available: bool) -> Outcome {
-        let _ = self.probe.run(&self.usage, self.failures);
+        let _ = self.probe.run(&self.usage, self.failures, false);
         Mover {
             fs: &self.fs,
             index: &self.index,
@@ -275,7 +312,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// Test hook: one delete, bypassing the plan.
     #[cfg(test)]
     pub(crate) fn delete_now(&self, id: SegmentId, archive_available: bool) -> Outcome {
-        let _ = self.probe.run(&self.usage, self.failures);
+        let _ = self.probe.run(&self.usage, self.failures, false);
         Mover {
             fs: &self.fs,
             index: &self.index,
@@ -283,10 +320,20 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         .delete_segment(id, archive_available)
     }
 
-    fn note_probe(&mut self, p: &ProbeResult) {
+    /// Probe both volumes and record what the probe saw, whichever probe it is (the first of the
+    /// tick or one after an action): the failure count and every unavailable to available
+    /// transition, which makes the "archive returned" pass (ticket #59) due.
+    fn probe_now(&mut self, may_clear: bool) -> ProbeResult {
+        let p = self.probe.run(&self.usage, self.failures, may_clear);
         if p.failures_cleared {
             self.failures = 0;
         }
+        let available = p.archive.is_available();
+        if self.archive_was_available == Some(false) && available {
+            self.returned_this_tick = true;
+        }
+        self.archive_was_available = Some(available);
+        p
     }
 
     fn run_plan(
@@ -296,11 +343,14 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         executed: &mut usize,
         report: &mut TickReport,
     ) -> Result<(), TickError> {
-        let mut failed: HashSet<SegmentId> = HashSet::new();
+        // An action that did not succeed is never retried within the tick. A failed move does not
+        // forbid the delete that the floor then demands (a different action).
+        let mut failed: HashSet<(SegmentId, bool)> = HashSet::new();
         let mut replans = 0_u32;
         loop {
             let hot_space = current.hot.map_err(TickError::HotVolume)?;
-            let segments = self.load_segments()?;
+            let (segments, truncated) = self.load_segments()?;
+            report.segments_truncated |= truncated;
             let hot_total = segments
                 .iter()
                 .filter(|s| s.tier == Tier::Hot)
@@ -335,7 +385,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                     Action::Delete(id) => (id, false),
                     _ => continue,
                 };
-                if failed.contains(&id) {
+                if failed.contains(&(id, is_move)) {
+                    continue;
+                }
+                if is_move && self.returned_this_tick {
+                    // The archive just came back: the pass of section 9 runs before any move.
                     continue;
                 }
                 let tier_bytes = segments
@@ -346,7 +400,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 *executed = executed.saturating_add(1);
                 self.account(outcome, report);
                 if !outcome.succeeded() {
-                    failed.insert(id);
+                    failed.insert((id, is_move));
                 }
                 if let Some((Tier::Hot, bytes)) = tier_bytes
                     && outcome.removed_hot_copy()
@@ -354,9 +408,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                     hot_left = hot_left.saturating_sub(bytes);
                 }
                 // Re-probe after every action.
-                let again = self.probe.run(&self.usage, self.failures);
-                self.note_probe(&again);
-                *current = again;
+                *current = self.probe_now(false);
                 if current.hot.is_err() {
                     report.hot_probe_failed = true;
                     self.hot_after_last_tick = Some(hot_left);
@@ -415,14 +467,21 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         }
     }
 
-    /// Page through both tiers (`oldest` is bounded per call, SEC-2) and cap the total.
-    fn load_segments(&self) -> Result<Vec<StoredSegment>, TickError> {
-        self.load_segments_with(MAX_OLDEST, MAX_SEGMENTS)
+    /// Page through both tiers (`oldest` is bounded per call, SEC-2). A tier above the cap
+    /// yields its oldest `cap` segments and `true`: the planner consumes oldest first anyway.
+    fn load_segments(&self) -> Result<(Vec<StoredSegment>, bool), TickError> {
+        self.load_segments_with(MAX_OLDEST, self.max_segments)
     }
 
-    fn load_segments_with(&self, page: usize, cap: usize) -> Result<Vec<StoredSegment>, TickError> {
+    fn load_segments_with(
+        &self,
+        page: usize,
+        cap: usize,
+    ) -> Result<(Vec<StoredSegment>, bool), TickError> {
         let mut all = Vec::new();
+        let mut truncated = false;
         for tier in [Tier::Hot, Tier::Archive] {
+            let start = all.len();
             let mut after = None;
             loop {
                 let rows = self
@@ -432,38 +491,50 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                 let full = rows.len() == page;
                 after = rows.last().map(|s| (s.ended_at, s.id));
                 all.extend(rows);
-                if all.len() > cap {
-                    return Err(TickError::TooManySegments);
+                if all.len().saturating_sub(start) > cap {
+                    all.truncate(start.saturating_add(cap));
+                    truncated = true;
+                    break;
                 }
                 if !full {
                     break;
                 }
             }
         }
-        Ok(all)
+        Ok((all, truncated))
     }
 
-    /// Delete quarantined files of a volume that is below its floor, oldest first, until the
-    /// volume is back at floor plus headroom. Counts toward the per-tick bound.
+    /// Delete quarantined files of a volume that is below its floor, oldest first, before the
+    /// plan deletes any video of that volume (section 6 eviction order). Counts toward the
+    /// per-tick bound, failed attempts included.
     fn evict_quarantine(
         &mut self,
         current: &mut ProbeResult,
         executed: &mut usize,
         report: &mut TickReport,
     ) {
+        let totals = self.index.totals().unwrap_or_default();
         for tier in [Tier::Hot, Tier::Archive] {
-            let (space, floor) = match tier {
-                Tier::Hot => (current.hot.ok(), self.cfg.policy.hot_min_free.get()),
+            let (space, floor, deletable) = match tier {
+                Tier::Hot => (
+                    current.hot.ok(),
+                    self.cfg.policy.hot_min_free.get(),
+                    totals.hot.bytes,
+                ),
                 _ => match current.archive {
-                    ArchiveProbe::Available(s) => (Some(s), self.cfg.policy.archive_min_free.get()),
-                    _ => (None, 0),
+                    ArchiveProbe::Available(s) => (
+                        Some(s),
+                        self.cfg.policy.archive_min_free.get(),
+                        totals.archive.bytes,
+                    ),
+                    _ => (None, 0, 0),
                 },
             };
             let Some(space) = space else { continue };
             if !evict::below_floor(&space, floor) {
                 continue;
             }
-            let Some(sel) = evict::select(&self.fs, tier, &space, floor) else {
+            let Some(sel) = evict::select(&self.fs, tier, &space, floor, deletable) else {
                 continue;
             };
             self.observer.quarantine_eviction(tier, sel.files.len());
@@ -472,13 +543,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                     report.truncated = true;
                     return;
                 }
+                *executed = executed.saturating_add(1);
                 if !self.evict_one(tier, c) {
                     continue;
                 }
-                *executed = executed.saturating_add(1);
                 report.quarantine_evicted = report.quarantine_evicted.saturating_add(1);
-                *current = self.probe.run(&self.usage, self.failures);
-                self.note_probe(current);
+                *current = self.probe_now(false);
                 match tier_space(current, tier) {
                     Some(s) if s.free_bytes < sel.goal => {}
                     _ => break,

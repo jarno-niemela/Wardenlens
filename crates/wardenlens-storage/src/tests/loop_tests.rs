@@ -155,6 +155,12 @@ fn start_unmounted_then_mount_while_running_keeps_every_archive_row_and_moves_la
         r.archive_returned,
         "the 'archive returned' pass is due on this tick"
     );
+    assert_eq!(
+        r.moved, 0,
+        "no moves in the returning tick: the pass of #59 runs first"
+    );
+    let r = lp.tick(late()).unwrap();
+    assert!(!r.archive_returned);
     assert_eq!(r.moved, 3);
     for id in &hot {
         assert_eq!(env.tier_of(*id), Some(Tier::Archive));
@@ -250,33 +256,76 @@ fn three_archive_side_failures_make_the_archive_unavailable_until_a_probe_file_r
     std::fs::remove_dir(env.arch.join(PROBE_FILE)).unwrap();
     let r = lp.tick(late()).unwrap();
     assert!(r.archive.is_available());
-    assert_eq!(r.moved, 6);
+    assert!(r.archive_returned);
+    assert_eq!(r.moved, 0, "the returning tick plans no moves");
     assert_eq!(lp.move_failures(), 0);
+    assert_eq!(lp.tick(late()).unwrap().moved, 6);
 }
 
 #[test]
-fn a_stale_probe_file_is_unlinked_first() {
+fn a_stale_probe_file_is_unlinked_by_the_next_ticks_first_probe() {
     let env = Env::new();
-    env.add("cam-1", 0, SEG, Tier::Hot);
+    for n in 0..3 {
+        env.add("cam-1", n, SEG, Tier::Hot);
+    }
     std::fs::write(env.arch.join(PROBE_FILE), b"left by a crash").unwrap();
     let fault = Fault {
         sticky: true,
         ..Fault::once(Op::Mkdir(Tier::Archive), 1)
     };
     let (mut lp, state) = build(&env, Some(fault));
-    // Three failures (three segments), with a stale file in the way of the probe round trip.
-    for n in 1..3 {
-        env.add("cam-1", n, SEG, Tier::Hot);
-    }
+    // Three failures: the state holds for the rest of the tick, whatever the probe file is.
     let r = lp.tick(late()).unwrap();
     assert_eq!(r.archive_failures, 3);
-    assert!(
-        r.archive.is_available(),
-        "the round trip succeeded over the stale file"
-    );
-    assert!(!env.arch.join(PROBE_FILE).exists());
-    assert_eq!(lp.move_failures(), 0, "cleared");
+    assert_eq!(cause(r.archive), Some(UnavailableCause::MoveFailures));
+    assert_eq!(lp.move_failures(), 3);
+    // The next tick's first probe unlinks the stale file, round-trips a new one and clears.
     state.lock().unwrap().fault = None;
+    let r = lp.tick(late()).unwrap();
+    assert!(r.archive.is_available());
+    assert!(r.archive_returned);
+    assert!(!env.arch.join(PROBE_FILE).exists());
+    assert_eq!(lp.move_failures(), 0);
+}
+
+#[test]
+fn three_failures_hold_for_the_rest_of_the_tick_and_the_floor_wins() {
+    // A working scratch file: the old code cleared the count at the next re-probe and kept
+    // writing to a failing archive while the hot volume stayed below its floor.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 100_000]).unwrap();
+    // 20 x 40 kB: used 900 kB, free 100 kB; the plan wants four moves (160 kB to the target).
+    let ids: Vec<_> = (0..20)
+        .map(|n| env.add("cam-1", n, 40_000, Tier::Hot))
+        .collect();
+    let fault = Fault {
+        sticky: true,
+        ..Fault::once(Op::Write, 1)
+    };
+    let (mut lp, state) = build(&env, Some(fault));
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.archive_failures, 3, "{r:?}");
+    assert_eq!(
+        cause(r.archive),
+        Some(UnavailableCause::MoveFailures),
+        "{r:?}"
+    );
+    assert!(r.deleted >= 1, "floor wins over video: {r:?}");
+    assert!(r.replans >= 1);
+    assert_eq!(
+        count(&state, Op::CreatePart),
+        3,
+        "no fourth write to the failing archive"
+    );
+    let free = 1_000_000 - super::support::du(&env.hot);
+    assert!(free >= 250_000, "the hot floor holds: {free}");
+    assert_eq!(env.tier_of(ids[0]), None, "oldest first");
+    // The next tick's first probe clears the state.
+    state.lock().unwrap().fault = None;
+    let r = lp.tick(now()).unwrap();
+    assert!(r.archive.is_available());
+    assert_eq!(lp.move_failures(), 0);
 }
 
 #[test]
@@ -662,27 +711,38 @@ fn mp4box_walk_over_a_stored_segment_is_bounded_and_typed() {
         Storage::open_with(env.cfg(), env.index.clone(), env.usage.clone(), |r| r).unwrap();
     let mut lp = l;
     lp.tick(now()).unwrap();
-    // A planted file with a moov box far above the 1 MiB cap: refused from the header alone.
+    // A planted file with a moov box above the 1 MiB cap, inside a file big enough to hold it:
+    // refused from the header, with the specific variant.
     let p = env.hot_file("cam-1", 0);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     let ftyp = [
         0, 0, 0, 16, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0,
     ];
-    let huge = u32::try_from(MAX_PAYLOAD_LEN + 1024).unwrap();
+    let declared = u32::try_from(MAX_PAYLOAD_LEN + 1024).unwrap();
     let mut bytes = ftyp.to_vec();
-    bytes.extend_from_slice(&huge.to_be_bytes());
+    bytes.extend_from_slice(&declared.to_be_bytes());
     bytes.extend_from_slice(b"moov");
-    bytes.resize(bytes.len() + 64, 0);
+    let total = ftyp.len() + usize::try_from(declared).unwrap() + 64;
+    bytes.resize(total, 0);
     std::fs::write(&p, &bytes).unwrap();
     let id = env.row("cam-1", 0, bytes.len(), Tier::Hot);
     let h = files.open_segment(id).unwrap().into_handle();
     let mut src = ReadSeekSource::new(h).unwrap();
-    assert!(summarize(&mut src).is_err());
+    assert!(
+        matches!(
+            summarize(&mut src),
+            Err(Mp4BoxError::PayloadTooLarge { .. })
+        ),
+        "the 1 MiB cap on moov"
+    );
     // Garbage is a typed error, not a panic.
     std::fs::write(&p, b"\0\0\0\x04junk").unwrap();
     let h = files.open_segment(id).unwrap().into_handle();
     let mut src = ReadSeekSource::new(h).unwrap();
-    assert!(matches!(summarize(&mut src), Err(e) if e != Mp4BoxError::Overflow));
+    assert!(matches!(
+        summarize(&mut src),
+        Err(Mp4BoxError::ExceedsParent { .. } | Mp4BoxError::InvalidSize(_))
+    ));
 }
 
 #[test]
@@ -724,7 +784,8 @@ fn segments_are_paged_in_order_and_capped() {
     }
     let (lp, _) = build(&env, None);
     // Pages of 3 (including the exact multiple of the page size at 6 rows and 8 rows total).
-    let all = lp.load_for_test(3, 100).unwrap();
+    let (all, cut) = lp.load_for_test(3, 100).unwrap();
+    assert!(!cut);
     assert_eq!(all.len(), 8);
     let mut ids: Vec<_> = all.iter().map(|s| s.id).collect();
     ids.sort();
@@ -741,14 +802,28 @@ fn segments_are_paged_in_order_and_capped() {
         .collect();
     assert!(hot.windows(2).all(|w| w[0] <= w[1]), "oldest first");
     for page in [1, 2, 4, 8, 9] {
-        assert_eq!(lp.load_for_test(page, 100).unwrap().len(), 8, "page {page}");
+        assert_eq!(
+            lp.load_for_test(page, 100).unwrap().0.len(),
+            8,
+            "page {page}"
+        );
     }
-    // The cap: exactly 8 is fine, 7 is refused.
-    assert_eq!(lp.load_for_test(3, 8).unwrap().len(), 8);
-    assert!(matches!(
-        lp.load_for_test(3, 7),
-        Err(TickError::TooManySegments)
-    ));
+    // The cap is per tier (4 each): exactly 4 is fine, 3 keeps the oldest three and says so.
+    let (rows, cut) = lp.load_for_test(3, 4).unwrap();
+    assert_eq!((rows.len(), cut), (8, false));
+    let (rows, cut) = lp.load_for_test(3, 3).unwrap();
+    assert_eq!((rows.len(), cut), (6, true));
+    let hot_all: Vec<_> = all
+        .iter()
+        .filter(|s| s.tier == Tier::Hot)
+        .map(|s| s.id)
+        .collect();
+    let hot_cut: Vec<_> = rows
+        .iter()
+        .filter(|s| s.tier == Tier::Hot)
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(hot_cut, hot_all[..3], "the oldest-first prefix");
 }
 
 #[test]
@@ -920,4 +995,196 @@ fn du_mp4(root: &std::path::Path) -> u64 {
     let mut n = 0;
     walk(root, &mut n);
     n
+}
+
+// ---- archive returned ---------------------------------------------------------------------
+
+#[test]
+fn archive_returned_is_set_when_the_archive_went_away_mid_tick_and_is_back_next_tick() {
+    let env = Env::new();
+    for n in 0..4 {
+        env.add("cam-1", n, 1000, Tier::Hot);
+    }
+    let (mut lp, _) = build(&env, None);
+    let marker = env.arch.join(ARCHIVE_MARKER);
+    let m2 = marker.clone();
+    env.index.faults.lock().unwrap().get_hook = Some(Box::new(move || {
+        let _ = std::fs::remove_file(m2);
+    }));
+    let r = lp.tick(late()).unwrap();
+    assert!(!r.archive.is_available() && !r.archive_returned, "{r:?}");
+    // The first probe of the next tick sees it available, but the loop knows it was away.
+    std::fs::write(&marker, b"").unwrap();
+    let r = lp.tick(late()).unwrap();
+    assert!(r.archive_returned, "{r:?}");
+    assert_eq!(r.moved, 0, "no moves in the returning tick");
+    assert!(lp.tick(late()).unwrap().moved >= 1);
+}
+
+#[test]
+fn archive_appearing_mid_tick_plans_no_moves_for_the_rest_of_that_tick() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    let ids: Vec<_> = (0..9)
+        .map(|n| env.add("cam-1", n, SEG, Tier::Hot))
+        .collect();
+    let (mut lp, _) = build(&env, None);
+    // The first delete (floor wins, archive unavailable) is followed by the archive appearing.
+    let marker = env.arch.join(ARCHIVE_MARKER);
+    env.index.faults.lock().unwrap().get_hook = Some(Box::new(move || {
+        std::fs::write(marker, b"").unwrap();
+    }));
+    let r = lp.tick(now()).unwrap();
+    assert!(r.archive.is_available());
+    assert!(r.archive_returned, "{r:?}");
+    assert_eq!(r.moved, 0, "{r:?}");
+    assert!(r.replans >= 1);
+    assert_eq!(env.tier_of(ids[8]), Some(Tier::Hot));
+    assert!(
+        std::fs::read_dir(&env.arch)
+            .unwrap()
+            .all(|e| e.unwrap().file_name() == ARCHIVE_MARKER)
+    );
+}
+
+#[test]
+fn a_healthy_archive_at_the_first_probe_is_not_a_return() {
+    let env = Env::new();
+    env.add("cam-1", 0, 1000, Tier::Hot);
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(late()).unwrap();
+    assert!(!r.archive_returned);
+    assert_eq!(r.moved, 1);
+}
+
+// ---- degrade, order and bounds ------------------------------------------------------------
+
+#[test]
+fn above_the_segment_cap_the_plan_uses_the_oldest_prefix_and_the_floor_still_holds() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    let ids: Vec<_> = (0..9)
+        .map(|n| env.add("cam-1", n, SEG, Tier::Hot))
+        .collect();
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_segments(8); // cap + 1 rows in the hot tier
+    let r = lp.tick(now()).unwrap();
+    assert!(r.segments_truncated, "a health warning: {r:?}");
+    assert_eq!(r.moved, 2, "moves still run");
+    assert!(
+        1_000_000 - super::support::du(&env.hot) >= 250_000,
+        "the hot floor holds"
+    );
+    assert_eq!(env.tier_of(ids[0]), Some(Tier::Archive), "oldest first");
+    // Archive unavailable: the floor-wins deletes still run above the cap.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    for n in 0..9 {
+        env.add("cam-1", n, SEG, Tier::Hot);
+    }
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_segments(8);
+    let r = lp.tick(now()).unwrap();
+    assert!(r.segments_truncated && r.deleted >= 1, "{r:?}");
+    assert!(1_000_000 - super::support::du(&env.hot) >= 250_000);
+}
+
+#[test]
+fn unknown_directory_entry_kinds_fall_back_to_open_and_fstat() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 600_001]).unwrap();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..10 {
+        std::fs::write(d.join(format!("00000{i}-000.mp4")), pattern(15_000)).unwrap();
+    }
+    // A FIFO with a quarantine-shaped name is never opened blocking and never deleted.
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        d.join("000099-000.mp4"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let (mut lp, state) = build(&env, None);
+    state.lock().unwrap().unknown_kinds = true;
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.quarantine_evicted, 1, "{r:?}");
+    assert!(!d.join("000000-000.mp4").exists());
+    assert!(std::fs::symlink_metadata(d.join("000099-000.mp4")).is_ok());
+}
+
+#[test]
+fn failed_quarantine_evictions_count_toward_the_action_bound() {
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; 500_000]).unwrap();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..10 {
+        std::fs::write(d.join(format!("00000{i}-000.mp4")), pattern(40_000)).unwrap();
+    }
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 2;
+    let state: super::fault::Shared = Arc::new(Mutex::new(super::fault::State {
+        fault: Some(Fault {
+            sticky: true,
+            ..Fault::once(Op::Unlink(Tier::Hot), 1)
+        }),
+        ..super::fault::State::default()
+    }));
+    let s2 = Arc::clone(&state);
+    let (mut lp, _) = Storage::open_with(cfg, env.index.clone(), env.usage.clone(), move |r| {
+        super::fault::FaultFs::new(r, s2)
+    })
+    .unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(count(&state, Op::Unlink(Tier::Hot)), 2, "{r:?}");
+    assert!(r.truncated);
+    assert_eq!(r.quarantine_evicted, 0);
+}
+
+#[test]
+fn index_health_counts_only_index_errors() {
+    // Planner and probe errors are not the index's fault.
+    let env = Env::new();
+    *env.usage.hot_overfull.lock().unwrap() = true;
+    let (mut lp, _) = build(&env, None);
+    for _ in 0..4 {
+        assert!(matches!(lp.tick(now()), Err(TickError::Plan(_))));
+    }
+    assert!(!lp.index_health_error());
+    // A failed index read is, and the error path reports it through the accessor.
+    let env = Env::new();
+    env.index.faults.lock().unwrap().oldest = true;
+    let (mut lp, _) = build(&env, None);
+    for _ in 0..3 {
+        assert!(matches!(lp.tick(now()), Err(TickError::Index)));
+    }
+    assert!(lp.index_health_error());
+}
+
+#[test]
+fn a_quarantine_that_is_needed_is_deleted_before_video_when_the_total_reaches_the_floor() {
+    // Order, not a gate: the quarantine alone (50 kB) cannot reach the floor, quarantine plus
+    // video can. The quarantine goes first, then the plan deletes only what is still needed.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    let ids: Vec<_> = (0..9)
+        .map(|n| env.add("cam-1", n + 100, SEG, Tier::Hot))
+        .collect();
+    let d = env.hot.join("_quarantine/cam-1/2023-11-12");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("000000-000.mp4"), pattern(50_000)).unwrap();
+    let (mut lp, _) = build(&env, None);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.quarantine_evicted, 1, "{r:?}");
+    assert!(!d.join("000000-000.mp4").exists());
+    let gone = ids.iter().filter(|id| env.tier_of(**id).is_none()).count();
+    assert_eq!(gone, 2, "two segments finish the job: {r:?}");
 }

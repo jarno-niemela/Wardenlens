@@ -62,7 +62,7 @@ pub fn space_from_stat(v: &VolumeStat) -> Result<VolumeSpace, ProbeError> {
         .blocks_available
         .checked_mul(v.block_size)
         .ok_or(ProbeError::Unusable)?;
-    if capacity_bytes == 0 || free_bytes > capacity_bytes {
+    if capacity_bytes == 0 {
         return Err(ProbeError::Unusable);
     }
     Ok(VolumeSpace {
@@ -111,7 +111,7 @@ impl ArchiveProbe {
 
 /// Result of one probe of both volumes.
 #[derive(Debug, Clone, Copy)]
-pub struct ProbeResult {
+pub(crate) struct ProbeResult {
     /// The hot volume.
     pub hot: Result<VolumeSpace, ProbeError>,
     /// The archive.
@@ -123,7 +123,7 @@ pub struct ProbeResult {
 /// Probes both volumes. Owns the hot handle (opened once) and publishes the archive handle of the
 /// latest successful probe through the shared [`ArchiveSlot`].
 #[derive(Debug)]
-pub struct Probe {
+pub(crate) struct Probe {
     hot: Arc<RootDir>,
     archive_path: PathBuf,
     slot: Arc<ArchiveSlot>,
@@ -147,9 +147,14 @@ impl Probe {
 
     /// Probe both volumes. `failures` is the current count of consecutive archive-side move
     /// failures. Re-run every tick and after every action.
-    pub fn run(&self, usage: &impl VolumeUsage, failures: u32) -> ProbeResult {
+    pub(crate) fn run(
+        &self,
+        usage: &impl VolumeUsage,
+        failures: u32,
+        may_clear: bool,
+    ) -> ProbeResult {
         let hot = usage.space(Tier::Hot, &self.hot);
-        let (archive, failures_cleared) = self.probe_archive(usage, failures);
+        let (archive, failures_cleared) = self.probe_archive(usage, failures, may_clear);
         ProbeResult {
             hot,
             archive,
@@ -157,7 +162,12 @@ impl Probe {
         }
     }
 
-    fn probe_archive(&self, usage: &impl VolumeUsage, failures: u32) -> (ArchiveProbe, bool) {
+    fn probe_archive(
+        &self,
+        usage: &impl VolumeUsage,
+        failures: u32,
+        may_clear: bool,
+    ) -> (ArchiveProbe, bool) {
         let unavailable = |cause| {
             // A failed probe leaves the state unavailable and keeps no handle.
             self.slot.clear();
@@ -186,6 +196,11 @@ impl Probe {
         // and removed.
         let mut cleared = false;
         if failures >= MAX_MOVE_FAILURES {
+            // Only the first probe of a tick may clear the failures: a state reached mid-tick
+            // holds for the rest of that tick (ADR 0005 section 6 case 2, section 8 item 5).
+            if !may_clear {
+                return unavailable(UnavailableCause::MoveFailures);
+            }
             if scratch_round_trip(&fresh).is_err() {
                 return unavailable(UnavailableCause::MoveFailures);
             }
@@ -298,16 +313,8 @@ mod tests {
             (stat(10, 11, 0, 4096), "bfree > blocks"),
             (stat(10, 0, 0, 0), "zero block size"),
             (stat(u64::MAX, 0, 1, 2), "capacity overflows"),
-            (stat(10, 10, 20, 4096), "free > capacity: avail beyond used"),
         ] {
-            let r = space_from_stat(&v);
-            // `free > capacity` cannot happen with bavail <= used + bavail, so this case is fine;
-            // everything else must be Unusable.
-            if why == "free > capacity: avail beyond used" {
-                assert!(r.is_ok(), "{why}");
-            } else {
-                assert_eq!(r, Err(ProbeError::Unusable), "{why}");
-            }
+            assert_eq!(space_from_stat(&v), Err(ProbeError::Unusable), "{why}");
         }
     }
 }

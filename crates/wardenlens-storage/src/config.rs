@@ -18,6 +18,8 @@ pub struct StorageConfig {
     /// the recorder.
     pub max_actions_per_tick: usize,
     /// Accept an archive on the same filesystem as the hot root. **Tests only**: in production
-    /// this is the "unmounted disk" case that would fill the SSD.
+    /// this is the "unmounted disk" case that would fill the SSD, so the field exists only with
+    /// the `test-support` feature.
+    #[cfg(feature = "test-support")]
     pub allow_same_filesystem: bool,
 }

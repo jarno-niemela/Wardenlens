@@ -15,12 +15,12 @@ use crate::fs::{Fs, Opened};
 use crate::index::{Rel, SharedIndex};
 
 /// Copy chunk of M4.
-pub const COPY_CHUNK: usize = 1 << 20;
+pub(crate) const COPY_CHUNK: usize = 1 << 20;
 
 /// The archive-side step that failed. Only these count toward the three move failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Stage {
+pub(crate) enum Stage {
     /// M2: creating a directory on the archive, or the fsync of its parent.
     M2,
     /// M3: removing a stale `.part` or creating the new one.
@@ -38,7 +38,7 @@ pub enum Stage {
 /// Why a row was dropped (the section 9 cells for a bad hot file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Dropped {
+pub(crate) enum Dropped {
     /// Hot file missing and no usable archive copy (`missing`).
     Missing,
     /// Hot file of the wrong size, quarantined (`size_mismatch`).
@@ -48,7 +48,7 @@ pub enum Dropped {
 /// Why a segment was skipped without any action or blame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Skip {
+pub(crate) enum Skip {
     /// The row is gone (a stale plan).
     NoRow,
     /// The row is not on the tier the action expects (a stale plan).
@@ -62,7 +62,7 @@ pub enum Skip {
 /// What happened to one segment. Every variant that is not a success is final for the tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Outcome {
+pub(crate) enum Outcome {
     /// M1-M9 completed.
     Moved,
     /// The row says archive (M8 committed) but the hot file could not be unlinked: the section 9
@@ -92,13 +92,14 @@ pub enum Outcome {
 impl Outcome {
     /// Whether this outcome counts toward the three archive-side failures.
     #[must_use]
-    pub const fn blames_archive(self) -> bool {
+    #[cfg(test)]
+    pub(crate) const fn blames_archive(self) -> bool {
         matches!(self, Self::ArchiveFailure(_))
     }
 
     /// Whether the hot copy of the segment is gone (its bytes left the hot volume).
     #[must_use]
-    pub const fn removed_hot_copy(self) -> bool {
+    pub(crate) const fn removed_hot_copy(self) -> bool {
         matches!(
             self,
             Self::Moved | Self::MovedHotLeft | Self::Deleted | Self::SourceQuarantined
@@ -108,7 +109,7 @@ impl Outcome {
     /// Whether the action took effect (the loop does not exclude the id from the rest of the tick
     /// on success; every other outcome is never retried within the tick).
     #[must_use]
-    pub const fn succeeded(self) -> bool {
+    pub(crate) const fn succeeded(self) -> bool {
         matches!(
             self,
             Self::Moved
@@ -300,9 +301,19 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
             return Ok(true);
         }
         drop(stale);
-        if !self.quarantined(Tier::Archive, rel) {
-            self.drop_part(&dir, part);
-            return Err(fail(Stage::M6));
+        match self.fs.quarantine(Tier::Archive, &rel.comps()) {
+            Ok(QuarantineOutcome::Moved { .. }) => {}
+            Ok(_) => {
+                // The 1,000 bound is used up: the file stays in place, counted `unverified`. An
+                // EEXIST at M6 is never the archive's fault (section 7).
+                self.drop_part(&dir, part);
+                return Err(Outcome::Unverified);
+            }
+            Err(_) => {
+                // The quarantine rename itself failed on the archive (a `renameat2` error, M6).
+                self.drop_part(&dir, part);
+                return Err(fail(Stage::M6));
+            }
         }
         if self
             .fs
@@ -315,13 +326,16 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
         Ok(false)
     }
 
-    /// `mkdirat`; `EEXIST` is fine; a created directory's parent is fsynced.
+    /// `mkdirat`, then `fsync` of the parent. `EEXIST` is fine, but the parent is fsynced anyway:
+    /// an earlier attempt may have created the directory and failed its own fsync, and the move
+    /// must not commit (M8) and unlink the hot copy (M9) before the entry is durable.
     fn ensure_dir(&self, parent: &[&str], name: &str) -> Result<(), ()> {
         match self.fs.mkdir(Tier::Archive, parent, name) {
-            Ok(()) => self.fs.sync_dir(Tier::Archive, parent).map_err(|_| ()),
-            Err(e) if e.errno() == Some(Errno::EXIST) => Ok(()),
-            Err(_) => Err(()),
+            Ok(()) => {}
+            Err(e) if e.errno() == Some(Errno::EXIST) => {}
+            Err(_) => return Err(()),
         }
+        self.fs.sync_dir(Tier::Archive, parent).map_err(|_| ())
     }
 
     fn drop_part(&self, dir: &[&str; 2], part: &str) {

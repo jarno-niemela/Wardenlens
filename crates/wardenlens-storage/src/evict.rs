@@ -46,15 +46,18 @@ pub(crate) struct Selection {
     pub(crate) goal: u64,
 }
 
-/// Choose what to delete from the quarantine of `tier`, or nothing. Deleting evidence only
-/// makes sense when it restores the goal (P2): when the whole quarantine cannot bring the free
-/// space back to the floor, nothing is selected. The selection is the shortest oldest-first
-/// prefix that reaches the goal, so without its last file the goal would not be met.
+/// Choose what to delete from the quarantine of `tier`, or nothing. Quarantine goes first, as an
+/// order (section 6): reachability is judged on the combined goal, free space plus the whole
+/// quarantine plus the `deletable_bytes` of the tier's indexed segments (which the plan deletes
+/// after). Nothing is selected only when even that total cannot reach the floor (P2: deleting
+/// evidence that cannot restore the goal loses it for nothing). Otherwise the selection is the
+/// shortest oldest-first prefix that reaches the goal, or the whole quarantine when it does not.
 pub(crate) fn select<F: Fs>(
     fs: &F,
     tier: Tier,
     space: &VolumeSpace,
     floor_percent: u8,
+    deletable_bytes: u64,
 ) -> Option<Selection> {
     let floor = percent_of(space.capacity_bytes, u64::from(floor_percent))?;
     let target = percent_of(
@@ -71,7 +74,10 @@ pub(crate) fn select<F: Fs>(
         total = total.saturating_add(o.len);
         sized.push((c, o.len));
     }
-    let reachable = space.free_bytes.saturating_add(total);
+    let reachable = space
+        .free_bytes
+        .saturating_add(total)
+        .saturating_add(deletable_bytes);
     if reachable < floor {
         return None;
     }
@@ -144,14 +150,17 @@ pub(crate) fn scan<F: Fs>(fs: &F, tier: Tier) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut budget = MAX_QUARANTINE_ENTRIES;
     let cameras = list(fs, tier, &[QUARANTINE_DIR], &mut budget);
-    for cam in cameras.iter().filter(|e| e.kind == FileKind::Directory) {
+    for cam in cameras
+        .iter()
+        .filter(|e| matches!(e.kind, FileKind::Directory | FileKind::Other))
+    {
         if CameraId::from_str(&cam.name).is_err() {
             continue;
         }
         let days = list(fs, tier, &[QUARANTINE_DIR, &cam.name], &mut budget);
         for day in days
             .iter()
-            .filter(|e| e.kind == FileKind::Directory && is_day(&e.name))
+            .filter(|e| matches!(e.kind, FileKind::Directory | FileKind::Other) && is_day(&e.name))
         {
             let files = list(
                 fs,
@@ -159,7 +168,12 @@ pub(crate) fn scan<F: Fs>(fs: &F, tier: Tier) -> Vec<Candidate> {
                 &[QUARANTINE_DIR, &cam.name, &day.name],
                 &mut budget,
             );
-            for f in files.iter().filter(|e| e.kind == FileKind::Regular) {
+            // `DT_UNKNOWN` (kind `Other`) is not a verdict: the sizing step opens the file and
+            // `fstat`s the descriptor, which refuses anything that is not regular.
+            for f in files
+                .iter()
+                .filter(|e| matches!(e.kind, FileKind::Regular | FileKind::Other))
+            {
                 if let Some((time, suffix)) = parse_name(&f.name) {
                     out.push(Candidate {
                         day: day.name.clone(),

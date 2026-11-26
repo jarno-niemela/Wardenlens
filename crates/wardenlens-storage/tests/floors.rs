@@ -229,7 +229,8 @@ fn start_unmounted_mount_while_running_keeps_archive_rows_and_moves_land_on_the_
     std::fs::write(w.arch.join(ARCHIVE_MARKER), b"").unwrap();
     let r = lp.tick(aged).unwrap();
     assert!(r.archive.is_available() && r.archive_returned);
-    assert_eq!(r.moved, 3);
+    assert_eq!(r.moved, 0, "no moves in the returning tick");
+    assert_eq!(lp.tick(aged).unwrap().moved, 3);
     for id in &hot {
         assert_eq!(
             tier_of(&files, *id),
