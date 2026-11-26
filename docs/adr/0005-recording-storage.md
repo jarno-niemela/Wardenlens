@@ -316,6 +316,17 @@ identity and every sidecar are proven by means no sidecar can influence**:
   `Index::open`, or holds the service's process lock (`wardenlens.lock`) across it; an `sqlite3` shell or another program
   opening the file concurrently is outside this guarantee. A reader open while a writer is live is a design item for #68, not
   handled here;
+  **The `flock` excludes openers, not connections already open (#175).** A process that has the index open can close its
+  last connection while an opener classifies, and SQLite then checkpoints and deletes `-wal` and `-shm`. So `classify`
+  (open.rs) treats a sidecar that vanishes between its `lstat` and its open (ENOENT), and any refusal after which the
+  sidecars' presence differs from what the attempt judged, as "state changed": it reads and judges again under the same
+  lock, at most 8 times, then returns `SidecarsChanging` (nothing modified). A refusal with unchanged sidecars stands.
+  Chosen over a shared `flock` held for the life of every connection (which would make a running service block every
+  other opener, and is #148's scope): under our lock sidecars can only disappear (every creator is an opener), so the
+  state settles in a few steps and a verdict on the settled state is the same. Residual: the lock-free `immutable=1` read of
+  the main file can overlap a closer's checkpoint before it deletes the `-wal`. `discard_if_created` unlinks only a file that
+  is still the inode this call created (device and inode) **and** still of size 0, under the lock, so a populated index is
+  never removed.
 - **the instance id and the generation** tie a `-wal` to its main file. At creation, in rollback mode and in one
   transaction before WAL is switched on, a bootstrap script (not a numbered migration; `migrations/000_bootstrap.sql`)
   sets the `application_id` and creates the single-row table `index_meta (id = 1, instance_id BLOB(16), generation)` with
