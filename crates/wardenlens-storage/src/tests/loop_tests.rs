@@ -1826,7 +1826,7 @@ fn hot_rows_are_evicted_when_there_is_no_archive_or_no_archive_rows() {
 }
 
 #[test]
-fn the_first_failed_cap_delete_ends_the_cap_for_the_tick() {
+fn a_failed_cap_delete_is_skipped_and_the_cap_continues() {
     let env = Env::new();
     for n in 0..5 {
         env.add("cam-2", n, 1000, Tier::Archive);
@@ -1839,9 +1839,39 @@ fn the_first_failed_cap_delete_ends_the_cap_for_the_tick() {
     lp.set_max_rows(2);
     let r = lp.tick(now()).unwrap();
     assert_eq!(r.delete_failed, 1, "{r:?}");
-    // Without the stop the next row would have been deleted (the fault fires once).
-    assert_eq!(r.rows_evicted_over_cap, 0, "{r:?}");
-    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 5);
+    assert!(r.cap_delete_failed, "{r:?}");
+    // The oldest failed; the next three went (the fault fires once), so the cap holds.
+    assert_eq!(r.rows_evicted_over_cap, 3, "{r:?}");
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 2);
+}
+
+#[test]
+fn failed_cap_ids_are_remembered_across_ticks_and_bounded() {
+    // The oldest row is pinned for good (a sticky fault on its unlink would also hit the others:
+    // a directory planted over its file does it for that row alone).
+    let env = Env::new();
+    for n in 0..4 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    let pinned = env.arch_file("cam-2", 0);
+    std::fs::remove_file(&pinned).unwrap();
+    std::fs::create_dir(&pinned).unwrap();
+    std::fs::write(pinned.join("x"), b"x").unwrap();
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 2;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_rows(2);
+    let r = lp.tick(now()).unwrap();
+    assert!(r.cap_delete_failed, "{r:?}");
+    // Bound 2: one failed attempt plus one deletion.
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    let r = lp.tick(now()).unwrap();
+    // The pinned row is paged past without an attempt: both actions go to deletions.
+    assert_eq!(r.delete_failed, 0, "{r:?}");
+    assert_eq!(r.rows_evicted_over_cap, 1, "{r:?}");
+    assert!(r.cap_delete_failed, "{r:?}");
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 2);
+    assert!(lp.cap_failed_len() <= 8);
 }
 
 #[test]
@@ -1862,7 +1892,10 @@ fn the_row_cap_has_its_own_bound_and_never_takes_the_plans_actions() {
     let r = lp.tick(late()).unwrap();
     assert_eq!(r.moved, 4, "{r:?}");
     assert_eq!(r.rows_evicted_over_cap, 4, "{r:?}");
-    assert!(r.truncated, "the cap hit its own bound: {r:?}");
+    assert!(
+        r.cap_truncated && !r.truncated,
+        "the cap hit its own bound: {r:?}"
+    );
 }
 
 /// A tick with one aged move to run, whose first `get` runs `hook` (a fault that appears after
@@ -1962,18 +1995,16 @@ fn a_failed_totals_read_on_a_truncated_archive_degrades_instead_of_aborting() {
     let r = lp.tick(now()).unwrap();
     // Quarantine step, the stand-in read and the row cap each count one.
     assert_eq!(r.index_errors, 3, "{r:?}");
-    assert_eq!(
-        (r.moved, r.deleted),
-        (0, 0),
-        "no archive-driven action: {r:?}"
+    // Round 3 ruling: no moves and no archive eviction, but the plan's floor deletes for an
+    // unavailable archive run (ENOSPC safety outranks a possible move).
+    assert_eq!(r.moved, 0, "no archive-driven action: {r:?}");
+    assert!(r.deleted >= 1, "the hot floor delete runs: {r:?}");
+    assert!(!r.rolling_deletes_refused, "{r:?}");
+    assert!(
+        1_000_000 - super::support::du(&env.hot) >= 250_000,
+        "the hot floor holds"
     );
-    for id in hot {
-        assert_eq!(
-            env.tier_of(id),
-            Some(Tier::Hot),
-            "the floor delete waits: {r:?}"
-        );
-    }
+    assert!(hot.iter().any(|id| env.tier_of(*id).is_none()));
     env.index.faults.lock().unwrap().totals = false;
     assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 10);
 }
@@ -2002,4 +2033,62 @@ fn archive_full_is_reported_while_the_hot_deletes_are_refused() {
     for id in hot {
         assert_eq!(env.tier_of(id), Some(Tier::Hot));
     }
+}
+
+#[test]
+fn persistent_totals_failures_on_a_truncated_archive_keep_the_hot_floor_over_many_ticks() {
+    // Hot state Ok (the floor is reachable), archive cut to its prefix, totals failing on every
+    // tick, ingest on every tick: no move, no archive row touched, and the hot floor holds.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    env.set_cap("arch", 1_000_000);
+    for n in 0..10 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+    }
+    for n in 20..24 {
+        env.add("cam-1", n, 95_000, Tier::Hot);
+    }
+    let (mut lp, _) = build(&env, None);
+    lp.set_max_segments(3);
+    env.index.faults.lock().unwrap().totals = true;
+    for (t, n) in (0..12).zip(100..) {
+        env.add("cam-1", n, 60_000, Tier::Hot);
+        let r = lp.tick(now()).unwrap();
+        assert_eq!(r.moved, 0, "tick {t}: {r:?}");
+        assert!(r.index_errors >= 1, "tick {t}: {r:?}");
+        assert_eq!(
+            r.hot,
+            Some(wardenlens_core::storage::HotState::Ok),
+            "tick {t}: {r:?}"
+        );
+        let free = 1_000_000 - super::support::du(&env.hot);
+        assert!(
+            free >= 250_000,
+            "tick {t}: hot free {free} below the floor: {r:?}"
+        );
+    }
+    env.index.faults.lock().unwrap().totals = false;
+    assert_eq!(env.index.bytes_by_tier().unwrap().archive.segments, 10);
+}
+
+#[test]
+fn the_remembered_failed_cap_ids_are_bounded_at_four_times_the_action_bound() {
+    // Six rows pinned by planted directories, one attempt per tick: the memory holds 4 ids.
+    let env = Env::new();
+    for n in 0..6 {
+        env.add("cam-2", n, 1000, Tier::Archive);
+        let pinned = env.arch_file("cam-2", n);
+        std::fs::remove_file(&pinned).unwrap();
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(pinned.join("x"), b"x").unwrap();
+    }
+    let mut cfg = env.cfg();
+    cfg.max_actions_per_tick = 1;
+    let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+    lp.set_max_rows(0);
+    for t in 0..6 {
+        let r = lp.tick(now()).unwrap();
+        assert!(r.cap_delete_failed, "tick {t}: {r:?}");
+    }
+    assert_eq!(lp.cap_failed_len(), 4);
 }

@@ -1,6 +1,7 @@
 //! `StorageLoop::tick`: probe, plan, execute, re-probe after each action, at most N actions.
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use wardenlens_core::storage::{
@@ -109,6 +110,11 @@ pub struct TickReport {
     /// A tier (either) holds more segments than the loop plans from: the plan used the oldest-first
     /// prefix (health warning; moves and floor deletes still run).
     pub segments_truncated: bool,
+    /// A row-cap delete failed (or a row that failed earlier was skipped): a row that cannot be
+    /// deleted (health warning). The cap continues past it.
+    pub cap_delete_failed: bool,
+    /// The row cap ran out of its own per-tick bound with rows still over the cap.
+    pub cap_truncated: bool,
     /// Segments evicted (oldest first) because the rows of both tiers exceeded [`MAX_SEGMENTS`].
     /// They are counted in `deleted` too.
     pub rows_evicted_over_cap: u32,
@@ -131,6 +137,8 @@ pub struct StorageLoop<I, F, U> {
     returned_pending: bool,
     max_segments: usize,
     max_rows: usize,
+    /// Rows whose cap delete failed, oldest first (bounded): paged past, not retried first.
+    cap_failed: VecDeque<SegmentId>,
     observer: Box<dyn Observer>,
 }
 
@@ -215,6 +223,7 @@ impl Storage {
             returned_pending: false,
             max_segments: MAX_SEGMENTS,
             max_rows: MAX_SEGMENTS,
+            cap_failed: VecDeque::new(),
             observer: Box::new(NoObserver),
         };
         Ok((looper, files))
@@ -259,6 +268,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     }
 
     /// Probe, plan and execute at most `max_actions_per_tick` actions, probing again after each.
+    /// Quarantine evictions count toward that bound. After the plan the row cap (retention, see
+    /// [`MAX_SEGMENTS`]) runs on a bound of its own, the same `max_actions_per_tick` again, so a
+    /// tick executes at most twice the bound and the cap never takes the plan's actions.
     /// A segment whose action did not succeed is never retried within the tick and the rest of
     /// the plan still runs.
     ///
@@ -299,6 +311,8 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             index_health_error: false,
             segments_truncated: false,
             rows_evicted_over_cap: 0,
+            cap_delete_failed: false,
+            cap_truncated: false,
             quarantine_incomplete: false,
             rolling_deletes_refused: false,
             hot_probe_failed: false,
@@ -339,6 +353,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     #[cfg(test)]
     pub(crate) const fn set_max_segments(&mut self, n: usize) {
         self.max_segments = n;
+    }
+
+    /// Test hook: how many failed cap ids are remembered.
+    #[cfg(test)]
+    pub(crate) fn cap_failed_len(&self) -> usize {
+        self.cap_failed.len()
     }
 
     /// Set the most rows (both tiers together) kept before the oldest are evicted.
@@ -514,16 +534,17 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // planner computes (free plus archive video): see `with_unseen_archive`.
             // If the true total cannot be read, the archive counts as unavailable for this tick's
             // archive-driven decisions (no moves, no archive evictions).
-            let (plan_segments, standin, degraded) = if truncated.archive && planned_available {
-                if let Ok((all, id)) = self.with_unseen_archive(&segments) {
-                    (all, id, false)
+            let (plan_segments, standin, degraded): (Cow<'_, [StoredSegment]>, _, _) =
+                if truncated.archive && planned_available {
+                    if let Ok((all, id)) = self.with_unseen_archive(&segments) {
+                        (Cow::Owned(all), id, false)
+                    } else {
+                        report.index_errors = report.index_errors.saturating_add(1);
+                        (Cow::Borrowed(&segments[..]), None, true)
+                    }
                 } else {
-                    report.index_errors = report.index_errors.saturating_add(1);
-                    (segments.clone(), None, true)
-                }
-            } else {
-                (segments.clone(), None, false)
-            };
+                    (Cow::Borrowed(&segments[..]), None, false)
+                };
             let planned =
                 self.make_plan(current, &plan_segments, now, hot_total, false, degraded)?;
             // The stand-in is never executed: the room it would free is not there, so the moves
@@ -533,10 +554,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // From a truncated hot prefix the rolling buffer's budget is understated: refuse its
             // hot deletes (and say so) rather than delete video on a wrong number. An archive-only
             // truncation does not touch the hot numbers.
-            // Degraded (the archive's true total unknown): only the rolling buffer's and reserve's
-            // hot deletes run; a floor delete the archive might have absorbed waits.
-            let rolling = planned.hot == HotState::RollingBuffer;
-            let refuse_hot = (truncated.hot && rolling) || (degraded && !rolling);
+            // Degraded (the archive's true total unknown): the plan treated the archive as
+            // unavailable, so its floor and reserve hot deletes run (ENOSPC safety outranks a
+            // possible move); they are not refused.
+            let refuse_hot = truncated.hot && planned.hot == HotState::RollingBuffer;
             let by_id: HashMap<SegmentId, Tier> = segments.iter().map(|s| (s.id, s.tier)).collect();
             // While the "archive returned" pass is pending no move runs, and no archive video is
             // evicted on behalf of one: only the evictions the archive's own floor needs stay.
@@ -742,7 +763,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
     /// may not exceed `max_rows`: the oldest archive rows go first, then the oldest hot rows
     /// (in the same tick) once none are left. With the archive unavailable only the hot tier's
     /// own excess goes: archive rows are never a reason to delete the only copy of hot video.
-    /// Deletes use the normal protocol. The first failed delete ends the cap for the tick.
+    /// Deletes use the normal protocol. A failed delete is skipped (see `evict_oldest`).
     fn enforce_row_cap(&mut self, current: &mut ProbeResult, report: &mut TickReport) {
         let Ok(totals) = self.index.totals() else {
             report.index_errors = report.index_errors.saturating_add(1);
@@ -767,8 +788,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         }
     }
 
-    /// Delete the `count` oldest rows of `tier`. `false` when the cap must stop for the tick: a
-    /// failed delete or read, a failed hot probe, or the bound.
+    /// Delete the `count` oldest rows of `tier`, skipping rows that failed before (this tick or
+    /// an earlier one) and continuing past a row that fails now, within the cap's own bound.
+    /// `false` when the cap must stop for the tick: a failed read or hot probe, or the bound.
     fn evict_oldest(
         &mut self,
         tier: Tier,
@@ -780,7 +802,8 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         let mut left = count;
         let mut after = None;
         while left > 0 {
-            let want = left.min(MAX_OLDEST);
+            // Rows known to be stuck are paged past: ask for that many more.
+            let want = left.saturating_add(self.cap_failed.len()).min(MAX_OLDEST);
             let Ok(page) = self.index.oldest(tier, after, want) else {
                 report.index_errors = report.index_errors.saturating_add(1);
                 return false;
@@ -788,15 +811,21 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             after = page.last().map(|s| (s.ended_at, s.id));
             let short = page.len() < want;
             for seg in page {
+                if self.cap_failed.contains(&seg.id) {
+                    report.cap_delete_failed = true;
+                    continue;
+                }
                 if *used >= self.cfg.max_actions_per_tick {
-                    report.truncated = true;
+                    report.cap_truncated = true;
                     return false;
                 }
                 *used = used.saturating_add(1);
                 let outcome = self.execute(seg.id, false, current.archive.is_available());
                 self.account(outcome, report);
                 if !outcome.succeeded() {
-                    return false;
+                    report.cap_delete_failed = true;
+                    self.remember_cap_failure(seg.id);
+                    continue;
                 }
                 report.rows_evicted_over_cap = report.rows_evicted_over_cap.saturating_add(1);
                 if tier == Tier::Hot {
@@ -810,12 +839,25 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                     return false;
                 }
                 left = left.saturating_sub(1);
+                if left == 0 {
+                    break;
+                }
             }
             if short {
                 break;
             }
         }
         true
+    }
+
+    /// Remember a row whose cap delete failed: at most `4 * max_actions_per_tick` ids, the oldest
+    /// forgotten first (so a stuck row is retried again once in a while).
+    fn remember_cap_failure(&mut self, id: SegmentId) {
+        let bound = self.cfg.max_actions_per_tick.saturating_mul(4).max(1);
+        while self.cap_failed.len() >= bound {
+            self.cap_failed.pop_front();
+        }
+        self.cap_failed.push_back(id);
     }
 
     /// Page through both tiers (`oldest` is bounded per call, SEC-2). A tier above the cap

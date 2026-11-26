@@ -15,8 +15,8 @@ const DEFAULT_MAX_ACTIONS: usize = 64;
 ///
 /// **Segment row cap.** The loop holds at most [`MAX_SEGMENTS`](crate::MAX_SEGMENTS) (1,000,000)
 /// segment rows (ADR 0005 section 6). It is retention, not safety: it runs after the plan's
-/// actions of a tick with a bound of its own (`max_actions_per_tick` again), and stops for the
-/// tick at its first failed delete. With the archive available the rows of both tiers together
+/// actions of a tick with a bound of its own (`max_actions_per_tick` again). A row whose delete
+/// fails is skipped, remembered across ticks (bounded) and reported, and the cap continues. With the archive available the rows of both tiers together
 /// are capped, oldest archive rows first and then the oldest hot rows. With the archive
 /// unavailable only the hot tier's own excess is evicted: hot video is never deleted because of
 /// archive rows. The cap is a fixed, generic bound, not a per-site setting.
