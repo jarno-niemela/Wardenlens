@@ -15,7 +15,7 @@
 )]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -27,6 +27,7 @@ use wardenlens_index::Index;
 
 const BASE: i64 = 1_700_000_000_000;
 const CHILD_ENV: &str = "WL49R4_CHILD_PATH";
+const PROBE_ENV: &str = "WL49R4_PROBE_PATH";
 const MARK: &str = "WL49R4:";
 
 fn private_tempdir() -> tempfile::TempDir {
@@ -62,26 +63,67 @@ fn count(idx: &Index, camera: &str) -> usize {
     .len()
 }
 
-/// POSIX (fcntl) locks this process holds on the inode of `path`, from `/proc/locks`.
-fn own_posix_locks_on(path: &Path) -> Vec<String> {
-    let md = std::fs::metadata(path).unwrap();
-    let dev = md.dev();
-    // /proc/locks prints MAJOR:MINOR:INODE with major and minor in hex.
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-    let key = format!("{major:02x}:{minor:02x}:{}", md.ino());
-    let pid = std::process::id().to_string();
-    std::fs::read_to_string("/proc/locks")
-        .unwrap()
+/// Does another process find SQLite's shared lock on the main file of `path` held by this one?
+///
+/// A child process (this test binary, selected by `PROBE_ENV`) opens its own connection and asks
+/// SQLite to leave WAL mode with `PRAGMA journal_mode = DELETE`. That needs an exclusive lock on
+/// the main file, which SQLite takes only when no other connection holds the shared lock, so the
+/// child gets `SQLITE_BUSY` exactly when a live connection of the parent holds it. The answer
+/// comes from the kernel's lock table through SQLite, with no timing and no parsing of
+/// `/proc/locks` (whose readers can skip entries while other processes change the lock table, and
+/// whose device encoding varies by filesystem).
+///
+/// Success in the child converts the database out of WAL mode, so call this last on a given file.
+fn another_process_sees_the_main_file_locked(path: &Path) -> bool {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_lock_probe_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE_ENV, path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "probe child failed: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let verdict = stdout
         .lines()
-        .filter(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            f.get(1) == Some(&"POSIX")
-                && f.get(4) == Some(&pid.as_str())
-                && f.get(5) == Some(&key.as_str())
-        })
-        .map(str::to_owned)
-        .collect()
+        .find_map(|l| l.split_once(MARK).map(|(_, rest)| rest.to_owned()))
+        .unwrap_or_else(|| panic!("probe child printed no verdict: {stdout}"));
+    match verdict.as_str() {
+        "locked" => true,
+        "unlocked" => false,
+        other => panic!("probe child said {other}"),
+    }
+}
+
+/// Runs only as a child of `another_process_sees_the_main_file_locked`.
+#[test]
+fn child_lock_probe_entry() {
+    let Some(path) = std::env::var_os(PROBE_ENV) else {
+        return;
+    };
+    let c = rusqlite::Connection::open(PathBuf::from(path)).unwrap();
+    c.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let verdict = match c.query_row("PRAGMA journal_mode = DELETE", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(mode) => {
+            assert_eq!(mode, "delete", "leaving WAL mode reported {mode}");
+            "unlocked"
+        }
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            "locked"
+        }
+        Err(e) => panic!("unexpected probe error: {e}"),
+    };
+    println!("{MARK}{verdict}");
+    std::io::stdout().flush().unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -101,9 +143,24 @@ fn control_a_plain_wal_connection_holds_a_posix_lock_on_the_main_file() {
     c.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
         .unwrap();
     assert!(
-        !own_posix_locks_on(&path).is_empty(),
+        another_process_sees_the_main_file_locked(&path),
         "an open WAL connection must hold its shared lock on the main file"
     );
+}
+
+/// Control for the probe itself: once the connection is closed nothing holds the lock, so the
+/// probe must say so (a probe that always answered "locked" would pass the tests above).
+#[test]
+fn control_the_probe_reports_unlocked_once_the_connection_is_closed() {
+    let dir = private_tempdir();
+    let path = dir.path().join("plain.db");
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
+        .unwrap();
+    c.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    drop(c);
+    assert!(!another_process_sees_the_main_file_locked(&path));
 }
 
 /// `Index::open` closes the `dup` of the verified descriptor that carried the `flock` when the
@@ -116,9 +173,8 @@ fn an_open_index_keeps_sqlites_posix_lock_on_the_main_file() {
     let path = dir.path().join("index.db");
     let mut idx = Index::open(&path).unwrap();
     idx.insert(&rec("cam1", BASE, 1000, 10), Tier::Hot).unwrap();
-    let locks = own_posix_locks_on(&path);
     assert!(
-        !locks.is_empty(),
+        another_process_sees_the_main_file_locked(&path),
         "an open Index holds no POSIX lock on its main file: SQLite's WAL shared lock was \
          dropped by closing one of our own descriptors"
     );
