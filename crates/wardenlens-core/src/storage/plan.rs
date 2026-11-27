@@ -49,11 +49,12 @@ pub enum HotState {
     /// plan restores it or it was never breached.
     Ok,
     /// The floor cannot be restored even by removing all hot video (something else fills
-    /// the volume), or only the emergency reserve cannot be reached
-    /// (`Plan::reserve_floor_unreachable`; the percentage floor is then still in force), and
-    /// this tick's plan deletes no hot video to stop growth: the archive
-    /// absorbs the ingest, there is nothing ingested, the moves already cover it, or the hot
-    /// video is already below the rolling budget and the emergency reserve is free.
+    /// the volume), and this tick's plan deletes no hot video to hold the rolling budget: the
+    /// archive absorbs the ingest, there is nothing ingested, the moves already cover it, or the
+    /// hot video is already below the rolling budget and the emergency reserve is free. Or only
+    /// the emergency reserve cannot be reached (`Plan::reserve_floor_unreachable`): the
+    /// percentage floor is then still in force and, without an archive, can still delete hot
+    /// video to restore it.
     /// State, never an error.
     Unsatisfiable,
     /// As `Unsatisfiable`, and this tick's plan deletes hot video to hold it at the rolling

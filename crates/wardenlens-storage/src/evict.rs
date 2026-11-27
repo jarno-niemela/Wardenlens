@@ -151,10 +151,10 @@ pub(crate) fn tier_floor(
     tier: Tier,
     space: &VolumeSpace,
     policy: &Policy,
-    removable: u64,
+    hot_video: u64,
 ) -> Option<(u64, u64)> {
     if tier == Tier::Hot {
-        let f = hot_floor(space.capacity_bytes, space.free_bytes, removable, policy);
+        let f = hot_floor(space.capacity_bytes, space.free_bytes, hot_video, policy);
         return Some((f.floor_bytes, f.target_bytes));
     }
     let pct = u64::from(policy.archive_min_free.get());

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use wardenlens_core::storage::{
     Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, PlanInput, SegmentId, SegmentIndex,
-    StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace, plan,
+    StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace, hot_floor, plan,
 };
 use wardenlens_core::time::Timestamp;
 use wardenlens_fsutil::RootDir;
@@ -469,11 +469,17 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         u32::try_from(now.saturating_sub(before)).unwrap_or(u32::MAX)
     }
 
+    /// The hot video bytes the index totals report; 0 when they cannot be read. The one source
+    /// of the hot figure for the status, the breach counter and the truncated-index alert.
+    fn hot_video_bytes(&self) -> u64 {
+        self.index.totals().map_or(0, |t| t.hot.bytes)
+    }
+
     /// One more breach per volume the first probe of a tick found under its floor (saturating).
     fn count_breaches(&mut self, first: &ProbeResult) {
         // Without the index totals the hot video counts as 0: the reserve then counts only when
         // free space already meets it, so an index failure cannot invent a breach.
-        let hot_video = self.index.totals().map_or(0, |t| t.hot.bytes);
+        let hot_video = self.hot_video_bytes();
         let n = status::breaches(
             first.hot.ok().map(|s| (s, hot_video)),
             &self.cfg.policy,
@@ -482,7 +488,8 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         self.snapshot.floor_breaches_total = self.snapshot.floor_breaches_total.saturating_add(n);
     }
 
-    /// Rebuild the snapshot after a tick. `report` is `None` when the tick failed before it had
+    /// Rebuild the snapshot after a tick. The hot floor is measured against the hot bytes of the
+    /// index totals (0 when they cannot be read, as in the breach counter). `report` is `None` when the tick failed before it had
     /// one. The index is read again here; when that fails the rows of the last good read stay and
     /// the error kind is `index` unless the tick had its own.
     fn record_tick(
@@ -500,9 +507,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         }
         // The hot floor needs the hot bytes; when the rows cannot be read they count as 0 (as in
         // `count_breaches`), never the bytes of an older read.
-        let rows = status::read_rows(&self.index);
-        let rows_read = rows.is_some();
-        if let Some(rows) = rows {
+        if let Some(rows) = status::read_rows(&self.index) {
             self.rows = rows;
         } else {
             error = error.or(Some(TickErrorKind::Index));
@@ -520,11 +525,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             self.add_unverified(unverified);
         }
         self.snapshot.quarantined_total = self.quarantine_count.load(Ordering::Relaxed);
+        let hot_video = self.hot_video_bytes();
         let s = &mut self.snapshot;
+        // The hot bytes come from the index totals, the same figure as `count_breaches`.
         let mut hot_rows = self.rows.0;
-        if !rows_read {
-            hot_rows.bytes = 0;
-        }
+        hot_rows.bytes = hot_video;
         s.hot = status::tier_status(Tier::Hot, probe.hot.ok(), &policy, &hot_rows);
         s.archive = status::tier_status(Tier::Archive, archive_space, &policy, &self.rows.1);
         s.archive_condition = status::archive_condition(&probe.archive, full);
@@ -942,14 +947,22 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                     capped_budget(planned.rolling_budget, planned.rolling_ceiling);
             }
             report.hot = Some(planned.hot);
-            report.hot_alert = needs_hot_alert(
-                planned.hot,
-                planned.archive,
-                // From a truncated hot prefix the hot total, and so the reachability of the
-                // reserve, is understated: the flag is suppressed (`segments_truncated` reports
-                // the degraded plan).
-                planned.reserve_floor_unreachable && !truncated.hot,
-            );
+            // From a truncated hot prefix the plan's hot total understates the video, so the
+            // reserve's reachability is judged by the true totals from the index instead.
+            let reserve_unreachable = if truncated.hot {
+                current.hot.is_ok_and(|space| {
+                    hot_floor(
+                        space.capacity_bytes,
+                        space.free_bytes,
+                        self.hot_video_bytes(),
+                        &self.cfg.policy,
+                    )
+                    .reserve_unreachable
+                })
+            } else {
+                planned.reserve_floor_unreachable
+            };
+            report.hot_alert = needs_hot_alert(planned.hot, planned.archive, reserve_unreachable);
             report.archive_full = planned.archive == ArchiveStatus::Full;
             let mut hot_left = hot_total;
             let mut replan = false;
