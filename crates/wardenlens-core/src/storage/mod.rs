@@ -40,6 +40,6 @@ pub use status::{
     TickErrorKind, TierStatus, VolumeStatus, free_percent,
 };
 pub use types::{
-    ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, MinFreePercent, MinFreePercentError, Policy,
-    SegmentId, StoredSegment, Tier, VolumeSpace, effective_reserve_bytes,
+    ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, HotFloor, MinFreePercent, MinFreePercentError,
+    Policy, SegmentId, StoredSegment, Tier, VolumeSpace, effective_reserve_bytes, hot_floor,
 };

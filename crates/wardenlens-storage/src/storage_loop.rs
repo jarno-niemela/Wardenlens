@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wardenlens_core::storage::{
-    Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, MinFreePercent, PlanInput, Policy,
-    SegmentId, SegmentIndex, StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace,
-    effective_reserve_bytes, plan,
+    Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, PlanInput, SegmentId, SegmentIndex,
+    StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace, plan,
 };
 use wardenlens_core::time::Timestamp;
 use wardenlens_fsutil::RootDir;
@@ -73,9 +72,11 @@ pub struct TickReport {
     pub archive_full: bool,
     /// The planner's state of the hot volume.
     pub hot: Option<HotState>,
-    /// The operator must be alerted about the hot volume: the plan is in `RollingBuffer`, or in
-    /// `Unsatisfiable` while the archive is not `Available` (the buffer is then rolling but this
-    /// tick happened to delete nothing). See [`HotState::RollingBuffer`].
+    /// The operator must be alerted about the hot volume, in three cases: the plan is in
+    /// `RollingBuffer`; or in `Unsatisfiable` while the archive is not `Available` (the buffer is
+    /// then rolling but this tick happened to delete nothing); or in `Unsatisfiable` because the
+    /// floor raised by the emergency reserve is unreachable, whatever the archive state. See
+    /// [`HotState::RollingBuffer`].
     pub hot_alert: bool,
     /// Moves completed (M1-M9).
     pub moved: u32,
@@ -470,11 +471,13 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
 
     /// One more breach per volume the first probe of a tick found under its floor (saturating).
     fn count_breaches(&mut self, first: &ProbeResult) {
+        // Without the index totals the hot video counts as 0: the reserve then counts only when
+        // free space already meets it, so an index failure cannot invent a breach.
+        let hot_video = self.index.totals().map_or(0, |t| t.hot.bytes);
         let n = status::breaches(
-            first.hot.ok(),
-            self.cfg.policy.hot_min_free,
+            first.hot.ok().map(|s| (s, hot_video)),
+            &self.cfg.policy,
             &first.archive,
-            self.cfg.policy.archive_min_free,
         );
         self.snapshot.floor_breaches_total = self.snapshot.floor_breaches_total.saturating_add(n);
     }
@@ -513,8 +516,8 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         }
         self.snapshot.quarantined_total = self.quarantine_count.load(Ordering::Relaxed);
         let s = &mut self.snapshot;
-        s.hot = status::tier_status(probe.hot.ok(), policy.hot_min_free, &self.rows.0);
-        s.archive = status::tier_status(archive_space, policy.archive_min_free, &self.rows.1);
+        s.hot = status::tier_status(Tier::Hot, probe.hot.ok(), &policy, &self.rows.0);
+        s.archive = status::tier_status(Tier::Archive, archive_space, &policy, &self.rows.1);
         s.archive_condition = status::archive_condition(&probe.archive, full);
         s.last_tick = Some(now);
         s.last_error = error;
@@ -722,17 +725,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         } else {
             segments
         };
-        let mut policy = self.cfg.policy;
-        if held {
-            // The planner already raises the hot floor to the reserve; this rounds it up to a
-            // whole percent instead, so a held tick keeps a little more than the exact reserve
-            // (the recorder keeps writing while the move waits). Both use
-            // `effective_reserve_bytes`, so the cap at the largest floor cannot drift.
-            // Unreachable goals fall to the planner's own rules (nothing is deleted for them).
-            if let Some(p) = reserve_percent(hot_space.capacity_bytes, policy) {
-                policy.hot_min_free = policy.hot_min_free.max(p);
-            }
-        }
+        // Held ticks plan with the archive unavailable: the planner's reserve floor and, when the
+        // floor is unreachable, the rolling buffer apply.
+        let policy = self.cfg.policy;
         plan(&PlanInput {
             hot: hot_space,
             archive: if archive_unknown || held {
@@ -1286,30 +1281,23 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             return;
         };
         for tier in [Tier::Hot, Tier::Archive] {
-            let (space, floor, deletable) = match tier {
-                Tier::Hot => (
-                    current.hot.ok(),
-                    self.cfg.policy.hot_min_free.get(),
-                    totals.hot.bytes,
-                ),
+            let (space, deletable) = match tier {
+                Tier::Hot => (current.hot.ok(), totals.hot.bytes),
                 _ => match current.archive {
-                    ArchiveProbe::Available(s) => (
-                        Some(s),
-                        self.cfg.policy.archive_min_free.get(),
-                        totals.archive.bytes,
-                    ),
-                    _ => (None, 0, 0),
+                    ArchiveProbe::Available(s) => (Some(s), totals.archive.bytes),
+                    _ => (None, 0),
                 },
             };
             let Some(space) = space else { continue };
-            if !evict::below_floor(&space, floor) {
+            let policy = self.cfg.policy;
+            if !evict::below_floor(tier, &space, &policy, totals.hot.bytes) {
                 continue;
             }
             let Some(sel) = evict::select(
                 &self.fs,
                 tier,
                 &space,
-                floor,
+                &policy,
                 deletable,
                 &mut report.quarantine_incomplete,
             ) else {
@@ -1457,23 +1445,6 @@ fn capped_budget(budget: Option<u64>, ceiling: Option<u64>) -> (Option<u64>, Opt
     }
 }
 
-/// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
-/// accepted floor), or `None` for no reserve.
-fn reserve_percent(
-    capacity: u64,
-    policy: Policy,
-) -> Option<wardenlens_core::storage::MinFreePercent> {
-    let reserve = effective_reserve_bytes(capacity, policy.emergency_reserve_bytes);
-    if reserve == 0 || capacity == 0 {
-        return None;
-    }
-    let pct = u128::from(reserve)
-        .checked_mul(100)?
-        .div_ceil(u128::from(capacity));
-    let pct = u8::try_from(pct.min(u128::from(MinFreePercent::MAX))).ok()?;
-    MinFreePercent::new(pct).ok()
-}
-
 #[cfg(test)]
 mod reserve_tests {
     use super::*;
@@ -1517,27 +1488,5 @@ mod reserve_tests {
         assert_eq!(capped_budget(None, None), (None, None));
         assert_eq!(capped_budget(Some(5), None), (None, None));
         assert_eq!(capped_budget(None, Some(5)), (None, None));
-    }
-
-    fn pol(reserve: u64) -> Policy {
-        Policy {
-            emergency_reserve_bytes: reserve,
-            ..Policy::default()
-        }
-    }
-    fn pct(capacity: u64, reserve: u64) -> Option<u8> {
-        reserve_percent(capacity, pol(reserve)).map(MinFreePercent::get)
-    }
-
-    #[test]
-    fn reserve_percent_covers_zero_rounding_and_the_cap() {
-        assert_eq!(pct(1000, 0), None, "no reserve");
-        assert_eq!(pct(0, 100), None, "zero capacity");
-        assert_eq!(pct(1000, 100), Some(10), "a whole percent");
-        assert_eq!(pct(1000, 101), Some(11), "rounds up");
-        assert_eq!(pct(1000, 1), Some(1), "a tiny reserve is one percent");
-        assert_eq!(pct(1000, 900), Some(90), "the cap exactly");
-        assert_eq!(pct(1000, 901), Some(90), "capped at the largest floor");
-        assert_eq!(pct(1000, u64::MAX), Some(90), "no overflow");
     }
 }

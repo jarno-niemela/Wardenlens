@@ -7,6 +7,7 @@ use crate::time::Timestamp;
 
 use super::types::{
     ArchiveState, Policy, SegmentId, StoredSegment, Tier, VolumeSpace, effective_reserve_bytes,
+    hot_floor,
 };
 
 /// One step of a plan.
@@ -48,15 +49,18 @@ pub enum HotState {
     /// plan restores it or it was never breached.
     Ok,
     /// The floor cannot be restored even by removing all hot video (something else fills
-    /// the volume), and this tick's plan deletes no hot video to stop growth: the archive
+    /// the volume), or only the emergency reserve cannot be reached
+    /// (`Plan::reserve_floor_unreachable`; the percentage floor is then still in force), and
+    /// this tick's plan deletes no hot video to stop growth: the archive
     /// absorbs the ingest, there is nothing ingested, the moves already cover it, or the hot
     /// video is already below the rolling budget and the emergency reserve is free.
     /// State, never an error.
     Unsatisfiable,
     /// As `Unsatisfiable`, and this tick's plan deletes hot video to hold it at the rolling
     /// budget because the archive cannot absorb it. Raise an alert. The adapter must alert on
-    /// `RollingBuffer`, and also on `Unsatisfiable` while the plan's `archive` is not
-    /// `Available`: the buffer is then rolling but this tick happened to delete nothing. When
+    /// `RollingBuffer`; on `Unsatisfiable` while the plan's `archive` is not `Available` (the
+    /// buffer is then rolling but this tick happened to delete nothing); and on `Unsatisfiable`
+    /// whenever `reserve_floor_unreachable` is set, whatever the archive state. When
     /// the emergency reserve cannot be met even after deleting all hot video, all of it is
     /// deleted and this is still the state: the adapter must alert.
     RollingBuffer,
@@ -91,9 +95,11 @@ pub struct Plan {
     /// it holds is evicted. Kept separate because `ArchiveStatus::Full` takes precedence
     /// over `BelowFloor` in `archive`.
     pub archive_below_floor: bool,
-    /// The hot floor was raised by the emergency reserve (it is above the percentage floor)
-    /// and is unreachable even by removing all hot video. The adapter must alert on it
-    /// whatever the archive state.
+    /// The emergency reserve would raise the hot floor above the percentage floor but the
+    /// volume cannot reach it (free space plus all hot video is below the reserve). The reserve
+    /// is then not part of the floor, so nothing is deleted or moved for it (`hot` is
+    /// `Unsatisfiable` unless the buffer is rolling). The adapter must alert on it whatever the
+    /// archive state.
     pub reserve_floor_unreachable: bool,
 }
 
@@ -213,23 +219,6 @@ fn effective_reserve(input: &PlanInput<'_>) -> u64 {
     )
 }
 
-/// The hot floor and target in bytes of free space. The emergency reserve is a minimum for
-/// both: a floor below it (a 0 % floor, or a small volume) is raised to the reserve, keeping the
-/// 1 pp headroom above it, so the reserve engages whenever free space falls under it and the
-/// recorder cannot run the volume to ENOSPC.
-fn hot_floor_and_target(input: &PlanInput<'_>) -> Result<(u64, u64), PlanError> {
-    let (floor, target) =
-        floor_and_target(input.hot.capacity_bytes, input.policy.hot_min_free.get())?;
-    let reserve = effective_reserve(input);
-    if reserve <= floor {
-        return Ok((floor, target));
-    }
-    Ok((
-        reserve,
-        reserve.saturating_add(target.saturating_sub(floor)),
-    ))
-}
-
 fn sum_bytes(segments: &[&StoredSegment], what: OverflowQuantity) -> Result<u64, PlanError> {
     segments
         .iter()
@@ -320,12 +309,13 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         _ => None,
     };
     let hot = tier_segments(input.segments, Tier::Hot);
-    let (hot_floor, hot_target) = hot_floor_and_target(input)?;
     let hot_total = sum_bytes(&hot, OverflowQuantity::HotTotal)?;
     let free = input.hot.free_bytes;
     let reachable = free
         .checked_add(hot_total)
         .ok_or(PlanError::Overflow(OverflowQuantity::HotTotal))?;
+    let floor = hot_floor(input.hot.capacity_bytes, free, hot_total, &input.policy);
+    let (hot_floor, hot_target) = (floor.floor_bytes, floor.target_bytes);
     let below = free < hot_floor;
     let unsatisfiable = reachable < hot_floor;
     let (budget, ceiling) = rolling_levels(input, hot_total, reachable);
@@ -374,13 +364,9 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         actions,
         archive: archive_status,
         archive_below_floor: below_floor,
-        reserve_floor_unreachable: unsatisfiable
-            && hot_floor
-                > percent_of(
-                    input.hot.capacity_bytes,
-                    u64::from(input.policy.hot_min_free.get()),
-                )?,
+        reserve_floor_unreachable: floor.reserve_unreachable,
         hot: match (need.unsatisfiable, rolling.deleted) {
+            (false, _) if floor.reserve_unreachable => HotState::Unsatisfiable,
             (false, _) => HotState::Ok,
             (true, false) => HotState::Unsatisfiable,
             (true, true) => HotState::RollingBuffer,

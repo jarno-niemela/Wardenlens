@@ -209,7 +209,8 @@ proptest! {
         let (hot_after, _, left) = simulate(hot.free_bytes, with_archive.then_some(archive.free_bytes), &segs, &p);
         let remaining: u64 = left.iter().filter(|s| s.tier == Tier::Hot).map(|s| s.bytes).sum();
         if !with_archive {
-            prop_assert!(remaining == 0 || hot_after >= reserve,
+            // An unreachable reserve is not part of the floor: nothing is deleted for it.
+            prop_assert!(remaining == 0 || hot_after >= reserve || p.reserve_floor_unreachable,
                 "free {} reserve {} left {} plan {:?}", hot_after, reserve, remaining, p);
         }
         prop_assert_eq!(p.rolling_ceiling.is_some(), p.rolling_budget.is_some());

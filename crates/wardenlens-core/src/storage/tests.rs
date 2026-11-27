@@ -1019,3 +1019,62 @@ fn a_reserve_floor_above_the_percentage_floor_that_is_unreachable_is_flagged() {
     .unwrap();
     assert!(!p.reserve_floor_unreachable, "{p:?}");
 }
+
+#[test]
+fn an_unreachable_reserve_deletes_nothing_and_raises_the_flag() {
+    // Cap 1000, floor 25 % = 250, reserve 500.
+    let segs: Vec<StoredSegment> = (0..3).map(|i| seg(i, Tier::Hot, 50, i)).collect();
+    // free 300 + video 150 = 450 < 500: the reserve cannot be met; the 250 floor is met.
+    let p = plan(&reserve_input(
+        300,
+        ArchiveState::Unavailable,
+        &segs,
+        500,
+        None,
+    ))
+    .unwrap();
+    assert!(p.reserve_floor_unreachable, "{p:?}");
+    assert_eq!(p.hot, HotState::Unsatisfiable);
+    assert_eq!(p.actions.len(), 0, "free 300 is above the 250 floor: {p:?}");
+    assert_eq!(p.rolling_budget, None);
+}
+
+/// The planner's below-floor decision (it moves hot video to a roomy archive exactly when the hot
+/// volume is below its floor) agrees with the status' `below_floor` for the same rows: a 0 %
+/// floor with a reserve, a reserve above 90 %, foreign data, a reserve that cannot be reached.
+#[test]
+fn planner_and_status_agree_on_the_hot_floor() {
+    let cap = 1000_u64;
+    let mut checked = 0;
+    for pct in [0_u8, 10, 25, 90] {
+        for reserve in [0_u64, 1, 150, 600, 900, 901, 2000, u64::MAX] {
+            for video in [10_u64, 100, 400] {
+                for foreign in (0..=cap - video).step_by(25) {
+                    let free = cap - video - foreign;
+                    let segs = [seg(0, Tier::Hot, video, 0)];
+                    let mut pin = input(
+                        vol(cap, free),
+                        ArchiveState::Available(vol(1_000_000, 1_000_000)),
+                        &segs,
+                        0,
+                    );
+                    pin.policy.hot_min_free = MinFreePercent::new(pct).unwrap();
+                    pin.policy.emergency_reserve_bytes = reserve;
+                    let p = plan(&pin).unwrap();
+                    let moves = p
+                        .actions
+                        .iter()
+                        .any(|a| matches!(a, Action::MoveToArchive(_)));
+                    let status = super::VolumeStatus::new_hot(vol(cap, free), video, &pin.policy);
+                    assert_eq!(
+                        moves,
+                        status.below_floor(),
+                        "pct {pct} reserve {reserve} video {video} free {free}: {p:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 1000);
+}

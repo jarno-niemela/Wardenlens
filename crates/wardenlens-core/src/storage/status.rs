@@ -8,7 +8,7 @@
 
 use crate::time::Timestamp;
 
-use super::types::{MinFreePercent, VolumeSpace};
+use super::types::{MinFreePercent, Policy, VolumeSpace, hot_floor};
 
 /// Percent of `capacity` that `free` is: `free * 100 / capacity`, rounded down, at most 100.
 ///
@@ -45,6 +45,26 @@ impl VolumeStatus {
             free_bytes: space.free_bytes,
             free_percent: free_percent(space.free_bytes, space.capacity_bytes),
             below_floor: u128::from(space.free_bytes) < floor_bytes,
+        }
+    }
+
+    /// The status of the hot volume: the floor is [`hot_floor`], the planner's own rule (the
+    /// percentage floor raised to the emergency reserve when the volume can reach it), so
+    /// `below_floor` agrees with what the planner treats as below its floor. `hot_video_bytes`
+    /// is the total size of the hot segments.
+    #[must_use]
+    pub fn new_hot(space: VolumeSpace, hot_video_bytes: u64, policy: &Policy) -> Self {
+        let floor = hot_floor(
+            space.capacity_bytes,
+            space.free_bytes,
+            hot_video_bytes,
+            policy,
+        );
+        Self {
+            total_bytes: space.capacity_bytes,
+            free_bytes: space.free_bytes,
+            free_percent: free_percent(space.free_bytes, space.capacity_bytes),
+            below_floor: space.free_bytes < floor.floor_bytes,
         }
     }
 

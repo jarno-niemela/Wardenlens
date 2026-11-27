@@ -2,8 +2,8 @@
 //! tick's counts and the index, and nothing else. It carries no path, no camera and no error text.
 
 use wardenlens_core::storage::{
-    ArchiveCondition, ArchiveUnavailableCause, MinFreePercent, SegmentIndex, StoredSegment,
-    TickErrorKind, Tier, TierStatus, TierTotals, VolumeSpace, VolumeStatus,
+    ArchiveCondition, ArchiveUnavailableCause, Policy, SegmentIndex, StoredSegment, TickErrorKind,
+    Tier, TierStatus, TierTotals, VolumeSpace, VolumeStatus,
 };
 
 use crate::error::TickError;
@@ -43,28 +43,36 @@ pub(crate) const fn archive_condition(probe: &ArchiveProbe, full: bool) -> Archi
 /// How many volumes of this probe are under their floor, by the byte rule of the planner. The
 /// archive counts only while it is available (an absent volume has no space to measure).
 pub(crate) fn breaches(
-    hot: Option<VolumeSpace>,
-    hot_floor: MinFreePercent,
+    hot: Option<(VolumeSpace, u64)>,
+    policy: &Policy,
     archive: &ArchiveProbe,
-    archive_floor: MinFreePercent,
 ) -> u64 {
-    let hot = hot.is_some_and(|s| VolumeStatus::new(s, hot_floor).below_floor());
+    let hot = hot.is_some_and(|(s, video)| VolumeStatus::new_hot(s, video, policy).below_floor());
     let archive = match archive {
-        ArchiveProbe::Available(s) => VolumeStatus::new(*s, archive_floor).below_floor(),
+        ArchiveProbe::Available(s) => VolumeStatus::new(*s, policy.archive_min_free).below_floor(),
         _ => false,
     };
     u64::from(hot).saturating_add(u64::from(archive))
 }
 
-/// A tier's status from its volume and the rows last read.
+/// A tier's status from its volume and the rows last read. The hot tier is measured against the
+/// planner's own floor (`hot_floor`, with the reserve), from the hot bytes of its rows.
 pub(crate) fn tier_status(
+    tier: Tier,
     space: Option<VolumeSpace>,
-    floor: MinFreePercent,
+    policy: &Policy,
     rows: &TierRows,
 ) -> TierStatus {
+    let floor = match tier {
+        Tier::Hot => policy.hot_min_free,
+        _ => policy.archive_min_free,
+    };
     TierStatus::new(
         floor,
-        space.map(|s| VolumeStatus::new(s, floor)),
+        space.map(|s| match tier {
+            Tier::Hot => VolumeStatus::new_hot(s, rows.bytes, policy),
+            _ => VolumeStatus::new(s, floor),
+        }),
         rows.segments,
         rows.oldest.map(|s| s.ended_at),
         rows.newest.map(|s| s.ended_at),
@@ -75,6 +83,7 @@ pub(crate) fn tier_status(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TierRows {
     pub(crate) segments: u64,
+    pub(crate) bytes: u64,
     pub(crate) oldest: Option<StoredSegment>,
     pub(crate) newest: Option<StoredSegment>,
 }
@@ -82,15 +91,16 @@ pub(crate) struct TierRows {
 /// Counts, the oldest and the newest row of both tiers; `None` when any index call failed.
 pub(crate) fn read_rows<I: SegmentIndex>(index: &SharedIndex<I>) -> Option<(TierRows, TierRows)> {
     let totals: TierTotals = index.totals().ok()?;
-    let one = |tier: Tier, segments: u64| -> Option<TierRows> {
+    let one = |tier: Tier, segments: u64, bytes: u64| -> Option<TierRows> {
         Some(TierRows {
             segments,
+            bytes,
             oldest: index.oldest(tier, None, 1).ok()?.into_iter().next(),
             newest: index.newest(tier).ok()?,
         })
     };
     Some((
-        one(Tier::Hot, totals.hot.segments)?,
-        one(Tier::Archive, totals.archive.segments)?,
+        one(Tier::Hot, totals.hot.segments, totals.hot.bytes)?,
+        one(Tier::Archive, totals.archive.segments, totals.archive.bytes)?,
     ))
 }

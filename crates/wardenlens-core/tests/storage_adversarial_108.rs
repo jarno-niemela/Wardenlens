@@ -78,10 +78,10 @@ fn hot_deleted(p: &Plan) -> Vec<SegmentId> {
         .collect()
 }
 
-/// A hot volume smaller than the (default, 2 GiB) emergency reserve, well above its 25 %
-/// percentage floor, archive unavailable. Before #108 nothing was deleted (the floor holds);
-/// the reserve-as-floor now makes the floor unreachable by construction, so every hot segment
-/// is deleted on every tick although the reserve can never be met and nothing fills the volume.
+/// Invariant: a hot volume smaller than the (default, 2 GiB) emergency reserve, well above its
+/// 25 % percentage floor and with nothing else on it, archive unavailable, deletes nothing. The
+/// reserve is capped at 90 % of the capacity, so it never turns such a volume into a permanent
+/// emptying of all hot video.
 #[test]
 fn small_hot_volume_with_default_reserve_does_not_delete_all_video_when_well_above_its_floor() {
     let capacity = 1024 * MIB;
@@ -111,8 +111,8 @@ fn small_hot_volume_with_default_reserve_does_not_delete_all_video_when_well_abo
     );
 }
 
-/// Same over ticks: the recorder writes one 10 MiB segment per tick; retention collapses to the
-/// segment just written.
+/// Invariant over ticks: with a recorder writing one 10 MiB segment per tick, retention on such
+/// a volume stays above one segment (it never collapses to the segment just written).
 #[test]
 fn small_hot_volume_keeps_more_than_one_tick_of_video_across_ticks() {
     let capacity = 1024 * MIB;

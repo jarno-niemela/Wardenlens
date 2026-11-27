@@ -95,8 +95,9 @@ pub struct Policy {
     /// Hot segments that ended earlier than this are moved even without pressure.
     pub hot_max_age: DurationMs,
     /// Free space, in bytes, the planner keeps on the hot volume. It is a minimum for the hot
-    /// floor (a floor below it, such as a 0 % floor, is raised to it), so it engages whatever
-    /// the percentage. When the floor is unreachable the rolling buffer deletes the oldest hot
+    /// floor (a floor below it, such as a 0 % floor, is raised to it, see [`hot_floor`]), so it
+    /// engages whatever the percentage; capped at 90 % of the capacity and ignored while the
+    /// volume cannot reach it. When the floor is unreachable the rolling buffer deletes the oldest hot
     /// video until at least this much is free (or no hot video remains). It stops foreign data
     /// growth from driving the hot volume to ENOSPC while the buffer would otherwise sit at its
     /// budget.
@@ -169,4 +170,61 @@ pub fn effective_reserve_bytes(capacity_bytes: u64, reserve_bytes: u64) -> u64 {
         .checked_mul(u128::from(MinFreePercent::MAX))
         .map_or(u128::MAX, |scaled| scaled / 100);
     reserve_bytes.min(u64::try_from(cap).unwrap_or(u64::MAX))
+}
+
+/// The hot floor in force for one probe, from [`hot_floor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotFloor {
+    /// Free bytes below which the hot volume is under its floor.
+    pub floor_bytes: u64,
+    /// Free bytes the plan restores to when it is below (the floor plus 1 pp of headroom).
+    pub target_bytes: u64,
+    /// The emergency reserve would raise the floor but the volume cannot reach it (free space
+    /// plus all hot video is below the reserve): the reserve is then not part of the floor, so it
+    /// never makes the floor unreachable and nothing is deleted for it.
+    pub reserve_unreachable: bool,
+}
+
+/// The one hot-floor rule, used by the planner, the status (`below_floor`, the breach counter)
+/// and the quarantine eviction so they cannot disagree.
+///
+/// The floor is the percentage floor, raised to the effective reserve (see
+/// [`effective_reserve_bytes`]) when the reserve is above it and the volume can reach it
+/// (`free + hot video >= reserve`). The target keeps the usual 1 pp of headroom above the floor.
+#[must_use]
+pub fn hot_floor(
+    capacity_bytes: u64,
+    free_bytes: u64,
+    hot_video_bytes: u64,
+    policy: &Policy,
+) -> HotFloor {
+    let percent = |p: u8| {
+        u128::from(capacity_bytes)
+            .checked_mul(u128::from(p))
+            .map_or(u64::MAX, |scaled| {
+                u64::try_from(scaled / 100).unwrap_or(u64::MAX)
+            })
+    };
+    let min_free = policy.hot_min_free.get();
+    let (floor, target) = (percent(min_free), percent(min_free.saturating_add(1)));
+    let reserve = effective_reserve_bytes(capacity_bytes, policy.emergency_reserve_bytes);
+    if reserve <= floor {
+        return HotFloor {
+            floor_bytes: floor,
+            target_bytes: target,
+            reserve_unreachable: false,
+        };
+    }
+    if free_bytes.saturating_add(hot_video_bytes) < reserve {
+        return HotFloor {
+            floor_bytes: floor,
+            target_bytes: target,
+            reserve_unreachable: true,
+        };
+    }
+    HotFloor {
+        floor_bytes: reserve,
+        target_bytes: reserve.saturating_add(target.saturating_sub(floor)),
+        reserve_unreachable: false,
+    }
 }
