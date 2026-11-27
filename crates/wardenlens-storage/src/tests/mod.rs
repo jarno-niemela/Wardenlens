@@ -1,3 +1,4 @@
+mod adversary_108_r4;
 mod adversary_160;
 mod adversary_160_r2;
 mod adversary_160_r3;

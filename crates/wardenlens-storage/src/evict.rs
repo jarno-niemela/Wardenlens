@@ -7,7 +7,7 @@
 use std::str::FromStr;
 
 use wardenlens_core::camera::CameraId;
-use wardenlens_core::storage::{Tier, VolumeSpace};
+use wardenlens_core::storage::{Policy, Tier, VolumeSpace, hot_floor};
 use wardenlens_fsutil::{DirEntry, FileKind, QUARANTINE_DIR};
 
 use crate::fs::Fs;
@@ -113,17 +113,15 @@ pub(crate) fn select<F: Fs>(
     fs: &F,
     tier: Tier,
     space: &VolumeSpace,
-    floor_percent: u8,
+    policy: &Policy,
     deletable_bytes: u64,
     incomplete: &mut bool,
 ) -> Option<Selection> {
-    let floor = percent_of(space.capacity_bytes, u64::from(floor_percent))?;
-    let target = percent_of(
-        space.capacity_bytes,
-        u64::from(floor_percent).saturating_add(1),
-    )?;
     let sized = scan_sized(fs, tier);
     *incomplete |= sized.incomplete;
+    // The floor is judged by the same figures as in the planner and the status (free space plus
+    // the indexed video); the quarantine only counts toward what the eviction can restore.
+    let (floor, target) = tier_floor(tier, space, policy, deletable_bytes)?;
     let reachable = space
         .free_bytes
         .saturating_add(sized.total)
@@ -146,10 +144,35 @@ pub(crate) fn percent_of(capacity: u64, percent: u64) -> Option<u64> {
     u64::try_from(scaled.checked_div(100)?).ok()
 }
 
-/// Whether `space` is below its floor of `floor_percent`.
-pub(crate) fn below_floor(space: &VolumeSpace, floor_percent: u8) -> bool {
-    percent_of(space.capacity_bytes, u64::from(floor_percent))
-        .is_some_and(|floor| space.free_bytes < floor)
+/// The floor and target, in free bytes, of `tier`'s volume. The hot tier uses the one hot-floor
+/// rule (`hot_floor`: the reserve counts only when `free + hot video` can reach it); the archive
+/// the plain percentage. `None` when the arithmetic does not fit.
+pub(crate) fn tier_floor(
+    tier: Tier,
+    space: &VolumeSpace,
+    policy: &Policy,
+    hot_video: u64,
+) -> Option<(u64, u64)> {
+    if tier == Tier::Hot {
+        let f = hot_floor(space.capacity_bytes, space.free_bytes, hot_video, policy);
+        return Some((f.floor_bytes, f.target_bytes));
+    }
+    let pct = u64::from(policy.archive_min_free.get());
+    Some((
+        percent_of(space.capacity_bytes, pct)?,
+        percent_of(space.capacity_bytes, pct.saturating_add(1))?,
+    ))
+}
+
+/// Whether `space` is below its floor; `hot_video` is the hot tier's indexed bytes (as the
+/// planner and the status see them).
+pub(crate) fn below_floor(
+    tier: Tier,
+    space: &VolumeSpace,
+    policy: &Policy,
+    hot_video: u64,
+) -> bool {
+    tier_floor(tier, space, policy, hot_video).is_some_and(|(floor, _)| space.free_bytes < floor)
 }
 
 fn digits(s: &str, n: usize) -> bool {
@@ -261,6 +284,7 @@ fn list<F: Fs>(fs: &F, tier: Tier, dir: &[&str], st: &mut ScanState) -> Vec<DirE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wardenlens_core::storage::MinFreePercent;
 
     #[test]
     fn names_follow_the_quarantine_pattern_only() {
@@ -290,14 +314,24 @@ mod tests {
             capacity_bytes: u64::MAX,
             free_bytes: 0,
         };
-        assert!(below_floor(&v, 90));
+        let policy = |pct| Policy {
+            hot_min_free: MinFreePercent::new(pct).unwrap(),
+            archive_min_free: MinFreePercent::new(pct).unwrap(),
+            emergency_reserve_bytes: 0,
+            ..Policy::default()
+        };
+        for tier in [Tier::Hot, Tier::Archive] {
+            assert!(below_floor(tier, &v, &policy(90), 0));
+        }
         let zero = VolumeSpace {
             capacity_bytes: 0,
             free_bytes: 0,
         };
-        assert!(
-            !below_floor(&zero, 25),
-            "capacity 0 is unusable, not below a floor"
-        );
+        for tier in [Tier::Hot, Tier::Archive] {
+            assert!(
+                !below_floor(tier, &zero, &policy(25), 0),
+                "capacity 0 is unusable, not below a floor"
+            );
+        }
     }
 }

@@ -56,6 +56,7 @@ fn run(
         policy,
         ingested_bytes: ingested,
         rolling_budget,
+        rolling_ceiling: None,
     })
 }
 
@@ -234,10 +235,10 @@ proptest! {
 }
 
 /// Ticket override: "Never let the recorder run / to ENOSPC." A hot floor of 0 % is a valid
-/// configuration (0-90). With the archive unavailable and foreign data plus video filling the
-/// volume to 0 free bytes, deletable hot video exists, yet nothing is planned.
+/// configuration (0-90). The reserve is a minimum for the floor, so with the archive unavailable
+/// and foreign data plus video filling the volume to 0 free bytes the planner deletes hot video
+/// until the reserve is free (ticket #108; it once planned nothing).
 #[test]
-#[ignore = "follow-up #108; minor, round 5: a 0 % hot floor never engages the emergency reserve"]
 fn zero_percent_floor_at_enospc_with_deletable_video_frees_space() {
     let segs: Vec<StoredSegment> = (0..10)
         .map(|i| seg(i, Tier::Hot, 100, i64::try_from(i).unwrap()))
@@ -258,9 +259,8 @@ fn zero_percent_floor_at_enospc_with_deletable_video_frees_space() {
     );
 }
 
-/// Same with the archive available and empty: nothing moves either.
+/// Same with the archive available and empty: the video moves (it once did not).
 #[test]
-#[ignore = "follow-up #108; minor, round 5: a 0 % hot floor never engages the emergency reserve"]
 fn zero_percent_floor_at_enospc_with_archive_space_moves_video() {
     let segs: Vec<StoredSegment> = (0..10)
         .map(|i| seg(i, Tier::Hot, 100, i64::try_from(i).unwrap()))

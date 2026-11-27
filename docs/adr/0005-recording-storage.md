@@ -564,6 +564,39 @@ times the value in all); it re-probes after each one. The
 tick interval is 30 s (#68). Catch-up after downtime takes several ticks (see the example), which is acceptable
 because writing continues meanwhile.
 
+**Amendment (ticket #108): the emergency reserve, the rolling buffer and its budget.** These refine the hot side
+of the rules above; the planner is `wardenlens_core::storage::plan`.
+
+- *Effective hot floor.* `floor = max(percent floor, min(reserve, 90 % of capacity))` when the volume can reach
+  that reserve, i.e. `free + hot video >= min(reserve, 90 % of capacity)`; otherwise the reserve is not part of the
+  floor and the plain percentage floor applies. The target keeps the usual 1 pp of headroom above the floor. The
+  reserve (`emergency_reserve_bytes`) is capped at the largest accepted floor (`MinFreePercent::MAX`, 90 %).
+  One core helper, `hot_floor`, implements this and is used by the planner, the status (`below_floor`), the
+  breach counter and the quarantine eviction, so they cannot disagree. The reserve engages whatever the percentage
+  (a 0 % floor still keeps it free), and it never makes the floor unreachable. Outside the rolling buffer nothing is
+  deleted or moved for a reserve the volume cannot reach: that case is reported (`reserve_floor_unreachable`, state
+  `Unsatisfiable`) and alerted, not acted on. Inside the rolling buffer (the percentage floor is also unreachable
+  and the archive cannot help) the #44 drain toward the reserve still applies, down to no hot video; the state is
+  `RollingBuffer` and the alert fires. Whether that drain should also be gated on reachability is tracked in #194.
+- *Small volumes.* On a volume smaller than the reserve the floor is 90 % of the capacity: a 1 GiB volume with the
+  default 2 GiB reserve and nothing else on it keeps about 92 MiB of video and is otherwise quiet; it is not
+  emptied on every tick. With foreign data such that `free + hot video` is below the capped reserve, the reserve is
+  unreachable: the percentage floor applies and the alert is raised. A volume that foreign data keeps under the
+  percentage floor is the rolling-buffer case below.
+- *Rolling buffer.* When the floor is unreachable even by removing all hot video (case 4) and the archive cannot
+  take the load, the oldest hot video is deleted until what remains is at most the rolling budget and the
+  reserve is free, or no hot video is left. This is the ticket #44 override of case 4 and it stays; it applies only
+  when the percentage floor itself is unreachable, and the reserve cap and reachability rule above keep a reserve
+  from triggering it. Where the archive can absorb the video, or the plan deletes nothing for the floor, hot video
+  is never deleted for a floor that deleting cannot reach.
+- *Budget, ratchet, ceiling and recovery.* The budget is the hot-video level the buffer holds. On entry it is the
+  video held before that tick's ingest (the seed), which is also its ceiling. It ratchets down to the video left only
+  when the reserve forced a delete at or below the budget (a ratchet on every tick would drain the buffer), and it
+  recovers, never above the ceiling, to `min(ceiling, hot video + free space - reserve)`. The adapter feeds the
+  budget and the ceiling back each tick, caps the budget at the ceiling, and clears both when the buffer ends.
+- *Alerts.* The adapter alerts on `RollingBuffer`, on `Unsatisfiable` while the archive is not `Available`, and on
+  `Unsatisfiable` whenever the floor raised by the reserve is unreachable (`TickReport::hot_alert`).
+
 ### 7. Crash-safe tier move
 
 Only the storage loop moves or deletes segments and changes `tier` (a single task, enforced by one process holding an
