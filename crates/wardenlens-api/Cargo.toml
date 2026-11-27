@@ -23,9 +23,16 @@ sha2 = { version = "0.11.1", default-features = false }
 subtle = "2.6.1"
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
+# #62 (ADR 0004 section 9): the streamed download. `rt` for spawn and spawn_blocking, `sync` for the
+# pump channel and the download semaphore, `time` for the idle timeout; no `fs` or `io-util`.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "time"] }
+# Already in the tree through axum; the body type of the streamed download implements its trait.
+http-body = { version = "1.1.0", default-features = false }
 
 [dev-dependencies]
+wardenlens-core = { workspace = true, features = ["test-support"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "time", "test-util"] }
+tempfile = { workspace = true }
 http-body-util = "0.1.5"
 secrecy = { workspace = true }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }

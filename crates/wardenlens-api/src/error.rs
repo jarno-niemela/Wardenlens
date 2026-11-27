@@ -21,6 +21,8 @@ pub(crate) fn code_for(status: StatusCode) -> &'static str {
         StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
         StatusCode::REQUEST_TIMEOUT => "request_timeout",
         StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        StatusCode::RANGE_NOT_SATISFIABLE => "range_not_satisfiable",
+        StatusCode::SERVICE_UNAVAILABLE => "unavailable",
         s if s.is_server_error() => "internal_error",
         _ => "bad_request",
     }
