@@ -16,8 +16,9 @@ pub enum StoreError {
     #[error("a file with this name already exists")]
     NameTaken,
     /// Sealed (fsynced) but no free key: every key tried was taken by a file or an index row. The
-    /// finished file was moved into the hot quarantine, never deleted (#195).
-    #[error("no free name for the finished segment; it was kept in quarantine")]
+    /// finished file was kept: moved into the hot quarantine, or renamed in place to
+    /// `<name>.mp4.unsealed` when that failed. Never deleted (#195).
+    #[error("no free name for the finished segment; it was kept")]
     NoFreeName,
     /// Every quarantine name is taken: the file was left where it is.
     #[error("every quarantine name is taken")]

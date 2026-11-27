@@ -102,21 +102,34 @@ impl HotStore {
 
 impl HotStore {
     /// A sealed `.part` that found no free name: moved into `_quarantine` (the file is real
-    /// video). When even that fails the `.part` is left where it is, never unlinked.
+    /// video). When that fails it is renamed in place to `<name>.mp4.unsealed`, a name the
+    /// start-up reconciliation does not delete (it deletes `.part` files, and leaves what it does
+    /// not know as `unknown_left`). Either way [`StoreError::NoFreeName`]: the file is kept. Only
+    /// when both moves fail is the `.part` left as it is (never unlinked) and the error says why.
     fn keep_unnamed(&mut self, writer: HotWriter) -> Result<Sealed, StoreError> {
         let HotWriter {
             file,
-            dir: _dir,
+            dir,
             part,
             day,
             ..
         } = writer;
         drop(file);
-        match quarantine(
+        let moved = quarantine(
             &self.root,
             &[self.camera.as_str(), day.as_str(), part.as_str()],
-        ) {
-            Ok(QuarantineOutcome::Moved { .. }) => Err(StoreError::NoFreeName),
+        );
+        if matches!(moved, Ok(QuarantineOutcome::Moved { .. })) {
+            return Err(StoreError::NoFreeName);
+        }
+        let unsealed = format!(
+            "{}.unsealed",
+            part.strip_suffix(PART_SUFFIX).unwrap_or(&part)
+        );
+        if dir.rename_noreplace(&part, &dir, &unsealed).is_ok() {
+            return Err(StoreError::NoFreeName);
+        }
+        match moved {
             Ok(_) => Err(StoreError::QuarantineExhausted),
             Err(e) => Err(StoreError::from_fs(e)),
         }

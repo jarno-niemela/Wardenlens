@@ -258,8 +258,10 @@ cannot answer for a key, the key is used (the file's name is still never replace
 gets no row (`Sealed::key_checked` is false), and reconciliation judges it at the next start (a file at a row's key
 whose size differs is invalid and is quarantined; one of the row's size is a twin, section 9, and is never deleted
 unless byte-identical); (ii) when every key tried is taken (by a file or a row), the sealed `.part` is moved into the hot
-quarantine under its `.mp4.part` name (`StoreError::NoFreeName`, counted `segments_quarantined`); if even that move
-fails the `.part` is left where it is, never unlinked. A quarantined `.mp4.part` is a complete segment, not matched by the
+quarantine under its `.mp4.part` name (`StoreError::NoFreeName`, counted `segments_quarantined`); if that move fails
+the sealed file is renamed in place to `<name>.mp4.unsealed` (same outcome), a name the start-up `.part` rule does not
+delete and the walk reports `unknown_left`; only if both moves fail is the `.part` left as it is, never unlinked, and the
+segment counts as aborted. A quarantined `.mp4.part` or an `.mp4.unsealed` is a complete segment, not matched by the
 section 9 walk (it is `unknown_left`) and not evicted: an operator can rename it back; (b) **a read-only index volume holds the recorder, it does not quarantine**:
 `SQLITE_READONLY` and `SQLITE_CANTOPEN` and the I/O error kinds `ReadOnlyFilesystem` and `PermissionDenied` (the index
 error's `is_unwritable`) are permanent for the run but say nothing about the file, so the file is kept in place (it has no row; the

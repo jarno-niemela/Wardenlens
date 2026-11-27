@@ -469,13 +469,29 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
         }
     }
 
+    /// Whether `other` (the file of the row's key on the other tier) is the row's own copy: of
+    /// the row's size and, when the row's own file is there, the same bytes. `None` when the
+    /// bytes could not be compared (nothing may be deleted then). A missing or wrong-size own
+    /// file leaves the other as the only candidate for the row's data.
+    fn is_rows_copy(&self, row: &IndexedSegment, rel: &Rel, mut other: Opened) -> Option<bool> {
+        if other.len != row.record.bytes {
+            return Some(false);
+        }
+        match self.fs.open_read(row.tier, &rel.comps()) {
+            Ok(mut own) if own.len == row.record.bytes => same_bytes(&mut own, &mut other),
+            Ok(_) => Some(true),
+            Err(e) if e.is_not_found() => Some(true),
+            Err(_) => None,
+        }
+    }
+
     /// Delete segment `id`: unlink the hot copy, then the archive copy (when the archive is
     /// available), fsync each parent directory, then remove the row.
     ///
     /// **The twin check runs first**, before anything is unlinked, so an error there never
     /// leaves an unlinked file behind a kept row. The twin is the file of the same row on the
     /// other tier (when that tier is in play): a missing one is nothing to delete; one of the
-    /// wrong size is quarantined and left alone (a failure to quarantine is `DeleteFailed`); a
+    /// wrong size, or of the right size but other bytes than the row's own file, is quarantined and left alone (a failure to quarantine is `DeleteFailed`); a
     /// non-regular object (`NotRegular`), a symlink (`ELOOP`) or a regular file planted where a
     /// directory of the twin's path should be (`ENOTDIR`) is not a segment: it is left alone,
     /// counted as [`Outcome::DeletedTwinLeft`], and never pins the row. Any other error is
@@ -509,14 +525,19 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
         let mut skip_other = false;
         if tiers.contains(&other) {
             match self.fs.open_read(other, &rel.comps()) {
-                Ok(o) if o.len == row.record.bytes => drop(o),
                 Ok(o) => {
-                    // A wrong-size twin is an invalid file: quarantined, never deleted (section 9).
-                    drop(o);
-                    if !self.quarantined(other, &rel) {
+                    // A twin is the same bytes, not just the same size (a name is not an
+                    // identity, #195): a file that is not the row's own copy is quarantined,
+                    // never deleted. A wrong-size file is invalid and treated alike (section 9).
+                    let Some(same) = self.is_rows_copy(&row, &rel, o) else {
                         return Outcome::DeleteFailed;
+                    };
+                    if !same {
+                        if !self.quarantined(other, &rel) {
+                            return Outcome::DeleteFailed;
+                        }
+                        skip_other = true;
                     }
-                    skip_other = true;
                 }
                 Err(e) if e.is_not_found() => {}
                 // A symlink (ELOOP) or another non-regular object is not a segment and cannot be
