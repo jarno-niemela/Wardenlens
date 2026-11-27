@@ -6,6 +6,8 @@
 
 mod client;
 mod discovery;
+mod discovery_adv;
+mod discovery_adversary;
 mod fixtures;
 mod leaks;
 mod limits;

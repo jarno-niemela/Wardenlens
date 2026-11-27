@@ -1,14 +1,74 @@
-//! The `XAddrs` pass-list: one choke point that turns a hostile URL string into a canonical
-//! `http://` URL on a private or link-local address, or into the reason it was dropped (SEC-10).
+//! The `XAddrs` pass-list: one choke point that turns a hostile URL string into a typed
+//! [`XAddr`] (an IP literal, a port and a validated service path) on a private address, or into
+//! the reason it was dropped (SEC-10).
 //!
 //! Nothing is kept as given. The string is split into scheme, authority, port and path, each part
-//! is checked against what is known to be good, and the URL is rebuilt from the parsed parts, so a
-//! spelling the parser accepts but a client might read differently (userinfo, a host name, a
-//! decimal or octal host, a zone id, a fragment) never reaches the caller.
+//! is checked against what is known to be good, and the value is built from the parsed parts, so
+//! a spelling the parser accepts but a client might read differently (userinfo, a host name, a
+//! decimal or octal host, a zone id, a fragment) never reaches the caller. The path goes through
+//! the same predicate as [`crate::OnvifClient::with_device_path`], so everything accepted here
+//! can be used by the client; nobody has to parse a URL again.
+//!
+//! Deliberate difference from core's `classify` (bind addresses): `fe80::/10` is refused. A
+//! link-local IPv6 address needs a zone id to be connected to, and an `XAddr` carries none.
+//! IPv4 link-local (`169.254.0.0/16`) works without a zone and is kept.
 
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU16;
 use std::str::FromStr;
+
+use crate::client::ServicePath;
+
+/// A validated device service address found by discovery.
+///
+/// `Debug` shows no address (it is LAN data from a hostile source); `Display` writes the
+/// canonical `http://host[:port]/path` for an operator to confirm.
+#[derive(Clone, PartialEq, Eq)]
+pub struct XAddr {
+    host: IpAddr,
+    port: Option<NonZeroU16>,
+    path: ServicePath,
+}
+
+impl XAddr {
+    /// The private IP literal.
+    #[must_use]
+    pub fn host(&self) -> IpAddr {
+        self.host
+    }
+
+    /// The port, 80 when the URL named none.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port.map_or(80, NonZeroU16::get)
+    }
+
+    /// The service path: starts with `/`, valid for [`crate::OnvifClient::with_device_path`].
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.path.as_str()
+    }
+}
+
+impl fmt::Debug for XAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("XAddr(..)")
+    }
+}
+
+impl fmt::Display for XAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.host {
+            IpAddr::V4(a) => write!(f, "http://{a}")?,
+            IpAddr::V6(a) => write!(f, "http://[{a}]")?,
+        }
+        if let Some(p) = self.port {
+            write!(f, ":{p}")?;
+        }
+        f.write_str(self.path.as_str())
+    }
+}
 
 /// Longest `XAddr` that is looked at, in bytes.
 pub(crate) const MAX_XADDR_LEN: usize = 512;
@@ -16,7 +76,7 @@ pub(crate) const MAX_XADDR_LEN: usize = 512;
 /// Why one `XAddr` was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum XAddrDrop {
+pub(crate) enum XAddrDrop {
     /// Longer than 512 bytes.
     TooLong,
     /// Has a space, a control character or a non-ASCII character.
@@ -34,10 +94,11 @@ pub enum XAddrDrop {
     NotIpLiteral,
     /// The port is empty, not decimal digits, 0 or above 65535.
     BadPort,
-    /// A well-formed address that is not private (RFC 1918, `fc00::/7`) or link-local
-    /// (`169.254.0.0/16`, `fe80::/10`).
+    /// A well-formed address that is not private (RFC 1918, `fc00::/7`) or IPv4 link-local
+    /// (`169.254.0.0/16`).
     OutsideLan,
-    /// The path or query has a character outside the allowed set, a `%`, a `?` or a `#`.
+    /// The path is not a valid service path (the client's rule: no `?`, `#`, `%`, `@`, `//` at
+    /// the start, dot segments, or more than 256 bytes).
     BadPath,
 }
 
@@ -62,22 +123,17 @@ fn lan_v4(a: Ipv4Addr) -> bool {
     a.is_private() || a.is_link_local()
 }
 
-/// `fc00::/7` (unique local) or `fe80::/10` (link-local). An IPv4-mapped address is neither.
+/// `fc00::/7` (unique local) only. An IPv4-mapped address is not in it.
 fn lan_v6(a: Ipv6Addr) -> bool {
-    let first = a.segments()[0];
-    (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+    (a.segments().first().copied().unwrap_or(0) & 0xfe00) == 0xfc00
 }
 
-fn path_byte_ok(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&b)
-}
-
-/// Checks `raw` and returns the canonical form `http://host[:port]/path`.
+/// Checks `raw` and returns the typed address.
 ///
 /// # Errors
-/// The [`XAddrDrop`] reason when `raw` is not a plain-HTTP URL on a private or link-local IP
-/// literal.
-pub(crate) fn validate(raw: &str) -> Result<String, XAddrDrop> {
+/// The [`XAddrDrop`] reason when `raw` is not a plain-HTTP URL on a private (or IPv4 link-local)
+/// IP literal with a valid service path.
+pub(crate) fn validate(raw: &str) -> Result<XAddr, XAddrDrop> {
     if raw.len() > MAX_XADDR_LEN {
         return Err(XAddrDrop::TooLong);
     }
@@ -99,16 +155,17 @@ pub(crate) fn validate(raw: &str) -> Result<String, XAddrDrop> {
         return Err(XAddrDrop::Userinfo);
     }
     let (host, port) = split_authority(authority)?;
-    let host = canonical_host(host)?;
+    let host = parse_host(host)?;
     let port = match port {
-        None => String::new(),
-        Some(p) => format!(":{}", parse_port(p)?),
+        None => None,
+        Some(p) => Some(parse_port(p)?),
     };
-    if !path.bytes().all(path_byte_ok) || !(path.is_empty() || path.starts_with('/')) {
+    if !(path.is_empty() || path.starts_with('/')) {
         return Err(XAddrDrop::BadPath);
     }
-    let path = if path.is_empty() { "/" } else { path };
-    Ok(format!("http://{host}{port}{path}"))
+    let path = ServicePath::new(if path.is_empty() { "/" } else { path })
+        .map_err(|_| XAddrDrop::BadPath)?;
+    Ok(XAddr { host, port, path })
 }
 
 /// Splits `host[:port]` or `[v6][:port]` into the host text (with its brackets) and the port text.
@@ -131,29 +188,29 @@ fn split_authority(authority: &str) -> Result<(&str, Option<&str>), XAddrDrop> {
     }
 }
 
-fn canonical_host(host: &str) -> Result<String, XAddrDrop> {
+fn parse_host(host: &str) -> Result<IpAddr, XAddrDrop> {
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         let a = Ipv6Addr::from_str(inner).map_err(|_| XAddrDrop::NotIpLiteral)?;
         return if lan_v6(a) {
-            Ok(format!("[{a}]"))
+            Ok(IpAddr::V6(a))
         } else {
             Err(XAddrDrop::OutsideLan)
         };
     }
     let a = Ipv4Addr::from_str(host).map_err(|_| XAddrDrop::NotIpLiteral)?;
     if lan_v4(a) {
-        Ok(a.to_string())
+        Ok(IpAddr::V4(a))
     } else {
         Err(XAddrDrop::OutsideLan)
     }
 }
 
-fn parse_port(p: &str) -> Result<u16, XAddrDrop> {
+fn parse_port(p: &str) -> Result<NonZeroU16, XAddrDrop> {
     if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
         return Err(XAddrDrop::BadPort);
     }
-    match p.parse::<u16>() {
-        Ok(v) if v != 0 => Ok(v),
-        _ => Err(XAddrDrop::BadPort),
-    }
+    p.parse::<u16>()
+        .ok()
+        .and_then(NonZeroU16::new)
+        .ok_or(XAddrDrop::BadPort)
 }

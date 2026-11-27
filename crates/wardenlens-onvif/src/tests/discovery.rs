@@ -18,7 +18,7 @@ use crate::OnvifError;
 use crate::discovery::{
     DEFAULT_WINDOW, DiscoveredDevice, DiscoveryError, DropReason, MAX_DATAGRAM, MAX_DEVICES,
     MAX_REPLIES, MAX_SCOPES, MAX_WINDOW, MAX_XADDRS, ProbeReplyError, XAddrDrop, build_probe,
-    effective_window, parse_probe_matches, run,
+    effective_window, parse as parse_probe_matches, run,
 };
 
 const ID: &str = "uuid:00000000000000000000000000000001";
@@ -52,11 +52,13 @@ fn good() -> String {
 }
 
 fn dev(refr: &str, xaddrs: &[&str], scopes: &[&str]) -> DiscoveredDevice {
-    DiscoveredDevice {
-        xaddrs: xaddrs.iter().map(|s| (*s).to_owned()).collect(),
-        scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
-        endpoint_ref: refr.to_owned(),
-    }
+    let d = DiscoveredDevice::for_test(refr, xaddrs, scopes);
+    assert_eq!(
+        d.xaddrs().len(),
+        xaddrs.len(),
+        "test fixture xaddr must validate"
+    );
+    d
 }
 
 // ---- the XAddr pass-list ----
@@ -80,7 +82,8 @@ fn xaddr_table() -> Vec<(String, Result<String, XAddrDrop>)> {
         ok("HTTP://10.0.0.1/x", "http://10.0.0.1/x"),
         ok("http://10.0.0.1", "http://10.0.0.1/"),
         ok("http://[fd12::1]:2020/onvif", "http://[fd12::1]:2020/onvif"),
-        ok("http://[FE80::0:1]/x", "http://[fe80::1]/x"),
+        no("http://[FE80::0:1]/x", OutsideLan),
+        ok("http://[FD00::0:1]/x", "http://[fd00::1]/x"),
         // schemes
         no("https://192.168.1.10/x", Https),
         no("HTTPS://192.168.1.10/x", Https),
@@ -136,8 +139,9 @@ fn xaddr_table() -> Vec<(String, Result<String, XAddrDrop>)> {
         ok("http://[fc00::1]/x", "http://[fc00::1]/x"),
         ok("http://[fdff::1]/x", "http://[fdff::1]/x"),
         no("http://[fe00::1]/x", OutsideLan),
-        ok("http://[fe80::1]/x", "http://[fe80::1]/x"),
-        ok("http://[febf::1]/x", "http://[febf::1]/x"),
+        no("http://[fe80::1]/x", OutsideLan),
+        no("http://[febf::1]/x", OutsideLan),
+        no("http://[fe80::1]:80/x", OutsideLan),
         no("http://[fec0::1]/x", OutsideLan),
         no("http://[ff02::1]/x", OutsideLan),
         // ports
@@ -155,6 +159,13 @@ fn xaddr_table() -> Vec<(String, Result<String, XAddrDrop>)> {
         no("http://10.0.0.1?q=1", BadPath),
         no("http://10.0.0.1#f", BadPath),
         no("http://10.0.0.1/a%2fb", BadPath),
+        no("http://10.0.0.1//x", BadPath),
+        no("http://10.0.0.1//8.8.8.8/x", BadPath),
+        no("http://10.0.0.1/a/../b", BadPath),
+        no("http://10.0.0.1/..", BadPath),
+        no("http://10.0.0.1/./x", BadPath),
+        no("http://10.0.0.1/a@b", BadPath),
+        no("http://10.0.0.1/@", BadPath),
         no("http://10.0.0.1/a\"b", BadPath),
         no("http://10.0.0.1/a<b", BadPath),
         no("http://10.0.0.1/a\\b", BadPath),
@@ -173,20 +184,27 @@ fn xaddr_table() -> Vec<(String, Result<String, XAddrDrop>)> {
 fn xaddr_pass_list_table() {
     use crate::discovery::xaddr_validate as validate;
     for (input, want) in xaddr_table() {
-        assert_eq!(validate(&input), want, "input {input:?}");
+        assert_eq!(
+            validate(&input).map(|x| x.to_string()),
+            want,
+            "input {input:?}"
+        );
     }
 }
 
 #[test]
-fn xaddr_length_boundary() {
+fn xaddr_length_boundaries() {
     use crate::discovery::xaddr_validate as validate;
-    let with_len = |n: usize| {
-        let base = "http://10.0.0.1/";
-        format!("{base}{}", "a".repeat(n - base.len()))
-    };
-    assert!(validate(&with_len(511)).is_ok());
-    assert!(validate(&with_len(512)).is_ok());
-    assert_eq!(validate(&with_len(513)), Err(XAddrDrop::TooLong));
+    // Path: 256 bytes is the client's limit (the `/` counts).
+    let path = |n: usize| format!("http://10.0.0.1/{}", "a".repeat(n - 1));
+    assert!(validate(&path(255)).is_ok());
+    assert!(validate(&path(256)).is_ok());
+    assert_eq!(validate(&path(257)), Err(XAddrDrop::BadPath));
+    assert_eq!(validate(&path(300)), Err(XAddrDrop::BadPath));
+    // Whole URL: 512 bytes is looked at, one more is refused before anything else.
+    let url = |n: usize| format!("{}{}", "x".repeat(n - 1), "y");
+    assert_eq!(validate(&url(512)), Err(XAddrDrop::NoScheme));
+    assert_eq!(validate(&url(513)), Err(XAddrDrop::TooLong));
 }
 
 fn lan_oracle(u: &str) -> bool {
@@ -196,10 +214,10 @@ fn lan_oracle(u: &str) -> bool {
     let authority = rest.split('/').next().unwrap_or("");
     if let Some(inner) = authority.strip_prefix('[') {
         let host = inner.split(']').next().unwrap_or("");
-        return host.parse::<std::net::Ipv6Addr>().is_ok_and(|a| {
-            let s0 = a.segments()[0];
-            s0 >> 9 == 0x7e || s0 >> 6 == 0x3fa
-        });
+        // Unique local only: `fe80::/10` needs a zone id and is refused.
+        return host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|a| a.segments()[0] >> 9 == 0x7e);
     }
     let host = authority.split(':').next().unwrap_or("");
     host.parse::<Ipv4Addr>()
@@ -236,14 +254,16 @@ fn xaddr_hostile_components_keep_the_invariant_and_reach_ok() {
     let ok_count = std::cell::Cell::new(0_u32);
     runner
         .run(&hostile_url(), |url| {
-            if let Ok(u) = validate(&url) {
+            if let Ok(x) = validate(&url) {
+                let u = x.to_string();
                 ok_count.set(ok_count.get() + 1);
+                prop_assert!(x.path().starts_with('/') && x.port() != 0);
                 prop_assert!(u.starts_with("http://"));
                 prop_assert!(u.bytes().all(|b| (0x21..=0x7e).contains(&b)));
                 prop_assert!(!u.contains(['@', '%', '#', '?']));
                 prop_assert!(lan_oracle(&u), "{url:?} -> {u:?}");
                 // Canonical form is a fixed point.
-                prop_assert_eq!(validate(&u), Ok(u.clone()));
+                prop_assert_eq!(validate(&u), Ok(x));
             }
             Ok(())
         })
@@ -446,7 +466,7 @@ fn xaddr_and_scope_and_match_caps_at_minus_one_exact_plus_one() {
         (MAX_XADDRS + 1, MAX_XADDRS, 1),
     ] {
         let r = parse_probe_matches(reply(&[pm("urn:uuid:a", &xs(n), "")]).as_bytes(), ID).unwrap();
-        assert_eq!(r.devices[0].xaddrs.len(), kept);
+        assert_eq!(r.devices[0].xaddrs().len(), kept);
         assert_eq!(r.drops.len(), drops);
     }
     for (n, kept, drops) in [
@@ -459,7 +479,7 @@ fn xaddr_and_scope_and_match_caps_at_minus_one_exact_plus_one() {
             ID,
         )
         .unwrap();
-        assert_eq!(r.devices[0].scopes.len(), kept);
+        assert_eq!(r.devices[0].scopes().len(), kept);
         assert_eq!(r.drops.len(), drops);
         if drops == 1 {
             assert_eq!(r.drops[0], DropReason::TooManyScopes);
@@ -499,15 +519,15 @@ fn bad_scopes_are_reported_not_silently_lost() {
         ID,
     )
     .unwrap();
-    assert_eq!(r.devices[0].scopes, vec!["onvif://ok", "onvif://two"]);
-    assert_eq!(r.drops, vec![DropReason::ScopeTooLong]);
+    assert_eq!(r.devices[0].scopes(), vec!["onvif://ok", "onvif://two"]);
+    assert_eq!(r.drops, vec![DropReason::BadScope]);
     let r = parse_probe_matches(
         reply(&[pm("urn:uuid:a", "http://10.0.0.1/x", &"y".repeat(5000))]).as_bytes(),
         ID,
     )
     .unwrap();
-    assert_eq!(r.devices[0].scopes.len(), 0);
-    assert_eq!(r.drops, vec![DropReason::ScopeTooLong]);
+    assert_eq!(r.devices[0].scopes().len(), 0);
+    assert_eq!(r.drops, vec![DropReason::BadScope]);
 }
 
 fn merged(devs: Vec<DiscoveredDevice>) -> (Vec<DiscoveredDevice>, Vec<DropReason>) {
@@ -571,7 +591,7 @@ fn merge_caps_hold_at_minus_one_exact_plus_one() {
     v.push(dev("urn:uuid:0", &["http://10.0.0.2/x"], &[]));
     let (d, dr) = merged(v);
     assert_eq!(dr.len(), 0);
-    assert_eq!(d[0].xaddrs.len(), 2);
+    assert_eq!(d[0].xaddrs().len(), 2);
     // merging cannot grow xaddrs or scopes past the caps
     let many: Vec<String> = (0..MAX_XADDRS + 3)
         .map(|i| format!("http://10.0.1.{i}/x"))
@@ -583,8 +603,8 @@ fn merge_caps_hold_at_minus_one_exact_plus_one() {
         dev("urn:uuid:a", &[], &[]),
         dev("urn:uuid:a", &refs, &srefs),
     ]);
-    assert_eq!(d[0].xaddrs.len(), MAX_XADDRS);
-    assert_eq!(d[0].scopes.len(), MAX_SCOPES);
+    assert_eq!(d[0].xaddrs().len(), MAX_XADDRS);
+    assert_eq!(d[0].scopes().len(), MAX_SCOPES);
     assert_eq!(dr.len(), 6);
 }
 
@@ -610,15 +630,15 @@ proptest! {
         if let Ok(r) = r {
             let (devices, _) = merged(r.devices);
             for d in devices {
-                prop_assert!(!d.xaddrs.is_empty() && d.xaddrs.len() <= MAX_XADDRS);
-                prop_assert!(d.scopes.len() <= MAX_SCOPES);
-                prop_assert!(!d.endpoint_ref.is_empty() && d.endpoint_ref.len() <= 256);
-                prop_assert!(!d.endpoint_ref.chars().any(char::is_control));
-                for u in &d.xaddrs {
-                    prop_assert!(lan_oracle(u));
+                prop_assert!(!d.xaddrs().is_empty() && d.xaddrs().len() <= MAX_XADDRS);
+                prop_assert!(d.scopes().len() <= MAX_SCOPES);
+                prop_assert!(!d.endpoint_ref().is_empty() && d.endpoint_ref().len() <= 256);
+                prop_assert!(d.endpoint_ref().bytes().all(|b| (0x21..=0x7e).contains(&b)));
+                for u in d.xaddrs() {
+                    prop_assert!(lan_oracle(&u.to_string()));
                 }
-                for sc in &d.scopes {
-                    prop_assert!(sc.len() <= 256 && !sc.chars().any(char::is_control));
+                for sc in d.scopes() {
+                    prop_assert!(sc.len() <= 256 && sc.bytes().all(|b| (0x21..=0x7e).contains(&b)));
                 }
             }
         }
@@ -671,16 +691,26 @@ fn the_probe_is_well_formed_and_carries_the_id() {
 }
 
 #[test]
-fn message_ids_are_random_and_shaped() {
+fn message_ids_are_random_rfc4122_v4_uuids() {
     let a = crate::discovery::new_message_id().unwrap();
     let b = crate::discovery::new_message_id().unwrap();
     assert_ne!(a, b);
-    for id in [&a, &b] {
-        let hex = id.strip_prefix("uuid:").unwrap();
-        assert_eq!(hex.len(), 32);
+    for _ in 0..200 {
+        let id = crate::discovery::new_message_id().unwrap();
+        let uuid = id.strip_prefix("urn:uuid:").unwrap();
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
         assert!(
-            hex.bytes()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            uuid.bytes()
+                .all(|c| c == b'-' || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+        );
+        assert!(parts[2].starts_with('4'), "{uuid}");
+        assert!(
+            matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+            "{uuid}"
         );
     }
 }
@@ -708,6 +738,9 @@ async fn responder(make: impl Fn(&str) -> Vec<Vec<u8>> + Send + 'static) -> Sock
             .to_owned();
         for dgram in make(&id) {
             let _ = sock.send_to(&dgram, from).await;
+            // Paced: let the receiver drain before the next send, so the default socket buffer
+            // is never the thing under test.
+            tokio::task::yield_now().await;
         }
     });
     addr
@@ -804,8 +837,8 @@ async fn loopback_stops_at_64_replies_and_64_devices() {
     .await;
     let got = run(to, LOOP, LONG, MAX_REPLIES, ID).await.unwrap();
     assert_eq!(got.len(), 64);
-    assert_eq!(got.first().unwrap().endpoint_ref, "urn:uuid:000");
-    assert_eq!(got.last().unwrap().endpoint_ref, "urn:uuid:063");
+    assert_eq!(got.first().unwrap().endpoint_ref(), "urn:uuid:000");
+    assert_eq!(got.last().unwrap().endpoint_ref(), "urn:uuid:063");
 }
 
 #[tokio::test]
@@ -857,15 +890,14 @@ fn label(e: DiscoveryError) -> &'static str {
     match e {
         DiscoveryError::Random => "Random",
         DiscoveryError::Socket(_) => "Socket",
-        DiscoveryError::Receive(_) => "Receive",
     }
 }
 
 #[test]
 fn every_discovery_error_variant_is_driven_or_listed() {
-    // `Random` (the OS RNG failing) and `Receive` (a recv error that is not a timeout) cannot be
-    // provoked from a test on loopback.
-    let undrivable: BTreeSet<&str> = ["Random", "Receive"].into();
+    // `Random` (the OS RNG failing) cannot be provoked from a test. A receive error is not an
+    // error of the run: see `a_receive_error_keeps_what_was_found`.
+    let undrivable: BTreeSet<&str> = ["Random"].into();
     let driven: BTreeSet<&str> = [label(DiscoveryError::Socket(
         io::ErrorKind::AddrNotAvailable,
     ))]
@@ -873,7 +905,6 @@ fn every_discovery_error_variant_is_driven_or_listed() {
     let all: BTreeSet<&str> = [
         label(DiscoveryError::Random),
         label(DiscoveryError::Socket(io::ErrorKind::Other)),
-        label(DiscoveryError::Receive(io::ErrorKind::Other)),
     ]
     .into();
     let covered: BTreeSet<&str> = driven.union(&undrivable).copied().collect();
@@ -881,7 +912,6 @@ fn every_discovery_error_variant_is_driven_or_listed() {
     for e in [
         DiscoveryError::Random,
         DiscoveryError::Socket(io::ErrorKind::Other),
-        DiscoveryError::Receive(io::ErrorKind::Other),
     ] {
         assert!(e.to_string().len() > 1);
     }
@@ -992,5 +1022,123 @@ async fn loopback_the_65th_reply_is_not_read_even_when_devices_would_fit() {
     .await;
     let got = run(to, LOOP, LONG, MAX_REPLIES, ID).await.unwrap();
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].endpoint_ref, "urn:uuid:first");
+    assert_eq!(got[0].endpoint_ref(), "urn:uuid:first");
+}
+
+// ---- round 2: the ASCII pass-list, redaction, reply and datagram bounds ----
+
+/// Every spelling a denylist of control characters lets through (TEST-9): format, bidi, zero
+/// width, no-break and separator characters, a fullwidth letter, a space inside, at the start,
+/// inside and at the end.
+const NOT_PRINTABLE_ASCII: [&str; 8] = [
+    "\u{202e}", "\u{200b}", "\u{feff}", "\u{a0}", "\u{2028}", "\u{ff21}", "\u{e9}", "\u{7f}",
+];
+
+#[test]
+fn endpoint_references_and_scopes_are_printable_ascii_only() {
+    // The space is not in the list: inside an endpoint reference it is refused too (below), and
+    // in a scope list it is a separator.
+    for bad in NOT_PRINTABLE_ASCII {
+        for field in [format!("{bad}a"), format!("a{bad}b"), format!("a{bad}")] {
+            let r =
+                parse_probe_matches(reply(&[pm(&field, "http://10.0.0.1/x", "")]).as_bytes(), ID)
+                    .unwrap();
+            assert_eq!(r.devices.len(), 0, "endpoint {field:?} accepted");
+            assert_eq!(r.drops, vec![DropReason::BadEndpointReference], "{field:?}");
+            let scopes = format!("onvif://ok {field}");
+            let r = parse_probe_matches(
+                reply(&[pm("urn:uuid:a", "http://10.0.0.1/x", &scopes)]).as_bytes(),
+                ID,
+            )
+            .unwrap();
+            assert_eq!(
+                r.devices[0].scopes(),
+                ["onvif://ok"],
+                "scope {field:?} kept"
+            );
+            assert_eq!(r.drops, vec![DropReason::BadScope], "{field:?}");
+        }
+    }
+    let r = parse_probe_matches(
+        reply(&[pm("urn:uuid: a", "http://10.0.0.1/x", "")]).as_bytes(),
+        ID,
+    )
+    .unwrap();
+    assert_eq!(r.devices.len(), 0);
+    // ASCII whitespace around the value is still trimmed.
+    let r = parse_probe_matches(
+        reply(&[pm(" \turn:uuid:a\r\n", "http://10.0.0.1/x", "")]).as_bytes(),
+        ID,
+    )
+    .unwrap();
+    assert_eq!(r.devices[0].endpoint_ref(), "urn:uuid:a");
+}
+
+#[test]
+fn debug_shows_no_host_scope_or_endpoint() {
+    let d = dev(
+        "urn:uuid:ENDPOINT-SENTINEL",
+        &["http://192.168.77.66:8081/PATH-SENTINEL"],
+        &["onvif://SCOPE-SENTINEL"],
+    );
+    let shown = format!("{d:?} {:?} {:?}", d.xaddrs(), d.xaddrs().first());
+    for s in ["SENTINEL", "192.168", "8081"] {
+        assert!(!shown.contains(s), "{shown}");
+    }
+    let r = parse_probe_matches(good().as_bytes(), ID).unwrap();
+    let shown = format!("{r:?}");
+    for s in ["192.168.1.10", "aaaa", "Cam"] {
+        assert!(!shown.contains(s), "{shown}");
+    }
+}
+
+#[test]
+fn typed_xaddr_exposes_host_port_and_path_without_reparsing() {
+    let d = dev(
+        "urn:uuid:a",
+        &[
+            "http://10.0.0.7/onvif/device_service",
+            "http://[fd00::7]:8080/x",
+        ],
+        &[],
+    );
+    let (a, b) = (&d.xaddrs()[0], &d.xaddrs()[1]);
+    assert_eq!(a.host(), std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)));
+    assert_eq!((a.port(), a.path()), (80, "/onvif/device_service"));
+    assert_eq!(b.host(), "fd00::7".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!((b.port(), b.path()), (8080, "/x"));
+    assert_eq!(a.to_string(), "http://10.0.0.7/onvif/device_service");
+}
+
+#[tokio::test]
+async fn empty_spoofed_replies_do_not_use_up_the_reply_cap() {
+    // 64 echoing replies that yield no device (https only), then a real one.
+    let to = responder(|id| {
+        let mut v: Vec<Vec<u8>> = (0..64)
+            .map(|_| reply_for(id, &[pm("urn:uuid:spoof", "https://10.0.0.1/x", "")]).into_bytes())
+            .collect();
+        v.push(reply_for(id, &[]).into_bytes());
+        v.push(reply_for(id, &[pm("urn:uuid:real", "http://10.0.0.9/x", "")]).into_bytes());
+        v
+    })
+    .await;
+    let got = run(to, LOOP, LONG, 1, ID).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].endpoint_ref(), "urn:uuid:real");
+}
+
+#[tokio::test]
+async fn the_datagram_bound_stops_a_flood_at_4096() {
+    use crate::discovery::MAX_DATAGRAMS;
+    assert_eq!(MAX_DATAGRAMS, 4096);
+    for (strays, found) in [(MAX_DATAGRAMS - 1, 1), (MAX_DATAGRAMS, 0)] {
+        let to = responder(move |id| {
+            let mut v: Vec<Vec<u8>> = (0..strays).map(|_| b"x".to_vec()).collect();
+            v.push(reply_for(id, &[pm("urn:uuid:real", "http://10.0.0.9/x", "")]).into_bytes());
+            v
+        })
+        .await;
+        let got = run(to, LOOP, LONG, 1, ID).await.unwrap();
+        assert_eq!(got.len(), found, "{strays} strays before the reply");
+    }
 }
