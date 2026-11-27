@@ -63,6 +63,7 @@ fn run(
         policy,
         ingested_bytes: ingested,
         rolling_budget,
+        rolling_ceiling: None,
     })
 }
 
@@ -311,10 +312,11 @@ fn budget_clears_when_floor_reachable_and_reseeds_on_reentry() {
     assert_eq!(p.actions, vec![Action::Delete(SegmentId::new(1))]);
 }
 
-/// Ticket #44 override: "Never let the recorder run / to ENOSPC." Foreign data has filled the
-/// hot volume to zero free bytes while the archive is unavailable; the recorder cannot write,
-/// so nothing is ingested. Hot video is at the budget, so the planner deletes nothing and the
-/// volume stays at ENOSPC on every later tick, although 60 B of deletable hot video exist.
+/// Ticket #44 override: "Never let the recorder run / to ENOSPC." Regression test for a fixed
+/// defect: foreign data fills the hot volume to zero free bytes while the archive is
+/// unavailable and the recorder cannot write, so nothing is ingested. Hot video sits at the
+/// budget, which once made the planner delete nothing and leave the volume at ENOSPC. The
+/// emergency reserve now deletes the 60 B of deletable hot video even at the budget.
 #[test]
 fn rolling_buffer_frees_space_when_hot_volume_is_at_enospc() {
     let segs = [
@@ -340,8 +342,9 @@ fn rolling_buffer_frees_space_when_hot_volume_is_at_enospc() {
     }
 }
 
-/// Same defect over time: foreign data grows 5 B per tick while video is held flat at the
-/// budget, so free space reaches 0 and stays there; the recorder then cannot write at all.
+/// The same regression over time: foreign data grows 5 B per tick. The reserve must keep the
+/// volume from reaching and staying at 0 free bytes while hot video can still be deleted
+/// (the defect was a flat budget that let free space reach 0 and the recorder stop writing).
 #[test]
 fn rolling_buffer_does_not_hold_hot_volume_at_zero_free_while_video_is_deletable() {
     let mut segs: Vec<StoredSegment> = (0..10)
