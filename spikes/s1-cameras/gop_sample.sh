@@ -11,7 +11,8 @@ printf 'stream\tpackets\tfps\tkbps\tgop_frames\tgop_seconds\n'
 load_cams || exit 1
 for name in "${CAMS[@]}"; do
   for kind in main sub; do
-    url="$(rtsp_url "$name" "$(rtsp_path "$name" "$kind")")" || exit 1
+    path="$(rtsp_path "$name" "$kind")" || exit 1
+    url="$(rtsp_url "$name" "$path")" || exit 1
     timeout $((secs + 30)) ffprobe -v error -rtsp_transport tcp -select_streams v:0 \
       -read_intervals "%+$secs" -show_entries packet=pts_time,size,flags -of csv=p=0 "$url" 2>/dev/null \
     | awk -F, -v n="$(cam_id "$name")" -v k="$kind" '

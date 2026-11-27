@@ -21,6 +21,10 @@ step "vault scan"
 vault_scan_tree cargo run -q -p wardenlens-cli --locked -- || exit 1
 step "tooling tests"
 for t in scripts/tests/*.test.sh scripts/tests/adversarial/*.sh; do "$t" >/dev/null || { echo "FAILED: $t" >&2; "$t" | grep -v '^ok' >&2 || true; exit 1; }; done
+# Spike shell tests that need only stubs and a temporary HOME (never the real vault or a camera).
+for t in lib.adv.sh lib-r2.adv.sh cams-r1.adv.sh cams-r2.adv.sh pullpoint.test.sh; do
+  "spikes/s1-cameras/tests/$t" >/dev/null || { echo "FAILED: spikes/s1-cameras/tests/$t" >&2; "spikes/s1-cameras/tests/$t" | grep -v '^ok' >&2 || true; exit 1; }
+done
 if command -v shellcheck >/dev/null; then
   step "shellcheck"
   shellcheck -x scripts/agents scripts/ticket scripts/ticket-audit scripts/verify scripts/gate scripts/labels.sh \

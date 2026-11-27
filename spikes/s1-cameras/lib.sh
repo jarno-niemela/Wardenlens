@@ -46,7 +46,7 @@ selected_cams() {
 }
 
 # load_cams -> fills the global array CAMS with the selected inventory ids. The one choke point for the scripts that
-# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, a vault failure or an empty selection.
+# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, an id with no vendor RTSP path, a vault failure or an empty selection.
 load_cams() {
   local out id
   declare -A seen=()
@@ -55,6 +55,7 @@ load_cams() {
   while IFS= read -r id; do
     [[ -n $id ]] || continue
     if [[ -n ${seen[$id]:-} ]]; then CAMS=(); echo "duplicate camera id: $id" >&2; return 1; fi
+    rtsp_path "$id" main >/dev/null || { CAMS=(); return 1; }
     seen[$id]=1; CAMS+=("$id")
   done <<<"$out"
   (( ${#CAMS[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; return 1; }
@@ -115,6 +116,7 @@ uri_enc() { printf '%s' "$1" | jq -rRs '@uri'; }
 # spike-only exception of ADR 0002 (those tools take the credentials nowhere else).
 rtsp_url() {
   local host
+  [[ ${2:-} == /* ]] || { echo "no RTSP path for camera: $1" >&2; return 1; }
   cam_creds "$1" || return 1
   host="$(cam_host "$1")" && [[ -n "$host" ]] || { echo "no host for camera: $1" >&2; return 1; }
   printf 'rtsp://%s:%s@%s:554%s' "$(uri_enc "$CAM_USER")" "$(uri_enc "$CAM_PASS")" "$host" "$2"

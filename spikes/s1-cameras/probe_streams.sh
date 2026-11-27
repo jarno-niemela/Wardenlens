@@ -8,7 +8,7 @@ source "$here/lib.sh"
 load_cams || exit 1
 for name in "${CAMS[@]}"; do
   for kind in main sub; do
-    path="$(rtsp_path "$name" "$kind")"
+    path="$(rtsp_path "$name" "$kind")" || exit 1
     url="$(rtsp_url "$name" "$path")" || exit 1
     printf '== %s %s\n' "$name" "$kind"
     timeout 25 ffprobe -v error -rtsp_transport tcp -select_streams v:0 \

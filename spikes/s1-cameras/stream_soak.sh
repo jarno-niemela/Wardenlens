@@ -13,13 +13,12 @@ if [[ -e "$out" ]]; then
   listing="$(ls -A "$out")" || { echo "refusing to run: cannot list $out" >&2; exit 1; }
   [[ -z "$listing" ]] || { echo "refusing to run: $out is not empty" >&2; exit 1; }
 fi
-mkdir -p "$out"
-deadline=$(( $(date +%s) + duration ))
 
 run_stream() { # <cam> <kind>
-  local cam="$1" kind="$2" tag restarts=0 url left rc
+  local cam="$1" kind="$2" tag restarts=0 path url left rc
   tag="${cam}_${kind}"
-  url="$(rtsp_url "$cam" "$(rtsp_path "$cam" "$kind")")" || return 1
+  path="$(rtsp_path "$cam" "$kind")" || return 1
+  url="$(rtsp_url "$cam" "$path")" || return 1
   : >"$out/$tag.log"; : >"$out/$tag.progress"
   while :; do
     left=$(( deadline - $(date +%s) ))
@@ -41,10 +40,15 @@ run_stream() { # <cam> <kind>
 }
 
 load_cams || exit 1
+mkdir -p "$out"
+deadline=$(( $(date +%s) + duration ))
 streams=()
 for id in "${CAMS[@]}"; do streams+=("$id:main" "$id:sub"); done
 # Fail before starting anything if a URL cannot be built (unknown camera, missing host).
-for s in "${streams[@]}"; do rtsp_url "${s%%:*}" "$(rtsp_path "${s%%:*}" "${s##*:}")" >/dev/null || exit 1; done
+for s in "${streams[@]}"; do
+  path="$(rtsp_path "${s%%:*}" "${s##*:}")" || exit 1
+  rtsp_url "${s%%:*}" "$path" >/dev/null || exit 1
+done
 for s in "${streams[@]}"; do run_stream "${s%%:*}" "${s##*:}" & done
 wait
 

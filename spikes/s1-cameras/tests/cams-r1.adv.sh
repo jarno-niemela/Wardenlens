@@ -75,6 +75,10 @@ cred cam-x admin pw-synth-x; host cam-x 192.0.2.9
 check "rtsp_path: an id with no known vendor path is an error, not an empty path" '! p=$(rtsp_path cam-x main 2>/dev/null) || [[ -n $p ]]'
 reset; CAMERAS="cam-x" "$here/probe_streams.sh" >/dev/null 2>&1
 check "probe_streams.sh: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
+for s in gop_sample.sh stream_soak.sh; do
+  reset; CAMERAS="cam-x" "$here/$s" "$fx/novp-$s" 1 >/dev/null 2>&1
+  check "$s: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
+done
 
 # ============================== cam_ids against the real binary ==============================
 (cd "$root" && timeout 600 cargo build -q -p wardenlens-cli --locked) || { echo "FAIL could not build wardenlens"; exit 1; }
