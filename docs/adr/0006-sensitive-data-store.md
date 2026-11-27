@@ -277,7 +277,7 @@ row above.
 - **Backups: the protection is conditional.** The database and the key are separate files, but the dev key
   (`~/.config`) and the dev database (`~/.local/share`) are both under `$HOME`, so a whole-home or whole-disk backup
   holds both and then gives no protection. **The key path must be excluded from backups** (#69 documents this for the
-  service key, #76 for the dev key) and the key is kept in the password manager instead (`vault key export`, below).
+  service key, #76 for the dev key: `docs/DEV_VAULT.md`) and the key is kept in the password manager instead (`vault key export`, below).
 - **Permission checks (refuse, do not warn).** `KeyFile::load` refuses a file that is not a regular file (symlinks are
   refused, `O_NOFOLLOW` plus `fstat` on our own opened descriptor, not a path check followed by an open), not owned by the
   current user, readable or writable by group or others (`mode & 0o077 != 0`), or not exactly 32 bytes. The same
@@ -723,6 +723,24 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   map (section 7) and those raw bytes are replaced. **When a hit cannot be mapped exactly** (a view character that came
   from several raw characters and lies partly inside the hit, or a joined-view match spanning a line break), `redact`
   replaces **the whole raw line** (or lines) the hit touches, never a guessed sub-range.
+  **As built (#76), which narrows the paragraph above.** The filter must stream in bounded memory (a spike pipes a
+  30-minute `ffmpeg` log through it), and a line is unbounded, so the view-and-offset-map design with a whole-line
+  fallback was not built. `redact` matches in two ways, both in a streaming pass that keeps
+  `max(longest needle - 1, 64)` bytes across reads (64 covers the longest address token the scan recognises):
+  (1) the **literal renderings** of each value (the raw value, the percent forms, base64 at three alignments, hex, the XML
+  escape, and for a credential the `user:password@` URL prefix) by Aho-Corasick; (2) **address tokens**: an IPv4, IPv6
+  or MAC value is not spelled out but found by the scan's own tokenisers (`scan/net.rs`, shared, so scan and redact
+  agree), which canonicalise zero-padded, dashed, compressed, IPv4-mapped and unpadded spellings. Matching ignores
+  **ASCII case only**. The input is **not squeezed** (zero-width characters, fullwidth letters, white-space runs) and the
+  decoded, JSON-unescaped, joined and line-split views are **not** applied, so a value that appears only in one of those
+  forms is not replaced; `vault scan` still finds all of them. (The squeezed forms of a needle are compiled, but that
+  matches the input only where the input already holds them.) Every match, overlapping or touching ones merged, becomes
+  the fixed `[REDACTED]`: no entry id and no length. Exit 0 done, 1 an input or output error (what was written is
+  redacted), 2 the vault or key unusable (nothing is read or written). An entry whose value is too short to match safely
+  is listed by id on stderr and its value is not replaced; the `user:password@` prefix of a credential with a short
+  password is still replaced when it is long enough. The store's `unscannable` flag is not consulted (such an entry is
+  matched like any other: masking more is allowed). `redact`, like `scan`, is an oracle for guesses (see the oracle note
+  in the threat list).
 - **RTSP URLs on argv (accepted spike-only exception).** The `ffmpeg`/`ffprobe` spikes pass an RTSP URL with credentials
   on argv (ADR 0002). That stays an accepted exception **for the spikes only**; the product uses `retina` with
   in-process credentials (below) and never puts a credential in a URL or on argv.

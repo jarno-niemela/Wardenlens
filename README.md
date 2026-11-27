@@ -64,7 +64,7 @@ target design; see [Roadmap](#roadmap) for what exists today.
 | Web UI | A LAN web UI with a live grid sized to the viewport, motion recaps, full-screen live or last-event playback, and Recent and Archive views |
 | API | An API-first design: an OpenAPI-described HTTP API with bearer tokens, LAN-only binding by default |
 | Camera optimizer | Reads camera settings, proposes improvements with a diff, applies them on approval and can revert them |
-| Secrets | Credentials and site data (addresses, MACs, serials, names) kept in an encrypted vault rather than config files, with an exact-match leak scan on commits (ADR 0006; not built yet) |
+| Secrets | Credentials and site data (addresses, MACs, serials, names) kept in an encrypted vault rather than config files, with an exact-match leak scan on commits (ADR 0006; developer guide: [`docs/DEV_VAULT.md`](docs/DEV_VAULT.md)) |
 | Deployment | Docker with GPU access; production (pinned release) and staging environments |
 
 ### Hardware characterised so far
@@ -126,7 +126,7 @@ Key design decisions are recorded as Architecture Decision Records:
 | [0003](docs/adr/0003-gpu-stack.md) | GPU stack for Maxwell: NVDEC, cudarc and NVRTC, ONNX Runtime, CUDA 12.9 |
 | [0004](docs/adr/0004-service-architecture.md) | Service architecture: tokio, axum, utoipa, crate map, API token auth, LAN-only transport, connection limits |
 | [0005](docs/adr/0005-recording-storage.md) | Recording format: in-house fMP4 writer, segment rules, SQLite index, crash-safe tier moves and reconciliation, `fsutil` |
-| [0006](docs/adr/0006-sensitive-data-store.md) | Encrypted sensitive-data vault (XChaCha20-Poly1305) and the exact-match leak scan |
+| [0006](docs/adr/0006-sensitive-data-store.md) | Encrypted sensitive-data vault (XChaCha20-Poly1305) and the exact-match leak scan; how to use it: [`docs/DEV_VAULT.md`](docs/DEV_VAULT.md) |
 
 Design principles (from [`docs/CODING_GUIDELINES.md`](docs/CODING_GUIDELINES.md) and the ADRs):
 

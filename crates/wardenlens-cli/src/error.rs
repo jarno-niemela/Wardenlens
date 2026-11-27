@@ -32,6 +32,13 @@ pub(crate) enum CliError {
     /// cause is the source.
     #[error("the scan could not run")]
     CouldNotScan(#[source] Box<CliError>),
+    /// The redaction filter could not be built: the vault, the key or the environment was
+    /// unusable (exit 2). Nothing was read from stdin or written. The cause is the source.
+    #[error("the redaction filter could not be built")]
+    CouldNotRedact(#[source] Box<CliError>),
+    /// Copying stdin to stdout failed part way (exit 1); what was written was redacted.
+    #[error("redaction stopped: {0}")]
+    Redact(#[from] wardenlens_vault::RedactError),
     /// At least one vault value was found (exit 1). Only a count.
     #[error("found {0} occurrence(s) of vault values")]
     Leak(usize),
@@ -59,6 +66,7 @@ impl CliError {
             Self::Key(SecretsError::KeyFileExists | SecretsError::InvalidKeyEncoding) => 1,
             Self::Scan(_)
             | Self::CouldNotScan(_)
+            | Self::CouldNotRedact(_)
             | Self::Incomplete(_)
             | Self::Key(_)
             | Self::KeyMismatch(_)

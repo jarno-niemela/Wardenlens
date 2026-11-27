@@ -149,6 +149,22 @@ pub(crate) enum VaultCommand {
     /// Binary files are skipped with a notice; a file over 8 MiB, an unreadable file and a
     /// vault or key that cannot be used all make the scan fail (exit 2).
     Scan(ScanArgs),
+    /// Copy stdin to stdout, replacing every vault value with `[REDACTED]` (a filter for logs).
+    ///
+    /// Exact match against the values in the vault: a credential's password and its
+    /// `user:password@` URL prefix, hosts, MAC addresses, secrets and so on, in the raw, percent,
+    /// base64, hex and XML renderings the leak scan knows. An IPv4, IPv6 or MAC address is found
+    /// in any spelling the scan recognises (zero-padded, dashed, compressed, mapped, unpadded).
+    /// Matching ignores ASCII case only. The input is not squeezed (zero-width and fullwidth
+    /// characters and runs of white space are not normalised) and the decoded, JSON-unescaped and
+    /// line-split views are not replaced; `vault scan` finds all of these. Streams in bounded
+    /// chunks and finds a value split across two reads. Overlapping or touching matches become
+    /// one marker, which reveals no length. Other bytes, binary included, are copied unchanged.
+    /// An entry that is too short to match safely is listed on stderr and its value is not
+    /// replaced. Fails closed: if the vault or key cannot be used nothing is written and the exit
+    /// code is 2; an input or output error exits 1 (bytes already written were redacted). Like
+    /// `scan`, it tells whoever feeds it text whether a guess occurs in the vault.
+    Redact,
 }
 
 /// Arguments of `scan`: files and directories, or one git source.

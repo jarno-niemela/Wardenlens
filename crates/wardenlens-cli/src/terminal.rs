@@ -29,6 +29,9 @@ pub(crate) trait Terminal {
     fn prompt_secret(&mut self, label: &str) -> io::Result<Zeroizing<Vec<u8>>>;
     /// Reads piped standard input up to `limit` bytes; more is an `InvalidData` error.
     fn read_piped(&mut self, limit: usize) -> io::Result<Zeroizing<Vec<u8>>>;
+    /// Standard input and output together, for a filter that streams one into the other
+    /// (`read_piped` is for a value that fits in memory).
+    fn stream(&mut self) -> (&mut dyn Read, &mut dyn Write);
     /// Standard output.
     fn out(&mut self) -> &mut dyn Write;
     /// Standard error (notices and warnings; never a value).
@@ -37,6 +40,7 @@ pub(crate) trait Terminal {
 
 /// The process's real standard streams.
 pub(crate) struct StdTerminal {
+    stdin: io::Stdin,
     stdout: io::Stdout,
     stderr: io::Stderr,
 }
@@ -44,6 +48,7 @@ pub(crate) struct StdTerminal {
 impl StdTerminal {
     pub(crate) fn new() -> Self {
         Self {
+            stdin: io::stdin(),
             stdout: io::stdout(),
             stderr: io::stderr(),
         }
@@ -128,6 +133,10 @@ impl Terminal for StdTerminal {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "input too long"));
         }
         Ok(buf)
+    }
+
+    fn stream(&mut self) -> (&mut dyn Read, &mut dyn Write) {
+        (&mut self.stdin, &mut self.stdout)
     }
 
     fn out(&mut self) -> &mut dyn Write {

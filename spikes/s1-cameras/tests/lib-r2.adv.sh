@@ -13,27 +13,24 @@ ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
-export HOME="$fx/home"; mkdir -p "$HOME"   # the real ~/.config is never read
-# secret <json-array> : (re)write the fake secret file
-secret() { printf '%s' "$1" >"$fx/secret.json"; }
-secret '[{"name":"XR","login":"admin","password":"x"},{"name":"C110","login":"admin","password":"x"},
- {"name":"HDIPC","login":"admin","password":"x"}]'
-cat >"$fx/cameras.toml" <<'T'
-[cameras.reolink-1]
-host = "10.0.0.1"
-[cameras.reolink-2]
-host = "10.0.0.2"
-[cameras.xr]
-host = "127.0.0.1:PORT"
-[cameras.tapo]
-host = "10.0.0.4"
-onvif_port = 2020
-[cameras.hdipc]
-host = "10.0.0.5"
-onvif_port = 8000
-T
-export WARDENLENS_SECRET_FILE="$fx/secret.json" WARDENLENS_CAMERAS="$fx/cameras.toml"
-mkdir -p "$fx/bin"; export PATH="$fx/bin:$PATH"
+export HOME="$fx/home"; mkdir -p "$HOME"   # the real ~/.config and ~/.local/share are never read
+# shellcheck source=vault_stub.sh
+source "$here/tests/vault_stub.sh"
+# secret <json-array of {name,login,password}>: (re)write the stub vault's credential entries.
+secret() {
+  no_entries; printf '[]' >"$VAULT_STUB/.redact"
+  local n u pw
+  n=$(jq 'length' <<<"$1")
+  for ((i = 0; i < n; i++)); do
+    # jq -j and a sentinel keep a trailing newline in the value.
+    u="$(jq -j ".[$i].login // \"\"" <<<"$1"; printf x)"; pw="$(jq -j ".[$i].password // \"\"" <<<"$1"; printf x)"
+    cred "$(jq -r ".[$i].name" <<<"$1")" "${u%x}" "${pw%x}"
+  done
+  for c in IPC-BO "IPC-BO (2)" XR C110 HDIPC; do hosts_for "$c"; done
+}
+hosts_for() { case "$1" in IPC-BO) host "$1" 10.0.0.1 ;; "IPC-BO (2)") host "$1" 10.0.0.2 ;; XR) host "$1" "127.0.0.1:${PORT:-1}" ;; C110) host "$1" 10.0.0.4 ;; HDIPC) host "$1" "${HDIPC_HOST:-10.0.0.5}" ;; esac; }
+secret '[{"name":"XR","login":"admin","password":"pw-top-synth-1"},{"name":"C110","login":"admin","password":"pw-top-synth-2"},
+ {"name":"HDIPC","login":"admin","password":"pw-top-synth-3"}]'
 # shellcheck source=../lib.sh
 source "$here/lib.sh"
 
@@ -59,21 +56,36 @@ for txt in 'frame=  250 fps= 25 q=-1.0 size=N/A time=00:00:10.00 bitrate=N/A spe
   r=$(R "$txt"); check "redact: leaves ordinary text intact: $txt" '[[ $r == "$txt" ]]'
 done
 
-# ============================== cam_field / cam_creds / rtsp_url ==============================
-secret '[{"name":"XR","login":null,"password":"p"},{"name":"C110","login":"","password":null},
- {"name":"HDIPC","login":"a","password":"p1"},{"name":"HDIPC","login":"b","password":"p2"}]'
-check "cam_creds: explicit null login is an error" '! cam_creds XR 2>/dev/null'
+# Layer 1 (the vault filter) is a stub here; the shape masks above are layer 2. A vault value is replaced:
+secret '[{"name":"XR","login":"admin","password":"s3cr3t-pw"}]'
+r=$(R 'login admin s3cr3t-pw ok'); check "redact: a vault value is replaced by layer 1" '[[ $r == "login admin [REDACTED] ok" ]]'
+touch "$VAULT_STUB/.broken"
+r=$(R 'rtsp://u:p@h/ 10.0.0.1 aa:bb:cc:dd:ee:ff' 2>/dev/null); rc=$?
+check "redact: with the vault filter failing, layer 2 prints nothing either (fail closed)" '[[ -z $r ]]'
+R 'x' >/dev/null 2>&1; check "redact: status is non-zero when layer 1 fails" '[[ $? != 0 ]]'
+rm -f "$VAULT_STUB/.broken"
+
+# ============================== cam_creds / rtsp_url ==============================
+secret '[{"name":"XR","login":"","password":"p"},{"name":"C110","login":"","password":""}]'
 cam_creds C110 2>/dev/null; rc=$?
-check "cam_creds: empty login + null password -> ok, empty strings" '[[ $rc == 0 && -z $CAM_USER && -z $CAM_PASS ]]'
-cam_creds HDIPC 2>/dev/null; rc=$?
-check "cam_creds: duplicate camera entries are an error, not a multi-line user" '[[ $rc != 0 || $CAM_USER != *$'"'"'\n'"'"'* ]]'
-check "cam_creds: missing secret file is an error" '! (SECRET_FILE=/nonexistent; cam_creds C110) 2>/dev/null'
+check "cam_creds: empty login and password entries -> ok, empty strings" '[[ $rc == 0 && -z $CAM_USER && -z $CAM_PASS ]]'
 secret '[{"name":"C110","login":"admin","password":"p"}]'
 # Callers use url="$(rtsp_url ...)" under set -e; errexit is not inherited by command substitution.
 o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url XR /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
-check "rtsp_url in \$(...): camera missing from secret file aborts the caller (no credential-less URL)" '[[ $rc != 0 && $o != *URL=* ]]'
+check "rtsp_url in \$(...): camera missing from the vault aborts the caller (no credential-less URL)" '[[ $rc != 0 && $o != *URL=* ]]'
 o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url NOPE /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
 check "rtsp_url in \$(...): unknown camera aborts the caller" '[[ $rc != 0 && $o != *URL=* ]]'
+secret '[{"name":"XR","login":"a","password":"p"}]'; rm "$VAULT_STUB/cam_xr_host"
+o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url XR /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
+check "rtsp_url: no host entry aborts the caller" '[[ $rc != 0 && $o != *URL=* ]]'
+
+# ============================== cam_onvif_url ==============================
+secret '[{"name":"C110","login":"a","password":"p"}]'
+check "cam_onvif_url: no port configured -> default port" '[[ $(cam_onvif_url C110) == http://10.0.0.4/onvif/device_service ]]'
+vault_put cam:tapo:onvif_port 2020
+check "cam_onvif_url: port from the vault entry" '[[ $(cam_onvif_url C110) == http://10.0.0.4:2020/onvif/device_service ]]'
+check "cam_onvif_url: ONVIF_PORT overrides" '[[ $(ONVIF_PORT=8000 cam_onvif_url C110) == http://10.0.0.4:8000/onvif/device_service ]]'
+check "cam_onvif_url: a non-numeric port is refused" '! ONVIF_PORT="80/../x" cam_onvif_url C110 2>/dev/null'
 
 # ============================== dahua.sh ==============================
 # Capture what curl parsed from -K: swap --digest for --basic and decode Basic auth at a local server.
@@ -81,7 +93,7 @@ real_curl=$(command -v curl)
 printf '#!/usr/bin/env bash\na=(); for x in "$@"; do [[ $x == --digest ]] && x=--basic; a+=("$x"); done\necho called >>%q\nexec %q "${a[@]}"\n' \
   "$fx/curl.called" "$real_curl" >"$fx/bin/curl"; chmod +x "$fx/bin/curl"
 port=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-sed -i "s/PORT/$port/" "$fx/cameras.toml"
+PORT=$port
 serve() {
   python3 -I -c '
 import socket,base64,sys
@@ -143,6 +155,7 @@ esac
 S
 chmod +x "$fx/s1/onvif.sh"
 secret '[{"name":"HDIPC","login":"admin","password":"p"},{"name":"C110","login":"admin","password":"p"}]'
+ONVIF_PORT=8000; export ONVIF_PORT; redact_add "aa:bb:cc:dd:ee:ff"; redact_add "fd00::5"
 pull() { # <cam> <addr> -> 0 if the address was followed
   : >"$fx/pp.log"; PP_LOG="$fx/pp.log" PP_ADDR="$2" timeout 10 "$fx/s1/onvif_pull.sh" "$1" 1 >"$fx/pp.out" 2>&1
   [[ -s $fx/pp.log ]]
@@ -161,7 +174,7 @@ done
 pull HDIPC http://10.0.0.5:8000/onvif/pp
 check "onvif_pull: control chars stripped from camera text" '! grep -q $'"'"'\x1b'"'"' "$fx/pp.out" && ! grep -q $'"'"'\x07'"'"' "$fx/pp.out"'
 check "onvif_pull: MAC / IPv6 in event text are masked" '! grep -qE "aa:bb:cc|fd00::5" "$fx/pp.out"'
-sed -i 's/^host = "10.0.0.5"/host = "[fd00::5]"/' "$fx/cameras.toml"
+HDIPC_HOST="[fd00::5]"; hosts_for HDIPC
 check "onvif_pull: IPv6 camera, same origin is followed" 'pull HDIPC "http://[fd00::5]:8000/onvif/pp"'
 check "onvif_pull: IPv6 camera, other host refused" '! pull HDIPC "http://[fd00::6]:8000/onvif/pp"'
 

@@ -9,11 +9,13 @@
 
 mod error;
 pub mod legacy;
+mod redact;
 mod scan;
 mod store;
 mod validate;
 
 pub use error::VaultError;
+pub use redact::{MARKER, RedactError, Redactor, Unredactable};
 pub use scan::{
     BINARY_PROBE_LEN, Content, Hit, MAX_FILE_LEN, MAX_HITS, MAX_INPUT_LEN, MAX_NEEDLE_BYTES,
     Matcher, ScanEntry, ScanError, ScanReport, Unscannable, classify, is_invisible, scan,
