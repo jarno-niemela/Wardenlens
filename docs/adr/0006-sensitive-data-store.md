@@ -215,7 +215,7 @@ Rules:
   the file learns that an entry is, say, 12 bytes long. There is no padding in v1; this is listed as residual risk 12.
 - **Migration (`vault import-legacy`).** Reads `agentdvr-cameras.secret.json` and `cameras.local.toml` and imports
   **mapped fields only** (the host, display name, username, password and similar fields the importer knows) as
-  `cam:<id>:credential`, `cam:<id>:host`, `cam:<id>:name`, with ids from the inventory ids or an ordinal (section 1).
+  `cam:<id>:credential`, `cam:<id>:host`, `cam:<id>:name`, with ids from the inventory ids or an ordinal (section 1). A JSON camera is joined to its inventory id by name (id, vendor or model, case-insensitive, whole words; exact beats word), by `--map <index>=<id>`, never by guess: no match or a tie is refused, listing indexes and ids only (#188). `vault mv <from> <to>` renames a camera's entries in one transaction.
   **Unknown keys are not imported and not guessed:** the importer lists them **by key name** (never by value) so the
   owner can classify each with `vault set`. (An earlier draft turned every unknown scalar into an `other` entry; that
   put public strings into the matcher and made the false positives unmanageable.) It is idempotent, and prints counts and

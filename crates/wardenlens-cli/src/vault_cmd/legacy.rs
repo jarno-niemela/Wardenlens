@@ -1,7 +1,8 @@
 //! `vault import-legacy`: the `AgentDVR` secret JSON and the camera inventory (ADR 0006 section 4).
 //!
-//! Imports through `legacy::map_legacy` only, which refuses ids two files would share. Prints
-//! counts, ids and key names, never values.
+//! Joins each JSON camera to an inventory id (`legacy::resolve_ids`), then imports through
+//! `legacy::map_legacy_with_ids` only, which refuses ids two files would share. Prints counts,
+//! ids, camera indexes and key names, never values.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -10,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
 use wardenlens_vault::legacy::{
-    LegacyError, LegacyImport as Mapped, MAX_REPORTED_KEYS, map_legacy,
+    Basis, LegacyError, LegacyImport as Mapped, MAX_REPORTED_KEYS, Resolution, Row,
+    check_inventory_names, map_legacy_with_ids, resolve_ids,
 };
 use wardenlens_vault::{Scan, Scannability};
 use zeroize::Zeroizing;
@@ -77,12 +79,55 @@ fn names_to_ids(table: &toml::Table) -> Result<BTreeMap<String, String>, CliErro
     Ok(map)
 }
 
-pub(super) fn import<T: Terminal>(
-    args: &LegacyArgs,
-    env: &Env,
-    term: &mut T,
-) -> Result<(), CliError> {
-    let paths = env.paths()?;
+/// Parses `--map <json-index>=<id>`. The text is never echoed: it is user input, but a typo
+/// must not put anything but a fixed message into an error.
+fn parse_map(text: &str) -> Result<(usize, String), CliError> {
+    const BAD: CliError =
+        CliError::Refused("--map needs <json-index>=<id>, for example --map 1=reolink-1");
+    let (index, id) = text.split_once('=').ok_or(BAD)?;
+    let index = index.parse::<usize>().map_err(|_| BAD)?;
+    if id.is_empty() {
+        return Err(BAD);
+    }
+    Ok((index, id.to_owned()))
+}
+
+fn say_mapping(resolution: &Resolution, term: &mut impl Terminal) -> Result<(), CliError> {
+    for (i, row) in resolution.rows().iter().enumerate() {
+        let index = i.saturating_add(1);
+        let line = match row {
+            Row::Mapped { id, basis } => {
+                let how = match basis {
+                    Basis::Explicit => "mapped by --map",
+                    Basis::Exact => "exact match",
+                    _ => "word match",
+                };
+                format!("camera index {index} -> {id} ({how})")
+            }
+            Row::NoMatch => format!(
+                "camera index {index} -> unmapped: no inventory id, vendor or model matches"
+            ),
+            Row::Ambiguous(ids) => {
+                format!(
+                    "camera index {index} -> unmapped: ambiguous between {} ids",
+                    ids.len()
+                )
+            }
+            _ => format!("camera index {index} -> unmapped"),
+        };
+        say(term, &line)?;
+    }
+    Ok(())
+}
+
+/// Reads both files, joins every JSON camera to an inventory id (printing the mapping) and maps
+/// the fields. Writes nothing.
+fn map_files(args: &LegacyArgs, env: &Env, term: &mut impl Terminal) -> Result<Mapped, CliError> {
+    let explicit = args
+        .map
+        .iter()
+        .map(|m| parse_map(m))
+        .collect::<Result<Vec<_>, _>>()?;
     let config = env.config_dir()?;
     let pick = |given: &Option<PathBuf>, name: &str| match given {
         Some(p) => (p.clone(), true),
@@ -114,11 +159,50 @@ pub(super) fn import<T: Terminal>(
         .map(names_to_ids)
         .transpose()?
         .unwrap_or_default();
-    let mapped = map_legacy(json.as_ref(), &names, table.as_ref()).map_err(|e| match e {
+    if json.is_none() && !explicit.is_empty() {
+        return Err(CliError::Refused(
+            "--map needs the secret file, and none was found",
+        ));
+    }
+    check_inventory_names(&names).map_err(|_| DUPLICATE_NAME)?;
+    let resolution = json
+        .as_ref()
+        .map(|j| resolve_ids(j, table.as_ref(), &explicit))
+        .transpose()?;
+    if let Some(r) = &resolution {
+        say_mapping(r, term)?;
+    }
+    let ids = match resolution {
+        Some(r) => r.into_ids()?,
+        None => Vec::new(),
+    };
+    map_legacy_with_ids(json.as_ref(), &ids, &names, table.as_ref()).map_err(|e| match e {
         LegacyError::DuplicateName => DUPLICATE_NAME,
         other => CliError::from(other),
-    })?;
+    })
+}
 
+pub(super) fn import<T: Terminal>(
+    args: &LegacyArgs,
+    env: &Env,
+    term: &mut T,
+) -> Result<(), CliError> {
+    let mapped = map_files(args, env, term)?;
+    if args.dry_run {
+        for e in &mapped.entries {
+            say(term, &format!("would import {} ({})", e.id, e.kind))?;
+        }
+        say(
+            term,
+            &format!(
+                "would import {} entries; nothing was written",
+                mapped.entries.len()
+            ),
+        )?;
+        return report_unknown(&mapped, term);
+    }
+
+    let paths = env.paths()?;
     let mut session = open_write(&paths, term)?;
     let mut unscannable = Vec::new();
     let total = mapped.entries.len();
@@ -165,20 +249,21 @@ pub(super) fn import<T: Terminal>(
     )
 }
 
+/// One line per unused field name with the number of cameras it was found in.
 fn report_unknown(mapped: &Mapped, term: &mut impl Terminal) -> Result<(), CliError> {
-    if !mapped.unknown_keys.is_empty() {
+    if !mapped.unused_fields.is_empty() {
         say(
             term,
-            "not imported (classify each with `wardenlens vault set`):",
+            "not imported, field name and number of cameras (classify each with `wardenlens vault set`):",
         )?;
-        for key in &mapped.unknown_keys {
-            say(term, &format!("  {key}"))?;
+        for (name, count) in &mapped.unused_fields {
+            say(term, &format!("  {name}: {count}"))?;
         }
     }
     if mapped.keys_truncated {
         say(
             term,
-            &format!("  (list cut at {MAX_REPORTED_KEYS} keys; more were not imported)"),
+            &format!("  (list cut at {MAX_REPORTED_KEYS} fields; more were not imported)"),
         )?;
     }
     Ok(())

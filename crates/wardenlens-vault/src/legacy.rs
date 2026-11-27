@@ -24,6 +24,9 @@ use wardenlens_secrets::Credentials;
 use crate::store::Value;
 use crate::validate::{check_credential, display_name_text, normalize_text};
 
+pub mod resolve;
+pub use resolve::{Basis, Resolution, Row, resolve_ids};
+
 /// Most cameras accepted from one legacy file (SEC-2).
 pub const MAX_LEGACY_CAMERAS: usize = 256;
 /// Most unknown or skipped keys reported; further ones only set `keys_truncated`.
@@ -63,6 +66,10 @@ pub struct LegacyImport {
     pub unknown_keys: Vec<String>,
     /// True if more keys than [`MAX_REPORTED_KEYS`] were skipped and the list was cut.
     pub keys_truncated: bool,
+    /// The same fields grouped by field name (no camera id): how many cameras (or sections)
+    /// each unused field was found in. A refused or reserved id is grouped as
+    /// `cameras.<section>`. At most [`MAX_REPORTED_KEYS`] distinct names; names only.
+    pub unused_fields: BTreeMap<String, usize>,
 }
 
 impl LegacyImport {
@@ -80,6 +87,9 @@ impl LegacyImport {
         }
         self.entries.extend(other.entries);
         self.keys_truncated |= other.keys_truncated;
+        for (name, n) in other.unused_fields {
+            self.count_field(name, n);
+        }
         for key in other.unknown_keys {
             if self.unknown_keys.len() >= MAX_REPORTED_KEYS {
                 self.keys_truncated = true;
@@ -90,12 +100,28 @@ impl LegacyImport {
         Ok(self)
     }
 
+    fn count_field(&mut self, name: String, n: usize) {
+        if let Some(c) = self.unused_fields.get_mut(&name) {
+            *c = c.saturating_add(n);
+        } else if self.unused_fields.len() >= MAX_REPORTED_KEYS {
+            self.keys_truncated = true;
+        } else {
+            self.unused_fields.insert(name, n);
+        }
+    }
+
     fn report(&mut self, inv: Option<&str>, key: &str) {
+        let cut = printable(key);
+        let group = if inv == Some("cameras") {
+            format!("cameras.{cut}")
+        } else {
+            cut.clone()
+        };
+        self.count_field(group, 1);
         if self.unknown_keys.len() >= MAX_REPORTED_KEYS {
             self.keys_truncated = true;
             return;
         }
-        let cut = printable(key);
         self.unknown_keys.push(match inv {
             Some(inv) => format!("{inv}.{cut}"),
             None => cut,
@@ -148,6 +174,26 @@ pub enum LegacyError {
     /// The file lists more than 256 cameras.
     #[error("too many cameras")]
     TooMany,
+    /// `--map` named a JSON index that is not in the file (indexes start at 1).
+    #[error("--map names a camera index that is not in the secret file")]
+    MapIndexOutOfRange,
+    /// `--map` named an id the inventory does not have (or cannot use).
+    #[error("--map names an id that is not in the inventory")]
+    MapUnknownId,
+    /// `--map` gave one index twice.
+    #[error("--map gives one camera index twice")]
+    MapDuplicateIndex,
+    /// Some cameras have no single inventory id. Indexes and ids only; never a name.
+    #[error("{}", resolve::unresolved_text(.missing, .ambiguous))]
+    Unresolved {
+        /// Indexes (1-based) that match no inventory id.
+        missing: Vec<usize>,
+        /// Indexes that match several inventory ids equally well, with those ids.
+        ambiguous: Vec<(usize, Vec<String>)>,
+    },
+    /// Several cameras map onto one inventory id. Indexes and the id only.
+    #[error("{}", resolve::shared_text(.0))]
+    SharedId(Vec<(String, Vec<usize>)>),
 }
 
 /// Maps both legacy files for one import and refuses any entry id the two would share.
@@ -164,6 +210,28 @@ pub fn map_legacy(
 ) -> Result<LegacyImport, LegacyError> {
     let j = json
         .map(|j| map_secret_json(j, names_to_ids))
+        .transpose()?
+        .unwrap_or_default();
+    let t = toml
+        .map(map_inventory_toml)
+        .transpose()?
+        .unwrap_or_default();
+    j.merge(t)
+}
+
+/// [`map_legacy`] with the inventory id of every JSON camera already decided (see
+/// [`resolve_ids`] and [`map_secret_json_with_ids`]). `ids` is ignored when `json` is `None`.
+///
+/// # Errors
+/// As [`map_legacy`] and [`map_secret_json_with_ids`].
+pub fn map_legacy_with_ids(
+    json: Option<&serde_json::Value>,
+    ids: &[String],
+    names_to_ids: &BTreeMap<String, String>,
+    toml: Option<&toml::Table>,
+) -> Result<LegacyImport, LegacyError> {
+    let j = json
+        .map(|j| map_secret_json_with_ids(j, ids, names_to_ids))
         .transpose()?
         .unwrap_or_default();
     let t = toml
@@ -251,6 +319,16 @@ fn by_stored_name(
     Ok(map)
 }
 
+/// Checks that no two inventory names are one stored name (invariant I1). [`map_secret_json`]
+/// does this itself; the CLI calls it before [`resolve_ids`], so the refusal does not depend on
+/// whether the names also tie as matches.
+///
+/// # Errors
+/// [`LegacyError::DuplicateName`].
+pub fn check_inventory_names(names_to_ids: &BTreeMap<String, String>) -> Result<(), LegacyError> {
+    by_stored_name(names_to_ids).map(drop)
+}
+
 /// Maps the `AgentDVR` secret file (a JSON array of camera objects).
 ///
 /// Mapped: `name` (display name), `login` or `username`, and `password` (a credential entry).
@@ -265,11 +343,51 @@ pub fn map_secret_json(
     json: &serde_json::Value,
     names_to_ids: &BTreeMap<String, String>,
 ) -> Result<LegacyImport, LegacyError> {
+    let by_stored_name = by_stored_name(names_to_ids)?;
+    secret_json(json, |_, name| {
+        // The inventory owns the display name of a camera it named.
+        name.filter(|n| !n.is_empty())
+            .and_then(|n| by_stored_name.get(n))
+            .map(|id| (id.clone(), true))
+    })
+}
+
+/// [`map_secret_json`] with the inventory id of every camera already decided (see
+/// [`resolve_ids`]): `ids[i]` is the id of the `i`-th JSON camera. `names_to_ids` is checked
+/// for two names that are one stored name (invariant I1) and tells which ids own a display
+/// name in the inventory: their JSON `name` is reported, not emitted (the two files would
+/// otherwise both write `cam:<id>:name`); for any other id the JSON name is imported.
+///
+/// # Errors
+/// As [`map_secret_json`]; [`LegacyError::InvalidId`] if `ids` is not one usable id per camera.
+pub fn map_secret_json_with_ids(
+    json: &serde_json::Value,
+    ids: &[String],
+    names_to_ids: &BTreeMap<String, String>,
+) -> Result<LegacyImport, LegacyError> {
+    by_stored_name(names_to_ids)?;
+    let owners: BTreeSet<&str> = names_to_ids.values().map(String::as_str).collect();
+    if json.as_array().is_none_or(|c| c.len() != ids.len())
+        || ids.iter().any(|id| inventory_id(Some(id), "json", 0).1)
+    {
+        return Err(LegacyError::InvalidId);
+    }
+    secret_json(json, |ordinal, _| {
+        let id = ids.get(ordinal)?;
+        Some((id.clone(), owners.contains(id.as_str())))
+    })
+}
+
+/// `pick(ordinal, stored name)` is the inventory id of a camera and whether the inventory owns
+/// its display name; `None` gives the ordinal fallback.
+fn secret_json(
+    json: &serde_json::Value,
+    pick: impl Fn(usize, Option<&str>) -> Option<(String, bool)>,
+) -> Result<LegacyImport, LegacyError> {
     let cameras = json.as_array().ok_or(LegacyError::NotAnArray)?;
     if cameras.len() > MAX_LEGACY_CAMERAS {
         return Err(LegacyError::TooMany);
     }
-    let by_stored_name = by_stored_name(names_to_ids)?;
     let mut out = LegacyImport::default();
     let mut seen = BTreeSet::new();
     let mut taken = BTreeSet::new();
@@ -297,10 +415,9 @@ pub fn map_secret_json(
             return Err(LegacyError::DuplicateName);
         }
         let name = looked_up.filter(|_| storable_name);
-        let mapped = looked_up
-            .filter(|n| !n.is_empty())
-            .and_then(|n| by_stored_name.get(n))
-            .map(String::as_str);
+        let picked = pick(ordinal, looked_up);
+        let mapped = picked.as_ref().map(|(id, _)| id.as_str());
+        let owns_name = picked.as_ref().is_some_and(|(_, owns)| *owns);
         let (inv, renamed) = inventory_id(mapped, "json", ordinal);
         if renamed && let Some(m) = mapped {
             out.report(Some("cameras"), m);
@@ -312,7 +429,7 @@ pub fn map_secret_json(
             .map(|l| (l, "login"))
             .or(username.map(|u| (u, "username")));
         if let Some(n) = name {
-            if mapped.is_some() && !renamed {
+            if owns_name && !renamed {
                 // The inventory owns the display name of a mapped camera: the two files can
                 // never both emit `cam:<inv>:name`.
                 out.report(Some(&inv), "name");
@@ -455,6 +572,8 @@ pub fn map_inventory_toml(table: &toml::Table) -> Result<LegacyImport, LegacyErr
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use secrecy::ExposeSecret;
 
     use super::*;
@@ -511,6 +630,40 @@ mod tests {
             panic!("shape")
         };
         assert_eq!(shown.expose_secret(), "Garage");
+    }
+
+    #[test]
+    fn unused_fields_are_grouped_by_name_with_a_count() {
+        let v = json(
+            r#"[{"name":"Front Gate","login":"u","password":"p","gpu":1,"height":2},
+                {"name":"Garage","login":"u2","password":"p2","gpu":3,"onvif":"http://192.0.2.10/"},
+                {"login":"u3","password":"p3","gpu":4}]"#,
+        );
+        let i = map_secret_json(&v, &ids()).unwrap();
+        let want: BTreeMap<String, usize> = [("gpu", 3), ("height", 1), ("name", 2), ("onvif", 1)]
+            .into_iter()
+            .map(|(k, n)| (k.to_owned(), n))
+            .collect();
+        assert_eq!(i.unused_fields, want);
+        let all = format!("{:?}", i.unused_fields);
+        assert!(!all.contains("192.0.2.10") && !all.contains("Front Gate"));
+    }
+
+    #[test]
+    fn grouped_counts_merge_and_are_bounded() {
+        let j = map_secret_json(&json(r#"[{"name":"Garage","gpu":1}]"#), &ids()).unwrap();
+        let t = map_inventory_toml(&toml::from_str("[cameras.a]\ngpu = \"x\"\n").unwrap()).unwrap();
+        let both = j.merge(t).unwrap();
+        assert_eq!(both.unused_fields.get("gpu"), Some(&2));
+        // More distinct names than the cap: the group list is cut and says so.
+        let mut obj = String::from(r#"[{"login":"u","password":"p-synthetic-long""#);
+        for n in 0..1100 {
+            let _ = write!(obj, r#","k{n}":"v""#);
+        }
+        obj.push_str("}]");
+        let i = map_secret_json(&json(&obj), &BTreeMap::new()).unwrap();
+        assert_eq!(i.unused_fields.len(), MAX_REPORTED_KEYS);
+        assert!(i.keys_truncated);
     }
 
     #[test]

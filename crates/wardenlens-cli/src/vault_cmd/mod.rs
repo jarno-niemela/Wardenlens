@@ -10,6 +10,7 @@ mod scan;
 mod session;
 mod value;
 
+use wardenlens_core::camera::CameraId;
 use wardenlens_core::entry::EntryId;
 use wardenlens_secrets::{KeyFile, SecretsError};
 use wardenlens_vault::{Scan, Scannability, Value, Vault, VaultError};
@@ -40,6 +41,7 @@ pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Re
         VaultCommand::Get(a) => get(&a, &env.paths()?, term),
         VaultCommand::List => list(&env.paths()?, term),
         VaultCommand::Rm { id } => rm(&id, &env.paths()?, term),
+        VaultCommand::Mv { from, to } => mv(&from, &to, &env.paths()?, term),
         VaultCommand::Rekey => keys::rekey(&env.paths()?, term),
         VaultCommand::CheckKey { path } => keys::check_key(path.as_deref(), env, term),
         VaultCommand::Key(crate::args::KeyCommand::Export) => keys::export(&env.paths()?, term),
@@ -176,6 +178,26 @@ fn rm<T: Terminal>(id: &str, p: &Paths, term: &mut T) -> Result<(), CliError> {
         return Err(CliError::NoEntry(id.to_string()));
     }
     say(term, &format!("removed {id}"))
+}
+
+/// `vault mv`: the camera ids are validated as camera ids (a lower-case slug), so a value typed
+/// by mistake is refused without being echoed.
+fn mv<T: Terminal>(from: &str, to: &str, p: &Paths, term: &mut T) -> Result<(), CliError> {
+    const BAD: CliError = CliError::Refused(
+        "camera ids are 1 to 32 characters: lower-case letters, digits and '-', starting with a letter",
+    );
+    let from = CameraId::new(from).map_err(|_| BAD)?;
+    let to = CameraId::new(to).map_err(|_| BAD)?;
+    let mut session = open_write(p, term)?;
+    let moved = session.vault.rename_camera(&from, &to)?;
+    // The old ids are not listed: the new ones say what exists now.
+    for id in &moved {
+        say(term, &format!("moved to {id}"))?;
+    }
+    say(
+        term,
+        &format!("moved {} entries from {from} to {to}", moved.len()),
+    )
 }
 
 #[cfg(test)]

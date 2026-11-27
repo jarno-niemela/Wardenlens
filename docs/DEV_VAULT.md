@@ -15,7 +15,15 @@ argv (`vault set` reads a prompt or stdin; `vault get` writes the value to a pip
 3. `wardenlens vault import-legacy` reads the two legacy plaintext files
    (`~/.config/wardenlens/agentdvr-cameras.secret.json`, `~/.config/wardenlens/cameras.local.toml`; or pass
    `--secret-json` and `--inventory`) and stores the mapped fields. It prints ids and counts, never values, and lists
-   by name every key it did not import (classify those with `vault set`). Re-running it is safe. These two files and
+   by field name, one line per name with the number of cameras it was found in, everything it did not import (classify
+   those with `vault set`). Re-running it is safe.
+   The JSON has no host or id, so each JSON camera is joined to an inventory id by its display name: the whole name
+   equals the id or the inventory `name`, or the id, `vendor` or `model` occurs in it as whole words (case-insensitive;
+   an exact match beats a word match). A camera that matches nothing, or several ids equally (two cameras of one
+   model), is refused, listing only camera indexes (from 1) and ids; join it with `--map <index>=<id>` (repeatable).
+   `--dry-run` shows the mapping and what would be imported and writes nothing.
+   If an earlier import left `cam:import-json-N:*` entries, `wardenlens vault mv import-json-N <id>` moves all of
+   a camera's entries to the inventory id in one transaction (it refuses if any target entry exists, and prints ids only). These two files and
    the `WARDENLENS_CAMERAS` / `WARDENLENS_SECRET_FILE` variables are **only** for `import-legacy`; no spike reads
    them any more. One tool still does: `scripts/agents` falls back to the legacy secret JSON to check agent prompts
    when no vault exists. With a vault present it scans prompts with `vault scan` instead, and once the legacy file is
