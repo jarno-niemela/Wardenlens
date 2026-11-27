@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use secrecy::{ExposeSecret, SecretString};
+use wardenlens_core::camera::CameraId;
 use wardenlens_core::entry::{EntryId, EntryKind};
 use wardenlens_fsutil::{
     FsError, PrivateFile, Scratch, copy_bounded, immutable_uri, open_private_file,
@@ -988,6 +989,97 @@ impl Vault {
             .execute("DELETE FROM entries WHERE id = ?1", [id.as_str()])
             .map_err(VaultError::sqlite("delete"))?;
         Ok(n > 0)
+    }
+
+    /// Moves every entry `cam:<from>:<field>` (one field token, no further colon) to
+    /// `cam:<to>:<field>`; only camera-id-shaped ids (`CameraId`) are addressed, so the entries of
+    /// an inventory camera named `a:b` are never taken for camera `a`. Keeps kind, value and the
+    /// `unscannable` flag, in one transaction: either all move or none. Each record is opened
+    /// under its old id and re-sealed under the new one (the id is bound into the cipher text).
+    /// Returns the new ids. No value is returned or printed.
+    ///
+    /// # Errors
+    /// [`VaultError::RenameSame`], [`VaultError::RenameReservedTarget`] (the target starts with
+    /// the reserved `import-` prefix), [`VaultError::NothingToRename`] (no `cam:<from>:<field>` entry),
+    /// [`VaultError::RenameTargetExists`] (any target id is taken; nothing is overwritten),
+    /// [`VaultError::InvalidId`] (a target id would be invalid, for example over the length
+    /// cap), [`VaultError::CorruptEntry`] or a store failure.
+    pub fn rename_camera(
+        &mut self,
+        from: &CameraId,
+        to: &CameraId,
+    ) -> Result<Vec<EntryId>, VaultError> {
+        if from == to {
+            return Err(VaultError::RenameSame);
+        }
+        if to.as_str().starts_with(crate::legacy::RESERVED_PREFIX) {
+            return Err(VaultError::RenameReservedTarget);
+        }
+        let from_prefix = format!("cam:{from}:");
+        let to_prefix = format!("cam:{to}:");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(VaultError::sqlite("begin"))?;
+        let rows: Vec<(String, i64, Vec<u8>)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, kind, record FROM entries WHERE substr(id, 1, ?2) = ?1
+                     ORDER BY id LIMIT ?3",
+                )
+                .map_err(VaultError::sqlite("rename list"))?;
+            let prefix_len = i64::try_from(from_prefix.len()).unwrap_or(i64::MAX);
+            let limit = i64::try_from(MAX_ENTRIES.saturating_add(1)).unwrap_or(i64::MAX);
+            stmt.query_map(params![from_prefix, prefix_len, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(VaultError::sqlite("rename list"))?
+            .collect::<Result<_, _>>()
+            .map_err(VaultError::sqlite("rename list"))?
+        };
+        // Only `cam:<from>:<field>` with one field token: `cam:a:b:host` belongs to a camera
+        // named `a:b`, not to `a`.
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(id, _, _)| {
+                id.strip_prefix(from_prefix.as_str())
+                    .is_some_and(|field| !field.is_empty() && !field.contains(':'))
+            })
+            .collect();
+        if rows.is_empty() {
+            return Err(VaultError::NothingToRename);
+        }
+        let mut moved = Vec::with_capacity(rows.len());
+        for (old, code, record) in &rows {
+            let suffix = old.strip_prefix(from_prefix.as_str()).unwrap_or_default();
+            let new = EntryId::new(&format!("{to_prefix}{suffix}"))?;
+            let taken = tx
+                .query_row(
+                    "SELECT 1 FROM entries WHERE id = ?1",
+                    [new.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(VaultError::sqlite("rename lookup"))?
+                .is_some();
+            if taken {
+                return Err(VaultError::RenameTargetExists {
+                    id: new.to_string(),
+                });
+            }
+            let kind = kind_from_column(*code).ok_or_else(|| VaultError::corrupt(old))?;
+            let rk = record_kind(kind)?;
+            let plain = open(&self.key, rk, old, record).map_err(|_| VaultError::corrupt(old))?;
+            let resealed = seal(&self.key, rk, new.as_str(), &plain)?;
+            tx.execute(
+                "UPDATE entries SET id = ?2, record = ?3, updated_at = ?4 WHERE id = ?1",
+                params![old, new.as_str(), resealed, now()],
+            )
+            .map_err(VaultError::sqlite("rename write"))?;
+            moved.push(new);
+        }
+        tx.commit().map_err(VaultError::sqlite("commit"))?;
+        Ok(moved)
     }
 
     /// Re-seals every entry and the keycheck under `new_key` in one transaction (fresh nonce

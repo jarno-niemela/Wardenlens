@@ -180,6 +180,16 @@ pub(crate) enum VaultCommand {
     Key(KeyCommand),
     /// Import the legacy `AgentDVR` secret file and camera inventory.
     ImportLegacy(LegacyArgs),
+    /// Rename a camera: move every `cam:<from>:*` entry to `cam:<to>:*` in one transaction.
+    ///
+    /// Refuses if the source has no entry or any target entry exists; nothing is overwritten.
+    /// Use it to turn `import-json-N` into an inventory id. Prints ids, never values.
+    Mv {
+        /// The camera id to move from, for example `import-json-1`.
+        from: String,
+        /// The camera id to move to, for example an inventory id.
+        to: String,
+    },
     /// Scan files, directories, the staged changes or a pushed range for any vault value. Exits 1 on a hit, 2 if the scan could not run.
     ///
     /// A hit is printed as `entry-id kind path:line`; the value, the matching text and the line
@@ -275,6 +285,16 @@ pub(crate) struct LegacyArgs {
     /// The camera inventory; defaults to `cameras.local.toml` in the config directory.
     #[arg(long)]
     pub(crate) inventory: Option<PathBuf>,
+    /// Joins a JSON camera to an inventory id by hand: `--map <json-index>=<id>`, repeatable. Indexes count from 1 (the N of `import-json-N`).
+    ///
+    /// Without it each camera is matched by its display name against the inventory id, vendor and
+    /// model (case-insensitive, whole words); a camera with no match or several equal matches is
+    /// refused, never guessed.
+    #[arg(long = "map", value_name = "INDEX=ID")]
+    pub(crate) map: Vec<String>,
+    /// Show which inventory id each JSON camera maps to and what would be imported, and write nothing.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
 }
 
 /// The `--kind` choices.

@@ -148,7 +148,9 @@ const COMBINING_RANGES: [(u32, u32); 99] = [
     (0xFE20, 0xFE2F),
 ];
 
-fn is_combining_mark(c: char) -> bool {
+/// True for a combining mark in the blocks of `COMBINING_RANGES` (not every Unicode mark).
+#[must_use]
+pub fn is_combining_mark(c: char) -> bool {
     let n = u32::from(c);
     COMBINING_RANGES
         .iter()

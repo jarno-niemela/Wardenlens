@@ -97,6 +97,21 @@ pub enum VaultError {
         /// The kind that was being stored.
         kind: EntryKind,
     },
+    /// `rename_camera` found no entry of the source camera.
+    #[error("no entries to move: the source camera has none")]
+    NothingToRename,
+    /// `rename_camera` found the target camera already holding this entry (ids are not sensitive).
+    #[error("entry {id} already exists; nothing was moved")]
+    RenameTargetExists {
+        /// The id of the existing target entry.
+        id: String,
+    },
+    /// `rename_camera` was asked to use an id of the reserved `import-` ordinal namespace as target.
+    #[error("the target camera id starts with the reserved prefix import-")]
+    RenameReservedTarget,
+    /// `rename_camera` was asked to move a camera onto itself.
+    #[error("source and target camera are the same")]
+    RenameSame,
     /// The store would exceed 10,000 entries.
     #[error("vault holds the maximum number of entries")]
     TooManyEntries,

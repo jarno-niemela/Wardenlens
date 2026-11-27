@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use wardenlens_secrets::KeyFile;
 use wardenlens_vault::Vault;
+use wardenlens_vault::legacy::LegacyError;
 use zeroize::Zeroizing;
 
 use super::run;
@@ -707,7 +708,8 @@ fn a_partial_legacy_import_keeps_its_typed_error_and_reports_progress() {
     drop(vault);
     let json = r#"[{"name":"A","login":"svc","password":"pw-synthetic-1"},
                    {"name":"B","login":"svc","password":"pw-synthetic-2"}]"#;
-    let files = legacy_files(&home, json, "[cameras.cam-a]\nname = \"A\"\nmystery = 1\n");
+    let toml = "[cameras.cam-a]\nname = \"A\"\nmystery = 1\n[cameras.cam-b]\nname = \"B\"\n";
+    let files = legacy_files(&home, json, toml);
     let (json_arg, inv_arg) = (files.json.to_str().unwrap(), files.toml.to_str().unwrap());
     let mut t = Fake::pipe();
     let err = cmd(
@@ -1032,13 +1034,20 @@ host = "192.0.2.10"
 mac = "02:00:00:00:00:01"
 vendor = "acme"
 colour = "grey"
+[cameras.cam-two]
+vendor = "Unlisted"
 "#;
 
 fn import(home: &Home, files: &Legacy) -> Fake {
+    import_with(home, files, &[])
+}
+
+fn import_with(home: &Home, files: &Legacy, extra: &[&str]) -> Fake {
     let mut term = Fake::pipe();
     let json = files.json.to_str().unwrap();
     let inv = files.toml.to_str().unwrap();
-    let args = ["import-legacy", "--secret-json", json, "--inventory", inv];
+    let mut args = vec!["import-legacy", "--secret-json", json, "--inventory", inv];
+    args.extend_from_slice(extra);
     cmd(&home.env(), &args, &mut term).unwrap();
     term
 }
@@ -1063,13 +1072,9 @@ fn import_legacy_imports_mapped_fields_and_lists_unknown_keys_by_name() {
         assert!(!all.contains(secret), "{secret} leaked: {all}");
     }
     assert!(out.contains("not imported"), "{out}");
-    for key in [
-        "site_note",
-        "reolink-1.colour",
-        "reolink-1.onvif",
-        "reolink-1.name",
-    ] {
-        assert!(out.contains(key), "{key} missing: {out}");
+    for key in ["site_note", "colour", "onvif", "name"] {
+        let line = format!("  {key}: 1");
+        assert!(out.lines().any(|l| l == line), "{line:?} missing: {out}");
     }
     let list = ok(&h, &["list"], Fake::pipe());
     for id in [
@@ -1077,7 +1082,8 @@ fn import_legacy_imports_mapped_fields_and_lists_unknown_keys_by_name() {
         "cam:reolink-1:host",
         "cam:reolink-1:mac",
         "cam:reolink-1:name",
-        "cam:import-json-2:credential",
+        "cam:cam-two:credential",
+        "cam:cam-two:name",
     ] {
         assert!(list.contains(id), "{id}: {list}");
     }
@@ -1116,7 +1122,7 @@ fn import_legacy_honours_keys_truncated() {
     }
     obj.push_str("}]");
     let l = legacy_files(&h, &obj, "[cameras.x]\nhost = \"192.0.2.9\"\n");
-    let t = import(&h, &l);
+    let t = import_with(&h, &l, &["--map", "1=x"]);
     assert!(t.out().contains("list cut at 1024"), "{}", t.out());
 }
 
@@ -1447,13 +1453,18 @@ fn adv_import_legacy_never_prints_any_value_including_unknown_and_refused_ones()
            {{"login":"","password":"empty-login-{MARK}"}}]"#
     );
     let toml = format!(
-        "note = \"top-{MARK}\"\n[cameras.cam1]\nhost = \"not a host {MARK}\"\nserial = \"SN-{MARK}\"\nweird = \"w-{MARK}\"\n"
+        "note = \"top-{MARK}\"\n[cameras.cam1]\nhost = \"not a host {MARK}\"\nserial = \"SN-{MARK}\"\nweird = \"w-{MARK}\"\n[cameras.cam2]\n[cameras.cam3]\n"
     );
     let l = legacy_files(&h, &json, &toml);
-    let t = import(&h, &l);
+    // The names are hostile text: each camera is joined by hand.
+    let t = import_with(
+        &h,
+        &l,
+        &["--map", "1=cam1", "--map", "2=cam2", "--map", "3=cam3"],
+    );
     let all = format!("{}{}", t.out(), t.err());
     assert!(!all.contains(MARK), "{all}");
-    for key in ["cam1.host", "cam1.weird", "note", "extra", "password"] {
+    for key in ["host: 1", "weird: 1", "note: 1", "extra: 1", "password: 2"] {
         assert!(all.contains(key), "{key} not reported: {all}");
     }
 }
@@ -1468,7 +1479,7 @@ fn adv_import_legacy_json_name_mapped_through_display_name() {
     let list = ok(&h, &["list"], Fake::pipe());
     assert!(list.contains("cam:porch-1:credential"), "{list}");
     assert!(list.contains("cam:porch-1:name"), "{list}");
-    assert!(t.out().contains("porch-1.name"), "{}", t.out());
+    assert!(t.out().contains("  name: 1"), "{}", t.out());
 }
 
 #[test]
@@ -1476,12 +1487,32 @@ fn adv_import_legacy_unusable_inventory_id_does_not_collide() {
     let h = Home::new();
     h.init();
     let json = r#"[{"name":"Shed","login":"svc","password":"pw-synthetic-55"}]"#;
-    let toml = "[cameras.\"Bad Id\"]\nname = \"Shed\"\nhost = \"192.0.2.32\"\n[cameras.import-json-1]\nhost = \"192.0.2.33\"\n";
-    let t = import(&h, &legacy_files(&h, json, toml));
+    let toml = "[cameras.\"Bad Id\"]\nname = \"Shed\"\nhost = \"192.0.2.32\"\n[cameras.import-json-1]\nhost = \"192.0.2.33\"\n[cameras.porch]\n";
+    let files = legacy_files(&h, json, toml);
+    // An unusable inventory id is never a candidate, and cannot be named by --map either.
+    let (j, i) = (files.json.to_str().unwrap(), files.toml.to_str().unwrap());
+    let refuse = |extra: &[&str]| {
+        let mut args = vec!["import-legacy", "--secret-json", j, "--inventory", i];
+        args.extend_from_slice(extra);
+        cmd(&h.env(), &args, &mut Fake::pipe()).unwrap_err()
+    };
+    assert!(
+        matches!(
+            refuse(&[]),
+            CliError::Legacy(LegacyError::Unresolved { .. })
+        ),
+        "the name of an unusable section matches nothing"
+    );
+    assert!(matches!(
+        refuse(&["--map", "1=import-json-1"]),
+        CliError::Legacy(LegacyError::MapUnknownId)
+    ));
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), "");
+    let t = import_with(&h, &files, &["--map", "1=porch"]);
     let list = ok(&h, &["list"], Fake::pipe());
     // Every mapped field is present exactly once and nothing overwrote anything.
     assert_eq!(list.matches(":host").count(), 2, "{list}");
-    assert!(list.contains(":credential"), "{list}");
+    assert!(list.contains("cam:porch:credential"), "{list}");
     assert!(t.out().contains("not imported"), "{}", t.out());
 }
 
@@ -1489,15 +1520,413 @@ fn adv_import_legacy_unusable_inventory_id_does_not_collide() {
 fn adv_import_legacy_reserved_prefix_section_does_not_overwrite_a_json_ordinal() {
     let h = Home::new();
     h.init();
-    // The unmapped JSON camera gets cam:import-json-1:*; a TOML section named with the reserved
-    // prefix must fall back to its own ordinal, never overwrite it.
+    // A TOML section named with the reserved prefix falls back to its own `import-toml-N`
+    // ordinal; it is not a candidate for the JSON camera and cannot be named by --map, so it can
+    // never receive (or overwrite) a JSON camera's entries.
     let json = r#"[{"name":"Lone","login":"svc","password":"pw-synthetic-66"}]"#;
-    let toml = "[cameras.import-json-1]\nname = \"Other\"\n";
+    let toml = "[cameras.import-json-1]\nname = \"Other\"\n[cameras.lone]\n";
     import(&h, &legacy_files(&h, json, toml));
     let list = ok(&h, &["list"], Fake::pipe());
-    assert_eq!(list.matches("cam:import-json-1:name").count(), 1, "{list}");
-    let name = ok(&h, &["get", "cam:import-json-1:name"], Fake::pipe());
+    assert!(!list.contains("cam:import-json-1:"), "{list}");
+    assert_eq!(list.matches("cam:import-toml-1:name").count(), 1, "{list}");
+    let name = ok(&h, &["get", "cam:lone:name"], Fake::pipe());
     assert_eq!(name, "Lone");
+}
+
+// ---- #188: import-legacy joins cameras to inventory ids; vault mv ---------------------------
+
+const TWINS_TOML: &str = r#"
+[cameras.door-a]
+vendor = "Bolt"
+model = "RLC-810A"
+host = "192.0.2.21"
+[cameras.door-b]
+vendor = "Bolt"
+model = "RLC-810A"
+host = "192.0.2.22"
+[cameras.yard]
+vendor = "Acme"
+model = "C200"
+host = "192.0.2.23"
+"#;
+
+const TWINS_JSON: &str = r#"[{"name":"Bolt front","login":"svc-one","password":"pw-synthetic-21","gpu":1},
+ {"name":"Bolt rear","login":"svc-two","password":"pw-synthetic-22","gpu":2},
+ {"name":"Yard C200","login":"svc-three","password":"pw-synthetic-23","height":480}]"#;
+
+fn refused(h: &Home, files: &Legacy, extra: &[&str]) -> (CliError, Fake) {
+    let mut term = Fake::pipe();
+    let mut args = vec![
+        "import-legacy",
+        "--secret-json",
+        files.json.to_str().unwrap(),
+        "--inventory",
+        files.toml.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let err = cmd(&h.env(), &args, &mut term).unwrap_err();
+    (err, term)
+}
+
+fn password(h: &Home, camera: &str) -> String {
+    ok(
+        h,
+        &[
+            "get",
+            &format!("cam:{camera}:credential"),
+            "--field",
+            "password",
+        ],
+        Fake::pipe(),
+    )
+}
+
+#[test]
+fn import_legacy_two_cameras_of_one_model_fail_listing_indexes_and_ids_only() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let (err, term) = refused(&h, &files, &[]);
+    let chain = format!(
+        "{err} {:?} {}",
+        err,
+        std::error::Error::source(&err).unwrap()
+    );
+    assert!(
+        matches!(err, CliError::Legacy(LegacyError::Unresolved { .. })),
+        "{chain}"
+    );
+    let shown = std::error::Error::source(&err).unwrap().to_string();
+    assert!(
+        shown.contains("camera index 1") && shown.contains("camera index 2"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("door-a") && shown.contains("door-b"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("yard"),
+        "the unique camera is not part of the failure: {shown}"
+    );
+    let all = format!("{shown}{}{}", term.out(), term.err());
+    for secret in [
+        "Bolt front",
+        "Bolt rear",
+        "svc-",
+        "pw-synthetic",
+        "192.0.2",
+        "RLC",
+    ] {
+        assert!(!all.contains(secret), "{secret} leaked: {all}");
+    }
+    assert_eq!(
+        ok(&h, &["list"], Fake::pipe()),
+        "",
+        "nothing is written on a refusal"
+    );
+}
+
+#[test]
+fn import_legacy_two_cameras_of_one_model_are_mapped_by_hand() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let t = import_with(&h, &files, &["--map", "1=door-b", "--map", "2=door-a"]);
+    let out = t.out();
+    assert!(
+        out.contains("camera index 1 -> door-b (mapped by --map)"),
+        "{out}"
+    );
+    assert!(out.contains("camera index 3 -> yard (word match)"), "{out}");
+    assert_eq!(password(&h, "door-b"), "pw-synthetic-21");
+    assert_eq!(password(&h, "door-a"), "pw-synthetic-22");
+    assert_eq!(password(&h, "yard"), "pw-synthetic-23");
+    // The credential sits with its host, and no ordinal id was made.
+    assert_eq!(
+        ok(&h, &["get", "cam:door-b:host"], Fake::pipe()),
+        "192.0.2.22"
+    );
+    assert!(!ok(&h, &["list"], Fake::pipe()).contains("import-json"));
+}
+
+#[test]
+fn import_legacy_groups_unused_fields_one_line_per_name_with_a_count() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let t = import_with(&h, &files, &["--map", "1=door-b", "--map", "2=door-a"]);
+    let out = t.out();
+    assert_eq!(out.matches("  gpu: 2\n").count(), 1, "{out}");
+    assert_eq!(out.matches("  height: 1\n").count(), 1, "{out}");
+    assert_eq!(
+        out.matches("gpu").count(),
+        1,
+        "one line per field name: {out}"
+    );
+    // The report is names and counts: no camera ids on those lines.
+    for line in out.lines().filter(|l| l.starts_with("  ")) {
+        assert!(!line.contains("door-") && !line.contains('.'), "{line}");
+    }
+}
+
+#[test]
+fn import_legacy_a_name_matching_no_id_fails_and_maps_by_hand() {
+    let h = Home::new();
+    h.init();
+    let json = r#"[{"name":"Mystery 192.0.2.99","login":"svc-x","password":"pw-synthetic-31"}]"#;
+    let files = legacy_files(&h, json, TWINS_TOML);
+    let (err, term) = refused(&h, &files, &[]);
+    let shown = std::error::Error::source(&err).unwrap().to_string();
+    assert!(shown.contains("no match for camera index 1"), "{shown}");
+    let all = format!("{shown}{}{}", term.out(), term.err());
+    for secret in ["Mystery", "192.0.2.99", "svc-x", "pw-synthetic"] {
+        assert!(!all.contains(secret), "{secret} leaked: {all}");
+    }
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), "");
+    import_with(&h, &files, &["--map", "1=yard"]);
+    assert_eq!(password(&h, "yard"), "pw-synthetic-31");
+}
+
+#[test]
+fn import_legacy_dry_run_shows_the_mapping_and_writes_nothing() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let mut t = Fake::pipe();
+    let args = [
+        "import-legacy",
+        "--dry-run",
+        "--secret-json",
+        files.json.to_str().unwrap(),
+        "--inventory",
+        files.toml.to_str().unwrap(),
+        "--map",
+        "1=door-b",
+        "--map",
+        "2=door-a",
+    ];
+    cmd(&h.env(), &args, &mut t).unwrap();
+    let out = t.out();
+    assert!(
+        out.contains("camera index 2 -> door-a (mapped by --map)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("would import cam:door-b:credential (credential)"),
+        "{out}"
+    );
+    assert!(out.contains("nothing was written"), "{out}");
+    assert!(out.contains("  gpu: 2"), "{out}");
+    assert!(!format!("{out}{}", t.err()).contains("pw-synthetic"));
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), "");
+}
+
+#[test]
+fn import_legacy_dry_run_of_an_unresolved_file_reports_why_and_fails() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let mut t = Fake::pipe();
+    let args = [
+        "import-legacy",
+        "--dry-run",
+        "--secret-json",
+        files.json.to_str().unwrap(),
+        "--inventory",
+        files.toml.to_str().unwrap(),
+    ];
+    let err = cmd(&h.env(), &args, &mut t).unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    let out = t.out();
+    assert!(
+        out.contains("camera index 1 -> unmapped: ambiguous"),
+        "{out}"
+    );
+    assert!(out.contains("camera index 3 -> yard (word match)"), "{out}");
+    assert!(!out.contains("would import"), "{out}");
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), "");
+}
+
+#[test]
+fn import_legacy_dry_run_does_not_need_a_vault() {
+    let h = Home::new(); // never initialised
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let mut t = Fake::pipe();
+    let args = [
+        "import-legacy",
+        "--dry-run",
+        "--secret-json",
+        files.json.to_str().unwrap(),
+        "--inventory",
+        files.toml.to_str().unwrap(),
+        "--map",
+        "1=door-a",
+        "--map",
+        "2=door-b",
+    ];
+    cmd(&h.env(), &args, &mut t).unwrap();
+    assert!(t.out().contains("nothing was written"), "{}", t.out());
+}
+
+#[test]
+fn import_legacy_bad_map_arguments_are_refused_without_an_echo() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, TWINS_JSON, TWINS_TOML);
+    let hostile = format!("{MARK}=door-a");
+    for bad in ["1", "=door-a", "x=door-a", "1=", hostile.as_str()] {
+        let (err, term) = refused(&h, &files, &["--map", bad]);
+        let all = format!("{err} {:?}{}{}", err, term.out(), term.err());
+        assert!(matches!(err, CliError::Refused(_)), "{bad}: {all}");
+        assert!(!all.contains(MARK), "{all}");
+        assert_eq!(err.exit_code(), 1);
+    }
+    let kind = |extra: &[&str]| {
+        let (err, _) = refused(&h, &files, extra);
+        match err {
+            CliError::Legacy(e) => e,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(kind(&["--map", "0=yard"]), LegacyError::MapIndexOutOfRange);
+    assert_eq!(kind(&["--map", "4=yard"]), LegacyError::MapIndexOutOfRange);
+    assert_eq!(kind(&["--map", "1=nope"]), LegacyError::MapUnknownId);
+    assert_eq!(
+        kind(&["--map", "1=yard", "--map", "1=door-a"]),
+        LegacyError::MapDuplicateIndex
+    );
+    let shared = kind(&["--map", "1=yard", "--map", "2=yard", "--map", "3=door-a"]);
+    assert_eq!(
+        shared,
+        LegacyError::SharedId(vec![("yard".into(), vec![1, 2])])
+    );
+    // A hostile id value in --map is not echoed by the typed error either.
+    let id_err = kind(&["--map", &format!("1=zz-{MARK}")]);
+    assert!(!id_err.to_string().contains(MARK));
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), "");
+}
+
+#[test]
+fn import_legacy_map_without_a_secret_file_is_refused() {
+    let h = Home::new();
+    h.init();
+    let files = legacy_files(&h, "[]", TWINS_TOML);
+    let args = [
+        "import-legacy",
+        "--inventory",
+        files.toml.to_str().unwrap(),
+        "--map",
+        "1=yard",
+    ];
+    let err = cmd(&h.env(), &args, &mut Fake::pipe()).unwrap_err();
+    assert!(
+        matches!(err, CliError::Refused(m) if m.contains("--map needs")),
+        "{err:?}"
+    );
+}
+
+fn seed_ordinal(h: &Home) {
+    for (id, kind, v) in [
+        (
+            "cam:import-json-1:credential",
+            "credential",
+            "svc-reader\npw-synthetic-41",
+        ),
+        ("cam:import-json-1:name", "display-name", "Front Gate"),
+        ("cam:import-json-1:host", "host", "192.0.2.41"),
+    ] {
+        set_text(h, id, kind, v);
+    }
+}
+
+#[test]
+fn vault_mv_renames_every_entry_and_prints_ids_only() {
+    let h = Home::new();
+    h.init();
+    seed_ordinal(&h);
+    let t = ok(&h, &["mv", "import-json-1", "reolink-1"], Fake::pipe());
+    assert!(t.contains("moved to cam:reolink-1:host"), "{t}");
+    assert!(
+        t.contains("moved 3 entries from import-json-1 to reolink-1"),
+        "{t}"
+    );
+    assert!(!t.contains("192.0.2") && !t.contains("Front Gate"), "{t}");
+    let list = ok(&h, &["list"], Fake::pipe());
+    assert!(!list.contains("import-json"), "{list}");
+    assert_eq!(
+        ok(&h, &["get", "cam:reolink-1:host"], Fake::pipe()),
+        "192.0.2.41"
+    );
+    assert_eq!(
+        ok(&h, &["get", "cam:reolink-1:name"], Fake::pipe()),
+        "Front Gate"
+    );
+    assert_eq!(password(&h, "reolink-1"), "pw-synthetic-41");
+}
+
+#[test]
+fn vault_mv_refuses_a_reserved_import_target() {
+    let h = Home::new();
+    h.init();
+    seed_ordinal(&h);
+    let before = ok(&h, &["list"], Fake::pipe());
+    let err = cmd(
+        &h.env(),
+        &["mv", "import-json-1", "import-json-2"],
+        &mut Fake::pipe(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("reserved prefix"), "{err}");
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), before);
+}
+
+#[test]
+fn vault_mv_refuses_a_taken_target_a_missing_source_and_bad_ids() {
+    let h = Home::new();
+    h.init();
+    seed_ordinal(&h);
+    set_text(&h, "cam:reolink-1:name", "display-name", "Other Name");
+    let before = ok(&h, &["list"], Fake::pipe());
+    let err = cmd(
+        &h.env(),
+        &["mv", "import-json-1", "reolink-1"],
+        &mut Fake::pipe(),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cam:reolink-1:name already exists"),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), before);
+    let err = cmd(&h.env(), &["mv", "import-json-9", "x"], &mut Fake::pipe()).unwrap_err();
+    assert!(err.to_string().contains("no entries to move"), "{err}");
+    let err = cmd(
+        &h.env(),
+        &["mv", "import-json-1", "import-json-1"],
+        &mut Fake::pipe(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("the same"), "{err}");
+    let hostile = MARK.to_uppercase();
+    for bad in [
+        "Cam1",
+        "cam:x",
+        "a b",
+        "",
+        &"z".repeat(33),
+        hostile.as_str(),
+    ] {
+        let err = cmd(&h.env(), &["mv", "import-json-1", bad], &mut Fake::pipe()).unwrap_err();
+        assert!(matches!(err, CliError::Refused(_)), "{err:?}");
+        assert!(!err.to_string().contains(&hostile), "{err}");
+        let err = cmd(&h.env(), &["mv", bad, "ok-id"], &mut Fake::pipe()).unwrap_err();
+        assert!(matches!(err, CliError::Refused(_)), "{err:?}");
+    }
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), before);
 }
 
 #[test]
