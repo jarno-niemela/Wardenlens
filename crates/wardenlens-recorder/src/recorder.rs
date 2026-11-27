@@ -56,7 +56,7 @@ pub(crate) struct Open<W> {
 /// `tokio::task::spawn_blocking`. Ending the source stops it gracefully.
 ///
 /// Frame handling, in this order:
-/// 1. A B slice closes the segment and holds recording off for good ([`HoldReason::BFramesDetected`]).
+/// 1. A B slice closes the segment and holds recording off for good ([`crate::HoldReason::BFramesDetected`]).
 /// 2. A wall clock outside 2000..=2099 closes the segment and holds off while it lasts.
 /// 3. A discontinuity, or parameter sets that differ from the current ones, closes the segment.
 /// 4. The core `Segmenter` decides: append, start a segment at a keyframe, or drop.
