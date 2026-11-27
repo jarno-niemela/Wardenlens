@@ -163,6 +163,12 @@ chooses a different SQLite crate, the vault follows it; the vault does not set t
 | service vault | camera credentials, host, display names for the running service | `/var/lib/wardenlens/vault.db` (a volume), separate from the recording index |
 | developer vault | the same kinds for tooling, spikes and the leak scan | `$HOME/.local/share/wardenlens/dev-vault.db`, mode 0600, directory 0700. **Always this fixed path** (the one the git hooks use, section 9); `vault init` **refuses** when `XDG_DATA_HOME` or `XDG_CONFIG_HOME` is set and would resolve the dev vault or key elsewhere |
 
+**Service vault path (rule, #66, #163).** The config has no vault key: the service vault is `vault.db` **in the
+directory of `database.path`** (so `/var/lib/wardenlens/vault.db` next to `/var/lib/wardenlens/index.db`). `import`,
+`camera` and `serve` all derive it this way, and a `database.path` whose file name is `vault.db` is refused (the two
+files would be one). Moving the index moves the vault with it; a separate vault location would need a new config key
+and an amendment of this section.
+
 Rules:
 
 - **The vault is a separate file from the recording index** (ADR 0005 / #49). A backup, copy or `sqlite3` dump of the

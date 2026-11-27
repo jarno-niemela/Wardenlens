@@ -58,14 +58,14 @@ const MAX_ZERO_SCAN: u64 = wardenlens_fsutil::MAX_COPY_LEN;
 
 /// Presence and length of each sidecar (`None` = absent), in the order of [`SUFFIXES`].
 #[derive(Debug, Clone, Copy)]
-struct Sidecars {
-    wal: Option<u64>,
-    shm: Option<u64>,
-    journal: Option<u64>,
+pub(crate) struct Sidecars {
+    pub(crate) wal: Option<u64>,
+    pub(crate) shm: Option<u64>,
+    pub(crate) journal: Option<u64>,
 }
 
 impl Sidecars {
-    fn read(path: &Path) -> Result<Self, IndexError> {
+    pub(crate) fn read(path: &Path) -> Result<Self, IndexError> {
         let mut out = [None; 3];
         for (slot, suffix) in out.iter_mut().zip(SUFFIXES) {
             *slot = sidecar_len(Path::new(&sidecar_path(path, suffix))).map_err(|e| match e {
@@ -80,7 +80,7 @@ impl Sidecars {
         Ok(Self { wal, shm, journal })
     }
 
-    fn first_present(self) -> Option<&'static str> {
+    pub(crate) fn first_present(self) -> Option<&'static str> {
         [
             (self.wal, "-wal"),
             (self.shm, "-shm"),
@@ -100,7 +100,7 @@ enum Kind {
     Ours,
 }
 
-fn sidecar_path(path: &Path, suffix: &str) -> std::ffi::OsString {
+pub(crate) fn sidecar_path(path: &Path, suffix: &str) -> std::ffi::OsString {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     name
@@ -108,7 +108,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> std::ffi::OsString {
 
 /// The journal-mode bytes and `application_id` of the header, or the refusal for a file that is
 /// not an index. `Ok((is_wal, app_id))`.
-fn read_header(file: &File) -> Result<([u8; HEADER_LEN], bool), IndexError> {
+pub(crate) fn read_header(file: &File) -> Result<([u8; HEADER_LEN], bool), IndexError> {
     let mut head = [0u8; HEADER_LEN];
     match file.read_exact_at(&mut head, 0) {
         Ok(()) => {}
@@ -142,7 +142,7 @@ fn read_header(file: &File) -> Result<([u8; HEADER_LEN], bool), IndexError> {
 /// | `-journal` non-empty | `PendingJournal` | `PendingJournal` (WAL never writes one) |
 /// | `-journal` empty | `StraySidecar` | `StraySidecar` |
 /// | `-wal`, `-shm` any | `StraySidecar` | allowed (judged by `probe`) |
-fn check_sidecars(wal_mode: bool, sc: Sidecars) -> Result<(), IndexError> {
+pub(crate) fn check_sidecars(wal_mode: bool, sc: Sidecars) -> Result<(), IndexError> {
     match sc.journal {
         Some(0) => return Err(IndexError::StraySidecar { suffix: "-journal" }),
         Some(_) => return Err(IndexError::PendingJournal),
@@ -301,7 +301,7 @@ pub(crate) fn check_wal_header(
 /// its table, so a `-wal` from a diverged copy of this index is caught). The integrity check reads
 /// the whole file once at start-up; its cost grows linearly with the index, a few seconds per
 /// hundred megabytes.
-fn judge_view(conn: &Db, migrations: &[Migration]) -> Result<InstanceId, IndexError> {
+pub(crate) fn judge_view(conn: &Db, migrations: &[Migration]) -> Result<InstanceId, IndexError> {
     let found = app_id(conn)?;
     if found != APPLICATION_ID {
         return Err(IndexError::WrongApplicationId { found });
@@ -350,7 +350,7 @@ pub(crate) fn corruption_or(op: &'static str) -> impl FnOnce(rusqlite::Error) ->
 }
 
 /// Opens the main file alone, read-only, ignoring any `-wal` and writing nothing: `immutable=1`.
-fn open_immutable(path: &Path, file: &PrivateFile) -> Result<Db, IndexError> {
+pub(crate) fn open_immutable(path: &Path, file: &PrivateFile) -> Result<Db, IndexError> {
     let conn = Connection::open_with_flags(
         immutable_uri(path)?,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -446,7 +446,7 @@ pub(crate) fn probe_wal_readonly(
     verdict
 }
 
-fn wal_verdict(
+pub(crate) fn wal_verdict(
     path: &Path,
     file: &PrivateFile,
     migrations: &[Migration],
@@ -527,7 +527,7 @@ pub(crate) enum Stage {
 }
 
 /// Why one classification attempt did not end in a verdict.
-enum Step {
+pub(crate) enum Step {
     /// A sidecar the attempt had read was gone when it was opened: the state changed.
     Vanished,
     /// The attempt refused the file; this stands only if the sidecars did not change meanwhile.
@@ -608,7 +608,22 @@ fn classify_once(
     }
     let (head, wal_mode) = read_header(file.file())?;
     check_sidecars(wal_mode, sc)?;
-    let usable_wal = match sc.wal {
+    let usable_wal = wal_is_usable(sc, path, &head)?;
+    if usable_wal {
+        probe_wal_readonly(path, file, migrations)?;
+    } else {
+        probe_immutable(path, file, migrations)?;
+    }
+    Ok(Kind::Ours)
+}
+
+/// True when the `-wal` is a non-empty valid one that SQLite would replay.
+pub(crate) fn wal_is_usable(
+    sc: Sidecars,
+    path: &Path,
+    head: &[u8; HEADER_LEN],
+) -> Result<bool, Step> {
+    match sc.wal {
         Some(n) if n > 0 => {
             let wal = match open_sidecar(Path::new(&sidecar_path(path, "-wal"))) {
                 Ok(wal) => wal,
@@ -622,16 +637,10 @@ fn classify_once(
             {
                 return Err(IndexError::BadSidecar { suffix: "-wal" }.into());
             }
-            check_wal_header(&wal, &head)? == WalHeader::Valid
+            Ok(check_wal_header(&wal, head)? == WalHeader::Valid)
         }
-        _ => false,
-    };
-    if usable_wal {
-        probe_wal_readonly(path, file, migrations)?;
-    } else {
-        probe_immutable(path, file, migrations)?;
+        _ => Ok(false),
     }
-    Ok(Kind::Ours)
 }
 
 fn app_id(conn: &Db) -> Result<u32, IndexError> {

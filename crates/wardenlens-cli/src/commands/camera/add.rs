@@ -152,6 +152,14 @@ pub(super) struct Request {
 
 fn request(args: &AddArgs) -> Result<Request, CameraCmdError> {
     let id = CameraId::new(&args.id).map_err(CameraCmdError::Camera)?;
+    // Before anything else (no prompt, no connection, no write): `import agentdvr` owns this
+    // prefix and overwrites the rows under it, so a hand-added row there would be lost.
+    if id
+        .as_str()
+        .starts_with(crate::commands::import::RESERVED_ID_PREFIX)
+    {
+        return Err(CameraCmdError::ReservedId);
+    }
     let name = DisplayName::new(args.name.as_deref().unwrap_or(id.as_str()))
         .map_err(CameraCmdError::Camera)?;
     Ok(Request {

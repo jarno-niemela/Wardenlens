@@ -370,6 +370,22 @@ identity and every sidecar are proven by means no sidecar can influence**:
   the main file can overlap a closer's checkpoint before it deletes the `-wal`. `discard_if_created` unlinks only a file that
   is still the inode this call created (device and inode) **and** still of size 0, under the lock, so a populated index is
   never removed.
+- **The read-only open (`Index::open_read_only`, #163).** For a caller that only looks (the dry run of `import agentdvr`); it
+  returns a `ReadOnlyIndex` that reads cameras and writes nothing. It runs no migration, sets no pragma, creates no file,
+  takes **no `flock`** and begins no write transaction, and it keeps the checks of the read-write open: the private parent,
+  our own `O_NOFOLLOW` descriptor (never created), the owner and mode of the file and every sidecar, the sidecar table, the
+  `-wal` header, the schema identity and `integrity_check`, and the same-process registry (a file this process has open is
+  refused with `AlreadyOpenInProcess`, and a refused open releases its entry). **Without a usable `-wal`** the main file is
+  read with `immutable=1`; **with a valid non-empty `-wal` and its `-shm`** (a live or crashed writer) the same `-wal` verdict
+  as above runs, and a `SQLITE_OPEN_READ_ONLY` connection with `NO_CKPT_ON_CLOSE` replays the `-wal` in memory, so the main
+  file and the `-wal` are never changed. **The `-shm` of a live `-wal` may be updated** (SQLite's reader marks), as by any
+  reader; it is derived state. States that the read-write open would change first are **reported, not entered**:
+  `Uninitialised` (a zero-length file, which it formats), `NeedsMigration` (an older schema, which it migrates; chosen over
+  a row decoder per schema version, which would need maintaining for a dry run), and `NeedsRecovery` (a valid non-empty
+  `-wal` with no `-shm`: opening it would create the `-shm`). **Advisory only:** with no lock, a concurrent writer can make
+  an `immutable=1` read fail or go stale (there is no SQLite lock on that path), and a writer that closes in the window can
+  leave an empty `-wal` or `-shm`, which is harmless; the result is never relied on for a write (the real run re-checks
+  under its own locks).
 - **the instance id and the generation** tie a `-wal` to its main file. At creation, in rollback mode and in one
   transaction before WAL is switched on, a bootstrap script (not a numbered migration; `migrations/000_bootstrap.sql`)
   sets the `application_id` and creates the single-row table `index_meta (id = 1, instance_id BLOB(16), generation)` with

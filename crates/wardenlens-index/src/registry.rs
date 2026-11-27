@@ -36,7 +36,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-use wardenlens_fsutil::{PrivateFile, open_private_file};
+use wardenlens_fsutil::{PrivateFile, open_existing_private_file, open_private_file};
 
 use crate::IndexError;
 
@@ -137,6 +137,18 @@ fn judge(set: &HashSet<Key>, path: &Path) -> Verdict {
 /// Opens `path` as a private file and registers its identity, or refuses when this process
 /// already has that file open.
 pub(crate) fn open_registered(path: &Path) -> Result<Held, IndexError> {
+    register(path, open_private_file)
+}
+
+/// [`open_registered`] for a file that must exist: nothing is created (the read-only open).
+pub(crate) fn open_registered_existing(path: &Path) -> Result<Held, IndexError> {
+    register(path, open_existing_private_file)
+}
+
+fn register(
+    path: &Path,
+    open: fn(&Path) -> Result<PrivateFile, wardenlens_fsutil::FsError>,
+) -> Result<Held, IndexError> {
     // Held across the stat and the open by design: the open is one per process at a time, and
     // `open_private_file` uses `O_NONBLOCK` and refuses non-regular files, so a FIFO cannot hang
     // it while the mutex is held.
@@ -146,7 +158,7 @@ pub(crate) fn open_registered(path: &Path) -> Result<Held, IndexError> {
         Verdict::Registered => return Err(IndexError::AlreadyOpenInProcess),
         Verdict::HardLinked => return Err(IndexError::HardLinkedIndex),
     }
-    let file = open_private_file(path)?;
+    let file = open(path)?;
     let Ok(meta) = file.file().metadata() else {
         // Cannot tell this file from a registered one: closing it might drop the first
         // handle's locks, so it is parked like the race below.

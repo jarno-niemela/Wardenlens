@@ -20,6 +20,7 @@ mod error;
 mod migrate;
 mod open;
 mod ops;
+mod readonly;
 mod registry;
 mod rows;
 mod sql;
@@ -35,6 +36,7 @@ use wardenlens_fsutil::FileLock;
 pub use cameras::{CameraRecord, MAX_CAMERAS, StoredCamera};
 pub use error::{CursorFault, IndexError};
 pub use open::BUSY_TIMEOUT;
+pub use readonly::ReadOnlyIndex;
 pub use tokens::{TOUCH_INTERVAL_MS, TokenIndex};
 
 /// An open index. Holds the connection and, until it is dropped, the descriptor whose identity

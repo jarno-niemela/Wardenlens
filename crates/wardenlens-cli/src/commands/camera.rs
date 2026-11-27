@@ -72,6 +72,11 @@ pub(crate) enum CameraCmdError {
     /// The embedded catalogue is invalid (cannot happen; a test pins it).
     #[error("the built-in camera catalogue is invalid")]
     Catalogue(#[source] CatalogueError),
+    /// The id starts with the prefix that `import agentdvr` owns.
+    #[error(
+        "camera ids starting with `agentdvr-` are reserved for `wardenlens import agentdvr`; choose another id"
+    )]
+    ReservedId,
     /// The model is not in the catalogue.
     #[error("no catalogue entry for that model; use `<vendor>/<model>` as in cameras/README.md")]
     UnknownModel,
@@ -134,6 +139,7 @@ impl CameraCmdError {
             | Self::Camera(_)
             | Self::Path(_)
             | Self::UnknownModel
+            | Self::ReservedId
             | Self::Guard(_)
             | Self::Password(_)
             | Self::Credential(_)
@@ -198,6 +204,14 @@ fn run(
 pub(crate) fn catalogue() -> Result<Vec<wardenlens_core::catalogue::CatalogueEntry>, CatalogueError>
 {
     catalogue::load()
+}
+
+/// `vendor/model` as a `ModelRef` (for `import agentdvr --model`).
+///
+/// # Errors
+/// [`CameraError::ModelSlug`] when `text` has no `/` or a part is not a slug.
+pub(crate) fn parse_model(text: &str) -> Result<wardenlens_core::camera::ModelRef, CameraError> {
+    catalogue::parse_model(text)
 }
 
 /// The key file, or a message that points at `secrets init` when it is missing.

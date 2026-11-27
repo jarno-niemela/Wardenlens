@@ -162,6 +162,22 @@ pub fn open_private_file(path: &Path) -> Result<PrivateFile, FsError> {
     })
 }
 
+/// Like [`open_private_file`] but never creates: a missing file is the `open` error with
+/// [`FsError::is_not_found`] true. The same checks (regular, owner, mode, `O_NOFOLLOW`).
+///
+/// # Errors
+/// As [`open_private_file`], and not found.
+pub fn open_existing_private_file(path: &Path) -> Result<PrivateFile, FsError> {
+    let fd = open_existing(path).map_err(FsError::io("open"))?;
+    let st = fstat(&fd).map_err(FsError::io("fstat"))?;
+    check_stat(&st)?;
+    Ok(PrivateFile {
+        file: File::from(fd),
+        identity: FileIdentity::of(&st),
+        created: false,
+    })
+}
+
 fn open_existing(path: &Path) -> Result<rustix::fd::OwnedFd, Errno> {
     // O_NONBLOCK so that a planted FIFO cannot block the open; fstat then rejects it.
     openat(
@@ -275,6 +291,64 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(open_private_file(&link).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn existing_open_of_a_missing_file_is_not_found_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        let e = open_existing_private_file(&p).unwrap_err();
+        assert!(e.is_not_found(), "{e:?}");
+        assert!(!p.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn existing_open_applies_the_same_checks_and_never_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        drop(open_private_file(&p).unwrap());
+        let f = open_existing_private_file(&p).unwrap();
+        assert!(!f.created());
+        f.verify_path_unchanged(&p).unwrap();
+        // The descriptor is read-only, like an existing file's in `open_private_file`.
+        {
+            use std::os::unix::fs::FileExt;
+            assert!(f.file().write_at(b"x", 0).is_err());
+        }
+        // Wrong mode.
+        for mode in [0o644, 0o640, 0o604, 0o4600] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            let e = open_existing_private_file(&p).unwrap_err();
+            assert!(matches!(e, FsError::InsecureMode { .. }), "{mode:o}: {e:?}");
+        }
+        // A symlink, also to a private file.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&p, &link).unwrap();
+        let e = open_existing_private_file(&link).unwrap_err();
+        assert_eq!(e.errno(), Some(Errno::LOOP));
+        // A directory.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let e = open_existing_private_file(&sub).unwrap_err();
+        assert!(matches!(e, FsError::NotRegular), "{e:?}");
+    }
+
+    #[test]
+    fn existing_open_of_a_fifo_does_not_block_and_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &p,
+            rustix::fs::FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let e = open_existing_private_file(&p).unwrap_err();
+        assert!(matches!(e, FsError::NotRegular), "{e:?}");
     }
 
     #[test]

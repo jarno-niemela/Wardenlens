@@ -11,6 +11,7 @@ mod model;
 mod open_tests;
 mod ops_tests;
 mod plan_tests;
+mod readonly_tests;
 mod registry_tests;
 mod rows_tests;
 mod schema_tests;

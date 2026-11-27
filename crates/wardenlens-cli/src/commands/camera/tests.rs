@@ -1115,26 +1115,69 @@ fn the_password_is_not_read_for_a_duplicate_id_or_a_missing_key() {
     assert_eq!(o.input_left, pw().len(), "the password was read");
 }
 
-/// `import` reads the registry with the catalogue: re-importing over an id that `camera add`
-/// stored with a catalogue-listed query works (with no catalogue the row cannot be read).
+/// `camera add` refuses the id prefix that `import agentdvr` owns, before any prompt, connection
+/// or write (#207), so an import never meets a hand-added row.
 #[test]
-fn import_updates_a_camera_that_camera_add_stored_with_a_listed_query() {
+fn camera_add_refuses_the_import_id_prefix_and_writes_nothing() {
+    for id in ["agentdvr-1", "agentdvr-", "agentdvr-front-door"] {
+        let site = Site::new();
+        let a = args(id, "127.0.0.1", "dahua/ipc-hfw4431r-z", Some(closed_port()));
+        let o = run_add(&site, &foreign(), &a, &pw());
+        assert!(matches!(o.result, Err(CameraCmdError::ReservedId)), "{id}");
+        assert_eq!(o.input_left, pw().len(), "{id}: the password was read");
+        assert_eq!(CameraCmdError::ReservedId.exit_code(), 1);
+        assert_eq!(site.cameras().len(), 0);
+        assert!(
+            site.files().iter().all(|f| !f.contains("vault")),
+            "{:?}",
+            site.files()
+        );
+    }
+    // A near miss is an ordinary id.
     let site = Site::new();
-    add_closed(&site, "agentdvr-1", "dahua/ipc-hfw4431r-z");
+    add_closed(&site, "agentdvr", "dahua/ipc-hfw4431r-z");
+    add_closed(&site, "my-agentdvr-1", "dahua/ipc-hfw4431r-z");
+}
+
+/// `import` reads the registry with the catalogue: a row under a catalogue-listed query path is
+/// read and updated by a re-import under the same model, and left alone under another.
+#[test]
+fn import_updates_its_own_rows_and_keeps_a_row_mapped_to_another_model() {
+    let site = Site::new();
     let xml = "<objects><cameras><camera id=\"1\" name=\"A\"><settings>\
                <videosourcestring>rtsp://192.0.2.5:554/live</videosourcestring>\
                <login>import-user</login><password>import-password-1</password></settings>\
                </camera></cameras></objects>";
     let parsed = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
     assert_eq!(parsed.cameras[0].id.as_str(), "agentdvr-1");
-    let model = ModelRef::new("agentdvr", "imported").unwrap();
-    let rows =
-        crate::commands::import::write_all(&site.config, site.key(), &parsed.cameras, &model)
-            .unwrap();
-    assert_eq!(rows.len(), 1);
+    let catalogue = crate::commands::camera::catalogue().unwrap();
+    let ready = |v: &str, m: &str| {
+        vec![crate::commands::import::Ready {
+            draft: parsed.cameras[0].clone(),
+            model: ModelRef::new(v, m).unwrap(),
+        }]
+    };
+    let write = |r: &[crate::commands::import::Ready]| {
+        let key = wardenlens_secrets::KeyFile::load(site.config.key_file()).unwrap();
+        crate::commands::import::write_all(&site.config, key, r, &catalogue).unwrap()
+    };
+    write(&ready("dahua", "ipc-hfw4431r-z"));
+    assert_eq!(
+        site.cameras()[0].record().model().to_string(),
+        "dahua/ipc-hfw4431r-z"
+    );
+    // Another model: kept.
+    write(&ready("agentdvr", "imported"));
+    assert_eq!(
+        site.cameras()[0].record().model().to_string(),
+        "dahua/ipc-hfw4431r-z"
+    );
+    // The same model: an update.
+    write(&ready("dahua", "ipc-hfw4431r-z"));
     let cams = site.cameras();
     assert_eq!(cams.len(), 1);
-    assert_eq!(cams[0].record().model().to_string(), "agentdvr/imported");
+    assert_eq!(cams[0].record().streams().main.as_str(), "/live");
 }
 
 mod adversary;
+mod adversary_163;
