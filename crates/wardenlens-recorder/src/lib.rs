@@ -4,7 +4,8 @@
 //! `Segmenter` cut them into segments, writes each segment as a fragmented MP4 with
 //! `wardenlens-mp4` through a [`SegmentStore`], and indexes it through the core `SegmentIndex`
 //! port. The crate depends on core, mp4 and fsutil only (ADR 0005 section 11); the frame type and
-//! the B-slice check are in `wardenlens_core::video`, and the index adapter is wired by the caller. There is no decoding and no re-encoding.
+//! the B-slice check are in `wardenlens_core::video`, and the index adapter is wired by the
+//! caller. There is no decoding and no re-encoding.
 //!
 //! The logic is generic over the two ports ([`SegmentStore`], `SegmentIndex`), so it is tested
 //! without a disk and without SQLite; [`HotStore`] and `wardenlens_index::Index` are the real

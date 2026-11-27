@@ -7,6 +7,19 @@ use crate::probe::find_row;
 use crate::recorder::Recorder;
 use crate::store::SegmentStore;
 
+/// The index's answer for one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadBack {
+    /// A row with the same key, size, duration and frames.
+    Match,
+    /// No row at the key.
+    NoRow,
+    /// A row at the key that is another segment.
+    Differs,
+    /// The index could not say.
+    Unknown,
+}
+
 impl<S: SegmentStore, I: SegmentIndex> Recorder<S, I>
 where
     I::Error: TransientFault + std::error::Error + Send + Sync + 'static,
@@ -32,6 +45,7 @@ where
             return;
         };
         let bytes = open.bytes_written;
+        let open_key = open.key;
         match self.store.commit(open.writer, &patch) {
             Ok(sealed) => {
                 self.keys.note(sealed.key);
@@ -50,7 +64,7 @@ where
                     sealed.len,
                     record.frame_count,
                 );
-                self.index_segment(&row);
+                self.index_segment(&row, sealed.key != open_key);
             }
             Err(e) => {
                 self.health.segments_aborted = self.health.segments_aborted.saturating_add(1);
@@ -59,17 +73,36 @@ where
         }
     }
 
-    /// Whether the index holds exactly this segment: same key, size, duration and frames.
-    fn row_matches(&self, row: &SegmentRecord) -> bool {
-        find_row(&self.index, &self.camera, row.started_at_ms)
-            .ok()
-            .flatten()
-            .is_some_and(|f| {
+    /// What the index says about this segment's key. `Unknown` means the question could not be
+    /// answered (a read error, too many overlapping rows): it is never read as "no row".
+    fn read_back(&self, row: &SegmentRecord) -> ReadBack {
+        match find_row(&self.index, &self.camera, row.started_at_ms) {
+            Err(_) => ReadBack::Unknown,
+            Ok(None) => ReadBack::NoRow,
+            Ok(Some(f)) => {
                 let r = &f.record;
-                r.bytes == row.bytes
+                if r.bytes == row.bytes
                     && r.duration_ms == row.duration_ms
                     && r.frame_count == row.frame_count
-            })
+                {
+                    ReadBack::Match
+                } else {
+                    ReadBack::Differs
+                }
+            }
+        }
+    }
+
+    /// Moves the file to quarantine; left in place (and counted unindexed) when that fails or
+    /// every name is taken.
+    fn quarantine(&mut self, row: &SegmentRecord) {
+        match self.store.quarantine(row.started_at_ms) {
+            Ok(()) => {
+                self.health.segments_quarantined =
+                    self.health.segments_quarantined.saturating_add(1);
+            }
+            Err(_) => self.count_unindexed(),
+        }
     }
 
     fn count_unindexed(&mut self) {
@@ -89,14 +122,14 @@ where
     /// the file is quarantined only when no such row exists. When the retries run out the
     /// finished file stays where it is (reconciliation adopts a `.mp4` without a row, ADR 0005
     /// section 9), unless the read-back finds the row.
-    fn index_segment(&mut self, row: &SegmentRecord) {
+    fn index_segment(&mut self, row: &SegmentRecord, bumped: bool) {
         let mut attempt = 0u32;
         loop {
             match self.index.insert(row, Tier::Hot) {
                 Ok(_) => return self.count_indexed(),
                 Err(e) if e.is_transient() => {
                     if attempt >= self.config.insert_retries {
-                        if self.row_matches(row) {
+                        if self.read_back(row) == ReadBack::Match {
                             self.count_indexed();
                         } else {
                             self.count_unindexed();
@@ -110,17 +143,21 @@ where
                     }
                 }
                 Err(_) => {
-                    if attempt > 0 && self.row_matches(row) {
-                        return self.count_indexed();
-                    }
-                    match self.store.quarantine(row.started_at_ms) {
-                        Ok(()) => {
-                            self.health.segments_quarantined =
-                                self.health.segments_quarantined.saturating_add(1);
-                        }
-                        // Left in place (every name taken, or the move failed): the next
-                        // start's reconciliation judges it.
-                        Err(_) => self.count_unindexed(),
+                    // A transient failure may have followed the commit, and a bumped key may
+                    // be held by another row: ask the index before judging the file.
+                    let seen = if attempt > 0 || bumped {
+                        self.read_back(row)
+                    } else {
+                        ReadBack::NoRow
+                    };
+                    match seen {
+                        ReadBack::Match => self.count_indexed(),
+                        // Never quarantine on an answer that was not given.
+                        ReadBack::Unknown => self.count_unindexed(),
+                        // The key belongs to another row: this good file is left for
+                        // reconciliation, not moved.
+                        ReadBack::Differs if bumped => self.count_unindexed(),
+                        ReadBack::Differs | ReadBack::NoRow => self.quarantine(row),
                     }
                     return;
                 }

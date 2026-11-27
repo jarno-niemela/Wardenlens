@@ -471,3 +471,35 @@ fn the_seed_error_keeps_its_source() {
     let source = std::error::Error::source(&e).unwrap();
     assert!(source.to_string().contains("busy"));
 }
+
+#[test]
+fn a_row_at_the_key_that_is_another_segment_is_not_this_one_and_quarantines() {
+    // Busy after another row took the key, then Duplicate: the read-back sees a row that
+    // differs (size), so this file is not indexed and is quarantined.
+    let mut r = Rig::new();
+    r.index.lock().unwrap().other_row_then_error = vec![IndexError::Busy { op: "insert" }].into();
+    r.start();
+    r.feed(Slice::P);
+    let d = r.finish();
+    assert_eq!((d.end.segments_indexed, d.end.segments_quarantined), (0, 1));
+}
+
+#[test]
+fn an_unreadable_index_never_quarantines_a_file_after_a_duplicate() {
+    // Busy, Duplicate, and the read-back is refused: the answer is unknown, not "no row".
+    let mut r = Rig::new();
+    r.start();
+    r.feed(Slice::P);
+    {
+        let mut s = r.index.lock().unwrap();
+        s.insert_errors = vec![IndexError::Busy { op: "insert" }, IndexError::Duplicate].into();
+        s.list_errors = 1;
+    }
+    let d = r.finish();
+    assert_eq!(
+        (d.end.segments_quarantined, d.end.segments_unindexed),
+        (0, 1)
+    );
+    assert_eq!(tree(&d.root).len(), 1);
+    assert!(!tree(&d.root)[0].contains("_quarantine"));
+}

@@ -256,6 +256,8 @@ pub struct IndexScript {
     /// The next inserts really commit the row and then fail with these (a checkpoint error
     /// inside `COMMIT`: the row is durable, the caller sees an error).
     pub commit_then_error: VecDeque<IndexError>,
+    /// As `commit_then_error`, but the committed row is another segment's (one byte more).
+    pub other_row_then_error: VecDeque<IndexError>,
     /// `list` fails this many times.
     pub list_errors: u32,
 }
@@ -290,6 +292,18 @@ impl SegmentIndex for TestIndex {
             let mut s = self.script.lock().unwrap();
             s.attempts += 1;
             if let Some(e) = s.insert_errors.pop_front() {
+                return Err(e);
+            }
+            if let Some(e) = s.other_row_then_error.pop_front() {
+                drop(s);
+                let other = SegmentRecord::new(
+                    record.camera.clone(),
+                    record.started_at_ms,
+                    record.duration_ms,
+                    record.bytes + 1,
+                    record.frame_count,
+                );
+                self.inner.insert(&other, tier)?;
                 return Err(e);
             }
             if let Some(e) = s.commit_then_error.pop_front() {

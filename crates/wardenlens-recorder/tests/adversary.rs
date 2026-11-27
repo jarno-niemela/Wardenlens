@@ -175,9 +175,7 @@ fn a_file_planted_at_the_final_name_mid_segment_is_never_replaced() {
     let d = r.finish();
     assert_eq!(std::fs::read(&planted).unwrap(), b"foreign");
     assert_eq!(part_files(&d.root).len(), 0);
-    // Round 2 ruling (retry at the next free key instead of discarding): the segment is
-    // finished under the next key. CONFLICT WITH THE CARRIED EXPECTATION `rows.len() == 0`;
-    // reported to the controller, see the implementer report.
+    // By the round-2 ruling the segment lands at the next free key.
     assert_eq!(d.rows.len(), 1);
     assert_eq!(d.rows[0].record.started_at_ms.as_i64(), T0 + 101);
 }

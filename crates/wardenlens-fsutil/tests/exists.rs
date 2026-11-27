@@ -39,9 +39,8 @@ fn a_file_without_permission_is_still_found_and_bad_names_are_refused() {
     let root = RootDir::open(d.path()).unwrap();
     assert!(root.exists("locked").unwrap());
     for bad in ["", ".", "..", "a/b", "a\0b"] {
-        let name = bad.replace("\\0", "\0");
         assert!(
-            matches!(root.exists(&name), Err(FsError::InvalidComponent)),
+            matches!(root.exists(bad), Err(FsError::InvalidComponent)),
             "{bad:?}"
         );
     }

@@ -36,6 +36,8 @@ pub(crate) struct Active {
 pub(crate) struct Open<W> {
     pub(crate) writer: W,
     pub(crate) init: InitSegment,
+    /// The key the segment was created under (the file may be finished under a later one).
+    pub(crate) key: UnixMs,
     pub(crate) pending: Pending,
     /// Next `mfhd` sequence number.
     pub(crate) sequence: u32,

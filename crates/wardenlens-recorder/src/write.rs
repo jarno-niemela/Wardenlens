@@ -90,6 +90,7 @@ where
                         writer,
                         bytes_written: u64::try_from(init.bytes().len()).unwrap_or(u64::MAX),
                         init,
+                        key: picked.key,
                         pending,
                         sequence: 1,
                         written_ticks: 0,
