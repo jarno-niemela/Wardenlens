@@ -92,7 +92,7 @@ impl<C: Clock + Send + 'static> FrameSource for FrameStream<C> {
     }
 }
 
-/// The retina session of [`open_stream`] as a [`StreamSource`].
+/// The retina session of [`open_stream_with`] as a [`StreamSource`].
 pub struct RetinaSource<C> {
     host: Host,
     port: NonZeroU16,
