@@ -3,10 +3,13 @@
 //! hands everything to [`crate::wiring::run`], which does the wiring (see its module docs).
 //!
 //! * The config, the key file and the index must be usable, or nothing starts (exit 2; an invalid
-//!   config is exit 1, as for the other commands). The first thing taken is the process lock, an
-//!   exclusive `flock` on `wardenlens.lock` in the directory of `database.path`, held until the
-//!   process exits (ADR 0005 section 9): a second `serve` exits 2 at once. Other commands (`token`,
-//!   `import`) do not take it; they serialise with the service through `Index::open`.
+//!   config is exit 1, as for the other commands). The process lock is `wardenlens.lock` in the
+//!   directory of `database.path`, an exclusive `flock` taken here before `Index::open` and held
+//!   until the process exits: a second `serve` over the same state directory exits 2 at once. The
+//!   directory is checked (as the index checks it) before the file is created. A second lock
+//!   inside the hot root refuses two instances over one hot root (see `wiring`). `Index::open`'s
+//!   own `flock` is released after the open, so `token` and `import` (which do not take the process
+//!   lock) serialise with the service only through that open. There is one `Index` per process.
 //! * A camera whose host is missing from the vault, or whose vault entries cannot be read, is
 //!   logged **by id** and skipped; the others run. Its login is decrypted here into the stream
 //!   source and goes nowhere else.
@@ -27,17 +30,18 @@ use wardenlens_core::camera::{
 };
 use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
-use wardenlens_fsutil::{FileLock, FsError, PrivateFile, open_private_file};
+use wardenlens_fsutil::{FileLock, FsError, PrivateFile, check_parent, open_private_file};
 use wardenlens_index::{Index, IndexError};
 use wardenlens_ingest::RetinaSource;
 use wardenlens_secrets::{KeyFile, SecretsError};
+use wardenlens_storage::StatvfsUsage;
 use wardenlens_vault::{Value, Vault, VaultError};
 
 use super::import::vault_path;
 use super::{Context, report_error};
 use crate::config_file::{ConfigFileError, load, resolve_path};
 use crate::wiring::{
-    CameraInput, ConnectionStats, ServeError, SystemClock, Tuning, raise_nofile_limit, run,
+    CameraInput, ServeError, Stopped, SystemClock, Tuning, raise_nofile_limit, release_runtime, run,
 };
 
 /// Why `serve` failed.
@@ -55,6 +59,9 @@ enum CommandError {
     /// Another `serve` holds the process lock (`wardenlens.lock` next to the index).
     #[error("another wardenlens instance is running (it holds the process lock)")]
     AlreadyRunning,
+    /// The directory of the index (the state directory) is missing or not private.
+    #[error("the index directory cannot be used")]
+    StateDir(#[source] FsError),
     /// The process lock file cannot be created or locked.
     #[error("the process lock cannot be taken")]
     Lock(#[source] FsError),
@@ -101,6 +108,8 @@ fn start(ctx: &Context<'_>) -> Result<(), CommandError> {
         tracing::warn!(error = %e, "could not raise the open-file limit");
     }
     let key = load_key(config.key_file())?;
+    // Before the lock file is created in it: a refused directory gets no file.
+    check_parent(state_dir(&config)).map_err(CommandError::StateDir)?;
     // Held (not read) until this function returns, i.e. for the life of the service.
     let _process_lock = take_process_lock(&config)?;
     let index = Index::open(config.database_path()).map_err(CommandError::Index)?;
@@ -110,13 +119,13 @@ fn start(ctx: &Context<'_>) -> Result<(), CommandError> {
         .enable_all()
         .build()
         .map_err(CommandError::Runtime)?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         let listener = TcpListener::bind(config.listen())
             .await
             .map_err(CommandError::Bind)?;
         let mut term = signal(SignalKind::terminate()).map_err(CommandError::Runtime)?;
         let mut int = signal(SignalKind::interrupt()).map_err(CommandError::Runtime)?;
-        let shutdown = async {
+        let shutdown = async move {
             tokio::select! {
                 _ = term.recv() => {}
                 _ = int.recv() => {}
@@ -130,23 +139,32 @@ fn start(ctx: &Context<'_>) -> Result<(), CommandError> {
             listener,
             shutdown,
             Tuning::default(),
-            ConnectionStats::default(),
+            StatvfsUsage,
         )
         .await
         .map_err(CommandError::from)
-    })
+    });
+    // A clean stop drops the runtime; anything else (an overrun, a signal during start-up, a
+    // refusal) abandons blocking tasks so that the exit is not held by them.
+    release_runtime(runtime, matches!(result, Ok(Stopped::Clean)));
+    result.map(|_| ())
 }
 
 /// The file name of the process lock, next to the index.
 const LOCK_FILE_NAME: &str = "wardenlens.lock";
 
-/// Takes the exclusive process lock; `AlreadyRunning` when another description holds it.
-fn take_process_lock(config: &Config) -> Result<(PrivateFile, FileLock), CommandError> {
-    let dir = match config.database_path().parent() {
+/// The directory of `database.path`.
+fn state_dir(config: &Config) -> &Path {
+    match config.database_path().parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
-    };
-    let file = open_private_file(&dir.join(LOCK_FILE_NAME)).map_err(CommandError::Lock)?;
+    }
+}
+
+/// Takes the exclusive process lock; `AlreadyRunning` when another description holds it.
+fn take_process_lock(config: &Config) -> Result<(PrivateFile, FileLock), CommandError> {
+    let file =
+        open_private_file(&state_dir(config).join(LOCK_FILE_NAME)).map_err(CommandError::Lock)?;
     match file.try_lock_exclusive().map_err(CommandError::Lock)? {
         Some(lock) => Ok((file, lock)),
         None => Err(CommandError::AlreadyRunning),

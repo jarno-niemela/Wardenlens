@@ -365,6 +365,21 @@ fn a_part_that_is_not_a_regular_file_or_not_canonical_is_left() {
     assert_eq!(std::fs::read(&outside).unwrap(), b"keep me");
 }
 
+/// The service's lock file in the hot root is neither reported nor touched; any other stray file
+/// at the root still is `unknown_left` (the skip is for that one name only).
+#[test]
+fn the_hot_root_lock_file_is_skipped_and_a_stray_file_is_not() {
+    let env = Env::new();
+    put(&env.hot, crate::HOT_LOCK_FILE, b"");
+    let before = snapshot(&env.hot);
+    let out = startup(&env);
+    assert_eq!(out.report.unknown_left, 0, "{:?}", out.report);
+    assert_eq!(snapshot(&env.hot), before);
+    put(&env.hot, "stray.txt", b"x");
+    let out = startup(&env);
+    assert_eq!(out.report.unknown_left, 1, "{:?}", out.report);
+}
+
 // ---- names, walk and bounds -------------------------------------------------------------------------
 
 #[test]

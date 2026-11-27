@@ -45,8 +45,8 @@ pub use fs::{Fs, Opened, PartFile, RealFs, SourceFile};
 #[cfg(test)]
 pub(crate) use mover::{COPY_CHUNK, Dropped, Outcome, Skip, Stage};
 pub use probe::{
-    ARCHIVE_MARKER, ArchiveProbe, MAX_MOVE_FAILURES, PROBE_FILE, StatvfsUsage, UnavailableCause,
-    VolumeUsage, space_from_stat,
+    ARCHIVE_MARKER, ArchiveProbe, HOT_LOCK_FILE, MAX_MOVE_FAILURES, PROBE_FILE, StatvfsUsage,
+    UnavailableCause, VolumeUsage, space_from_stat,
 };
 pub use reconcile::{Newest, ReconcileReport, Reconciled};
 pub use storage_loop::{

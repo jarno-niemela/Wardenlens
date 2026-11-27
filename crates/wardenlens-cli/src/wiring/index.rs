@@ -1,7 +1,9 @@
 //! The one open index, shared by the recorders, the storage loop and the API.
 //!
-//! [`Index`] holds the process lock (an exclusive `flock`, ADR 0005 section 5), so it can be
-//! opened once per process. [`SharedIndex`] puts it behind a mutex and implements the core ports
+//! There is exactly one [`Index`] per process (a second one on the same file in one process would
+//! close descriptors the first depends on, ADR 0005 section 5). It is not the process lock: that
+//! is `wardenlens.lock`, taken in `commands::serve`; `Index::open`'s own `flock` is released after
+//! the open. [`SharedIndex`] puts it behind a mutex and implements the core ports
 //! on the handle: [`SegmentIndex`] for the recorders and the storage loop (each call is one
 //! statement or transaction, so the lock is held briefly), and the two asynchronous read ports of
 //! the API ([`SegmentLister`], [`TokenStore`]), which run on the blocking pool because SQLite

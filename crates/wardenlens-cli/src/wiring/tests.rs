@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -29,11 +30,13 @@ use wardenlens_core::token_store::{NewToken, TokenName};
 use wardenlens_core::video::{Frame, H264Params};
 use wardenlens_index::Index;
 use wardenlens_ingest::{FrameSource, IngestError, StreamSource};
-use wardenlens_storage::ARCHIVE_MARKER;
+use wardenlens_storage::{ARCHIVE_MARKER, StatvfsUsage, VolumeUsage};
 
 use super::*;
 
 mod accept;
+mod adversary;
+mod round2;
 mod storage;
 
 const SPS: [u8; 7] = [0x67, 0x42, 0xc0, 0x0a, 0xf8, 0x41, 0xa2];
@@ -186,13 +189,47 @@ impl Site {
         cameras: Vec<CameraInput<S>>,
         tuning: Tuning,
     ) -> Running_ {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        self.start_with(
+            cameras,
+            tuning,
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            StatvfsUsage,
+        )
+    }
+
+    /// As `start`, with the acceptor and the volume source chosen by the test.
+    fn start_with<S, U>(
+        &self,
+        cameras: Vec<CameraInput<S>>,
+        tuning: Tuning,
+        listener: TcpListener,
+        usage: U,
+    ) -> Running_
+    where
+        S: StreamSource,
+        U: VolumeUsage + Send + 'static,
+    {
         let addr = listener.local_addr().unwrap();
+        self.start_on(cameras, tuning, listener, addr, usage)
+    }
+
+    fn start_on<S, L, U>(
+        &self,
+        cameras: Vec<CameraInput<S>>,
+        tuning: Tuning,
+        listener: L,
+        addr: SocketAddr,
+        usage: U,
+    ) -> Running_
+    where
+        S: StreamSource,
+        L: Accept,
+        U: VolumeUsage + Send + 'static,
+    {
         let index = Index::open(self.config.database_path()).unwrap();
         let (stop, rx) = oneshot::channel::<()>();
-        let stats = ConnectionStats::default();
+        let stats = tuning.stats.clone();
         let config = self.config.clone();
-        let s2 = stats.clone();
         let task = tokio::spawn(async move {
             run(
                 &config,
@@ -203,7 +240,7 @@ impl Site {
                     let _ = rx.await;
                 },
                 tuning,
-                s2,
+                usage,
             )
             .await
         });
@@ -222,13 +259,13 @@ struct Running_ {
     addr: SocketAddr,
     token: String,
     stop: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Result<(), ServeError>>,
+    task: JoinHandle<Result<Stopped, ServeError>>,
     stats: ConnectionStats,
 }
 
 impl Running_ {
     /// Stops the service and returns how long that took and its result.
-    async fn shutdown(mut self) -> (Duration, Result<(), ServeError>) {
+    async fn shutdown(mut self) -> (Duration, Result<Stopped, ServeError>) {
         let at = std::time::Instant::now();
         self.stop.take().unwrap().send(()).unwrap();
         let r = tokio::time::timeout(Duration::from_secs(20), self.task)
@@ -405,28 +442,56 @@ async fn a_service_without_cameras_serves_the_api() {
 }
 
 /// The ENOSPC wake: a rising edge sends one tick; staying true sends no more; a new edge sends
-/// again; the task ends when the sender of the channel is dropped.
+/// again; the task ends when the sender of the channel is dropped. Nothing here sleeps: the
+/// predicate counts the states it has judged, so "no tick" is asserted only after the task has
+/// seen the value, and a tick is waited for with a timeout.
 #[tokio::test]
 async fn wake_when_sends_one_tick_per_rising_edge() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let (tx, rx) = tokio::sync::watch::channel(0u8);
     let (wake, inbox) = std::sync::mpsc::channel();
-    let task = tokio::spawn(wake_when(rx, |v| *v >= 2, wake));
-    let settle = || tokio::time::sleep(Duration::from_millis(50));
-    tx.send_replace(1);
-    settle().await;
+    let judged = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&judged);
+    let task = tokio::spawn(wake_when(
+        rx,
+        move |v| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            *v >= 2
+        },
+        wake,
+    ));
+    // Waits until the task has judged `n` values in total.
+    let judged_at_least = |n: usize| {
+        let judged = Arc::clone(&judged);
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while judged.load(Ordering::SeqCst) < n {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the task judged the value");
+        }
+    };
+    let send = |value: u8, n: usize| {
+        tx.send_replace(value);
+        judged_at_least(n)
+    };
+    // The task first judges the initial value; later values would coalesce with it before.
+    judged_at_least(1).await;
+    send(1, 2).await;
     assert!(inbox.try_recv().is_err(), "not full yet");
-    tx.send_replace(2);
-    settle().await;
-    assert_eq!(inbox.try_recv().unwrap(), Wake::Tick);
-    tx.send_replace(3);
-    settle().await;
-    assert!(inbox.try_recv().is_err(), "still full: no second tick");
-    tx.send_replace(0);
-    settle().await;
-    tx.send_replace(2);
-    settle().await;
+    send(2, 3).await;
     assert_eq!(
-        inbox.try_recv().unwrap(),
+        inbox.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Wake::Tick
+    );
+    send(3, 4).await;
+    assert!(inbox.try_recv().is_err(), "still full: no second tick");
+    send(0, 5).await;
+    send(2, 6).await;
+    assert_eq!(
+        inbox.recv_timeout(Duration::from_secs(5)).unwrap(),
         Wake::Tick,
         "a new edge ticks again"
     );

@@ -17,7 +17,10 @@ pub(super) fn looper(
     Storage::open(cfg, index, StatvfsUsage).unwrap().0
 }
 
-async fn ticks(rx: &mut watch::Receiver<StorageSnapshot>, after: Option<Timestamp>) -> Timestamp {
+pub(super) async fn ticks(
+    rx: &mut watch::Receiver<StorageSnapshot>,
+    after: Option<Timestamp>,
+) -> Timestamp {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let seen = rx.borrow_and_update().last_tick;

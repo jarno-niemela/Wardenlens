@@ -18,7 +18,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
-use tokio::net::TcpListener;
+use std::future::Future;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use wardenlens_ingest::CancelToken;
 
@@ -58,7 +59,6 @@ pub(crate) struct ConnectionStats {
 
 impl ConnectionStats {
     /// The highest number of connections served at the same time so far.
-    #[cfg(test)]
     pub(crate) fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }
@@ -73,9 +73,27 @@ impl ConnectionStats {
     }
 }
 
+/// Where connections come from. [`TcpListener`] in production; a test wraps one to inject accept
+/// errors.
+pub(crate) trait Accept: Send + 'static {
+    /// The next connection.
+    ///
+    /// # Errors
+    /// The `accept` failure (`EMFILE`, `ECONNABORTED`, ...); the loop logs it and carries on.
+    fn accept(&mut self) -> impl Future<Output = std::io::Result<TcpStream>> + Send;
+}
+
+impl Accept for TcpListener {
+    async fn accept(&mut self) -> std::io::Result<TcpStream> {
+        TcpListener::accept(self)
+            .await
+            .map(|(stream, _peer)| stream)
+    }
+}
+
 /// Serves `router` on `listener` until `stop` is cancelled, then drains.
-pub(crate) async fn serve(
-    listener: TcpListener,
+pub(crate) async fn serve<L: Accept>(
+    mut listener: L,
     router: Router,
     limits: HttpLimits,
     stats: ConnectionStats,
@@ -103,7 +121,7 @@ pub(crate) async fn serve(
             a = listener.accept() => a,
         };
         let stream = match accepted {
-            Ok((stream, _peer)) => stream,
+            Ok(stream) => stream,
             Err(e) => {
                 tracing::warn!(kind = ?e.kind(), "accepting an API connection failed");
                 drop(permit);
