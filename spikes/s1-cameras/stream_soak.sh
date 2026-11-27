@@ -40,8 +40,6 @@ run_stream() { # <cam> <kind>
 }
 
 load_cams || exit 1
-mkdir -p "$out"
-deadline=$(( $(date +%s) + duration ))
 streams=()
 for id in "${CAMS[@]}"; do streams+=("$id:main" "$id:sub"); done
 # Fail before starting anything if a URL cannot be built (unknown camera, missing host).
@@ -49,6 +47,8 @@ for s in "${streams[@]}"; do
   path="$(rtsp_path "${s%%:*}" "${s##*:}")" || exit 1
   rtsp_url "${s%%:*}" "$path" >/dev/null || exit 1
 done
+mkdir -p "$out"
+deadline=$(( $(date +%s) + duration ))
 for s in "${streams[@]}"; do run_stream "${s%%:*}" "${s##*:}" & done
 wait
 

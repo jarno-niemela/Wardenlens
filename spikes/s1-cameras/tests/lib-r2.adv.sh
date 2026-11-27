@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Round-2 adversarial cases for spikes/s1-cameras: attacks on the round-1 fixes.
-# Fake fixtures under /tmp/claude-1000 and stub tools on PATH only; never contacts a camera and never
+# Fake fixtures under a temporary directory and stub tools on PATH only; never contacts a camera and never
 # reads the real secret or inventory files. FAIL lines are findings.
 # shellcheck disable=SC2016,SC2034,SC1091,SC1003  # literal $ in fixtures; vars are read via check/eval
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-mkdir -p /tmp/claude-1000
-fx=$(mktemp -d /tmp/claude-1000/s1-adv2.XXXXXX)
+# Hermetic: nothing from the caller reaches the real vault, binary or a camera.
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
+fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-adv2.XXXXXX") || exit 1
 trap 'chmod -R u+rwx "$fx" 2>/dev/null; rm -rf "$fx"' EXIT
 fail=0
 ok()   { echo "ok   $1"; }

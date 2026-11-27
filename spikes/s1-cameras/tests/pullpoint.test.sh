@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2016,SC2034
 # Regression test for pullpoint_ok (lib.sh): the camera-chosen pull-point address must be on the configured
 # host (any port) with no userinfo. Pure string checks with TEST-NET-1 addresses; never contacts anything.
 set -uo pipefail
+# Hermetic: nothing from the caller reaches the real vault, binary or a camera.
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=../lib.sh
 source "$here/lib.sh"

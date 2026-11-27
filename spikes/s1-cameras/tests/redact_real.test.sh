@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2016,SC2034
 # End-to-end test of lib.sh against the real `wardenlens` binary, a temporary HOME and a synthetic vault
 # (documentation addresses, made-up credentials). The real ~/.config and ~/.local/share are never read.
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
-mkdir -p /tmp/claude-1000
-fx=$(mktemp -d /tmp/claude-1000/s1-real.XXXXXX)
+fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-real.XXXXXX") || exit 1
 trap 'rm -rf "$fx"' EXIT
 fail=0
 ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
-(cd "$root" && cargo build -q -p wardenlens-cli --locked) || { echo "FAIL could not build wardenlens"; exit 1; }
+(cd "$root" && cargo build -q -p wardenlens-cli --locked --offline) || { echo "FAIL could not build wardenlens"; exit 1; }
 tdir=$(cd "$root" && cargo metadata --no-deps --format-version 1 | jq -r .target_directory)
 export WARDENLENS_BIN="$tdir/debug/wardenlens"
 [[ -x $WARDENLENS_BIN ]] || { echo "FAIL no binary at $WARDENLENS_BIN"; exit 1; }

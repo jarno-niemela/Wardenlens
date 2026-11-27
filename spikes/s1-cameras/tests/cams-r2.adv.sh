@@ -2,11 +2,13 @@
 # Round-2 adversarial cases for camera selection in spikes/s1-cameras (#190): the load_cams choke point and the
 # rtsp_path error arm, end to end through every script that enumerates cameras. Synthetic data only, a temporary
 # HOME, stub vault and stub ffprobe/ffmpeg; never contacts a camera. FAIL lines are findings.
-# shellcheck disable=SC2016,SC2034,SC1091
+# shellcheck disable=SC2016,SC2034,SC1091,SC2329
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-mkdir -p /tmp/claude-1000
-fx=$(mktemp -d /tmp/claude-1000/s1-cams2.XXXXXX)
+# Hermetic: nothing from the caller reaches the real vault, binary or a camera.
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
+fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-cams2.XXXXXX") || exit 1
 trap 'rm -rf "$fx"' EXIT
 fail=0
 ok()   { echo "ok   $1"; }

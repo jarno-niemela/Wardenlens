@@ -2,18 +2,22 @@
 # Adversarial cases for camera selection in spikes/s1-cameras (#190): cam_id, cam_ids, selected_cams and the three
 # scripts that enumerate cameras (probe_streams.sh, gop_sample.sh, stream_soak.sh). Synthetic data only, a temporary
 # HOME, stub ffprobe/ffmpeg; never contacts a camera. FAIL lines are findings.
-# shellcheck disable=SC2016,SC2034,SC1091
+# shellcheck disable=SC2016,SC2034,SC1091,SC2329
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
-mkdir -p /tmp/claude-1000
-fx=$(mktemp -d /tmp/claude-1000/s1-cams.XXXXXX)
+# Hermetic: nothing from the caller reaches the real vault, binary or a camera.
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
+fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-cams.XXXXXX") || exit 1
 trap 'rm -rf "$fx"' EXIT
 fail=0
 ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
+# rustup/cargo keep their state under the real HOME: pin it before HOME is replaced.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export HOME="$fx/home"; mkdir -p "$HOME"
 unset CAMERAS
 # shellcheck source=vault_stub.sh
@@ -76,12 +80,12 @@ check "rtsp_path: an id with no known vendor path is an error, not an empty path
 reset; CAMERAS="cam-x" "$here/probe_streams.sh" >/dev/null 2>&1
 check "probe_streams.sh: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
 for s in gop_sample.sh stream_soak.sh; do
-  reset; CAMERAS="cam-x" "$here/$s" "$fx/novp-$s" 1 >/dev/null 2>&1
+  reset; if [[ $s == stream_soak.sh ]]; then CAMERAS="cam-x" "$here/$s" "$fx/novp-$s" 1 >/dev/null 2>&1; else CAMERAS="cam-x" "$here/$s" 1 >/dev/null 2>&1; fi
   check "$s: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
 done
 
 # ============================== cam_ids against the real binary ==============================
-(cd "$root" && timeout 600 cargo build -q -p wardenlens-cli --locked) || { echo "FAIL could not build wardenlens"; exit 1; }
+(cd "$root" && timeout 600 cargo build -q -p wardenlens-cli --locked --offline) || { echo "FAIL could not build wardenlens"; exit 1; }
 tdir=$(cd "$root" && cargo metadata --no-deps --format-version 1 | jq -r .target_directory)
 real="$tdir/debug/wardenlens"
 export HOME="$fx/realhome"; mkdir -p "$HOME"; chmod 700 "$HOME"
