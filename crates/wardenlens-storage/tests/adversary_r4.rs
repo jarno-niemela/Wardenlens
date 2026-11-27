@@ -255,10 +255,12 @@ fn a_flapping_archive_with_room_never_deletes_video_on_an_available_tick() {
     let hot = w.hot.clone();
     let usage = w.fake(1_000_000, 100_000_000);
     let cfg = w.cfg(10_000);
-    let mut index = w.index;
-    // The loop owns its own index handle; keep adding through a second one.
-    let idx_path = w.tmp.path().join("idx/index.db");
-    let (mut lp, files) = Storage::open(cfg, Index::open(&idx_path).unwrap(), usage).unwrap();
+    // The loop owns an index and the test keeps adding through the same one: a second `Index`
+    // over the file is refused in one process (#148), so both go through one shared handle.
+    let _tmp = w.tmp; // keeps the directories alive
+    let index = Shared(std::sync::Arc::new(std::sync::Mutex::new(w.index)));
+    let mut adder = index.clone();
+    let (mut lp, files) = Storage::open(cfg, index, usage).unwrap();
     let mut was = true;
     for tick in 0..40 {
         let avail = rnd(3) != 0;
@@ -273,7 +275,7 @@ fn a_flapping_archive_with_room_never_deletes_video_on_an_available_tick() {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, vec![7_u8; 40_000]).unwrap();
             let rec = SegmentRecord::new(cam(), start, 1000, 40_000, 30);
-            index.insert(&rec, Tier::Hot).unwrap();
+            adder.insert(&rec, Tier::Hot).unwrap();
             n += 1;
         }
         let r = lp
@@ -287,6 +289,69 @@ fn a_flapping_archive_with_room_never_deletes_video_on_an_available_tick() {
         }
         was = avail;
         let _ = &files;
+    }
+}
+
+/// One `Index` shared by the storage loop and the test.
+#[derive(Clone)]
+struct Shared(std::sync::Arc<std::sync::Mutex<Index>>);
+
+impl Shared {
+    fn with<R>(&self, f: impl FnOnce(&mut Index) -> R) -> R {
+        f(&mut self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+}
+
+impl SegmentIndex for Shared {
+    type Error = <Index as SegmentIndex>::Error;
+
+    fn insert(&mut self, r: &SegmentRecord, t: Tier) -> Result<SegmentId, Self::Error> {
+        self.with(|i| i.insert(r, t))
+    }
+    fn get(
+        &self,
+        id: SegmentId,
+    ) -> Result<Option<wardenlens_core::storage::IndexedSegment>, Self::Error> {
+        self.with(|i| i.get(id))
+    }
+    fn list(
+        &self,
+        camera: &CameraId,
+        from: Timestamp,
+        to: Timestamp,
+        limit: usize,
+        cursor: Option<&wardenlens_core::storage::SegmentCursor>,
+    ) -> Result<wardenlens_core::storage::SegmentPage, Self::Error> {
+        self.with(|i| i.list(camera, from, to, limit, cursor))
+    }
+    fn set_tier(&mut self, id: SegmentId, t: Tier) -> Result<(), Self::Error> {
+        self.with(|i| i.set_tier(id, t))
+    }
+    fn delete(&mut self, id: SegmentId) -> Result<(), Self::Error> {
+        self.with(|i| i.delete(id))
+    }
+    fn oldest(
+        &self,
+        tier: Tier,
+        after: Option<(Timestamp, SegmentId)>,
+        n: usize,
+    ) -> Result<Vec<wardenlens_core::storage::StoredSegment>, Self::Error> {
+        self.with(|i| i.oldest(tier, after, n))
+    }
+    fn newest(
+        &self,
+        tier: Tier,
+    ) -> Result<Option<wardenlens_core::storage::StoredSegment>, Self::Error> {
+        self.with(|i| i.newest(tier))
+    }
+    fn bytes_by_tier(&self) -> Result<wardenlens_core::storage::TierTotals, Self::Error> {
+        self.with(|i| i.bytes_by_tier())
+    }
+    fn latest_started_at(&self, camera: &CameraId) -> Result<Option<UnixMs>, Self::Error> {
+        self.with(|i| i.latest_started_at(camera))
     }
 }
 

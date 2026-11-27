@@ -298,6 +298,20 @@ the device and inode compared; a symlink or a wrong owner is refused. Pragmas on
 checked on open, so a foreign SQLite file is refused. One writer and the rest readers (WAL): the cli keeps one write
 connection and a small number of read connections.
 
+**One handle per file per process (#148).** POSIX record locks, SQLite's included, belong to the process: closing *any*
+descriptor of the file drops every lock the process holds on it. A second `Index` over the same file in one process would
+strip the first of its locks when it (or a refused attempt) closed its descriptor. Two options were weighed: a registry that
+returns the existing shared handle, or one that refuses. **Refusing was chosen**: `wardenlens serve` holds exactly one
+`Index` behind `Arc<Mutex<Index>>`, so a second open is a bug that must fail loudly (`IndexError::AlreadyOpenInProcess`)
+rather than be papered over. The registry is a process-wide `HashSet` of (device, inode) of the main file behind a
+`Mutex` (poison recovered, never unwrapped), the crate's only global mutable state. Under that mutex `open` first `stat`s
+the path and refuses a registered identity **before opening any descriptor of the file** (closing even a refused
+descriptor would drop the first handle's locks); otherwise it opens its own descriptor, `fstat`s it and inserts the key, so a
+symlinked directory or a hard link cannot dodge the check (a name swapped in between the `stat` and the open is caught by the
+`fstat` key; that one descriptor is then parked, not closed, so the first handle keeps its locks, at the price of one leaked descriptor per attempt). A `-shm`, `-wal` or `-journal` path whose base file is registered is refused by the same `stat` step. A file that does not exist yet is created by that open and
+registered from its descriptor. The entry is removed when the `Index` drops, after its descriptor has closed, and on every
+error path of `open`. Other processes are still excluded by the `flock` taken during `open`.
+
 **Sidecars and identity (#49 rounds 2 and 3, defect pattern P3).** SQLite replays a hot `-journal` and a `-wal` on the
 first read and checkpoints when the last connection closes, so **no read-write connection is opened on `index.db` until its
 identity and every sidecar are proven by means no sidecar can influence**:
@@ -307,8 +321,7 @@ identity and every sidecar are proven by means no sidecar can influence**:
   **exactly one hard link** (SQLite rewrites a `-shm` and a `-wal` in place, so a sidecar that is a second name of another file
   would clobber it; `InsecureSidecar`, nothing modified). **The main file must have exactly one link too**
   (`HardLinkedIndex`, nothing modified): two names of one index file get two separate `-wal`/`-shm` pairs, so two processes
-  do not see each other's SQLite locks and overwrite each other's committed rows. (Holding the `flock` for the life of the
-  handle is #148.) The `-shm`/`-wal`/`-journal` rule is in `fsutil::sidecar_len`, the main-file rule in the index's open (#145); the
+  do not see each other's SQLite locks and overwrite each other's committed rows. (One process-wide handle per file is #148, below.) The `-shm`/`-wal`/`-journal` rule is in `fsutil::sidecar_len`, the main-file rule in the index's open (#145); the
   100-byte header is read through our own descriptor (magic, `application_id`, journal mode);
 - the settled state is judged read-only: `application_id`, `user_version` (too new is refused here, so the file stays
   byte-identical), then **every `sqlite_master` row** (`type, name, tbl_name, sql`) compared with a reference built in

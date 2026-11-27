@@ -61,7 +61,9 @@ fn reopen_keeps_data_and_works_with_a_live_wal() {
     let id = idx
         .insert(&rec("cam1", BASE, 1000, 10, 1), Tier::Hot)
         .unwrap();
-    // Reopen while the first handle is alive: its -wal holds the row, the main file does not.
+    // A second handle in this process is refused (#148); another process would find the row in
+    // the live -wal, which the stand-in for it keeps.
+    let _other = idx.into_foreign();
     let idx2 = Index::open(&f.path).unwrap();
     assert!(idx2.get(id).unwrap().is_some());
 }
@@ -680,7 +682,10 @@ fn a_hard_linked_main_file_is_refused_untouched_whether_empty_or_in_use() {
     let empty = fixture();
     std::fs::write(&empty.path, b"").unwrap();
     chmod(&empty.path, 0o600);
+    // (A live index with a `-wal` held by this process is refused earlier, as already open; the
+    // stand-in for another process keeps that state.)
     let (live, idx) = open_new();
+    let _other = idx.into_foreign();
     for f in [&empty, &live] {
         let twin = f.dir.path().join("twin");
         std::fs::hard_link(&f.path, &twin).unwrap();
@@ -689,7 +694,6 @@ fn a_hard_linked_main_file_is_refused_untouched_whether_empty_or_in_use() {
         assert!(matches!(err, IndexError::HardLinkedIndex), "{err:?}");
         assert_eq!(before, snapshot(f.dir.path()));
     }
-    drop(idx);
 }
 
 // ---- #175: a concurrent last close deletes the sidecars while we classify -------------------
@@ -714,15 +718,15 @@ fn row_count(idx: &Index, camera: &str) -> usize {
         .len()
 }
 
-/// An index with a live `-wal` holding three rows, still open.
-fn live_index_with_wal() -> (Fixture, Index) {
+/// An index with a live `-wal` holding three rows, still open by a stand-in for another process.
+fn live_index_with_wal() -> (Fixture, crate::Foreign) {
     let (f, mut idx) = open_new();
     for k in 0..3 {
         idx.insert(&rec("c", BASE + k * 10_000, 1000, 10, 1), Tier::Hot)
             .unwrap();
     }
     assert!(std::fs::metadata(sidecar(&f, "-wal")).unwrap().len() > 0);
-    (f, idx)
+    (f, idx.into_foreign())
 }
 
 #[test]
