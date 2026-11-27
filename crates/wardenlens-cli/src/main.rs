@@ -10,6 +10,7 @@ mod error;
 mod logging;
 mod terminal;
 mod vault_cmd;
+mod wiring;
 
 use std::error::Error;
 use std::io::{self, Write};
@@ -38,6 +39,11 @@ fn main() -> ExitCode {
     };
     let env = Env::from_process();
     let format = cli.log_format.unwrap_or(LogFormat::Text);
+    let ctx = commands::Context {
+        env: &env,
+        config_flag: cli.config.as_deref(),
+        log_format: format,
+    };
     match cli.command {
         None => {
             if cli.config.is_some() {
@@ -51,39 +57,23 @@ fn main() -> ExitCode {
         }
         Some(Command::Config(cmd)) => {
             logging::init(format, &env);
-            let ctx = commands::Context {
-                env: &env,
-                config_flag: cli.config.as_deref(),
-                log_format: format,
-            };
             commands::config::execute(&cmd, &ctx)
         }
         Some(Command::Import(cmd)) => {
             logging::init(format, &env);
-            let ctx = commands::Context {
-                env: &env,
-                config_flag: cli.config.as_deref(),
-                log_format: format,
-            };
             commands::import::execute(&cmd, &ctx)
         }
         Some(Command::Secrets(cmd)) => {
             logging::init(format, &env);
-            let ctx = commands::Context {
-                env: &env,
-                config_flag: cli.config.as_deref(),
-                log_format: format,
-            };
             commands::secrets::execute(&cmd, &ctx)
         }
         Some(Command::Token(cmd)) => {
             logging::init(format, &env);
-            let ctx = commands::Context {
-                env: &env,
-                config_flag: cli.config.as_deref(),
-                log_format: format,
-            };
             commands::token::execute(&cmd, &ctx)
+        }
+        Some(Command::Serve) => {
+            logging::init(format, &env);
+            commands::serve::execute(&ctx)
         }
         Some(Command::Vault(cmd)) => {
             // `--config` and `--log-format` are global for the grammar, but the vault has fixed
