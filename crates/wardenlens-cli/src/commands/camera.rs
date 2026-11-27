@@ -104,6 +104,11 @@ pub(crate) enum CameraCmdError {
     /// A path has a query the catalogue does not list for the model.
     #[error("a stream path has a query string that the catalogue does not list for this model")]
     PathQuery,
+    /// As [`Self::PathQuery`], but the catalogue lists a path with the same head.
+    #[error(
+        "a stream path has a query string that the catalogue does not list for this model; the catalogue lists {listed} for this stream (the catalogue's paths are used when the camera does not answer ONVIF)"
+    )]
+    PathQueryListed { listed: String },
     /// The key file does not exist.
     #[error("key file {path:?} does not exist; run `wardenlens secrets init` to create it")]
     KeyMissing { path: PathBuf },
@@ -147,7 +152,8 @@ impl CameraCmdError {
             | Self::NotFound
             | Self::Onvif(_)
             | Self::NoCataloguePaths
-            | Self::PathQuery => 1,
+            | Self::PathQuery
+            | Self::PathQueryListed { .. } => 1,
             Self::Catalogue(_)
             | Self::KeyMissing { .. }
             | Self::Key(_)
