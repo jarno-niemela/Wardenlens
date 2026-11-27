@@ -417,7 +417,7 @@ fn load_key(path: &Path) -> Result<KeyFile, ImportError> {
 }
 
 /// `vault.db` next to the index.
-fn vault_path(config: &Config) -> PathBuf {
+pub(crate) fn vault_path(config: &Config) -> PathBuf {
     let dir = match config.database_path().parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),

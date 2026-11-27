@@ -50,6 +50,13 @@ pub(crate) enum Command {
     /// Manage the API tokens in the index named by `database.path`.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Run the service: record every registered camera, run the storage loop and serve the API
+    /// on `api.listen`. Stops on SIGTERM or SIGINT after flushing the open segments (exit 0).
+    ///
+    /// Refuses to start (exit 2) when the config, the key file, the index or the hot root cannot
+    /// be used, or when another instance holds the process lock (`wardenlens.lock` next to the index) or the lock inside the hot root. A missing, read-only or same-filesystem
+    /// archive is not a refusal: the service starts in `archive_unavailable` mode.
+    Serve,
 }
 
 /// `wardenlens token ...`

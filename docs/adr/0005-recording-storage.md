@@ -694,7 +694,11 @@ through the unlink (POSIX semantics; #62 tests it).
 ### 8. Volume safety and the archive state
 
 **Hot root.** A missing, non-directory, unwritable or otherwise unusable **hot** root (or an index that cannot be
-opened) is the only volume problem that makes `wardenlens serve` refuse to start.
+opened) is the only volume problem that makes `wardenlens serve` refuse to start. The service also takes an exclusive
+`flock` on `<hot_root>/.wardenlens.lock` (mode `0600`, created through the root handle) for its whole life, so two
+instances with different state directories cannot run over one hot root (two storage loops on the same files); a second
+instance exits 2. The file is not a segment: the reconciliation walk skips that one name (it is not `unknown_left`).
+The process lock proper is `wardenlens.lock` in the directory of the index, taken before `Index::open`.
 
 **Archive state (`ArchiveState`) has one definition, used at boot and at every tick.** The archive is **unavailable**
 when any of these holds, and **available** otherwise:

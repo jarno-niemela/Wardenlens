@@ -20,7 +20,7 @@ use super::{Mode, Reconciler, bump};
 use crate::evict;
 use crate::fs::Fs;
 use crate::index::Rel;
-use crate::probe::{ARCHIVE_MARKER, PROBE_FILE};
+use crate::probe::{ARCHIVE_MARKER, HOT_LOCK_FILE, PROBE_FILE};
 
 /// Most entries one directory may hold (SEC-2): a day directory holds about 1,440 files per
 /// camera, so this is far above anything legitimate and bounds the memory of one listing.
@@ -145,8 +145,9 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
             &[],
             |n| CameraId::new(n).is_ok(),
             |n| {
-                // Ours, but not a camera: the quarantine, the archive's marker and probe file.
+                // Ours, but not a camera: the quarantine, the hot root's lock file, the archive's marker and probe file.
                 n == QUARANTINE_DIR
+                    || (tier == Tier::Hot && n == HOT_LOCK_FILE)
                     || (tier == Tier::Archive && (n == ARCHIVE_MARKER || n == PROBE_FILE))
             },
         )
