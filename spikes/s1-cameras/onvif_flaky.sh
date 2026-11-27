@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Characterise ONVIF reliability of a flaky camera: N rounds of unauthenticated (GetSystemDateAndTime)
 # and authenticated (GetDeviceInformation) requests with a 10 s timeout, fresh TCP connection each.
-# Usage: onvif_flaky.sh <camera-name> <rounds> <sleep-seconds>
+# Usage: onvif_flaky.sh <camera-id> <rounds> <sleep-seconds>
 # Output TSV: round, request, http_code, seconds   (summarise with awk)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

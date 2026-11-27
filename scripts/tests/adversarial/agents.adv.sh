@@ -28,8 +28,8 @@ prompt() { local f; f=$(mktemp "$tmp/pXXXXXX"); printf '%s\n' "$1" >"$f"; echo "
 # Secret file in the real schema used by spikes/s1-cameras/lib.sh: array of cameras with
 # name / login / password / onvif.
 cat >"$tmp/secret.json" <<'JSON'
-[{"name":"IPC-BO","login":"camoperator","password":"Hunter2Pass","onvif":"http://camoperator:Hunter2Pass@cam.example:8000/onvif"},
- {"name":"XR","login":"xrviewer","password":87654321}]
+[{"name":"test-cam-a","login":"camoperator","password":"Hunter2Pass","onvif":"http://camoperator:Hunter2Pass@cam.example:8000/onvif"},
+ {"name":"test-cam-b","login":"xrviewer","password":87654321}]
 JSON
 
 # --- secret scan: real schema keys ---

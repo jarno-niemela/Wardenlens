@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Round-2 adversarial cases for spikes/s1-cameras: attacks on the round-1 fixes.
-# Fake fixtures under /tmp/claude-1000 and stub tools on PATH only; never contacts a camera and never
+# Fake fixtures under a temporary directory and stub tools on PATH only; never contacts a camera and never
 # reads the real secret or inventory files. FAIL lines are findings.
 # shellcheck disable=SC2016,SC2034,SC1091,SC1003  # literal $ in fixtures; vars are read via check/eval
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-mkdir -p /tmp/claude-1000
-fx=$(mktemp -d /tmp/claude-1000/s1-adv2.XXXXXX)
+# Hermetic: nothing from the caller reaches the real vault, binary or a camera.
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS XDG_CONFIG_HOME XDG_DATA_HOME BASH_ENV ENV
+while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
+fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-adv2.XXXXXX") || exit 1
 trap 'chmod -R u+rwx "$fx" 2>/dev/null; rm -rf "$fx"' EXIT
 fail=0
 ok()   { echo "ok   $1"; }
@@ -26,11 +28,11 @@ secret() {
     u="$(jq -j ".[$i].login // \"\"" <<<"$1"; printf x)"; pw="$(jq -j ".[$i].password // \"\"" <<<"$1"; printf x)"
     cred "$(jq -r ".[$i].name" <<<"$1")" "${u%x}" "${pw%x}"
   done
-  for c in IPC-BO "IPC-BO (2)" XR C110 HDIPC; do hosts_for "$c"; done
+  for c in reolink-1 reolink-2 xr tapo hdipc; do hosts_for "$c"; done
 }
-hosts_for() { case "$1" in IPC-BO) host "$1" 10.0.0.1 ;; "IPC-BO (2)") host "$1" 10.0.0.2 ;; XR) host "$1" "127.0.0.1:${PORT:-1}" ;; C110) host "$1" 10.0.0.4 ;; HDIPC) host "$1" "${HDIPC_HOST:-10.0.0.5}" ;; esac; }
-secret '[{"name":"XR","login":"admin","password":"pw-top-synth-1"},{"name":"C110","login":"admin","password":"pw-top-synth-2"},
- {"name":"HDIPC","login":"admin","password":"pw-top-synth-3"}]'
+hosts_for() { case "$1" in reolink-1) host "$1" 10.0.0.1 ;; reolink-2) host "$1" 10.0.0.2 ;; xr) host "$1" "127.0.0.1:${PORT:-1}" ;; tapo) host "$1" 10.0.0.4 ;; hdipc) host "$1" "${CAM5_HOST:-10.0.0.5}" ;; esac; }
+secret '[{"name":"xr","login":"admin","password":"pw-top-synth-1"},{"name":"tapo","login":"admin","password":"pw-top-synth-2"},
+ {"name":"hdipc","login":"admin","password":"pw-top-synth-3"}]'
 # shellcheck source=../lib.sh
 source "$here/lib.sh"
 
@@ -57,7 +59,7 @@ for txt in 'frame=  250 fps= 25 q=-1.0 size=N/A time=00:00:10.00 bitrate=N/A spe
 done
 
 # Layer 1 (the vault filter) is a stub here; the shape masks above are layer 2. A vault value is replaced:
-secret '[{"name":"XR","login":"admin","password":"s3cr3t-pw"}]'
+secret '[{"name":"xr","login":"admin","password":"s3cr3t-pw"}]'
 r=$(R 'login admin s3cr3t-pw ok'); check "redact: a vault value is replaced by layer 1" '[[ $r == "login admin [REDACTED] ok" ]]'
 touch "$VAULT_STUB/.broken"
 r=$(R 'rtsp://u:p@h/ 10.0.0.1 aa:bb:cc:dd:ee:ff' 2>/dev/null); rc=$?
@@ -66,26 +68,26 @@ R 'x' >/dev/null 2>&1; check "redact: status is non-zero when layer 1 fails" '[[
 rm -f "$VAULT_STUB/.broken"
 
 # ============================== cam_creds / rtsp_url ==============================
-secret '[{"name":"XR","login":"","password":"p"},{"name":"C110","login":"","password":""}]'
-cam_creds C110 2>/dev/null; rc=$?
+secret '[{"name":"xr","login":"","password":"p"},{"name":"tapo","login":"","password":""}]'
+cam_creds tapo 2>/dev/null; rc=$?
 check "cam_creds: empty login and password entries -> ok, empty strings" '[[ $rc == 0 && -z $CAM_USER && -z $CAM_PASS ]]'
-secret '[{"name":"C110","login":"admin","password":"p"}]'
+secret '[{"name":"tapo","login":"admin","password":"p"}]'
 # Callers use url="$(rtsp_url ...)" under set -e; errexit is not inherited by command substitution.
-o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url XR /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
+o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url xr /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
 check "rtsp_url in \$(...): camera missing from the vault aborts the caller (no credential-less URL)" '[[ $rc != 0 && $o != *URL=* ]]'
 o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url NOPE /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
 check "rtsp_url in \$(...): unknown camera aborts the caller" '[[ $rc != 0 && $o != *URL=* ]]'
-secret '[{"name":"XR","login":"a","password":"p"}]'; rm "$VAULT_STUB/cam_xr_host"
-o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url XR /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
+secret '[{"name":"xr","login":"a","password":"p"}]'; rm "$VAULT_STUB/cam_xr_host"
+o=$(bash -c 'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url xr /x)"; echo "URL=$url"' _ "$here" 2>/dev/null); rc=$?
 check "rtsp_url: no host entry aborts the caller" '[[ $rc != 0 && $o != *URL=* ]]'
 
 # ============================== cam_onvif_url ==============================
-secret '[{"name":"C110","login":"a","password":"p"}]'
-check "cam_onvif_url: no port configured -> default port" '[[ $(cam_onvif_url C110) == http://10.0.0.4/onvif/device_service ]]'
+secret '[{"name":"tapo","login":"a","password":"p"}]'
+check "cam_onvif_url: no port configured -> default port" '[[ $(cam_onvif_url tapo) == http://10.0.0.4/onvif/device_service ]]'
 vault_put cam:tapo:onvif_port 2020
-check "cam_onvif_url: port from the vault entry" '[[ $(cam_onvif_url C110) == http://10.0.0.4:2020/onvif/device_service ]]'
-check "cam_onvif_url: ONVIF_PORT overrides" '[[ $(ONVIF_PORT=8000 cam_onvif_url C110) == http://10.0.0.4:8000/onvif/device_service ]]'
-check "cam_onvif_url: a non-numeric port is refused" '! ONVIF_PORT="80/../x" cam_onvif_url C110 2>/dev/null'
+check "cam_onvif_url: port from the vault entry" '[[ $(cam_onvif_url tapo) == http://10.0.0.4:2020/onvif/device_service ]]'
+check "cam_onvif_url: ONVIF_PORT overrides" '[[ $(ONVIF_PORT=8000 cam_onvif_url tapo) == http://10.0.0.4:8000/onvif/device_service ]]'
+check "cam_onvif_url: a non-numeric port is refused" '! ONVIF_PORT="80/../x" cam_onvif_url tapo 2>/dev/null'
 
 # ============================== dahua.sh ==============================
 # Capture what curl parsed from -K: swap --digest for --basic and decode Basic auth at a local server.
@@ -105,30 +107,30 @@ c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
   srv=$!; sleep 0.3
 }
 for pw in 'a\tb\nc' $'tab\there' ' lead and trail ' 'ends\' '#hash;semi' "q'uo\"te" 'ünï€' '\\\"'; do
-  secret "$(jq -n --arg p "$pw" '[{name:"XR",login:"admin",password:$p}]')"
+  secret "$(jq -n --arg p "$pw" '[{name:"xr",login:"admin",password:$p}]')"
   rm -f "$fx/auth"; serve
-  "$here/dahua.sh" XR get / >/dev/null 2>&1; wait "$srv" 2>/dev/null
+  "$here/dahua.sh" xr get / >/dev/null 2>&1; wait "$srv" 2>/dev/null
   got=$(cat "$fx/auth" 2>/dev/null; echo .); got=${got%.}
   check "dahua.sh: password round-trips through curl -K: $(printf %q "$pw")" '[[ $got == "admin:$pw" ]]'
 done
 for pw in $'a\nb' $'a\rb' $'a\r\nuser = "evil:x"'; do
-  secret "$(jq -n --arg p "$pw" '[{name:"XR",login:"admin",password:$p}]')"
+  secret "$(jq -n --arg p "$pw" '[{name:"xr",login:"admin",password:$p}]')"
   rm -f "$fx/curl.called"
-  out=$("$here/dahua.sh" XR get / 2>&1); rc=$?
+  out=$("$here/dahua.sh" xr get / 2>&1); rc=$?
   check "dahua.sh: refuses CR/LF password $(printf %q "$pw") before curl, no echo" '[[ $rc != 0 && ! -e $fx/curl.called && $out != *evil* ]]'
 done
-secret "$(jq -n '[{name:"XR",login:"ad\nmin",password:"p"}]')"; rm -f "$fx/curl.called"
-"$here/dahua.sh" XR get / >/dev/null 2>&1; rc=$?
+secret "$(jq -n '[{name:"xr",login:"ad\nmin",password:"p"}]')"; rm -f "$fx/curl.called"
+"$here/dahua.sh" xr get / >/dev/null 2>&1; rc=$?
 check "dahua.sh: refuses CR/LF username" '[[ $rc != 0 && ! -e $fx/curl.called ]]'
-secret "$(jq -n '[{name:"XR",login:"admin",password:"pw\n"}]')"; rm -f "$fx/curl.called"
-"$here/dahua.sh" XR get / >/dev/null 2>&1; rc=$?
+secret "$(jq -n '[{name:"xr",login:"admin",password:"pw\n"}]')"; rm -f "$fx/curl.called"
+"$here/dahua.sh" xr get / >/dev/null 2>&1; rc=$?
 check "dahua.sh: password with trailing newline is refused, not silently truncated" '[[ $rc != 0 && ! -e $fx/curl.called ]]'
 
 # ============================== onvif.sh ==============================
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >%q\ncat >%q\necho; echo "HTTP 200 0s"\n' "$fx/onvif.argv" "$fx/env.xml" >"$fx/bin/curl"
 UH=$'a&b<c>d"e\'f]]>&amp;'; PH='p&<>"'"'"'$(id)`x`\'
-secret "$(jq -n --arg u "$UH" --arg p "$PH" '[{name:"C110",login:$u,password:$p}]')"
-"$here/onvif.sh" C110 device '<tds:GetDeviceInformation/>' >/dev/null 2>&1
+secret "$(jq -n --arg u "$UH" --arg p "$PH" '[{name:"tapo",login:$u,password:$p}]')"
+"$here/onvif.sh" tapo device '<tds:GetDeviceInformation/>' >/dev/null 2>&1
 v=$(python3 -I - "$fx/env.xml" "$UH" "$PH" <<'PY' 2>&1
 import sys,base64,hashlib,xml.dom.minidom as m
 d=m.parse(sys.argv[1]); t=lambda n:d.getElementsByTagName(n)[0].firstChild.data
@@ -154,34 +156,34 @@ case "$2" in
 esac
 S
 chmod +x "$fx/s1/onvif.sh"
-secret '[{"name":"HDIPC","login":"admin","password":"p"},{"name":"C110","login":"admin","password":"p"}]'
+secret '[{"name":"hdipc","login":"admin","password":"p"},{"name":"tapo","login":"admin","password":"p"}]'
 ONVIF_PORT=8000; export ONVIF_PORT; redact_add "aa:bb:cc:dd:ee:ff"; redact_add "fd00::5"
 pull() { # <cam> <addr> -> 0 if the address was followed
   : >"$fx/pp.log"; PP_LOG="$fx/pp.log" PP_ADDR="$2" timeout 10 "$fx/s1/onvif_pull.sh" "$1" 1 >"$fx/pp.out" 2>&1
   [[ -s $fx/pp.log ]]
 }
-check "onvif_pull: same origin is followed" 'pull HDIPC http://10.0.0.5:8000/onvif/pp'
+check "onvif_pull: same origin is followed" 'pull hdipc http://10.0.0.5:8000/onvif/pp'
 # Host-only comparison (Tapo serves the pull point on another port); fragment/query text is not authority.
 for a in http://10.0.0.5:8001/x http://10.0.0.5/x http://10.0.0.5:80/x 'http://10.0.0.5:8000#@evil.example/'; do
-  check "onvif_pull: same host, other port or fragment is followed: $a" 'pull HDIPC "$a"'
+  check "onvif_pull: same host, other port or fragment is followed: $a" 'pull hdipc "$a"'
 done
 for a in 'http://10.0.0.5:8000@evil.example/x' 'http://10.0.0.5.:8000/x' 'http://10.0.0.50:8000/x' \
   'http://10.0.0.5:8000.evil.example/x' 'http://evil@10.0.0.5:8000/x' \
   'http://10.0.0.5:8000\@evil.example/x' 'http://[::ffff:10.0.0.5]:8000/x' \
   'http://10.0.0.5:8000/x>http://evil.example/y'; do
-  check "onvif_pull: refuses $a" '! pull HDIPC "$a"'
+  check "onvif_pull: refuses $a" '! pull hdipc "$a"'
 done
-pull HDIPC http://10.0.0.5:8000/onvif/pp
+pull hdipc http://10.0.0.5:8000/onvif/pp
 check "onvif_pull: control chars stripped from camera text" '! grep -q $'"'"'\x1b'"'"' "$fx/pp.out" && ! grep -q $'"'"'\x07'"'"' "$fx/pp.out"'
 check "onvif_pull: MAC / IPv6 in event text are masked" '! grep -qE "aa:bb:cc|fd00::5" "$fx/pp.out"'
-HDIPC_HOST="[fd00::5]"; hosts_for HDIPC
-check "onvif_pull: IPv6 camera, same origin is followed" 'pull HDIPC "http://[fd00::5]:8000/onvif/pp"'
-check "onvif_pull: IPv6 camera, other host refused" '! pull HDIPC "http://[fd00::6]:8000/onvif/pp"'
+CAM5_HOST="[fd00::5]"; hosts_for hdipc
+check "onvif_pull: IPv6 camera, same origin is followed" 'pull hdipc "http://[fd00::5]:8000/onvif/pp"'
+check "onvif_pull: IPv6 camera, other host refused" '! pull hdipc "http://[fd00::6]:8000/onvif/pp"'
 
 # ============================== stream_soak.sh ==============================
 printf '#!/usr/bin/env bash\nexit 1\n' >"$fx/bin/ffmpeg"; chmod +x "$fx/bin/ffmpeg"
-secret '[{"name":"IPC-BO","login":"a","password":"p"},{"name":"IPC-BO (2)","login":"a","password":"p"},
- {"name":"XR","login":"a","password":"p"},{"name":"C110","login":"a","password":"p"},{"name":"HDIPC","login":"a","password":"p"}]'
+secret '[{"name":"reolink-1","login":"a","password":"p"},{"name":"reolink-2","login":"a","password":"p"},
+ {"name":"xr","login":"a","password":"p"},{"name":"tapo","login":"a","password":"p"},{"name":"hdipc","login":"a","password":"p"}]'
 mkdir -p "$fx/d1"; echo keep >"$fx/d1/.hidden"
 "$here/stream_soak.sh" "$fx/d1" 1 >/dev/null 2>&1; rc=$?
 check "stream_soak: refuses dir with only a dotfile" '[[ $rc != 0 && ! -e $fx/d1/summary.tsv ]]'

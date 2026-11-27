@@ -19,6 +19,11 @@ case ${2:-} in
     [[ ${4:-} == --field ]] && f="$f.${5:-}"
     [[ -f $f ]] || { echo "error: no entry with id ${3:-}" >&2; exit 1; }
     cat "$f" ;;
+  list)
+    for f in "$VAULT_STUB"/cam_*_host; do
+      [[ -f $f ]] || continue
+      b="${f##*/cam_}"; printf 'cam:%s:host\thost\tscannable\n' "${b%_host}"
+    done ;;
   redact)
     exec python3 -I -c '
 import sys, json
@@ -33,25 +38,18 @@ S
 chmod +x "$fx/bin/wardenlens"
 export PATH="$fx/bin:$PATH"
 
-# stub_id <display name or id> -> inventory id (the mapping lib.sh's cam_id has).
-stub_id() {
-  case "$1" in
-    IPC-BO) echo reolink-1 ;; "IPC-BO (2)") echo reolink-2 ;; XR) echo xr ;; C110) echo tapo ;; HDIPC) echo hdipc ;;
-    *) echo "$1" ;;
-  esac
-}
 # redact_add <value>: the stub's redact replaces this value.
 redact_add() { jq --arg v "$1" '. + [$v]' "$VAULT_STUB/.redact" >"$VAULT_STUB/.r" && mv "$VAULT_STUB/.r" "$VAULT_STUB/.redact"; }
 # vault_put <entry-id> <value>
 vault_put() { printf '%s' "$2" >"$VAULT_STUB/${1//:/_}"; }
 # cred <camera> <user> <password>: the credential entry (both fields); the password is also redacted.
 cred() {
-  local id; id="$(stub_id "$1")"
+  local id; id="$1"
   printf '%s' "$2" >"$VAULT_STUB/cam_${id}_credential.username"
   printf '%s' "$3" >"$VAULT_STUB/cam_${id}_credential.password"
   [[ -z $3 ]] || redact_add "$3"
 }
 # host <camera> <host>
-host() { vault_put "cam:$(stub_id "$1"):host" "$2"; }
+host() { vault_put "cam:$1:host" "$2"; }
 # no_entries: an empty vault
 no_entries() { find "$VAULT_STUB" -maxdepth 1 -type f ! -name '.*' -delete; }

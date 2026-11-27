@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Minimal ONVIF SOAP client with WS-Security UsernameToken (PasswordDigest).
-# Usage: onvif.sh <camera-name> <service-path-key> <soap-body-xml> [curl-extra...]
+# Usage: onvif.sh <camera-id> <service-path-key> <soap-body-xml> [curl-extra...]
 #   service key: device | media | events
 # Prints the response body (and "HTTP <code> <seconds>s" on stderr). Read-only requests only.
 set -euo pipefail

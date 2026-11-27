@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ONVIF PullPoint event watcher (read-only). Creates a pull-point subscription and polls it.
-# Usage: onvif_pull.sh <camera-name> <total-seconds>
+# Usage: onvif_pull.sh <camera-id> <total-seconds>
 # Prints one line per poll: time, HTTP status, and any notification topics and SimpleItem Name=Value pairs.
 # Env: ONVIF_PULL_RAW_DIR keeps the first ONVIF_PULL_RAW_MAX (default 20) raw notification bodies, redacted.
 set -euo pipefail
