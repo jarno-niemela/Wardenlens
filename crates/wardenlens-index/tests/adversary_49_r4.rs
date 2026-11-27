@@ -63,17 +63,18 @@ fn count(idx: &Index, camera: &str) -> usize {
     .len()
 }
 
-/// Does another process find SQLite's shared lock on the main file of `path` held by this one?
+/// Does another process find a POSIX record lock held on the main file of `path`?
 ///
-/// A child process (this test binary, selected by `PROBE_ENV`) opens its own connection and asks
-/// SQLite to leave WAL mode with `PRAGMA journal_mode = DELETE`. That needs an exclusive lock on
-/// the main file, which SQLite takes only when no other connection holds the shared lock, so the
-/// child gets `SQLITE_BUSY` exactly when a live connection of the parent holds it. The answer
-/// comes from the kernel's lock table through SQLite, with no timing and no parsing of
-/// `/proc/locks` (whose readers can skip entries while other processes change the lock table, and
-/// whose device encoding varies by filesystem).
-///
-/// Success in the child converts the database out of WAL mode, so call this last on a given file.
+/// A child process (this test binary, selected by `PROBE_ENV`) opens the main file and tries a
+/// non-blocking whole-file exclusive POSIX lock (`F_SETLK`, `F_WRLCK`, as
+/// `rustix::fs::fcntl_lock(.., NonBlockingLockExclusive)` does). That conflicts with any POSIX
+/// lock another process holds on the inode, such as SQLite's shared lock on the main file, and
+/// with nothing on the `-wal` and `-shm` sidecars (different inodes). `EAGAIN` or `EACCES` mean
+/// "locked", success means "unlocked". The probe never changes the database: it writes nothing,
+/// and the child's lock is released when it exits. It runs in a child because closing a
+/// descriptor in the parent would drop the very lock being measured. There is no timing and no
+/// `/proc/locks` parsing (whose chunked reads can skip entries while other processes change the
+/// lock table).
 fn another_process_sees_the_main_file_locked(path: &Path) -> bool {
     let out = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -106,24 +107,26 @@ fn child_lock_probe_entry() {
     let Some(path) = std::env::var_os(PROBE_ENV) else {
         return;
     };
-    let c = rusqlite::Connection::open(PathBuf::from(path)).unwrap();
-    c.busy_timeout(std::time::Duration::ZERO).unwrap();
-    let verdict = match c.query_row("PRAGMA journal_mode = DELETE", [], |r| {
-        r.get::<_, String>(0)
-    }) {
-        Ok(mode) => {
-            assert_eq!(mode, "delete", "leaving WAL mode reported {mode}");
-            "unlocked"
-        }
-        Err(rusqlite::Error::SqliteFailure(e, _))
-            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
-        {
-            "locked"
-        }
-        Err(e) => panic!("unexpected probe error: {e}"),
-    };
+    // A write-lock request needs a descriptor open for writing; nothing is written.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(path))
+        .unwrap();
+    let verdict =
+        match rustix::fs::fcntl_lock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => "unlocked",
+            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::ACCESS => "locked",
+            Err(e) => panic!("unexpected probe error: {e}"),
+        };
     println!("{MARK}{verdict}");
     std::io::stdout().flush().unwrap();
+}
+
+/// Closing any descriptor of the inode drops every POSIX lock the process holds on it
+/// (fcntl(2)); SQLite still believes it holds its shared lock. This is the #49 regression.
+fn drop_process_posix_locks_on(path: &Path) {
+    drop(std::fs::File::open(path).unwrap());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -161,6 +164,24 @@ fn control_the_probe_reports_unlocked_once_the_connection_is_closed() {
         .unwrap();
     drop(c);
     assert!(!another_process_sees_the_main_file_locked(&path));
+}
+
+/// Control for the probe itself: an open connection whose main-file lock was dropped by closing
+/// one of our own descriptors (the regression the Index test guards) must read "unlocked", even
+/// though the connection still holds its `-shm` locks.
+#[test]
+fn control_the_probe_reports_unlocked_when_an_open_connections_lock_was_dropped() {
+    let dir = private_tempdir();
+    let path = dir.path().join("plain.db");
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
+        .unwrap();
+    c.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    assert!(another_process_sees_the_main_file_locked(&path));
+    drop_process_posix_locks_on(&path);
+    assert!(!another_process_sees_the_main_file_locked(&path));
+    drop(c);
 }
 
 /// `Index::open` closes the `dup` of the verified descriptor that carried the `flock` when the
