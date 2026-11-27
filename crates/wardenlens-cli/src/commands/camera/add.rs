@@ -239,7 +239,12 @@ pub(super) fn add(
     // entries behind.
     for path in std::iter::once(&streams.main).chain(streams.sub.iter()) {
         if !query_allowed(&entries, &req.model, path) {
-            return Err(CameraCmdError::PathQuery);
+            return Err(match catalogue::listed_like(entry, path.as_str()) {
+                Some(listed) => CameraCmdError::PathQueryListed {
+                    listed: listed.to_owned(),
+                },
+                None => CameraCmdError::PathQuery,
+            });
         }
     }
     // Everything that can fail without side effects comes before the first write.

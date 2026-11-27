@@ -418,6 +418,77 @@ fn a_query_the_catalogue_does_not_list_is_refused_before_the_vault_is_written() 
     assert_nothing_stored(&site);
 }
 
+/// A camera puts the URI in an XML text node, so its `&` is `&amp;` on the wire.
+fn xml(uri: &str) -> String {
+    uri.replace('&', "&amp;")
+}
+
+const DAHUA: &str = "dahua/ipc-hfw4431r-z";
+const DAHUA_MAIN: &str = "/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif";
+const DAHUA_SUB: &str = "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
+
+#[test]
+fn dahua_onvif_answers_with_unicast_and_proto_are_stored_as_given() {
+    let site = Site::new();
+    let fake = cam(
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_MAIN}")),
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_SUB}")),
+    );
+    let a = args("dahua-1", "127.0.0.1", DAHUA, Some(fake.port()));
+    run_add(&site, &foreign(), &a, &pw()).result.unwrap();
+    let cams = site.cameras();
+    assert_eq!(cams[0].record().streams().main.as_str(), DAHUA_MAIN);
+    assert_eq!(
+        cams[0].record().streams().sub.as_ref().unwrap().as_str(),
+        DAHUA_SUB
+    );
+}
+
+/// SEC-10 still holds for Dahua: reordered, extra, missing or swapped parameters are refused.
+#[test]
+fn dahua_queries_that_are_not_listed_are_refused_and_nothing_is_stored() {
+    for bad in [
+        "/cam/realmonitor?channel=1&subtype=0&proto=Onvif&unicast=true",
+        "/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif&x=1",
+        "/cam/realmonitor?channel=1&subtype=0&unicast=false&proto=Onvif",
+        "/cam/realmonitor?channel=2&subtype=0&unicast=true&proto=Onvif",
+        "/cam/realmonitor?subtype=0&channel=1&unicast=true&proto=Onvif",
+        "/cam/realmonitor?channel=1&subtype=0&unicast=true",
+    ] {
+        let site = Site::new();
+        let fake = cam(
+            &xml(&format!("rtsp://127.0.0.1:554{bad}")),
+            "rtsp://127.0.0.1:554/x",
+        );
+        let a = args("dahua-1", "127.0.0.1", DAHUA, Some(fake.port()));
+        let err = run_add(&site, &foreign(), &a, &pw()).result.unwrap_err();
+        assert!(
+            matches!(err, CameraCmdError::PathQueryListed { .. }),
+            "{bad}: {err:?}"
+        );
+        assert_nothing_stored(&site);
+    }
+}
+
+/// Decision for #218: no silent fallback to the catalogue path; the refusal names it instead.
+#[test]
+fn a_refused_query_with_a_listed_head_names_the_listed_path_for_that_stream() {
+    let site = Site::new();
+    let fake = cam(
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_MAIN}")),
+        "rtsp://127.0.0.1:554/cam/realmonitor?channel=1&amp;subtype=1&amp;unicast=true&amp;proto=Rtsp",
+    );
+    let a = args("dahua-1", "127.0.0.1", DAHUA, Some(fake.port()));
+    let err = run_add(&site, &foreign(), &a, &pw()).result.unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(
+        error_chain(&err).contains(DAHUA_SUB),
+        "{}",
+        error_chain(&err)
+    );
+    assert_nothing_stored(&site);
+}
+
 // ---- add: the fallback ----
 
 #[test]

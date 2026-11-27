@@ -28,7 +28,10 @@ gop = 50
 
 [[protocols]]
 kind = "rtsp"
-paths = ["/cam/realmonitor?channel=1&subtype=0", "/cam/realmonitor?channel=1&subtype=1"]
+# The first two are the main and sub stream (the order `camera add` relies on). The last two are
+# the forms Dahua's ONVIF GetStreamUri answers with (see the evidence entry below); an ONVIF
+# answer is accepted only when its query is exactly one of these (SEC-10).
+paths = ["/cam/realmonitor?channel=1&subtype=0", "/cam/realmonitor?channel=1&subtype=1", "/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif", "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"]
 
 [[protocols]]
 kind = "dahua_cgi"
@@ -54,3 +57,7 @@ section = "3. Dahua"
 [[evidence]]
 reference = "docs/adr/0002-camera-integration.md"
 section = "1. Two-client RTSP tolerance"
+
+[[evidence]]
+reference = "Dahua RTSP URL format, Dahua Technology support documentation (vendor material, not re-fetched)"
+section = "ONVIF GetStreamUri form rtsp://<ip>:554/cam/realmonitor?channel=1&subtype=<0|1>&unicast=true&proto=Onvif"
