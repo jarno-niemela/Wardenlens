@@ -20,9 +20,10 @@
 //!   content or a bad option is 1; a file that cannot be used, or any other failure, is 2. A file
 //!   readable by others draws a warning on stderr; the file is never changed. The buffer is
 //!   zeroised on drop.
-//! * `--dry-run` parses and prints, and writes no byte: not the vault, not the key, and not the
-//!   index. It reads an existing index with `Index::open_read_only` (no migration, no pragma, no
-//!   file created, no lock), so it applies the same row guard as the real run and reports the same
+//! * `--dry-run` parses and prints, and writes nothing: not the vault, not the key, and not the
+//!   index (no migration, no pragma, no file created; the main file and the `-wal` stay
+//!   byte-identical, and SQLite may update the `-shm` of a live `-wal`, as for any reader). It
+//!   reads an existing index with `Index::open_read_only` (no lock, so the answer is advisory), so it applies the same row guard as the real run and reports the same
 //!   skips; it keeps the real open's refusals (a stray sidecar, a damaged file). A missing or empty
 //!   index counts as no rows. An index that the real run would first migrate (older schema) or
 //!   recover (a `-wal` with no `-shm`) is not entered: every camera is reported as `would import
@@ -458,15 +459,33 @@ pub(super) enum Prelude {
     Recover,
 }
 
-/// Opens the registry for the dry run with [`Index::open_read_only`]: it writes nothing (no
-/// migration, no pragma, no file, no lock), so a dry run leaves the state directory byte-identical
-/// whatever it finds. It keeps the real open's refusals (a stray sidecar, a bad owner or mode, a
-/// damaged file), which are errors here as in the real run. States the real run would change first
-/// are reported, not entered.
+/// Opens the registry for the dry run with [`Index::open_read_only`]: it writes no byte of the
+/// main file, the `-wal` or any other file (no migration, no pragma, no file created, no lock).
+/// The one thing SQLite may update is the `-shm` of a live `-wal`, as for any reader. It keeps the
+/// real open's refusals (a stray sidecar, a bad owner or mode, a damaged file, a missing parent
+/// directory), which are errors here as in the real run. States the real run would change first
+/// are reported, not entered. The answer is advisory (see the index crate's `readonly` docs).
 fn open_for_dry_run(config: &Config) -> Result<Registry, ImportError> {
-    match Index::open_read_only(config.database_path()) {
+    let path = config.database_path();
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    registry_of(Index::open_read_only(path), parent.is_dir())
+}
+
+/// The registry state a dry run reports for the result of the read-only open. Pure, so every
+/// input is unit-tested.
+///
+/// A missing file is "no index" only when its parent directory exists: with no parent the real run
+/// refuses (the vault cannot be created either), so the dry run refuses too.
+fn registry_of(
+    opened: Result<ReadOnlyIndex, IndexError>,
+    parent_exists: bool,
+) -> Result<Registry, ImportError> {
+    match opened {
         Ok(r) => Ok(Registry::Reader(r)),
-        Err(IndexError::Fs(e)) if e.is_not_found() => Ok(Registry::None),
+        Err(IndexError::Fs(e)) if e.is_not_found() && parent_exists => Ok(Registry::None),
         Err(IndexError::Uninitialised) => Ok(Registry::None),
         Err(IndexError::NeedsMigration) => Ok(Registry::Changes(Prelude::Migrate)),
         Err(IndexError::NeedsRecovery) => Ok(Registry::Changes(Prelude::Recover)),
@@ -1751,5 +1770,78 @@ key_file = "/srv/wl/keys/secrets.key"
             let t = Status::WouldImportAfter(p).text();
             assert!(t.starts_with("would import") && t.contains(word), "{t}");
         }
+    }
+
+    /// Every input of the dry run's mapping from the read-only open to the registry state.
+    #[test]
+    fn registry_of_maps_every_open_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_found = || {
+            let e = wardenlens_fsutil::open_existing_private_file(&dir.path().join("missing"))
+                .unwrap_err();
+            assert!(e.is_not_found());
+            IndexError::Fs(e)
+        };
+        let is_none = |r: Result<Registry, ImportError>| matches!(r, Ok(Registry::None));
+        // A missing file: no index when the parent exists, the refusal when it does not.
+        assert!(is_none(registry_of(Err(not_found()), true)));
+        assert!(matches!(
+            registry_of(Err(not_found()), false),
+            Err(ImportError::Index(IndexError::Fs(_)))
+        ));
+        assert!(is_none(registry_of(Err(IndexError::Uninitialised), true)));
+        assert!(matches!(
+            registry_of(Err(IndexError::NeedsMigration), true),
+            Ok(Registry::Changes(Prelude::Migrate))
+        ));
+        assert!(matches!(
+            registry_of(Err(IndexError::NeedsRecovery), true),
+            Ok(Registry::Changes(Prelude::Recover))
+        ));
+        // Anything else is the refusal, with the same error as the real run.
+        for other in [
+            IndexError::StraySidecar { suffix: "-wal" },
+            IndexError::ForeignWal,
+            IndexError::Damaged,
+            IndexError::NotAnIndex,
+            IndexError::AlreadyOpenInProcess,
+        ] {
+            let text = other.to_string();
+            match registry_of(Err(other), true) {
+                Err(ImportError::Index(e)) => assert_eq!(e.to_string(), text),
+                _ => panic!("{text} was not refused"),
+            }
+        }
+        // A real reader is a reader.
+        let config = site_config(dir.path());
+        make_dirs(dir.path());
+        let key = KeyFile::generate(config.key_file()).unwrap();
+        write_all(
+            &config,
+            key,
+            &[Ready {
+                draft: one_draft("/stream1"),
+                model: default_model().unwrap(),
+            }],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            registry_of(Index::open_read_only(config.database_path()), true),
+            Ok(Registry::Reader(_))
+        ));
+    }
+
+    /// A missing parent directory is refused by the dry run, as the real run refuses it.
+    #[test]
+    fn a_dry_run_with_a_missing_state_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = site_config(dir.path());
+        assert!(!dir.path().join("state").exists());
+        assert!(matches!(
+            open_for_dry_run(&config),
+            Err(ImportError::Index(_))
+        ));
+        assert!(!dir.path().join("state").exists());
     }
 }

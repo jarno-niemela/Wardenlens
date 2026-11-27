@@ -294,6 +294,64 @@ mod tests {
     }
 
     #[test]
+    fn existing_open_of_a_missing_file_is_not_found_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        let e = open_existing_private_file(&p).unwrap_err();
+        assert!(e.is_not_found(), "{e:?}");
+        assert!(!p.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn existing_open_applies_the_same_checks_and_never_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        drop(open_private_file(&p).unwrap());
+        let f = open_existing_private_file(&p).unwrap();
+        assert!(!f.created());
+        f.verify_path_unchanged(&p).unwrap();
+        // The descriptor is read-only, like an existing file's in `open_private_file`.
+        {
+            use std::os::unix::fs::FileExt;
+            assert!(f.file().write_at(b"x", 0).is_err());
+        }
+        // Wrong mode.
+        for mode in [0o644, 0o640, 0o604, 0o4600] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            let e = open_existing_private_file(&p).unwrap_err();
+            assert!(matches!(e, FsError::InsecureMode { .. }), "{mode:o}: {e:?}");
+        }
+        // A symlink, also to a private file.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&p, &link).unwrap();
+        let e = open_existing_private_file(&link).unwrap_err();
+        assert_eq!(e.errno(), Some(Errno::LOOP));
+        // A directory.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let e = open_existing_private_file(&sub).unwrap_err();
+        assert!(matches!(e, FsError::NotRegular), "{e:?}");
+    }
+
+    #[test]
+    fn existing_open_of_a_fifo_does_not_block_and_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &p,
+            rustix::fs::FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let e = open_existing_private_file(&p).unwrap_err();
+        assert!(matches!(e, FsError::NotRegular), "{e:?}");
+    }
+
+    #[test]
     fn refuses_mode_0644() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("db");

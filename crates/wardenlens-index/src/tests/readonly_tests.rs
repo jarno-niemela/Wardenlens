@@ -10,6 +10,9 @@ use crate::cameras::CameraRecord;
 use crate::error::IndexError;
 use crate::migrate::MIGRATIONS;
 
+/// The bytes of a `-wal` and of its `-shm`.
+type WalAndShm = (Vec<u8>, Vec<u8>);
+
 fn record(id: &str) -> CameraRecord {
     CameraRecord::new(
         CameraId::new(id).unwrap(),
@@ -105,12 +108,6 @@ fn a_file_that_is_not_an_index_is_refused_like_the_real_open() {
 #[test]
 fn sidecars_are_refused_exactly_as_the_real_open_refuses_them() {
     type Setup = fn(&Fixture);
-    let write = |f: &Fixture, suffix: &str, bytes: &[u8], mode: u32| {
-        let p = std::path::PathBuf::from(format!("{}{suffix}", f.path.display()));
-        std::fs::write(&p, bytes).unwrap();
-        chmod(&p, mode);
-    };
-    let _ = write;
     let cases: [(&str, Setup); 5] = [
         ("garbage -wal", |f| {
             let p = format!("{}-wal", f.path.display());
@@ -238,4 +235,91 @@ fn a_wal_is_read_when_its_shm_exists_and_reported_when_it_does_not() {
     assert!(matches!(err, IndexError::NeedsRecovery), "{err:?}");
     assert_eq!(snapshot(g.dir.path()), before);
     drop(live);
+}
+
+/// A `-wal` that is not this index's, with a `-shm` (so the reader replays it): the reader must
+/// run the same verdict as the real open and refuse the same way, leaving the main file and the
+/// `-wal` untouched. Deleting the `wal_verdict` call of the reader fails this test.
+#[test]
+fn a_foreign_wal_with_a_shm_is_refused_like_the_real_open() {
+    // (name, the `-wal` and `-shm` bytes placed next to this index's main file)
+    let other_index = || {
+        // Another index of ours, with its own row, copied while it is open (a crash's state).
+        let g = fixture();
+        let mut idx = Index::open(&g.path).unwrap();
+        idx.upsert_camera(&record("cam-9"), &[], UnixMs::new(BASE).unwrap())
+            .unwrap();
+        let wal = std::fs::read(format!("{}-wal", g.path.display())).unwrap();
+        let shm = std::fs::read(format!("{}-shm", g.path.display())).unwrap();
+        drop(idx);
+        (wal, shm)
+    };
+    let cases: [(&str, WalAndShm); 2] = [
+        ("a -wal of another index of ours", other_index()),
+        (
+            "a -wal that replays into a foreign schema",
+            super::matrix_tests::foreign_wal(),
+        ),
+    ];
+    for (name, (wal, shm)) in cases {
+        let f = with_camera();
+        for (suffix, bytes) in [("-wal", wal), ("-shm", shm)] {
+            let p = std::path::PathBuf::from(format!("{}{suffix}", f.path.display()));
+            std::fs::write(&p, bytes).unwrap();
+            chmod(&p, 0o600);
+        }
+        let before = snapshot(f.dir.path());
+        let ro = Index::open_read_only(&f.path).unwrap_err();
+        let after = snapshot(f.dir.path());
+        for n in ["index.db", "index.db-wal"] {
+            assert_eq!(after[n], before[n], "{name}: {n} changed");
+        }
+        assert!(matches!(ro, IndexError::ForeignWal), "{name}: {ro:?}");
+        let rw = Index::open(&f.path).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&ro),
+            std::mem::discriminant(&rw),
+            "{name}: read-only {ro:?}, read-write {rw:?}"
+        );
+        assert_eq!(ro.to_string(), rw.to_string(), "{name}");
+    }
+}
+
+/// A hard link made after the registry's check, before the link count is read: refused.
+#[test]
+fn a_hard_link_made_during_the_open_is_refused() {
+    let f = with_camera();
+    let link = f.dir.path().join("other-name.db");
+    let err = crate::readonly::open_read_only_hooked(
+        &f.path,
+        MIGRATIONS,
+        || std::fs::hard_link(&f.path, &link).unwrap(),
+        || {},
+    )
+    .unwrap_err();
+    assert!(matches!(err, IndexError::HardLinkedIndex), "{err:?}");
+}
+
+/// The path swapped for another file while SQLite had it open: refused, not read.
+#[test]
+fn a_path_swapped_during_the_open_is_refused() {
+    let f = with_camera();
+    let other = with_camera();
+    let swap = f.dir.path().join("swap.db");
+    std::fs::copy(&other.path, &swap).unwrap();
+    chmod(&swap, 0o600);
+    let err = crate::readonly::open_read_only_hooked(
+        &f.path,
+        MIGRATIONS,
+        || {},
+        || std::fs::rename(&swap, &f.path).unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            IndexError::Fs(wardenlens_fsutil::FsError::IdentityMismatch)
+        ),
+        "{err:?}"
+    );
 }

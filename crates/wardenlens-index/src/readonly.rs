@@ -2,7 +2,9 @@
 //!
 //! [`Index::open_read_only`] is for a caller that only wants to look (the dry run of `import`). It
 //! runs **no migration, sets no pragma, creates no file, takes no `flock` and begins no write
-//! transaction**, so the state directory is byte-identical before and after. It keeps the checks
+//! transaction**, so the main file, the `-wal` and every other file are byte-identical before and
+//! after. The one exception: SQLite updates the `-shm` of a live `-wal` when it reads through it, as
+//! any reader does (see below). It keeps the checks
 //! of [`Index::open`]: the private parent, our own `O_NOFOLLOW` descriptor (never created), the
 //! owner and mode of the file and of every sidecar, the sidecar table (`check_sidecars`), the
 //! `-wal` header, the schema identity and `integrity_check`, and the registry of open files (a file
@@ -24,8 +26,16 @@
 //! connection replays it in memory with `NO_CKPT_ON_CLOSE`; SQLite then updates the existing
 //! `-shm` (reader marks), which is state of the running writer, not of the index.
 //!
-//! **No lock is taken**, so a concurrent read-write open can change the file under the reader;
-//! the reader sees SQLite's own consistent snapshot per statement. The dry run is advisory.
+//! **No lock is taken, and the result is advisory.** A concurrent writer or a read-write open can
+//! change the file while the reader looks:
+//! - on the `-wal` path SQLite's own locks give each statement a consistent view;
+//! - on the **immutable path there are no locks at all**, so a writer that appears meanwhile can
+//!   make a read fail (corruption or an I/O error) or return stale rows; the caller sees a typed
+//!   error or an old answer, never a write;
+//! - a writer that closes between the sidecar read and the open can leave an empty `-wal` or
+//!   `-shm` behind (SQLite's own close); that is harmless, and the next read-write open settles it.
+//!
+//! See ADR 0005 section 5 ("The read-only open").
 
 use std::path::Path;
 
@@ -101,6 +111,20 @@ pub(crate) fn open_read_only_with(
     path: &Path,
     migrations: &[migrate::Migration],
 ) -> Result<ReadOnlyIndex, IndexError> {
+    open_read_only_hooked(path, migrations, || {}, || {})
+}
+
+/// [`open_read_only_with`] with two hooks for tests (production passes no-ops): `after_open`
+/// runs once our descriptor is open and registered, before the link count is read; `before_verify`
+/// runs after the connection is open, before the path is compared with the descriptor again.
+/// They stand for a hard link or a swap of the path in those windows (same user, private
+/// directory), which the checks below catch.
+pub(crate) fn open_read_only_hooked(
+    path: &Path,
+    migrations: &[migrate::Migration],
+    after_open: impl FnOnce(),
+    before_verify: impl FnOnce(),
+) -> Result<ReadOnlyIndex, IndexError> {
     check_parent(crate::parent_of(path))?;
     let held = match open_registered_existing(path) {
         Ok(held) => held,
@@ -115,6 +139,9 @@ pub(crate) fn open_read_only_with(
         Err(e) => return Err(e),
     };
     let file = held.file()?;
+    after_open();
+    // The registry refuses a path with several links before it opens it; this is the same check
+    // on the descriptor we hold, for a link made in between (hooked in tests).
     if std::os::unix::fs::MetadataExt::nlink(
         &file
             .file()
@@ -126,10 +153,15 @@ pub(crate) fn open_read_only_with(
     }
     // Sidecars change only when a writer closes; judge the state we read, retrying a few times
     // as `classify` does when they changed under the judgement.
+    let mut before_verify = Some(before_verify);
     for _ in 0..crate::open::MAX_CLASSIFY_ATTEMPTS {
         let sc = Sidecars::read(path)?;
         match judge(sc, path, file, migrations) {
             Ok(conn) => {
+                if let Some(hook) = before_verify.take() {
+                    hook();
+                }
+                // SQLite opened the path by name: it must still be the file we checked.
                 file.verify_path_unchanged(path)?;
                 return Ok(ReadOnlyIndex { conn, _held: held });
             }
