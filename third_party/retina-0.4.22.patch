@@ -28,7 +28,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
      receiver_reports: ReceiverReportPolicy,
      bind_addr: Option<std::net::IpAddr>,
      backchannel: bool,
-@@ -762,6 +764,32 @@
+@@ -762,6 +764,37 @@
          self
      }
  
@@ -39,7 +39,10 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
 +    /// retina keep all of them, so memory grows with what the peer sends. Once
 +    /// more than this many bytes (plus up to one read) are held, the session
 +    /// fails; see `Error::is_buffer_limit`. Choose more than the largest
-+    /// access unit you accept, as RTP headers count too.
++    /// access unit you accept, as RTP headers count too. The limit is on the
++    /// data, not the ring: the ring grows to the next power of two of what it
++    /// holds (a limit just under a power of two keeps it from doubling), and a
++    /// frame handed to the caller is copied out of it.
 +    ///
 +    /// There's no limit by default.
 +    pub fn max_buffered_bytes(mut self, max_buffered_bytes: usize) -> Self {
@@ -53,6 +56,8 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
 +    /// By default a challenge whose best scheme is Basic fails the session
 +    /// before any credentials are sent; see `Error::is_basic_auth_refused`. A
 +    /// challenge that also offers Digest is answered with Digest regardless.
++    /// A Basic re-challenge at a keepalive is only logged, and the existing
++    /// client is kept.
 +    pub fn allow_basic_auth(mut self, allow: bool) -> Self {
 +        self.allow_basic_auth = allow;
 +        self
@@ -61,7 +66,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
      fn get_max_message_size(&self) -> usize {
          self.max_message_size.unwrap_or(usize::MAX)
      }
-@@ -1405,6 +1433,26 @@
+@@ -1405,6 +1438,26 @@
          .expect("BACKCHANNEL_REQUIRE is checked to be a valid header value at compile time")
  }
  
@@ -88,7 +93,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
  impl RtspConnection {
      async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
          let host =
-@@ -1418,6 +1466,10 @@
+@@ -1418,6 +1471,10 @@
          )
          .await
          .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
@@ -99,7 +104,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
          Ok(Self {
              inner,
              channels: ChannelMappings::default(),
-@@ -1549,9 +1601,17 @@
+@@ -1549,9 +1606,17 @@
                      })
                  }
                  let www_authenticate: &str = www_authenticate;
@@ -119,7 +124,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
                          conn_ctx: *self.inner.ctx(),
                          msg_ctx,
                          method: req.method().clone(),
-@@ -2680,7 +2740,7 @@
+@@ -2680,7 +2745,7 @@
                          && let Some(h) = response.headers.get("WWW-Authenticate")
                      {
                          let h: &str = h;
@@ -128,7 +133,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
                              Ok(c) => {
                                  *inner.requested_auth = Some(c);
                                  if !retried {
-@@ -2698,7 +2758,10 @@
+@@ -2698,7 +2763,10 @@
                                      retrying = true;
                                  }
                              }

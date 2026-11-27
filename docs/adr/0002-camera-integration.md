@@ -307,9 +307,12 @@ Option 2.
     assembled, so a compromised camera could make one session hold memory in proportion to what it sent before the
     frame timeout (link rate times `FRAME_TIMEOUT`, for example about 125 MB at 100 Mbit/s for 10 s).
     `wardenlens-ingest` caps a frame (8 MiB) only after retina hands it over. With the patch the session fails
-    (`StreamFailed`) once retina holds more than 16 MiB of unfinished data (`2 * MAX_FRAME_BYTES`, so a frame at
-    the 8 MiB cap, with its RTP headers, still passes and an oversize one is still dropped and counted). Residual:
-    the bound is 16 MiB plus one 4 KiB read per session, not 8 MiB.
+    (`StreamFailed`) once retina holds more than 16 MiB - 64 KiB of unfinished data. A frame at the 8 MiB cap, with
+    its RTP headers, still passes, and an oversize one is still dropped and counted. Residual: the limit is on the
+    ring's data, not on the ring. The ring grows to the next power of two, so it stays at or under 16 MiB per
+    session (that is why the limit is 64 KiB short of 16 MiB: a read of up to 4 KiB must not tip it to 32 MiB);
+    while a frame is handed over, retina also copies it, so the peak is about twice that (up to about 32 MiB), plus
+    the depacketizer's piece metadata. Not 8 MiB.
 13. **Vendored, patched `retina` 0.4.22 (#155).** Cargo cannot narrow the `basic-scheme` feature of `http-auth`
     (features are additive and retina enables the defaults), and retina has no option for either problem, so the
     workspace carries a patched copy through `[patch.crates-io]` (`third_party/retina`, excluded from the
@@ -317,20 +320,27 @@ Option 2.
     `0d28bd1d1f3c477d6a98ae9f62862e505124da7b71575a8d351cefd7b1cbfc55` (from `Cargo.lock`), upstream commit
     `2b6b7fe0a6f6a5bf69d5e9c8d4fd785ccd090873` (`.cargo_vcs_info.json`). The first commit of #155 is the package
     unmodified; the second is the patch, kept also as `third_party/retina-0.4.22.patch` (a `diff -ru` against the
-    package, 4 files, about 100 added lines, no new dependency). It adds:
+    package, 4 files, about 100 added lines, no new dependency). The pristine copy leaves out the package's `Cargo.lock`. It adds:
     - `SessionOptions::max_buffered_bytes(n)`: the connection fails (`Error::is_buffer_limit`) once the read ring must
       keep more than `n` bytes (from the oldest pinned packet to the end). `wardenlens-ingest` sets 16 MiB.
     - `SessionOptions::allow_basic_auth(bool)`, default false: a `WWW-Authenticate` list whose best scheme is Basic
       (`http-auth` prefers Digest when both are offered) fails the session with `Error::is_basic_auth_refused`
-      before any credentials are sent, at the first challenge and at a keepalive re-challenge. `wardenlens-ingest`
+      before any credentials are sent. At the first challenge this fails the session. A Basic re-challenge at a
+      keepalive only logs a warning and keeps the Digest client already in use; it does not fail the session. `wardenlens-ingest`
       maps it to `IngestError::BasicAuthRefused` and exposes the per-camera opt-in as `OpenOptions::allow_basic_auth`
       (`RetinaSource::with_open_options`). Wiring the opt-in to a camera setting is follow-up work.
+
+    Limits of a path source: cargo-deny does not match RUSTSEC advisories against it, so retina advisories must be
+    watched by hand; and the vendored crate's own tests cannot run (the published manifest has no `mylog`
+    dev-dependency, which they need), so the patch is covered by the tests of `wardenlens-ingest` only.
+    `wardenlens-ingest` pins `retina = "=0.4.22"` so the `[patch]` cannot silently stop applying.
 
     Upstream proposals are not filed by this project's agents; when retina has equivalent options, delete
     `third_party/` and the `[patch]` entry. cargo-deny sees a path source for the patched crate (its licence,
     MIT OR Apache-2.0, is on the allow list). Updating retina means re-applying the patch and re-checking the
     checksum above.
 14. **retina log records.** retina logs through the `log` facade; its `warn` records carry peer addresses and URLs.
-    The CLI log setup (`logging.rs`) caps the `retina` target at `error` whatever `RUST_LOG` says (user directives
-    for `retina` are dropped, then `retina=error` is added). No `log` bridge is installed, so today nothing from
+    The CLI log setup (`logging.rs`) caps the `retina` target at `error` whatever `RUST_LOG` says, with a `Targets` filter of its own
+    AND-ed with the `RUST_LOG` filter on the fmt layer (the user's string is not edited, so no directive spelling can
+    loosen the cap). No `log` bridge is installed, so today nothing from
     retina is printed; the cap is what keeps that true when one is added.

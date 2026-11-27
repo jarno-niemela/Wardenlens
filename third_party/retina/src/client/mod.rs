@@ -771,7 +771,10 @@ impl SessionOptions {
     /// retina keep all of them, so memory grows with what the peer sends. Once
     /// more than this many bytes (plus up to one read) are held, the session
     /// fails; see `Error::is_buffer_limit`. Choose more than the largest
-    /// access unit you accept, as RTP headers count too.
+    /// access unit you accept, as RTP headers count too. The limit is on the
+    /// data, not the ring: the ring grows to the next power of two of what it
+    /// holds (a limit just under a power of two keeps it from doubling), and a
+    /// frame handed to the caller is copied out of it.
     ///
     /// There's no limit by default.
     pub fn max_buffered_bytes(mut self, max_buffered_bytes: usize) -> Self {
@@ -785,6 +788,8 @@ impl SessionOptions {
     /// By default a challenge whose best scheme is Basic fails the session
     /// before any credentials are sent; see `Error::is_basic_auth_refused`. A
     /// challenge that also offers Digest is answered with Digest regardless.
+    /// A Basic re-challenge at a keepalive is only logged, and the existing
+    /// client is kept.
     pub fn allow_basic_auth(mut self, allow: bool) -> Self {
         self.allow_basic_auth = allow;
         self

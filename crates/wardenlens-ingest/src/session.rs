@@ -32,11 +32,12 @@ pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RTSP_MESSAGE_BYTES: usize = 256 * 1024;
 
 /// Most unfinished data retina may hold for one session (its read ring, which pins every packet
-/// of the access unit being assembled). Twice [`crate::MAX_FRAME_BYTES`]: room for an access unit
-/// at the frame cap plus its RTP and interleaving headers, so an oversize frame is still dropped
-/// and counted as before, while an access unit that never ends fails the session. Needs the
-/// patched retina of ADR 0002 section 13.
-const MAX_BUFFERED_BYTES: usize = 2 * crate::frame::MAX_FRAME_BYTES;
+/// of the access unit being assembled). Just under 16 MiB, so the ring (a power of two) never
+/// grows past 16 MiB, and well over [`crate::MAX_FRAME_BYTES`] plus its RTP and interleaving
+/// headers: a frame at the cap still passes and an oversize one is still dropped and counted,
+/// while an access unit that never ends fails the session. Needs the patched retina of ADR 0002
+/// section 13.
+const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 
 /// What `select_video_stream` needs to know about one SDP media section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +347,15 @@ mod tests {
             encoding_name: enc,
             receiving,
         }
+    }
+
+    #[test]
+    fn the_buffer_bound_keeps_the_ring_at_16_mib_and_fits_a_frame_at_the_cap() {
+        const FRAME: usize = crate::frame::MAX_FRAME_BYTES;
+        const { assert!(MAX_BUFFERED_BYTES + 4096 <= 16 * 1024 * 1024) };
+        // 8 MiB of payload in 1400-byte packets with 16 bytes of RTP and interleave header each,
+        // plus a generous allowance for the unparsed tail.
+        const { assert!(MAX_BUFFERED_BYTES > FRAME + FRAME / 50 + 256 * 1024) };
     }
 
     #[test]
