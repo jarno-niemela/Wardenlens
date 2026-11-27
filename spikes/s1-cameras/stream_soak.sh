@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Soak test: open every camera's main and sub RTSP stream in parallel (as an extra client next
 # to AgentDVR) for DURATION seconds, counting frames, warning lines and restarts.
-# Usage: stream_soak.sh <out-dir> [duration-seconds]   (default 1800)
+# Usage: [CAMERAS="id ..."] stream_soak.sh <out-dir> [duration-seconds]   (default 1800)
 # Per-stream log: <out-dir>/<cam>_<kind>.log (credentials redacted); summary: <out-dir>/summary.tsv
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,8 +40,11 @@ run_stream() { # <cam> <kind>
   echo "$restarts" >"$out/$tag.restarts"
 }
 
-streams=("IPC-BO:main" "IPC-BO:sub" "IPC-BO (2):main" "IPC-BO (2):sub" "XR:main" "XR:sub"
-  "C110:main" "C110:sub" "HDIPC:main" "HDIPC:sub")
+# Cameras: the inventory ids in CAMERAS (space separated), else every camera with a host in the vault.
+mapfile -t ids < <(selected_cams)
+(( ${#ids[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; exit 1; }
+streams=()
+for id in "${ids[@]}"; do streams+=("$id:main" "$id:sub"); done
 # Fail before starting anything if a URL cannot be built (unknown camera, missing host).
 for s in "${streams[@]}"; do rtsp_url "${s%%:*}" "$(rtsp_path "${s%%:*}" "${s##*:}")" >/dev/null || exit 1; done
 for s in "${streams[@]}"; do run_stream "${s%%:*}" "${s##*:}" & done

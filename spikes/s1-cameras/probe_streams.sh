@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # One-shot ffprobe of each camera's main/sub RTSP stream: codec, resolution, fps, bitrate.
-# Usage: probe_streams.sh  (output has credentials redacted)
+# Usage: [CAMERAS="id ..."] probe_streams.sh  (inventory ids; default: every camera with a vault host; output has credentials redacted)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$here/lib.sh"
-for name in "IPC-BO" "IPC-BO (2)" XR C110 HDIPC; do
+mapfile -t ids < <(selected_cams)
+(( ${#ids[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; exit 1; }
+for name in "${ids[@]}"; do
   for kind in main sub; do
     path="$(rtsp_path "$name" "$kind")"
     url="$(rtsp_url "$name" "$path")" || exit 1

@@ -15,18 +15,24 @@ vault_value() { # <id> [username|password]
   if [[ -n "${2:-}" ]]; then wl vault get "$1" --field "$2"; else wl vault get "$1"; fi
 }
 
-# cam_id <name-or-id> -> inventory id. The old AgentDVR display names are still accepted; anything that already
-# looks like an inventory id (lower case, digits, hyphen) is used as it is.
+# cam_id <inventory-id> -> the inventory id, checked (lower case, digits, hyphen). Display names are not accepted and
+# no name->id mapping lives in the tree: site-specific names stay in the vault (docs/DEV_VAULT.md).
 cam_id() {
-  case "$1" in
-    IPC-BO) echo reolink-1 ;;
-    "IPC-BO (2)") echo reolink-2 ;;
-    XR) echo xr ;;
-    C110) echo tapo ;;
-    HDIPC) echo hdipc ;;
-    *)
-      if [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]; then echo "$1"; else echo "unknown camera" >&2; return 1; fi ;;
-  esac
+  if [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]; then echo "$1"; else echo "unknown camera" >&2; return 1; fi
+}
+
+# cam_ids -> the inventory ids that have a host entry in the vault (cam:<id>:host), one per line. `vault list` prints
+# ids and kinds, never values.
+cam_ids() {
+  local out
+  out="$(wl vault list)" || return 1
+  awk -F'\t' '$1 ~ /^cam:[a-z0-9][a-z0-9-]*:host$/ { split($1, p, ":"); print p[2] }' <<<"$out"
+}
+
+# selected_cams -> the inventory ids in $CAMERAS (space separated) if set, else cam_ids; one per line, each checked.
+selected_cams() {
+  local c
+  if [[ -n ${CAMERAS:-} ]]; then for c in $CAMERAS; do cam_id "$c" || return 1; done; else cam_ids; fi
 }
 
 # cam_host <name> -> bare host from the vault (entry cam:<id>:host).
@@ -113,7 +119,7 @@ redact() {
   ) || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
-# Vendor RTSP paths (main|sub) by camera; accepts a display name or an inventory id.
+# Vendor RTSP paths (main|sub) by camera; takes an inventory id.
 rtsp_path() { # <name> <main|sub>
   local id
   id="$(cam_id "$1")" || return 1

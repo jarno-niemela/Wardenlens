@@ -6,8 +6,8 @@ camera owner's explicit approval each time (`https-off` disables it). The defaul
 
 Inputs: hosts and credentials come from the Wardenlens vault (`wardenlens vault get cam:<id>:host`,
 `cam:<id>:credential`; see `docs/DEV_VAULT.md`), so `wardenlens` must be on `PATH` (or set `WARDENLENS_BIN`) and
-the vault initialised and imported. A camera is named by its inventory id (`reolink-1`, `xr`, ...) or the old display
-name. The legacy files (`agentdvr-cameras.secret.json`, `cameras.local.toml`) and `WARDENLENS_SECRET_FILE` /
+the vault initialised and imported. A camera is named by its inventory id (`reolink-1`, `xr`, ...).
+The legacy files (`agentdvr-cameras.secret.json`, `cameras.local.toml`) and `WARDENLENS_SECRET_FILE` /
 `WARDENLENS_CAMERAS` are read only by `wardenlens vault import-legacy`; delete the legacy files yourself after a verified
 import and a key export. The ONVIF port is `ONVIF_PORT` or the optional vault entry `cam:<id>:onvif_port`.
 

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Sample each stream for SECS seconds (default 20) with ffprobe packet output and report
 # keyframe interval (frames), measured fps and bitrate (kbit/s).
-# Usage: gop_sample.sh [secs]
+# Usage: [CAMERAS="id ..."] gop_sample.sh [secs]   (inventory ids; default: every camera with a vault host)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$here/lib.sh"
 secs="${1:-20}"
 printf 'stream\tpackets\tfps\tkbps\tgop_frames\tgop_seconds\n'
-for name in "IPC-BO" "IPC-BO (2)" XR C110 HDIPC; do
+mapfile -t ids < <(selected_cams)
+(( ${#ids[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; exit 1; }
+for name in "${ids[@]}"; do
   for kind in main sub; do
     url="$(rtsp_url "$name" "$(rtsp_path "$name" "$kind")")" || exit 1
     timeout $((secs + 30)) ffprobe -v error -rtsp_transport tcp -select_streams v:0 \

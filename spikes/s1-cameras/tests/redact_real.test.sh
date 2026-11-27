@@ -26,10 +26,10 @@ printf 'operator-synthetic\n%s\n' "$PW" | "$WARDENLENS_BIN" vault set cam:reolin
 
 # shellcheck source=../lib.sh
 source "$here/lib.sh"
-cam_creds IPC-BO
+cam_creds reolink-1
 check "cam_creds reads the credential from the real vault" '[[ $CAM_USER == operator-synthetic && $CAM_PASS == "$PW" ]]'
-check "cam_host reads the host from the real vault" '[[ $(cam_host IPC-BO) == 192.0.2.44 ]]'
-u=$(rtsp_url IPC-BO /h264Preview_01_main)
+check "cam_host reads the host from the real vault" '[[ $(cam_host reolink-1) == 192.0.2.44 ]]'
+u=$(rtsp_url reolink-1 /h264Preview_01_main)
 r=$(printf 'ffprobe: %s: 401\nhost 192.0.2.44 ok\n' "$u" | redact); rc=$?
 check "redact removes the URL userinfo, password and host (real filter)" \
   '[[ $rc == 0 && $r != *"$PW"* && $r != *"$(uri_enc "$PW")"* && $r != *operator-synthetic* && $r != *192.0.2.44* && $r == *"[REDACTED]"* ]]'
@@ -40,6 +40,6 @@ check "redact streams a large input unchanged" '[[ $(printf "%s" "$big" | redact
 # Fail closed: no vault at all.
 r=$(HOME="$fx/empty" bash -c 'mkdir -p "$HOME"; source "$1/lib.sh"; printf "leak 192.0.2.44\n" | redact' _ "$here" 2>/dev/null); rc=$?
 check "redact without a vault prints nothing and fails" '[[ -z $r && $rc != 0 ]]'
-check "cam_creds without a vault fails" '! HOME="$fx/empty" bash -c "source \"$1/lib.sh\"; cam_creds IPC-BO" _ "$here" 2>/dev/null'
+check "cam_creds without a vault fails" '! HOME="$fx/empty" bash -c "source \"$1/lib.sh\"; cam_creds reolink-1" _ "$here" 2>/dev/null'
 
 exit "$fail"

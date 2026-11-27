@@ -19,6 +19,11 @@ case ${2:-} in
     [[ ${4:-} == --field ]] && f="$f.${5:-}"
     [[ -f $f ]] || { echo "error: no entry with id ${3:-}" >&2; exit 1; }
     cat "$f" ;;
+  list)
+    for f in "$VAULT_STUB"/cam_*_host; do
+      [[ -f $f ]] || continue
+      b="${f##*/cam_}"; printf 'cam:%s:host\thost\tscannable\n' "${b%_host}"
+    done ;;
   redact)
     exec python3 -I -c '
 import sys, json
@@ -33,13 +38,8 @@ S
 chmod +x "$fx/bin/wardenlens"
 export PATH="$fx/bin:$PATH"
 
-# stub_id <display name or id> -> inventory id (the mapping lib.sh's cam_id has).
-stub_id() {
-  case "$1" in
-    IPC-BO) echo reolink-1 ;; "IPC-BO (2)") echo reolink-2 ;; XR) echo xr ;; C110) echo tapo ;; HDIPC) echo hdipc ;;
-    *) echo "$1" ;;
-  esac
-}
+# stub_id <inventory id> -> the inventory id (cam_id in lib.sh checks, it does not map).
+stub_id() { echo "$1"; }
 # redact_add <value>: the stub's redact replaces this value.
 redact_add() { jq --arg v "$1" '. + [$v]' "$VAULT_STUB/.redact" >"$VAULT_STUB/.r" && mv "$VAULT_STUB/.r" "$VAULT_STUB/.redact"; }
 # vault_put <entry-id> <value>
