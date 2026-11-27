@@ -73,14 +73,18 @@ pub struct Plan {
     /// Hot-video byte level the rolling buffer holds: `Some` exactly when the hot floor is
     /// unreachable and the archive cannot take the load (the rolling-buffer case), else
     /// `None`. It equals the input level, except that when [`Policy::emergency_reserve_bytes`]
-    /// forces deletes below it, it ratchets down to the hot video left. It is never raised
-    /// while the buffer lasts. A budget of 0 keeps no hot video.
+    /// forces deletes below it, it ratchets down to the hot video left. It recovers after
+    /// such a ratchet, but only up to [`Plan::rolling_ceiling`], and never rises above it.
+    /// A budget of 0 keeps no hot video.
     ///
-    /// The adapter must store this value and pass it back as [`PlanInput::rolling_budget`]
-    /// on the next tick, clear it when it is `None`, clear it when the volume or the
-    /// configuration changes, and never feed back a value larger than the previous plan
-    /// returned.
+    /// The adapter must store this value and `rolling_ceiling` and pass them back as
+    /// [`PlanInput::rolling_budget`] and [`PlanInput::rolling_ceiling`] on the next tick, clear
+    /// both when they are `None`, clear them when the volume or the configuration changes, and
+    /// never feed back a budget larger than the previous plan's ceiling.
     pub rolling_budget: Option<u64>,
+    /// Ceiling of the rolling budget, `Some` exactly when `rolling_budget` is: the level the
+    /// budget may recover to. The adapter feeds it back as [`PlanInput::rolling_ceiling`].
+    pub rolling_ceiling: Option<u64>,
     /// Foreign or quarantined data keeps the archive below its floor even when everything
     /// it holds is evicted. Kept separate because `ArchiveStatus::Full` takes precedence
     /// over `BelowFloor` in `archive`.
@@ -167,6 +171,14 @@ pub struct PlanInput<'a> {
     /// returned; clear it when the volume or configuration changes.
     /// The target is an absolute level, so segment-size overshoot never accumulates.
     pub rolling_budget: Option<u64>,
+    /// The `rolling_ceiling` of the previous [`Plan`], fed back by the adapter; `None` when the
+    /// previous plan had none, in which case the ceiling is the budget in effect (the fed
+    /// `rolling_budget`, else the seed): the budget then never rises. The budget recovers after
+    /// a reserve-forced ratchet up to `min(ceiling, hot video + free space - emergency reserve)`
+    /// (the free space plus the hot video is what a recorder with the reserve kept free could
+    /// hold; deleting or moving video does not change that sum). A `rolling_budget` above the
+    /// ceiling is lowered to it. Clear it with `rolling_budget`.
+    pub rolling_ceiling: Option<u64>,
 }
 
 /// Percent of `capacity` rounded down.
@@ -187,6 +199,23 @@ fn floor_and_target(capacity: u64, floor_percent: u8) -> Result<(u64, u64), Plan
     ))
 }
 
+/// The hot floor and target in bytes of free space. The emergency reserve is a minimum for
+/// both: a floor below it (a 0 % floor, or a small volume) is raised to the reserve, keeping the
+/// 1 pp headroom above it, so the reserve engages whenever free space falls under it and the
+/// recorder cannot run the volume to ENOSPC.
+fn hot_floor_and_target(input: &PlanInput<'_>) -> Result<(u64, u64), PlanError> {
+    let (floor, target) =
+        floor_and_target(input.hot.capacity_bytes, input.policy.hot_min_free.get())?;
+    let reserve = input.policy.emergency_reserve_bytes;
+    if reserve <= floor {
+        return Ok((floor, target));
+    }
+    Ok((
+        reserve,
+        reserve.saturating_add(target.saturating_sub(floor)),
+    ))
+}
+
 fn sum_bytes(segments: &[&StoredSegment], what: OverflowQuantity) -> Result<u64, PlanError> {
     segments
         .iter()
@@ -199,6 +228,21 @@ fn tier_segments(segments: &[StoredSegment], tier: Tier) -> Vec<&StoredSegment> 
     let mut picked: Vec<&StoredSegment> = segments.iter().filter(|s| s.tier == tier).collect();
     picked.sort_by_key(|s| (s.ended_at, s.id));
     picked
+}
+
+/// The rolling budget the tick starts from and its ceiling (see [`PlanInput::rolling_ceiling`]).
+///
+/// The level is the fed budget, else the video held before this tick's ingest (the seed). The
+/// ceiling is the fed ceiling, else that level; the level is lowered to the ceiling. Then the
+/// level recovers up to `min(ceiling, reachable - reserve)`, never downwards.
+fn rolling_levels(input: &PlanInput<'_>, hot_total: u64, reachable: u64) -> (u64, u64) {
+    let level = input
+        .rolling_budget
+        .unwrap_or_else(|| hot_total.saturating_sub(input.ingested_bytes));
+    let ceiling = input.rolling_ceiling.unwrap_or(level);
+    let level = level.min(ceiling);
+    let room = reachable.saturating_sub(input.policy.emergency_reserve_bytes);
+    (level.max(ceiling.min(room)), ceiling)
 }
 
 /// Result of choosing which hot segments to move.
@@ -220,8 +264,11 @@ struct HotNeed {
     unsatisfiable: bool,
     /// Total size of the hot segments.
     hot_total: u64,
-    /// Hot-video level the rolling buffer holds, were it in effect.
+    /// Hot-video level the rolling buffer starts the tick holding, were it in effect: the fed
+    /// (or seeded) level, recovered up to `min(ceiling, reachable - reserve)`.
     budget: u64,
+    /// The level the budget may recover to; never below `budget`.
+    ceiling: u64,
     /// Free space of the hot volume before the plan.
     free: u64,
     /// Free space the rolling buffer keeps ([`Policy::emergency_reserve_bytes`]).
@@ -259,8 +306,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         _ => None,
     };
     let hot = tier_segments(input.segments, Tier::Hot);
-    let (hot_floor, hot_target) =
-        floor_and_target(input.hot.capacity_bytes, input.policy.hot_min_free.get())?;
+    let (hot_floor, hot_target) = hot_floor_and_target(input)?;
     let hot_total = sum_bytes(&hot, OverflowQuantity::HotTotal)?;
     let free = input.hot.free_bytes;
     let reachable = free
@@ -268,6 +314,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         .ok_or(PlanError::Overflow(OverflowQuantity::HotTotal))?;
     let below = free < hot_floor;
     let unsatisfiable = reachable < hot_floor;
+    let (budget, ceiling) = rolling_levels(input, hot_total, reachable);
     let need = HotNeed {
         needed: if below {
             hot_target.saturating_sub(free)
@@ -283,9 +330,8 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         hot_total,
         free,
         reserve: input.policy.emergency_reserve_bytes,
-        budget: input
-            .rolling_budget
-            .unwrap_or_else(|| hot_total.saturating_sub(input.ingested_bytes)),
+        budget,
+        ceiling,
     };
     let mut actions = Vec::new();
     let mut below_floor = false;
@@ -320,6 +366,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             (true, true) => HotState::RollingBuffer,
         },
         rolling_budget: rolling.budget,
+        rolling_ceiling: rolling.budget.map(|_| need.ceiling),
     })
 }
 

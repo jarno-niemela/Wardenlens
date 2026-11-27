@@ -56,6 +56,7 @@ fn run(
         policy,
         ingested_bytes: ingested,
         rolling_budget: None,
+        rolling_ceiling: None,
     })
 }
 
@@ -169,6 +170,8 @@ fn segment_exactly_at_max_age_is_not_moved_one_past_is() {
     let archive = vol(1000, 900);
     let policy = Policy {
         hot_max_age: DurationMs::from_millis(100),
+        // Not the 2 GiB default: it would exceed this 1000 B volume and be the floor (#108).
+        emergency_reserve_bytes: 0,
         ..Policy::default()
     };
     let segments = [seg(1, Tier::Hot, 10, 899), seg(2, Tier::Hot, 10, 900)];
@@ -274,7 +277,12 @@ fn hot_exactly_at_floor_plans_nothing() {
         vol(1000, 250),
         ArchiveState::Unavailable,
         &segments,
-        no_age_policy(),
+        // The default 2 GiB reserve exceeds this 1000 B volume and would be the floor (ticket
+        // #108); this test is about the percentage floor.
+        Policy {
+            emergency_reserve_bytes: 0,
+            ..no_age_policy()
+        },
         1,
         0,
     )

@@ -69,6 +69,7 @@ fn run_with(
         policy,
         ingested_bytes: ingested,
         rolling_budget,
+        rolling_ceiling: None,
     })
 }
 

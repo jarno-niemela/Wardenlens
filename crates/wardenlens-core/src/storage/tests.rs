@@ -66,6 +66,7 @@ fn input(
         },
         ingested_bytes,
         rolling_budget: None,
+        rolling_ceiling: None,
     }
 }
 
@@ -872,4 +873,96 @@ fn rolling_budget_never_rises_across_ticks() {
         budget = p.rolling_budget;
         apply_deletes(&mut segments, &mut free, &p);
     }
+}
+
+fn ceiling_input(
+    free: u64,
+    segments: &[StoredSegment],
+    reserve: u64,
+    budget: Option<u64>,
+    ceiling: Option<u64>,
+) -> PlanInput<'_> {
+    let mut pin = reserve_input(free, ArchiveState::Unavailable, segments, reserve, budget);
+    // A hot floor of 250 B that stays unreachable in these cases.
+    pin.rolling_ceiling = ceiling;
+    pin
+}
+
+#[test]
+fn budget_recovers_to_the_ceiling_once_the_foreign_burst_is_gone() {
+    // A burst ratcheted the budget to 0; now free 100 and no video: 100 - reserve 30 = 70
+    // can be held, the ceiling 50 limits it.
+    let p = plan(&ceiling_input(100, &[], 30, Some(0), Some(50))).unwrap();
+    assert_eq!(p.rolling_budget, Some(50));
+    assert_eq!(p.rolling_ceiling, Some(50));
+    assert_eq!(p.hot, HotState::Unsatisfiable);
+    assert_eq!(p.actions.len(), 0);
+}
+
+#[test]
+fn budget_recovery_is_limited_by_video_plus_free_minus_reserve() {
+    // 60 free, no video, reserve 30: only 30 B can be held.
+    let p = plan(&ceiling_input(60, &[], 30, Some(0), Some(50))).unwrap();
+    assert_eq!(p.rolling_budget, Some(30));
+    assert_eq!(p.rolling_ceiling, Some(50));
+    // Video counts toward it: 20 B of video and 40 free is the same 60 B.
+    let segs = [seg(0, Tier::Hot, 20, 0)];
+    let p = plan(&ceiling_input(40, &segs, 30, Some(0), Some(50))).unwrap();
+    assert_eq!(p.rolling_budget, Some(30));
+    assert!(p.actions.is_empty(), "20 B of video is under the budget 30");
+}
+
+#[test]
+fn recovery_never_lowers_the_budget_and_never_exceeds_the_ceiling() {
+    // Nothing to recover to (reachable - reserve = 0): the fed level stays, and the reserve
+    // then deletes and ratchets as before.
+    let segs: Vec<StoredSegment> = (0..3).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    let p = plan(&ceiling_input(0, &segs, 500, Some(20), Some(50))).unwrap();
+    assert_eq!(p.rolling_budget, Some(0));
+    assert_eq!(p.rolling_ceiling, Some(50));
+    // A fed budget above the ceiling is lowered to it.
+    let segs: Vec<StoredSegment> = (0..8).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    let p = plan(&ceiling_input(100, &segs, 0, Some(80), Some(50))).unwrap();
+    assert_eq!(p.rolling_budget, Some(50));
+    assert_eq!(p.actions.len(), 3, "80 B of video held to 50 B");
+}
+
+#[test]
+fn without_a_ceiling_the_fed_budget_is_the_ceiling() {
+    let p = plan(&ceiling_input(100, &[], 30, Some(10), None)).unwrap();
+    assert_eq!(p.rolling_budget, Some(10));
+    assert_eq!(p.rolling_ceiling, Some(10));
+}
+
+#[test]
+fn a_ratchet_then_recovery_returns_the_buffer_after_a_foreign_burst() {
+    const CEILING: u64 = 100;
+    // Floor 250 of 1000 is unreachable throughout. Reserve 40.
+    let mut segments: Vec<StoredSegment> = (0..10).map(|i| seg(i, Tier::Hot, 10, i)).collect();
+    let mut budget = None;
+    let mut ceiling = None;
+    let mut seen_low = false;
+    for tick in 0..40_u64 {
+        // Ticks 5..15: foreign data takes 60 B; afterwards it is gone again.
+        let foreign = if (5..15).contains(&tick) { 60 } else { 0 };
+        let video = hot_bytes(&segments);
+        let reachable = 1000 - 900 - foreign; // total space not held by steady foreign data
+        let mut free = reachable - video.min(reachable);
+        let mut pin = reserve_input(free, ArchiveState::Unavailable, &segments, 40, budget);
+        pin.rolling_ceiling = ceiling;
+        pin.ingested_bytes = if tick == 0 { 0 } else { 10 };
+        let p = plan(&pin).unwrap();
+        budget = p.rolling_budget;
+        ceiling = p.rolling_ceiling;
+        apply_deletes(&mut segments, &mut free, &p);
+        segments.push(seg(100 + tick, Tier::Hot, 10, 100 + tick));
+        seen_low |= hot_bytes(&segments) < CEILING / 2;
+    }
+    assert!(seen_low, "the burst must have squeezed the buffer");
+    let end = hot_bytes(&segments);
+    assert!(
+        end >= 50,
+        "the buffer stayed drained after the burst: {end} B"
+    );
+    assert_eq!(ceiling, Some(CEILING));
 }

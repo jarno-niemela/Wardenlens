@@ -595,10 +595,12 @@ fn rolling_budget_is_fed_back_and_cleared_when_the_archive_returns() {
     let r = lp.tick(now()).unwrap();
     assert!(!r.archive.is_available());
     assert!(lp.rolling_budget().is_some(), "{r:?}");
+    assert!(r.hot_alert, "rolling without an archive must alert: {r:?}");
     std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
     let r = lp.tick(now()).unwrap();
     assert!(r.archive_returned);
-    lp.tick(now()).unwrap();
+    let r = lp.tick(now()).unwrap();
+    assert!(!r.hot_alert, "the archive takes the load again: {r:?}");
     assert_eq!(
         lp.rolling_budget(),
         None,
@@ -1664,6 +1666,7 @@ fn archive_only_truncation_does_not_refuse_the_hot_rolling_buffer_deletes() {
         "{r:?}"
     );
     assert!(r.deleted >= 1, "the hot rolling buffer still runs: {r:?}");
+    assert!(r.hot_alert, "RollingBuffer alerts: {r:?}");
 }
 
 #[test]

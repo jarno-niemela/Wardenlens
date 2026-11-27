@@ -94,10 +94,12 @@ pub struct Policy {
     pub archive_min_free: MinFreePercent,
     /// Hot segments that ended earlier than this are moved even without pressure.
     pub hot_max_age: DurationMs,
-    /// Free space, in bytes, the rolling buffer keeps on the hot volume even when the floor is
-    /// unreachable: it deletes the oldest hot video until at least this much is free (or no hot
-    /// video remains). It stops foreign data growth from driving the hot volume to ENOSPC while
-    /// the buffer would otherwise sit at its budget. Only the rolling buffer uses it.
+    /// Free space, in bytes, the planner keeps on the hot volume. It is a minimum for the hot
+    /// floor (a floor below it, such as a 0 % floor, is raised to it), so it engages whatever
+    /// the percentage. When the floor is unreachable the rolling buffer deletes the oldest hot
+    /// video until at least this much is free (or no hot video remains). It stops foreign data
+    /// growth from driving the hot volume to ENOSPC while the buffer would otherwise sit at its
+    /// budget.
     pub emergency_reserve_bytes: u64,
 }
 

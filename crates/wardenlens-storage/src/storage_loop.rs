@@ -73,6 +73,10 @@ pub struct TickReport {
     pub archive_full: bool,
     /// The planner's state of the hot volume.
     pub hot: Option<HotState>,
+    /// The operator must be alerted about the hot volume: the plan is in `RollingBuffer`, or in
+    /// `Unsatisfiable` while the archive is not `Available` (the buffer is then rolling but this
+    /// tick happened to delete nothing). See [`HotState::RollingBuffer`].
+    pub hot_alert: bool,
     /// Moves completed (M1-M9).
     pub moved: u32,
     /// Moves whose row committed but whose hot file could not be unlinked.
@@ -159,6 +163,7 @@ pub struct StorageLoop<I, F, U> {
     probe: Probe,
     failures: u32,
     rolling_budget: Option<u64>,
+    rolling_ceiling: Option<u64>,
     hot_after_last_tick: Option<u64>,
     index_error_ticks: u32,
     archive_was_available: Option<bool>,
@@ -272,6 +277,7 @@ impl Storage {
             probe,
             failures: 0,
             rolling_budget: None,
+            rolling_ceiling: None,
             hot_after_last_tick: None,
             index_error_ticks: 0,
             archive_was_available: None,
@@ -389,6 +395,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             cap_truncated: false,
             quarantine_incomplete: false,
             rolling_deletes_refused: false,
+            hot_alert: false,
             hot_probe_failed: false,
             returned: None,
             returned_pass_unfinished: false,
@@ -688,9 +695,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             archive_only,
         } = mode;
         let hot_space = current.hot.map_err(TickError::HotVolume)?;
-        let ingested = self
-            .hot_after_last_tick
-            .map_or(0, |after| hot_total.saturating_sub(after));
+        let ingested = plausible_ingest(
+            self.hot_after_last_tick
+                .map_or(0, |after| hot_total.saturating_sub(after)),
+            hot_space,
+        );
         // `archive_only` plans with the hot video out of sight: the planner then plans no move and
         // no eviction on behalf of one, only what the archive's own floor needs.
         let visible: Vec<StoredSegment>;
@@ -726,6 +735,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             policy,
             ingested_bytes: ingested,
             rolling_budget: self.rolling_budget,
+            rolling_ceiling: self.rolling_ceiling,
         })
         .map_err(TickError::Plan)
     }
@@ -914,9 +924,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // Only the budget is withheld when the hot deletes were refused (it was computed from
             // an understated total); the states are always reported.
             if !refuse_hot {
-                self.rolling_budget = planned.rolling_budget;
+                (self.rolling_budget, self.rolling_ceiling) =
+                    capped_budget(planned.rolling_budget, planned.rolling_ceiling);
             }
             report.hot = Some(planned.hot);
+            report.hot_alert = needs_hot_alert(planned.hot, planned.archive);
             report.archive_full = planned.archive == ArchiveStatus::Full;
             let mut hot_left = hot_total;
             let mut replan = false;
@@ -1402,6 +1414,33 @@ fn tier_space(p: &ProbeResult, tier: Tier) -> Option<VolumeSpace> {
     }
 }
 
+/// Whether the plan's hot state calls for an operator alert: `RollingBuffer`, and `Unsatisfiable`
+/// while the archive is not `Available` (the buffer is rolling but this tick deleted nothing).
+const fn needs_hot_alert(hot: HotState, archive: ArchiveStatus) -> bool {
+    match hot {
+        HotState::RollingBuffer => true,
+        HotState::Unsatisfiable => !matches!(archive, ArchiveStatus::Available),
+        _ => false,
+    }
+}
+
+/// The budget and ceiling to feed back: both or neither, and the budget never above the ceiling
+/// (the seed it started from), whatever the planner returned.
+fn capped_budget(budget: Option<u64>, ceiling: Option<u64>) -> (Option<u64>, Option<u64>) {
+    match (budget, ceiling) {
+        (Some(b), Some(c)) => (Some(b.min(c)), Some(c)),
+        _ => (None, None),
+    }
+}
+
+/// Bytes recorded since the last tick, capped at the space in use on the hot volume: the video
+/// recorded in one tick is on the disk, so a larger figure comes from a corrupt index and would
+/// only shrink the seed of the rolling budget and delete good video.
+const fn plausible_ingest(ingested: u64, hot: VolumeSpace) -> u64 {
+    let used = hot.capacity_bytes.saturating_sub(hot.free_bytes);
+    if ingested < used { ingested } else { used }
+}
+
 /// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
 /// accepted floor), or `None` for no reserve.
 fn reserve_percent(
@@ -1422,6 +1461,62 @@ fn reserve_percent(
 #[cfg(test)]
 mod reserve_tests {
     use super::*;
+
+    #[test]
+    fn hot_alert_covers_the_rolling_buffer_and_an_unsatisfiable_floor_without_an_archive() {
+        use ArchiveStatus as A;
+        for hot in [
+            HotState::Ok,
+            HotState::Unsatisfiable,
+            HotState::RollingBuffer,
+        ] {
+            for archive in [
+                A::Available,
+                A::Unavailable,
+                A::Unusable,
+                A::Full,
+                A::BelowFloor,
+            ] {
+                let want = match hot {
+                    HotState::RollingBuffer => true,
+                    HotState::Unsatisfiable => archive != A::Available,
+                    _ => false,
+                };
+                assert_eq!(needs_hot_alert(hot, archive), want, "{hot:?} {archive:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fed_back_budget_is_capped_at_the_ceiling_and_travels_with_it() {
+        assert_eq!(capped_budget(Some(5), Some(9)), (Some(5), Some(9)));
+        assert_eq!(capped_budget(Some(20), Some(9)), (Some(9), Some(9)));
+        assert_eq!(capped_budget(Some(0), Some(0)), (Some(0), Some(0)));
+        assert_eq!(capped_budget(None, None), (None, None));
+        assert_eq!(capped_budget(Some(5), None), (None, None));
+        assert_eq!(capped_budget(None, Some(5)), (None, None));
+    }
+
+    #[test]
+    fn ingest_is_capped_at_the_space_in_use() {
+        let hot = |free| VolumeSpace {
+            capacity_bytes: 1000,
+            free_bytes: free,
+        };
+        assert_eq!(plausible_ingest(10, hot(900)), 10);
+        assert_eq!(
+            plausible_ingest(500, hot(900)),
+            100,
+            "only 100 B are in use"
+        );
+        assert_eq!(plausible_ingest(u64::MAX, hot(0)), 1000);
+        assert_eq!(plausible_ingest(5, hot(1000)), 0, "nothing in use");
+        assert_eq!(
+            plausible_ingest(5, hot(2000)),
+            0,
+            "free above capacity saturates"
+        );
+    }
 
     fn pol(reserve: u64) -> Policy {
         Policy {
