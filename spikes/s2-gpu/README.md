@@ -14,6 +14,8 @@ Benchmarks behind `docs/adr/0003-gpu-stack.md`. All GPU work runs in Docker
 | `ort_bench.py`, `run_ort_bench.sh` | YOLO latency/fps/VRAM, CUDA EP vs CPU |
 | `results/` | raw outputs quoted in the ADR; `models.sha256` = checksums of weights and ONNX files |
 
+This spike reads no site data (no hosts, credentials or camera names): its inputs are synthetic clips and public models. If one ever needs site data it goes through `wardenlens vault get` (see `docs/DEV_VAULT.md`), never a file.
+
 `fixtures/`, `models/` and `cuda-bgsub/target/` are gitignored (media and weights are not committed).
 Build cuda-bgsub on the host (`cargo build --release`, dynamic loading) and run it in the CUDA container:
 `docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility -v $PWD/cuda-bgsub/target/release:/b:ro nvidia/cuda:12.9.1-devel-ubuntu24.04 /b/cuda-bgsub`.

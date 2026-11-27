@@ -224,3 +224,17 @@ fn error_causes_are_not_doubled() {
         assert_eq!(tail.matches(part).count(), 1, "{line}");
     }
 }
+
+#[test]
+fn redact_filters_a_pipe_and_fails_closed_without_a_vault() {
+    let h = home();
+    // No vault yet: nothing is copied, exit 2.
+    let out = vault(&h, &["redact"], "leak 192.0.2.50 here");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "nothing may be written");
+    vault(&h, &["init"], "");
+    vault(&h, &["set", "cam:a:host", "--kind", "host"], "192.0.2.50");
+    let out = vault(&h, &["redact"], "leak 192.0.2.50 here\n");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"leak [REDACTED] here\n");
+}

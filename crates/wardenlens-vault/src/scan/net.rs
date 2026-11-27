@@ -11,8 +11,8 @@ use std::net::Ipv6Addr;
 /// Owners (indices into the matcher's entry list) of one stored number.
 pub(super) type Owners = Vec<u32>;
 
-/// A callback for a hit: the owners and the byte offset where the token starts.
-pub(super) type Hit<'a> = &'a mut dyn FnMut(&[u32], usize);
+/// A callback for a hit: the owners and the byte range `start..end` of the token.
+pub(super) type Hit<'a> = &'a mut dyn FnMut(&[u32], usize, usize);
 
 /// The longest tail of an IPv6 run tried as a sub-run (a full address is at most 45 bytes).
 const IPV6_TAIL: usize = 45;
@@ -61,9 +61,9 @@ pub(super) fn ipv4(b: &[u8], stored: &HashMap<u32, Owners>, hit: Hit<'_>) {
     if stored.is_empty() {
         return;
     }
-    let mut look = |n: u32, at: usize| {
+    let mut look = |n: u32, at: usize, end: usize| {
         if let Some(owners) = stored.get(&n) {
-            hit(owners, at);
+            hit(owners, at, end);
         }
     };
     // Fields (1 to 3 digits, at most 255) joined by exactly one separator form a chain; every
@@ -87,7 +87,7 @@ pub(super) fn ipv4(b: &[u8], stored: &HashMap<u32, Owners>, hit: Hit<'_>) {
                     .saturating_add(u64::from(d.saturating_sub(b'0')))
             });
             if let Ok(n) = u32::try_from(v) {
-                look(n, start);
+                look(n, start, i);
             }
         }
         let field = (run.len() <= 3)
@@ -112,7 +112,7 @@ pub(super) fn ipv4(b: &[u8], stored: &HashMap<u32, Owners>, hit: Hit<'_>) {
         starts[3] = start;
         count = count.saturating_add(1).min(4);
         if count == 4 {
-            look(u32::from_be_bytes(window), starts[0]);
+            look(u32::from_be_bytes(window), starts[0], i);
         }
         expect = ipv4_separator_end(b, i);
     }
@@ -131,7 +131,7 @@ pub(super) fn ipv4(b: &[u8], stored: &HashMap<u32, Owners>, hit: Hit<'_>) {
         if run.len() == 8 {
             let v = run.iter().fold(0u64, |a, &d| a.wrapping_shl(4) | nibble(d));
             if let Ok(n) = u32::try_from(v) {
-                look(n, start);
+                look(n, start, i);
             }
         }
     }
@@ -147,7 +147,7 @@ fn look_ipv6(
     at: usize,
     v6: &HashMap<u128, Owners>,
     v4: &HashMap<u32, Owners>,
-    hit: &mut dyn FnMut(&[u32], usize),
+    hit: Hit<'_>,
 ) {
     let Some(addr) = std::str::from_utf8(candidate)
         .ok()
@@ -155,13 +155,14 @@ fn look_ipv6(
     else {
         return;
     };
+    let end = at.saturating_add(candidate.len());
     if let Some(owners) = v6.get(&u128::from(addr)) {
-        hit(owners, at);
+        hit(owners, at, end);
     }
     if let Some(mapped) = addr.to_ipv4_mapped()
         && let Some(owners) = v4.get(&u32::from(mapped))
     {
-        hit(owners, at);
+        hit(owners, at, end);
     }
 }
 
@@ -172,7 +173,7 @@ fn try_variant(
     base: usize,
     v6: &HashMap<u128, Owners>,
     v4: &HashMap<u32, Owners>,
-    hit: &mut dyn FnMut(&[u32], usize),
+    hit: Hit<'_>,
 ) {
     if run.is_empty() {
         return;
@@ -256,9 +257,9 @@ pub(super) fn mac(b: &[u8], stored: &HashMap<u64, Owners>, hit: Hit<'_>) {
     if stored.is_empty() {
         return;
     }
-    let mut look = |n: u64, at: usize| {
+    let mut look = |n: u64, at: usize, end: usize| {
         if let Some(owners) = stored.get(&n) {
-            hit(owners, at);
+            hit(owners, at, end);
         }
     };
     let mut ring: [Group; 6] = [(0, 0); 6];
@@ -287,21 +288,21 @@ pub(super) fn mac(b: &[u8], stored: &HashMap<u64, Owners>, hit: Hit<'_>) {
         };
         let tail = |k: usize| ring.get(6usize.saturating_sub(k)..).unwrap_or_default();
         if len(1) == Some(12) {
-            look(mac_number(b, tail(1), false), start);
+            look(mac_number(b, tail(1), false), start, i);
         }
         let first = |k: usize| tail(k).first().map_or(start, |g| g.0);
         if count >= 2 && tail(2).iter().all(|g| g.1.saturating_sub(g.0) == 6) {
-            look(mac_number(b, tail(2), false), first(2));
+            look(mac_number(b, tail(2), false), first(2), i);
         }
         if count >= 3 && tail(3).iter().all(|g| g.1.saturating_sub(g.0) == 4) {
-            look(mac_number(b, tail(3), false), first(3));
+            look(mac_number(b, tail(3), false), first(3), i);
         }
         if count >= 6
             && tail(6)
                 .iter()
                 .all(|g| (1..=2).contains(&g.1.saturating_sub(g.0)))
         {
-            look(mac_number(b, tail(6), true), first(6));
+            look(mac_number(b, tail(6), true), first(6), i);
         }
     }
 }

@@ -5,6 +5,7 @@
 mod keys;
 mod legacy;
 mod paths;
+mod redact_cmd;
 mod scan;
 mod session;
 mod value;
@@ -27,10 +28,10 @@ pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Re
     // ADR 0006 section 6, for every subcommand: the key is a file, never the environment. For
     // a scan that refusal is "the scan could not run" (exit 2), never a pass.
     if let Err(e) = env.refuse_key_variable() {
-        return Err(if matches!(cmd, VaultCommand::Scan(_)) {
-            could_not_scan(e)
-        } else {
-            e
+        return Err(match cmd {
+            VaultCommand::Scan(_) => could_not_scan(e),
+            VaultCommand::Redact => CliError::CouldNotRedact(Box::new(e)),
+            _ => e,
         });
     }
     match cmd {
@@ -44,6 +45,7 @@ pub(crate) fn run<T: Terminal>(cmd: VaultCommand, env: &Env, term: &mut T) -> Re
         VaultCommand::Key(crate::args::KeyCommand::Export) => keys::export(&env.paths()?, term),
         VaultCommand::Key(crate::args::KeyCommand::Import) => keys::import(env, term),
         VaultCommand::ImportLegacy(a) => legacy::import(&a, env, term),
+        VaultCommand::Redact => redact_cmd::run(env, term),
         VaultCommand::Scan(a) => {
             let fixed = a.default_paths.then(|| env.without_overrides());
             let paths = fixed.as_ref().unwrap_or(env).paths();

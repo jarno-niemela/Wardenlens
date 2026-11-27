@@ -92,7 +92,7 @@ fn literals(set: &Automaton, v: &View<'_>, bit: u8, found: &mut Found) -> Result
 
 impl Matcher {
     fn tokens(&self, v: &View<'_>, found: &mut Found) {
-        let mut hit = |owners: &[u32], at: usize| {
+        let mut hit = |owners: &[u32], at: usize, _end: usize| {
             let line = v.line_at(at);
             for &o in owners {
                 found.add(o, line);

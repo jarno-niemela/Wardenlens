@@ -259,7 +259,7 @@ fn mac(value: &str) -> Expansion {
 }
 
 /// Everything except the unreserved characters is percent-encoded.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+pub(super) const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')

@@ -9,6 +9,7 @@
 //! Every collection is bounded: input at [`MAX_INPUT_LEN`] bytes, needles at
 //! [`MAX_NEEDLE_BYTES`] in total, entries at [`crate::MAX_ENTRIES`], hits at [`MAX_HITS`].
 
+mod literals;
 mod matcher;
 mod needles;
 mod net;
@@ -25,6 +26,9 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 
 use crate::error::VaultError;
 
+pub(crate) use literals::{
+    Addresses, MAX_TOKEN, literals as redaction_literals, userinfo_literals,
+};
 pub use matcher::Matcher;
 pub use squeeze::is_invisible;
 
