@@ -121,6 +121,9 @@ pub(crate) enum ImportError {
     /// A built-in camera constant or entry id was refused (cannot happen today).
     #[error("internal camera value refused")]
     Camera(#[source] CameraError),
+    /// The built-in camera catalogue is invalid (cannot happen; a test pins it).
+    #[error("the built-in camera catalogue is invalid")]
+    Catalogue(#[source] wardenlens_core::catalogue::CatalogueError),
     /// The vault file would be the index file.
     #[error("the vault file and the index file are the same path; rename `database.path`")]
     SameFile,
@@ -160,7 +163,7 @@ impl ImportError {
 
 /// What happened to one camera.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Status {
+pub(super) enum Status {
     WouldImport,
     Imported,
     Updated,
@@ -180,7 +183,7 @@ impl Status {
 
 /// One output line. Only ids, hosts, paths and fixed text; never a login.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Row {
+pub(super) struct Row {
     id: String,
     host: String,
     path: String,
@@ -442,7 +445,7 @@ fn now() -> Result<UnixMs, ImportError> {
     UnixMs::new(ms).map_err(|_| ImportError::Clock)
 }
 
-fn write_all(
+pub(super) fn write_all(
     config: &Config,
     key: KeyFile,
     drafts: &[CameraDraft],
@@ -450,10 +453,13 @@ fn write_all(
 ) -> Result<Vec<Row>, ImportError> {
     let mut vault = open_vault(&vault_path(config), key).map_err(ImportError::Vault)?;
     let mut index = Index::open(config.database_path()).map_err(ImportError::Index)?;
+    // The registry may hold cameras whose paths carry a query that the catalogue lists
+    // (`camera add`); reading or writing a row with no catalogue would refuse them.
+    let catalogue = super::camera::catalogue().map_err(ImportError::Catalogue)?;
     let mut rows = Vec::with_capacity(drafts.len());
     for d in drafts {
         let existed = index
-            .get_camera(&d.id, &[])
+            .get_camera(&d.id, &catalogue)
             .map_err(ImportError::Index)?
             .is_some();
         write_vault(&mut vault, d)?;
@@ -464,7 +470,7 @@ fn write_all(
             StreamSet::new(d.path.clone(), None),
         );
         index
-            .upsert_camera(&record, &[], now()?)
+            .upsert_camera(&record, &catalogue, now()?)
             .map_err(ImportError::Index)?;
         rows.push(row(
             d,

@@ -227,6 +227,9 @@ pub enum IndexError {
         /// The limit.
         max: usize,
     },
+    /// A camera with this id is registered already; nothing was written (`insert_camera`).
+    #[error("a camera with this id is already registered")]
+    CameraExists,
     /// A token with this id exists (active or revoked); nothing was written. Ids are never reused.
     #[error("a token with this id already exists")]
     TokenIdTaken,

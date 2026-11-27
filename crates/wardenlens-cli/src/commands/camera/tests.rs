@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use secrecy::ExposeSecret;
-use wardenlens_core::camera::CameraId;
+use wardenlens_core::camera::{CameraId, ModelRef};
 use wardenlens_core::connection::Backoff;
 use wardenlens_core::time::DurationMs;
 use wardenlens_onvif::ClientConfig;
@@ -277,6 +277,7 @@ fn run_add(site: &Site, net: &Fake, a: &AddArgs, stdin: &str) -> Outcome {
     let services = Services {
         network: net,
         client: fast(),
+        clock: now,
     };
     let result = add(&site.config, a, &mut term, &services);
     Outcome {
@@ -517,6 +518,7 @@ fn the_real_network_refuses_loopback_in_the_command() {
     let services = Services {
         network: &guard::SystemNetwork,
         client: fast(),
+        clock: now,
     };
     let err = add(&site.config, &a, &mut term, &services).unwrap_err();
     assert!(matches!(err, CameraCmdError::Guard(_)), "{err:?}");
@@ -793,6 +795,16 @@ fn remove_cleans_vault_entries_that_have_no_row() {
 #[test]
 fn exit_codes_follow_the_table() {
     assert_eq!(CameraCmdError::UnknownModel.exit_code(), 1);
+    // A full registry and a duplicate id are refusals; any other registry error is a failure.
+    assert_eq!(
+        CameraCmdError::Index(IndexError::TooManyCameras { max: 1 }).exit_code(),
+        1
+    );
+    assert_eq!(
+        CameraCmdError::Index(IndexError::CameraExists).exit_code(),
+        1
+    );
+    assert_eq!(CameraCmdError::Index(IndexError::Damaged).exit_code(), 2);
     assert_eq!(CameraCmdError::NotFound.exit_code(), 1);
     assert_eq!(CameraCmdError::NoCataloguePaths.exit_code(), 1);
     assert_eq!(CameraCmdError::Clock.exit_code(), 2);
@@ -851,7 +863,7 @@ impl Terminal for Broken {
 }
 
 #[test]
-fn a_closed_stdout_is_exit_2_for_every_command() {
+fn a_closed_stdout_is_exit_2_for_list_and_remove_but_not_for_a_stored_add() {
     let site = Site::new();
     add_closed(&site, "yard", "reolink/rlc-520a");
     let err = list(&site.config, &mut Broken).unwrap_err();
@@ -861,13 +873,15 @@ fn a_closed_stdout_is_exit_2_for_every_command() {
     assert!(matches!(err, CameraCmdError::Output(_)), "{err:?}");
     // The removal itself was done before the report failed.
     assert_eq!(site.cameras().len(), 0);
+    // `add` has stored the camera when it prints, so a closed stdout is not an error exit.
     let a = args("lawn", "127.0.0.1", "reolink/rlc-520a", Some(closed_port()));
     let services = Services {
         network: &foreign(),
         client: fast(),
+        clock: now,
     };
-    let err = add(&site.config, &a, &mut Broken, &services).unwrap_err();
-    assert!(matches!(err, CameraCmdError::Output(_)), "{err:?}");
+    add(&site.config, &a, &mut Broken, &services).unwrap();
+    assert_eq!(site.cameras().len(), 1);
 }
 
 /// A vault file that is not ours is refused and left byte for byte as it was; the add stores
@@ -953,3 +967,170 @@ fn errors_never_carry_the_inputs() {
         "{dbg}"
     );
 }
+
+// ---- round 2: rollback, clock, password order ----
+
+/// A vault whose `set` fails on the `fail_on`-th call (1-based) and records what is removed.
+struct FailingVault {
+    inner: Vault,
+    calls: usize,
+    fail_on: usize,
+}
+
+impl add::VaultOps for FailingVault {
+    fn set(
+        &mut self,
+        id: &wardenlens_core::entry::EntryId,
+        kind: EntryKind,
+        value: &Value,
+    ) -> Result<(), VaultError> {
+        self.calls = self.calls.saturating_add(1);
+        if self.calls == self.fail_on {
+            return Err(VaultError::TooManyEntries);
+        }
+        wardenlens_vault::Vault::set(
+            &mut self.inner,
+            id,
+            kind,
+            value,
+            wardenlens_vault::Scan::Normal,
+        )
+        .map(drop)
+    }
+    fn rm(&mut self, id: &wardenlens_core::entry::EntryId) -> Result<bool, VaultError> {
+        self.inner.rm(id)
+    }
+}
+
+/// A failure at each of the three vault writes removes the entries this run wrote and its own
+/// registry row, and no other camera is touched.
+#[test]
+fn a_vault_failure_part_way_removes_this_runs_row_and_entries_only() {
+    for fail_on in 1..=3 {
+        let site = Site::new();
+        add_closed(&site, "keep", "reolink/rlc-520a");
+        let before = site.vault().list().unwrap().len();
+        let entries = catalogue().unwrap();
+        let record = wardenlens_index::CameraRecord::new(
+            CameraId::new("mine").unwrap(),
+            catalogue::parse_model("reolink/rlc-520a").unwrap(),
+            NonZeroU16::new(554).unwrap(),
+            wardenlens_core::camera::StreamSet::new(
+                wardenlens_core::camera::RtspPath::new("/m").unwrap(),
+                None,
+            ),
+        );
+        let req = add::test_request("mine");
+        let mut index = Index::open(site.config.database_path()).unwrap();
+        let mut vault = FailingVault {
+            inner: site.vault(),
+            calls: 0,
+            fail_on,
+        };
+        let err = add::commit(
+            &mut index,
+            &mut vault,
+            &record,
+            &entries,
+            now().unwrap(),
+            &req,
+            secrecy::SecretString::from("pw".to_owned()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CameraCmdError::Vault(_)),
+            "{fail_on}: {err:?}"
+        );
+        drop(vault);
+        let ids: Vec<String> = site
+            .cameras()
+            .iter()
+            .map(|c| c.record().id().to_string())
+            .collect();
+        assert_eq!(ids, ["keep"], "fail_on {fail_on}: the row was left");
+        for kind in [
+            EntryKind::Credential,
+            EntryKind::Host,
+            EntryKind::DisplayName,
+        ] {
+            assert!(site.entry("mine", kind).is_none(), "{fail_on} {kind:?}");
+            assert!(site.entry("keep", kind).is_some(), "{fail_on} {kind:?}");
+        }
+        assert_eq!(site.vault().list().unwrap().len(), before, "{fail_on}");
+    }
+}
+
+fn broken_clock() -> Result<UnixMs, CameraCmdError> {
+    Err(CameraCmdError::Clock)
+}
+
+/// The clock is read before the first write: a clock failure leaves no vault, no registry row.
+#[test]
+fn a_clock_failure_writes_nothing() {
+    let site = Site::new();
+    let a = args(
+        "cam-a",
+        "127.0.0.1",
+        "reolink/rlc-520a",
+        Some(closed_port()),
+    );
+    let mut term = Scripted::piped(&pw());
+    let services = Services {
+        network: &foreign(),
+        client: fast(),
+        clock: broken_clock,
+    };
+    let err = add(&site.config, &a, &mut term, &services).unwrap_err();
+    assert!(matches!(err, CameraCmdError::Clock), "{err:?}");
+    assert_eq!(site.files().len(), 0, "{:?}", site.files());
+}
+
+/// The operator is asked for the password only after the key file and the duplicate check.
+#[test]
+fn the_password_is_not_read_for_a_duplicate_id_or_a_missing_key() {
+    let site = Site::new();
+    add_closed(&site, "cam-a", "reolink/rlc-520a");
+    let a = args(
+        "cam-a",
+        "127.0.0.1",
+        "reolink/rlc-520a",
+        Some(closed_port()),
+    );
+    let o = run_add(&site, &foreign(), &a, &pw());
+    assert!(matches!(o.result, Err(CameraCmdError::AlreadyRegistered)));
+    assert_eq!(o.input_left, pw().len(), "the password was read");
+    std::fs::remove_file(site.config.key_file()).unwrap();
+    let b = args(
+        "cam-b",
+        "127.0.0.1",
+        "reolink/rlc-520a",
+        Some(closed_port()),
+    );
+    let o = run_add(&site, &foreign(), &b, &pw());
+    assert!(matches!(o.result, Err(CameraCmdError::KeyMissing { .. })));
+    assert_eq!(o.input_left, pw().len(), "the password was read");
+}
+
+/// `import` reads the registry with the catalogue: re-importing over an id that `camera add`
+/// stored with a catalogue-listed query works (with no catalogue the row cannot be read).
+#[test]
+fn import_updates_a_camera_that_camera_add_stored_with_a_listed_query() {
+    let site = Site::new();
+    add_closed(&site, "agentdvr-1", "dahua/ipc-hfw4431r-z");
+    let xml = "<objects><cameras><camera id=\"1\" name=\"A\"><settings>\
+               <videosourcestring>rtsp://192.0.2.5:554/live</videosourcestring>\
+               <login>import-user</login><password>import-password-1</password></settings>\
+               </camera></cameras></objects>";
+    let parsed = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
+    assert_eq!(parsed.cameras[0].id.as_str(), "agentdvr-1");
+    let model = ModelRef::new("agentdvr", "imported").unwrap();
+    let rows =
+        crate::commands::import::write_all(&site.config, site.key(), &parsed.cameras, &model)
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    let cams = site.cameras();
+    assert_eq!(cams.len(), 1);
+    assert_eq!(cams[0].record().model().to_string(), "agentdvr/imported");
+}
+
+mod adversary;

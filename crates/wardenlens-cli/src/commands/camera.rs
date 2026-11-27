@@ -15,7 +15,8 @@
 //! The password never comes from argv: see [`password`]. Where `add` may connect is decided by
 //! [`guard`]. The catalogue is the one compiled in (the `catalogue` module).
 //!
-//! Exit codes: 0 done; 1 the request was refused (bad value, refused address, wrong login,
+//! Exit codes: 0 done; 1 the request was refused (bad value, refused address, wrong login, a full
+//! registry, a taken id,
 //! unknown or duplicate id); 2 the system could not do it (config, key file, vault, registry, I/O)
 //! and, as for the other commands, an invalid config is 1.
 
@@ -128,7 +129,9 @@ impl CameraCmdError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Config(e) => e.exit_code(),
-            Self::Camera(_)
+            // A full registry or a taken id is a refusal of the request, not a system failure.
+            Self::Index(IndexError::TooManyCameras { .. } | IndexError::CameraExists)
+            | Self::Camera(_)
             | Self::Path(_)
             | Self::UnknownModel
             | Self::Guard(_)
@@ -179,6 +182,7 @@ fn run(
             let services = Services {
                 network: &SystemNetwork,
                 client: wardenlens_onvif::ClientConfig::default(),
+                clock: now,
             };
             add::add(&config, args, term, &services)
         }
