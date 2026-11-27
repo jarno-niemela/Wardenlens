@@ -200,7 +200,7 @@ fn opening_the_live_shm_as_an_index_does_not_drop_the_first_handles_shm_lock() {
     );
     let r = Index::open(&shm);
     println!("open of the -shm: {:?}", r.as_ref().map(|_| ()));
-    assert!(r.is_err(), "the -shm opened as an index");
+    assert!(refused(&r), "the -shm opened as an index: {r:?}");
     drop(r);
     assert!(
         another_process_sees_locked(&shm),

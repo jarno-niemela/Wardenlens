@@ -16,15 +16,20 @@
 //!    descriptor of the file is opened**, because even closing a refused descriptor would drop
 //!    the first handle's locks. A missing file or any other `stat` error falls through; the open
 //!    below reports it. A `-shm`, `-wal` or `-journal` name of a registered base file is refused
-//!    the same way.
+//!    the same way, and so is any path with more than one hard link (`HardLinkedIndex`; a
+//!    hard link of a live sidecar must not be opened either).
 //! 2. open our own descriptor (creating the file when missing), `fstat` it and insert the key.
 //!    A key that is present here means the path was swapped between 1 and 2 (an attacker) or a
-//!    link appeared: refused, at the price of closing that one descriptor.
+//!    link appeared: refused, and that descriptor is **parked** (leaked), not closed, because
+//!    closing it would drop the first handle's locks. A failed `fstat` parks it the same way,
+//!    since it cannot be told apart from a registered file.
 //!
 //! The [`Registration`] is dropped after the descriptor it describes ([`Held`] field order), and
 //! on every error path of the open, so the entry never outlives the file handle and never leaks.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -74,23 +79,45 @@ impl Held {
 
 /// Sidecar suffixes of an index file. Opening one of them as an index would close a descriptor
 /// on the live `-shm`, `-wal` or `-journal` and drop the first handle's locks on it.
-const SIDECAR_SUFFIXES: [&str; 3] = ["-shm", "-wal", "-journal"];
+const SIDECAR_SUFFIXES: [&[u8]; 3] = [b"-shm", b"-wal", b"-journal"];
 
-/// Whether `path` is a registered file, or a sidecar name whose base file (same directory, suffix
-/// stripped) is registered. Only `stat`s: no descriptor is opened.
-fn names_a_registered_file(set: &HashSet<Key>, path: &Path) -> bool {
+/// What the pre-open `stat` found.
+enum Verdict {
+    /// Nothing known against this path.
+    Open,
+    /// This process has the file (or the base file of this sidecar name) open.
+    Registered,
+    /// The path has more than one hard link.
+    HardLinked,
+}
+
+/// Judges `path` from `stat`s only: no descriptor is opened. A registered file, or a sidecar
+/// name whose base file (same directory, suffix stripped, compared on bytes so a non-UTF-8 name
+/// cannot dodge it) is registered, is `Registered`; a path with several links is `HardLinked`.
+fn judge(set: &HashSet<Key>, path: &Path) -> Verdict {
     let registered =
         |p: &Path| std::fs::metadata(p).is_ok_and(|m| set.contains(&(m.dev(), m.ino())));
-    if registered(path) {
-        return true;
+    let meta = std::fs::metadata(path);
+    if meta
+        .as_ref()
+        .is_ok_and(|m| set.contains(&(m.dev(), m.ino())))
+    {
+        return Verdict::Registered;
     }
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    SIDECAR_SUFFIXES.iter().any(|suffix| {
-        name.strip_suffix(suffix)
-            .is_some_and(|base| !base.is_empty() && registered(&path.with_file_name(base)))
-    })
+    if let Some(name) = path.file_name().map(OsStr::as_bytes) {
+        let sidecar_of_registered = SIDECAR_SUFFIXES.iter().any(|suffix| {
+            name.strip_suffix(*suffix).is_some_and(|base| {
+                !base.is_empty() && registered(&path.with_file_name(OsStr::from_bytes(base)))
+            })
+        });
+        if sidecar_of_registered {
+            return Verdict::Registered;
+        }
+    }
+    if meta.is_ok_and(|m| m.is_file() && m.nlink() > 1) {
+        return Verdict::HardLinked;
+    }
+    Verdict::Open
 }
 
 /// Opens `path` as a private file and registers its identity, or refuses when this process
@@ -100,14 +127,21 @@ pub(crate) fn open_registered(path: &Path) -> Result<Held, IndexError> {
     // `open_private_file` uses `O_NONBLOCK` and refuses non-regular files, so a FIFO cannot hang
     // it while the mutex is held.
     let mut set = registry();
-    if names_a_registered_file(&set, path) {
-        return Err(IndexError::AlreadyOpenInProcess);
+    match judge(&set, path) {
+        Verdict::Open => {}
+        Verdict::Registered => return Err(IndexError::AlreadyOpenInProcess),
+        Verdict::HardLinked => return Err(IndexError::HardLinkedIndex),
     }
     let file = open_private_file(path)?;
-    let meta = file
-        .file()
-        .metadata()
-        .map_err(IndexError::io("inspecting index file"))?;
+    let Ok(meta) = file.file().metadata() else {
+        // Cannot tell this file from a registered one: closing it might drop the first
+        // handle's locks, so it is parked like the race below.
+        let _parked = std::mem::ManuallyDrop::new(file);
+        return Err(IndexError::Io {
+            op: "inspecting index file",
+            kind: std::io::ErrorKind::Other,
+        });
+    };
     let key = (meta.dev(), meta.ino());
     if !set.insert(key) {
         // The path was swapped to a registered file between the stat and the open. Closing this

@@ -120,3 +120,27 @@ fn a_poisoned_registry_is_recovered() {
     assert!(r.is_err());
     let (_f, _idx) = open_new();
 }
+
+/// The names beside a live index: which are refused as sidecars of it and which open as
+/// indexes of their own (table, both directions).
+#[test]
+fn sidecar_name_table_beside_a_live_index() {
+    let (f, _live) = open_new();
+    for (name, refused_as_sidecar) in [
+        ("index.db-shm", true),
+        ("index.db-wal", true),
+        ("index.db-journal", true),
+        ("index.db-wal-shm", false),
+        ("index.db-shm-wal", false),
+        ("-wal", false),
+        ("-shm", false),
+        ("-journal", false),
+        ("index.db-wal2", false),
+    ] {
+        let r = Index::open(&f.dir.path().join(name));
+        assert_eq!(is_refused(&r), refused_as_sidecar, "{name}: {:?}", r.err());
+        if !refused_as_sidecar {
+            assert!(r.is_ok(), "{name}");
+        }
+    }
+}
