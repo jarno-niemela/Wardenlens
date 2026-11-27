@@ -5,6 +5,7 @@
 
 mod bits;
 mod nal;
+mod profile;
 
 use core::fmt;
 
@@ -12,6 +13,7 @@ use crate::time::Timestamp;
 
 pub use bits::{Bits, BitsError, unescape};
 pub use nal::{AvccError, contains_b_slice, nal_units};
+pub use profile::{HIGH_FAMILY_PROFILES, avcc_has_chroma_extension, is_high_family};
 
 /// The parameter sets that a decoder or an MP4 muxer needs, as raw NAL units (one byte NAL header,
 /// no start code, no length prefix).

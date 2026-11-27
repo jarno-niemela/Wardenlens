@@ -27,8 +27,9 @@ use wardenlens_core::camera::{Credential, Host, RtspPath};
 use wardenlens_core::catalogue::StreamRole;
 use wardenlens_core::time::{Clock, Timestamp};
 use wardenlens_ingest::{
-    IngestError, MAX_FRAME_BYTES, MapError, NoReorderReason, ReorderVerdict, SpsError,
-    contains_b_slice, open_stream, parse_sps, sps_reordering,
+    IngestError, MAX_FRAME_BYTES, MapError, NoReorderReason, OpenOptions, ReorderVerdict,
+    RetinaSource, SpsError, StreamSource, contains_b_slice, open_stream, open_stream_with,
+    parse_sps, sps_reordering,
 };
 
 const USER: &str = "adv-user-q7";
@@ -50,6 +51,8 @@ const P1: [u8; 4] = [0x41, 0x9a, 0x00, 0x20];
 enum Challenge {
     Digest,
     Basic,
+    /// Basic listed first, Digest second, in one header: the client must pick Digest.
+    BasicThenDigest,
 }
 
 /// What the server sends after PLAY.
@@ -80,6 +83,15 @@ struct StepClock(AtomicI64);
 impl Clock for StepClock {
     fn now(&self) -> Timestamp {
         Timestamp::from_unix_millis(self.0.fetch_add(10, Ordering::SeqCst))
+    }
+}
+
+#[derive(Clone)]
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::from_unix_millis(1_700_000_000_000)
     }
 }
 
@@ -154,6 +166,9 @@ async fn serve(mut sock: TcpStream, port: u16, script: Script, log: Arc<Mutex<Ve
                             "WWW-Authenticate: Digest realm=\"t\", nonce=\"abc123\"\r\n"
                         }
                         Challenge::Basic => "WWW-Authenticate: Basic realm=\"t\"\r\n",
+                        Challenge::BasicThenDigest => {
+                            "WWW-Authenticate: Basic realm=\"t\", Digest realm=\"t\", nonce=\"abc123\"\r\n"
+                        }
                     };
                     respond(&mut sock, &req, "401 Unauthorized", challenge, "").await;
                 } else {
@@ -290,24 +305,131 @@ fn fu_a(seq0: u16, ts: u32, hdr: u8, body: &[u8], chunk: usize) -> Vec<(u16, u32
 /// base64, i.e. in the clear. The rustdoc of `open_stream` says Basic is used when asked; this
 /// test documents that the password is then on the wire.
 #[tokio::test]
-#[ignore = "follow-up #155"]
 async fn basic_challenge_never_receives_the_password_in_clear() {
     let server = spawn(Script {
         challenge: Challenge::Basic,
         after: After::Packets(vec![]),
     })
     .await;
-    let _ = open_with(&server, &cred()).await;
+    let out = open_with(&server, &cred()).await;
+    assert_eq!(out.err(), Some(IngestError::BasicAuthRefused));
     let leaked = base64(format!("{USER}:{PASSWORD}").as_bytes());
-    for r in server.requests.lock().unwrap().iter() {
+    let reqs = server.requests.lock().unwrap();
+    assert!(!reqs.is_empty());
+    for r in reqs.iter() {
         assert!(
-            !r.contains(&leaked),
-            "password sent as Basic credentials: {}",
+            !r.contains(&leaked) && header(r, "Authorization").is_none(),
+            "credentials sent to a Basic-only camera: {}",
             r.lines()
                 .find(|l| l.starts_with("Authorization"))
                 .unwrap_or("")
         );
     }
+}
+
+/// The per-camera opt-in: with it, a Basic-only camera gets Basic credentials (and the stream
+/// opens). Without it (the test above) nothing is sent.
+#[tokio::test]
+async fn basic_challenge_with_the_opt_in_is_answered_with_basic() {
+    let server = spawn(Script {
+        challenge: Challenge::Basic,
+        after: After::Packets(vec![(100, 90_000, true, IDR.to_vec())]),
+    })
+    .await;
+    let mut s = open_stream_with(
+        &Host::new("127.0.0.1").unwrap(),
+        NonZeroU16::new(server.port).unwrap(),
+        &RtspPath::new(PATH).unwrap(),
+        Some(&cred()),
+        StreamRole::Main,
+        StepClock(AtomicI64::new(1_700_000_000_000)),
+        OpenOptions::default().allow_basic_auth(true),
+    )
+    .await
+    .unwrap();
+    assert!(s.next_frame().await.unwrap().is_some());
+    let want = format!("Basic {}", base64(format!("{USER}:{PASSWORD}").as_bytes()));
+    let reqs = server.requests.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|r| header(r, "Authorization") == Some(want.as_str()))
+    );
+}
+
+/// The supervisor's source carries the opt-in: refused by default, answered when set.
+#[tokio::test]
+async fn retina_source_honours_the_basic_opt_in() {
+    for (allow, want_ok) in [(false, false), (true, true)] {
+        let server = spawn(Script {
+            challenge: Challenge::Basic,
+            after: After::Packets(vec![(100, 90_000, true, IDR.to_vec())]),
+        })
+        .await;
+        let mut source = RetinaSource::new(
+            Host::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(server.port).unwrap(),
+            RtspPath::new(PATH).unwrap(),
+            Some(cred()),
+            StreamRole::Main,
+            FixedClock,
+        );
+        if allow {
+            source = source.with_open_options(OpenOptions::default().allow_basic_auth(true));
+        }
+        let out = source.open(Duration::from_secs(5)).await;
+        assert_eq!(out.is_ok(), want_ok, "allow={allow}");
+        if !want_ok {
+            assert_eq!(out.err(), Some(IngestError::BasicAuthRefused));
+        }
+    }
+}
+
+/// A challenge that offers Digest as well as Basic is answered with Digest, never refused and
+/// never answered with Basic, whatever the order.
+#[tokio::test]
+async fn basic_and_digest_challenge_is_answered_with_digest() {
+    let server = spawn(Script {
+        challenge: Challenge::BasicThenDigest,
+        after: After::Packets(vec![(100, 90_000, true, IDR.to_vec())]),
+    })
+    .await;
+    let mut s = open_with(&server, &cred()).await.unwrap();
+    assert!(s.next_frame().await.unwrap().is_some());
+    let reqs = server.requests.lock().unwrap();
+    let auth: Vec<&str> = reqs
+        .iter()
+        .filter_map(|r| header(r, "Authorization"))
+        .collect();
+    assert_ne!(auth.len(), 0);
+    assert!(auth.iter().all(|a| a.starts_with("Digest ")), "{auth:?}");
+}
+
+/// The hostile camera of #155: one access unit that never ends. retina must stop buffering it,
+/// so the session fails at once (`StreamFailed`) instead of reading until the frame timeout
+/// (`FrameTimeout`) with everything it was sent still in memory.
+#[tokio::test]
+async fn endless_access_unit_fails_the_session_instead_of_growing() {
+    // 40 MiB of FU-A fragments of one NAL with no end bit and no marker, then silence.
+    let body = vec![0x5a_u8; 40 * 1024 * 1024];
+    let mut pkts = vec![(100, 90_000, true, IDR.to_vec())];
+    let mut frag = fu_a(101, 93_600, 0x65, &body, 60_000);
+    // Take the end bit and the marker off the last fragment: the access unit never completes.
+    if let Some(last) = frag.last_mut() {
+        last.2 = false;
+        last.3[1] &= !0x40;
+    }
+    pkts.extend(frag);
+    let server = spawn(Script {
+        challenge: Challenge::Digest,
+        after: After::Packets(pkts),
+    })
+    .await;
+    let mut s = open_with(&server, &cred())
+        .await
+        .unwrap()
+        .with_frame_timeout(Duration::from_secs(20));
+    assert!(s.next_frame().await.unwrap().is_some());
+    assert_eq!(s.next_frame().await, Err(IngestError::StreamFailed));
 }
 
 /// A user name with CR LF (allowed by `Credential::new` and `Credential::check`) must not split

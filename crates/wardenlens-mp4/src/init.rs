@@ -235,10 +235,7 @@ fn write_avcc(out: &mut Vec<u8>, params: &H264Params) -> Result<(), Mp4Error> {
             u16::try_from(params.pps().len()).map_err(|_| Mp4Error::BoxTooLarge)?,
         );
         o.extend_from_slice(params.pps());
-        if matches!(
-            info.profile_idc,
-            100 | 110 | 122 | 144 // the profiles whose avcC carries the extension (ISO 14496-15)
-        ) {
+        if wardenlens_core::video::avcc_has_chroma_extension(info.profile_idc) {
             o.push(0xfc | info.chroma_format_idc);
             o.push(0xf8 | info.bit_depth_luma.saturating_sub(8));
             o.push(0xf8 | info.bit_depth_chroma.saturating_sub(8));

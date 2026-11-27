@@ -149,10 +149,7 @@ fn parse_chroma(bits: &mut Bits<'_>, profile_idc: u8) -> Result<ChromaInfo, Mp4E
         depth_luma: 8,
         depth_chroma: 8,
     };
-    if !matches!(
-        profile_idc,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    ) {
+    if !wardenlens_core::video::is_high_family(profile_idc) {
         return Ok(info);
     }
     info.format = bits.ue_max(3, "chroma_format_idc out of range")?;
