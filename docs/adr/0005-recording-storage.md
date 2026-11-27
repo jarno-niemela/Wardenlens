@@ -308,7 +308,7 @@ rather than be papered over. The registry is a process-wide `HashSet` of (device
 the path and refuses a registered identity **before opening any descriptor of the file** (closing even a refused
 descriptor would drop the first handle's locks); otherwise it opens its own descriptor, `fstat`s it and inserts the key, so a
 symlinked directory or a hard link cannot dodge the check (a name swapped in between the `stat` and the open is caught by the
-`fstat` key, at the price of closing that one descriptor). A file that does not exist yet is created by that open and
+`fstat` key; that one descriptor is then parked, not closed, so the first handle keeps its locks, at the price of one leaked descriptor per attempt). A `-shm`, `-wal` or `-journal` path whose base file is registered is refused by the same `stat` step. A file that does not exist yet is created by that open and
 registered from its descriptor. The entry is removed when the `Index` drops, after its descriptor has closed, and on every
 error path of `open`. Other processes are still excluded by the `flock` taken during `open`.
 

@@ -504,8 +504,8 @@ fn a_held_file_lock_makes_a_second_open_wait_then_report_busy() {
     assert_eq!(before, snapshot(f.dir.path()));
     drop(lock);
     drop(Index::open(&f.path).unwrap());
-    // And the lock is not kept after a successful open: another process could open beside it. In
-    // this process a second handle is refused (#148), and is refused as such, not as `Busy`.
+    // A second handle in this process is refused (#148), and as `AlreadyOpenInProcess`, not
+    // `Busy`. (That the flock is released after a successful open is pinned by adversary_49_r4.)
     let a = Index::open(&f.path).unwrap();
     assert!(matches!(
         Index::open(&f.path),

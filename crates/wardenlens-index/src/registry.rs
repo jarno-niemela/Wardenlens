@@ -15,7 +15,8 @@
 //! 1. `stat` the path (following links): a registered identity is refused **before any
 //!    descriptor of the file is opened**, because even closing a refused descriptor would drop
 //!    the first handle's locks. A missing file or any other `stat` error falls through; the open
-//!    below reports it.
+//!    below reports it. A `-shm`, `-wal` or `-journal` name of a registered base file is refused
+//!    the same way.
 //! 2. open our own descriptor (creating the file when missing), `fstat` it and insert the key.
 //!    A key that is present here means the path was swapped between 1 and 2 (an attacker) or a
 //!    link appeared: refused, at the price of closing that one descriptor.
@@ -71,13 +72,35 @@ impl Held {
     }
 }
 
+/// Sidecar suffixes of an index file. Opening one of them as an index would close a descriptor
+/// on the live `-shm`, `-wal` or `-journal` and drop the first handle's locks on it.
+const SIDECAR_SUFFIXES: [&str; 3] = ["-shm", "-wal", "-journal"];
+
+/// Whether `path` is a registered file, or a sidecar name whose base file (same directory, suffix
+/// stripped) is registered. Only `stat`s: no descriptor is opened.
+fn names_a_registered_file(set: &HashSet<Key>, path: &Path) -> bool {
+    let registered =
+        |p: &Path| std::fs::metadata(p).is_ok_and(|m| set.contains(&(m.dev(), m.ino())));
+    if registered(path) {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    SIDECAR_SUFFIXES.iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .is_some_and(|base| !base.is_empty() && registered(&path.with_file_name(base)))
+    })
+}
+
 /// Opens `path` as a private file and registers its identity, or refuses when this process
 /// already has that file open.
 pub(crate) fn open_registered(path: &Path) -> Result<Held, IndexError> {
+    // Held across the stat and the open by design: the open is one per process at a time, and
+    // `open_private_file` uses `O_NONBLOCK` and refuses non-regular files, so a FIFO cannot hang
+    // it while the mutex is held.
     let mut set = registry();
-    if let Ok(meta) = std::fs::metadata(path)
-        && set.contains(&(meta.dev(), meta.ino()))
-    {
+    if names_a_registered_file(&set, path) {
         return Err(IndexError::AlreadyOpenInProcess);
     }
     let file = open_private_file(path)?;
@@ -87,6 +110,10 @@ pub(crate) fn open_registered(path: &Path) -> Result<Held, IndexError> {
         .map_err(IndexError::io("inspecting index file"))?;
     let key = (meta.dev(), meta.ino());
     if !set.insert(key) {
+        // The path was swapped to a registered file between the stat and the open. Closing this
+        // descriptor would drop the first handle's POSIX locks, so it is parked (leaked): one
+        // descriptor per attempt, needing a same-user attacker inside our private directory.
+        let _parked = std::mem::ManuallyDrop::new(file);
         return Err(IndexError::AlreadyOpenInProcess);
     }
     Ok(Held {

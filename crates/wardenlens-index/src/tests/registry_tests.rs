@@ -28,7 +28,8 @@ fn a_second_open_is_refused_and_the_first_handle_keeps_working() {
     assert!(fds >= 1);
     let before = snapshot(f.dir.path());
     assert!(is_refused(&Index::open(&f.path)));
-    // No descriptor of the file was opened (closing one would drop the first handle's locks).
+    // The descriptor count did not change (the child lock probe in tests/adversary_148.rs
+    // proves the locks themselves).
     assert_eq!(fds_on(&f.path), fds);
     assert_eq!(snapshot(f.dir.path()), before);
     // The first handle is intact.
