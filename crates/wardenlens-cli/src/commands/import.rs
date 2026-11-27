@@ -52,10 +52,14 @@
 //!   whose catalogue entry lists exactly that query, so an unlisted query is skipped (`path has a
 //!   query string`) even under a chosen model, and no other model is substituted. The check runs
 //!   in a dry run too, so both agree.
-//! * An existing registry row is updated (re-import) only if its model is of vendor `agentdvr`
-//!   (an earlier import) or equals the model chosen now. A row of another model was made by
-//!   `camera add` (or by an import with another model): it is skipped and its vault entries are
-//!   not touched (#207).
+//! * **Rows of `camera add`.** `camera add` refuses ids starting with `agentdvr-` (`ReservedId`),
+//!   which are this command's, so an import never meets a hand-added row. Every `agentdvr-*` row
+//!   is updated by a re-import (host, name, login and main path are replaced). As defence in
+//!   depth a row under a catalogue model (vendor not `agentdvr`) that differs from the model
+//!   chosen now is left as it is, with the vault untouched: an earlier `--model` import is not
+//!   re-mapped by accident. A dry run opens an existing index (never creates one) so that its
+//!   statuses agree with the real run. A pre-reservation hand-added `agentdvr-*` row cannot be
+//!   told from an imported one (the registry has no provenance); see [`RESERVED_ID_PREFIX`].
 //! * A path that contains any user or password the parser read (any camera's, since sites share
 //!   passwords, and the logins of skipped entries too; ASCII-case-insensitive) is skipped and its path is not
 //!   shown, so a login hidden in a path never reaches the registry or the output. A very short
@@ -82,7 +86,7 @@ use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
 use wardenlens_core::time::UnixMs;
 use wardenlens_fsutil::{FsError, is_symlink_refusal, open_regular_nofollow};
-use wardenlens_index::{CameraRecord, Index, IndexError};
+use wardenlens_index::{CameraRecord, Index, IndexError, StoredCamera};
 use wardenlens_secrets::{Credentials, KeyFile, SecretsError};
 use wardenlens_vault::{Scan, Value, Vault, VaultError};
 use zeroize::Zeroizing;
@@ -98,8 +102,17 @@ const VAULT_FILE_NAME: &str = "vault.db";
 /// in no catalogue, so a path with a query string is not imported under it (see the module docs).
 const MODEL: (&str, &str) = ("agentdvr", "imported");
 
+/// The id prefix of every camera this command writes (the parser makes `agentdvr-<n>`). `camera
+/// add` refuses it (`ReservedId`), so no hand-added row can share an id with an import and the
+/// import's read-then-write of a row cannot race with a `camera add` of the same id.
+///
+/// A row under this prefix that was hand-added before the reservation (an existing install) cannot
+/// be told from an imported one: the registry has no provenance. A re-import replaces its vault
+/// host, name and login and its main path. Rename or remove such a camera before importing.
+pub(crate) const RESERVED_ID_PREFIX: &str = "agentdvr-";
+
 /// The vendor slug of the models this command itself assigns. A registry row of any other vendor
-/// was made by `camera add` or by an earlier import with a catalogue model.
+/// was mapped to a catalogue model by an earlier import.
 const OWN_VENDOR: &str = "agentdvr";
 
 /// Why the import failed.
@@ -165,6 +178,9 @@ pub(crate) enum ImportError {
         "a model option names no catalogue entry; use `<vendor>/<model>` as in cameras/README.md"
     )]
     UnknownModel,
+    /// `--camera-model` names one camera twice.
+    #[error("`--camera-model` names the same camera twice")]
+    DuplicateCamera,
     /// `--camera-model` names a camera that is not in the file.
     #[error("`--camera-model` names a camera id that is not in the file")]
     UnknownCamera,
@@ -188,7 +204,11 @@ impl ImportError {
             Self::Config(e) => e.exit_code(),
             // Like `ConfigFileError`: a document that is refused for its content is 1; a file
             // that cannot be used (missing, too large, not regular, unreadable) is 2.
-            Self::Parse(_) | Self::ModelArg | Self::UnknownModel | Self::UnknownCamera => 1,
+            Self::Parse(_)
+            | Self::ModelArg
+            | Self::DuplicateCamera
+            | Self::UnknownModel
+            | Self::UnknownCamera => 1,
             _ => 2,
         }
     }
@@ -229,7 +249,8 @@ pub(super) enum SkipWhy {
     QueryNotListed(Option<ModelRef>),
     /// The path is listed by several catalogue models; none is guessed.
     Ambiguous(Vec<ModelRef>),
-    /// The registry holds this id under a model of another source (for example `camera add`).
+    /// The registry holds this id under a catalogue model other than the one chosen now (an
+    /// earlier import mapped it): a changed model is never applied silently.
     ExistingModel(ModelRef),
 }
 
@@ -254,8 +275,8 @@ impl SkipWhy {
                 )
             }
             Self::ExistingModel(m) => format!(
-                "the registry holds this id under model {m}, not an import model; not overwritten \
-                 (give the same model to update it)"
+                "the registry holds this id under model {m}, which differs from the model chosen \
+                 now; the row is left as it is (pass {m} with --model or --camera-model to update it)"
             ),
         }
     }
@@ -337,7 +358,7 @@ impl Choice {
             let (id, model) = text.split_once('=').ok_or(ImportError::ModelArg)?;
             let id = CameraId::new(id).map_err(|_| ImportError::ModelArg)?;
             if pairs.iter().any(|(seen, _)| *seen == id) {
-                return Err(ImportError::ModelArg);
+                return Err(ImportError::DuplicateCamera);
             }
             pairs.push((id, known(model)?));
         }
@@ -379,13 +400,45 @@ fn agentdvr(
     let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &catalogue, &choice)?;
     rows.extend(parsed.skipped.iter().map(skipped_row));
     if dry_run {
-        rows.extend(ready.iter().map(|r| row(r, Status::WouldImport)));
+        let index = open_existing_index(&config)?;
+        for r in &ready {
+            let existing = match &index {
+                Some(i) => i
+                    .get_camera(&r.draft.id, &catalogue)
+                    .map_err(ImportError::Index)?,
+                None => None,
+            };
+            rows.push(match conflict(existing.as_ref(), r) {
+                Some(why) => row_of(&r.draft, None, Status::Skipped(why)),
+                None => row(r, Status::WouldImport),
+            });
+        }
     } else {
         let key = load_key(config.key_file())?;
         let written = write_all(&config, key, &ready, &catalogue)?;
         rows.extend(written);
     }
     print_table(&rows, &mut io::stdout().lock()).map_err(ImportError::Output)
+}
+
+/// The index at `database.path`, or none when the file does not exist (nothing is created).
+fn open_existing_index(config: &Config) -> Result<Option<Index>, ImportError> {
+    if std::fs::symlink_metadata(config.database_path())
+        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    Index::open(config.database_path())
+        .map(Some)
+        .map_err(ImportError::Index)
+}
+
+/// Why the row that the registry holds must be left alone, if so (see the module docs): it is
+/// under a catalogue model that differs from the one chosen now. Shared by the dry run and the
+/// real run, so they agree.
+fn conflict(existing: Option<&StoredCamera>, r: &Ready) -> Option<SkipWhy> {
+    let have = existing?.record().model();
+    (have.vendor() != OWN_VENDOR && *have != r.model).then(|| SkipWhy::ExistingModel(have.clone()))
 }
 
 /// A camera that passed the screen, with the model it is registered under.
@@ -711,10 +764,10 @@ fn now() -> Result<UnixMs, ImportError> {
 
 /// Writes the cameras: the vault entries, then the registry row.
 ///
-/// A row that the registry already holds under a model of another vendor than `agentdvr` and that
-/// differs from the one chosen now was made by `camera add` (or by an import with another model):
-/// it is not overwritten and its vault entries are not touched, the camera is reported skipped.
-/// Re-running with the same model updates it (the same source).
+/// A row that the registry already holds under a catalogue model (vendor other than `agentdvr`)
+/// that differs from the one chosen now is left as it is and its vault entries are not touched; the
+/// camera is reported skipped. Ids are always `agentdvr-<n>`, which `camera add` refuses, so no
+/// `camera add` can create or change a row between the read and the write below.
 ///
 /// # Errors
 /// Vault, index and clock errors. A failure midway leaves the vault entries of the camera it
@@ -735,16 +788,9 @@ pub(super) fn write_all(
         let existing = index
             .get_camera(&d.id, catalogue)
             .map_err(ImportError::Index)?;
-        if let Some(e) = &existing {
-            let have = e.record().model();
-            if have.vendor() != OWN_VENDOR && *have != r.model {
-                rows.push(row_of(
-                    d,
-                    None,
-                    Status::Skipped(SkipWhy::ExistingModel(have.clone())),
-                ));
-                continue;
-            }
+        if let Some(why) = conflict(existing.as_ref(), r) {
+            rows.push(row_of(d, None, Status::Skipped(why)));
+            continue;
         }
         write_vault(&mut vault, d)?;
         let record = CameraRecord::new(
@@ -849,6 +895,7 @@ fn print_table(rows: &[Row], out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret as _;
 
     #[test]
     fn table_lists_columns_and_never_more() {
@@ -1161,6 +1208,14 @@ key_file = "/srv/wl/keys/secrets.key"
             // a chosen model
             (&all_c1, "/stream1", Ok(c1.clone())),
             (&all_c1, &cam, Ok(c1.clone())),
+            // `query_allowed` compares the query only: a chosen model that lists this query
+            // accepts it on another path head (unlike the auto-match, which needs the exact
+            // listed path). The choice is the user's; the credential rules still apply.
+            (
+                &all_c1,
+                "/elsewhere?channel=1&amp;subtype=0",
+                Ok(c1.clone()),
+            ),
             (&each_c2, "/other?x=1", Ok(c2.clone())),
             (&each_c2, "/stream1", Ok(c2.clone())),
             (&other_id, "/stream1", Ok(default.clone())),
@@ -1257,11 +1312,15 @@ key_file = "/srv/wl/keys/secrets.key"
         ] {
             assert!(ok(None, &[bad]).is_err(), "{bad:?}");
         }
-        // A camera named twice is refused, even for the same model.
-        assert!(matches!(
-            ok(None, &["agentdvr-2=acme/c1", "agentdvr-2=acme/c1"]),
-            Err(ImportError::ModelArg)
-        ));
+        // A camera named twice is refused, even for the same model, with its own error.
+        for pair in [
+            ["agentdvr-2=acme/c1", "agentdvr-2=acme/c1"],
+            ["agentdvr-2=acme/c1", "agentdvr-2=acme/c2"],
+        ] {
+            let e = ok(None, &pair).unwrap_err();
+            assert!(matches!(e, ImportError::DuplicateCamera), "{e:?}");
+            assert!(!e.to_string().contains("agentdvr-2"), "{e}");
+        }
         // No error echoes the option.
         let e = ok(Some("secretword/x"), &[]).unwrap_err().to_string();
         assert!(!e.contains("secretword"), "{e}");
@@ -1280,6 +1339,7 @@ key_file = "/srv/wl/keys/secrets.key"
         assert_eq!(ImportError::Symlink { path: p() }.exit_code(), 2);
         for usage in [
             ImportError::ModelArg,
+            ImportError::DuplicateCamera,
             ImportError::UnknownModel,
             ImportError::UnknownCamera,
         ] {
@@ -1396,7 +1456,7 @@ key_file = "/srv/wl/keys/secrets.key"
         );
     }
 
-    /// #207: a row of another source is not overwritten, and its vault entries are not touched.
+    /// A row under a catalogue model that differs from the one chosen now is left as it is.
     #[test]
     fn a_row_with_another_vendors_model_is_not_overwritten() {
         let dir = tempfile::tempdir().unwrap();
@@ -1437,6 +1497,109 @@ key_file = "/srv/wl/keys/secrets.key"
         let key = KeyFile::load(config.key_file()).unwrap();
         let rows = write_all(&config, key, &mk(model("acme", "c1")), &cat).unwrap();
         assert_eq!(rows[0].status, Status::Updated);
+    }
+
+    /// Every vault value of one camera, for a byte comparison.
+    fn vault_values(config: &Config, id: &CameraId) -> Vec<Option<String>> {
+        let vault = Vault::open(
+            &vault_path(config),
+            KeyFile::load(config.key_file()).unwrap(),
+        )
+        .unwrap();
+        [
+            EntryKind::Host,
+            EntryKind::DisplayName,
+            EntryKind::Credential,
+        ]
+        .into_iter()
+        .map(|k| {
+            vault
+                .get(&id.entry_id(k).unwrap())
+                .unwrap()
+                .map(|e| match e.value {
+                    Value::Text(t) => t.expose_secret().to_owned(),
+                    Value::Credential(c) => {
+                        format!("{}:{}", c.username, c.password.expose_secret())
+                    }
+                    other => format!("{other:?}"),
+                })
+        })
+        .collect()
+    }
+
+    /// A skipped row leaves the vault byte-identical: the second import has another host, name and
+    /// login for the same id. (Mutation check: moving `write_vault` above the guard fails this.)
+    #[test]
+    fn a_skipped_row_leaves_its_vault_entries_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path());
+        let config = site_config(dir.path());
+        let cat = catalogue();
+        let camera = |host: &str, name: &str, user: &str, pw: &str| {
+            let xml = format!(
+                "<objects><cameras><camera id=\"1\" name=\"{name}\"><settings>\
+                 <videosourcestring>rtsp://{host}/stream1</videosourcestring>\
+                 <login>{user}</login><password>{pw}</password></settings></camera>\
+                 </cameras></objects>"
+            );
+            wardenlens_agentdvr::parse(xml.as_bytes())
+                .unwrap()
+                .cameras
+                .remove(0)
+        };
+        let first = camera("192.0.2.5", "First", "user-one", "pass-one-1");
+        let second = camera("198.51.100.8", "Second", "user-two", "pass-two-2");
+        assert_eq!(first.id, second.id);
+        let key = KeyFile::generate(config.key_file()).unwrap();
+        let mapped = [Ready {
+            draft: first.clone(),
+            model: model("acme", "c1"),
+        }];
+        write_all(&config, key, &mapped, &cat).unwrap();
+        let before = vault_values(&config, &first.id);
+        assert!(before.iter().all(Option::is_some));
+        for m in [default_model().unwrap(), model("acme", "c2")] {
+            let other = [Ready {
+                draft: second.clone(),
+                model: m,
+            }];
+            let key = KeyFile::load(config.key_file()).unwrap();
+            let rows = write_all(&config, key, &other, &cat).unwrap();
+            assert!(matches!(
+                rows[0].status,
+                Status::Skipped(SkipWhy::ExistingModel(_))
+            ));
+            assert_eq!(
+                vault_values(&config, &first.id),
+                before,
+                "the vault changed"
+            );
+        }
+    }
+
+    /// The dry run reads an existing index and reports the same skip as the real run; with no
+    /// index it creates none.
+    #[test]
+    fn a_dry_run_opens_an_existing_index_and_creates_none() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path());
+        let config = site_config(dir.path());
+        assert!(open_existing_index(&config).unwrap().is_none());
+        assert!(!config.database_path().exists());
+        let cat = catalogue();
+        let d = one_draft("/stream1");
+        let mk = |m: ModelRef| Ready {
+            draft: d.clone(),
+            model: m,
+        };
+        let key = KeyFile::generate(config.key_file()).unwrap();
+        write_all(&config, key, &[mk(model("acme", "c1"))], &cat).unwrap();
+        let index = open_existing_index(&config).unwrap().unwrap();
+        let existing = index.get_camera(&d.id, &cat).unwrap();
+        assert!(conflict(existing.as_ref(), &mk(model("acme", "c2"))).is_some());
+        assert!(conflict(existing.as_ref(), &mk(default_model().unwrap())).is_some());
+        assert!(conflict(existing.as_ref(), &mk(model("acme", "c1"))).is_none());
+        assert!(conflict(None, &mk(model("acme", "c1"))).is_none());
     }
 
     #[test]
