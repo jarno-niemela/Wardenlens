@@ -66,9 +66,9 @@ fn a_busy_read_back_when_the_retries_run_out_leaves_the_file_in_place() {
     assert_eq!(tree(&d.root).len(), 1);
 }
 
-/// The rename retry bumps the key past a planted file. The bumped key is not probed in the index:
-/// a row may already hold it (its file is on another tier or gone), and the good segment is then
-/// refused as a duplicate and quarantined.
+/// Round 2 found: the rename retry bumps the key past a planted file, and a row may already hold
+/// the bumped key (its file is on another tier or gone). The good segment must then not be
+/// refused as a duplicate and quarantined: it stays where it is.
 #[test]
 fn a_rename_bump_onto_a_key_that_the_index_holds_does_not_lose_the_segment() {
     let mut r = Rig::build(fast(), None, |_, index| {

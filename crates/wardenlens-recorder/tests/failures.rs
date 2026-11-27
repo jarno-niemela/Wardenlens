@@ -12,7 +12,8 @@ use common::rig::*;
 use common::*;
 use rusqlite::ErrorCode;
 use wardenlens_core::mp4box::{SliceSource, summarize};
-use wardenlens_core::recording::SegmentConfig;
+use wardenlens_core::recording::{RelPath, SegmentConfig, SegmentRecord};
+use wardenlens_core::storage::{SegmentIndex, Tier};
 use wardenlens_index::IndexError;
 use wardenlens_recorder::{ChannelSource, HoldReason, Recorder, RecorderState, StoreError};
 
@@ -502,4 +503,26 @@ fn an_unreadable_index_never_quarantines_a_file_after_a_duplicate() {
     );
     assert_eq!(tree(&d.root).len(), 1);
     assert!(!tree(&d.root)[0].contains("_quarantine"));
+}
+
+#[test]
+fn a_segment_bumped_onto_a_key_another_row_holds_stays_in_place_unindexed() {
+    let mut r = Rig::build(fast(), None, |_, index| {
+        let rec = SegmentRecord::new(cam(), ms(T0 + 101), 1_000, 4_096, 10);
+        index.insert(&rec, Tier::Archive).unwrap();
+    });
+    r.start();
+    r.feed(Slice::P);
+    let planted = r.root.join(RelPath::new(&cam(), ms(T0 + 100)).to_string());
+    std::fs::write(&planted, b"foreign").unwrap();
+    let d = r.finish();
+    assert_eq!(std::fs::read(&planted).unwrap(), b"foreign");
+    assert_eq!(
+        (d.end.segments_unindexed, d.end.segments_quarantined),
+        (1, 0)
+    );
+    let kept = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
+    assert!(kept.is_file(), "{:?}", tree(&d.root));
+    assert_eq!(d.rows.len(), 1);
+    assert_eq!(d.rows[0].record.bytes, 4_096);
 }

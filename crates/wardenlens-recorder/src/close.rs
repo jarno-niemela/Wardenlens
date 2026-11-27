@@ -114,14 +114,17 @@ where
     }
 
     /// `Index::insert`. A transient error (busy, I/O) is retried up to `insert_retries` times
-    /// with a growing pause; the file is quarantined only on a constraint or permanent error.
+    /// with a growing pause. After a transient failure that outlasts the retries the finished
+    /// file stays where it is (reconciliation adopts a `.mp4` without a row, ADR 0005 section
+    /// 9); it counts as indexed only when the read-back finds its row.
     ///
-    /// A transient error can follow a commit (SQLite's checkpoint inside `COMMIT` may fail
-    /// after the row is durable), so the retry then meets its own row as a duplicate. After any
-    /// transient failure the row is therefore read back, and a matching row counts as indexed;
-    /// the file is quarantined only when no such row exists. When the retries run out the
-    /// finished file stays where it is (reconciliation adopts a `.mp4` without a row, ADR 0005
-    /// section 9), unless the read-back finds the row.
+    /// On any other (permanent) error the index is asked what it holds at the key
+    /// ([`ReadBack`]), because a failure can follow the commit:
+    /// - `Match`: indexed;
+    /// - `Unknown` (the index could not answer): never quarantine, the file stays and counts
+    ///   as unindexed;
+    /// - `Differs` on a bumped key (the key is another segment's row): the file stays, unindexed;
+    /// - `NoRow`, or `Differs` on an un-bumped key: quarantined.
     fn index_segment(&mut self, row: &SegmentRecord, bumped: bool) {
         let mut attempt = 0u32;
         loop {
@@ -143,14 +146,9 @@ where
                     }
                 }
                 Err(_) => {
-                    // A transient failure may have followed the commit, and a bumped key may
-                    // be held by another row: ask the index before judging the file.
-                    let seen = if attempt > 0 || bumped {
-                        self.read_back(row)
-                    } else {
-                        ReadBack::NoRow
-                    };
-                    match seen {
+                    // The row may be there already (a failure can follow the commit, whatever
+                    // its kind), so the index is always asked before the file is judged.
+                    match self.read_back(row) {
                         ReadBack::Match => self.count_indexed(),
                         // Never quarantine on an answer that was not given.
                         ReadBack::Unknown => self.count_unindexed(),
