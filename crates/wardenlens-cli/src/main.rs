@@ -75,6 +75,10 @@ fn main() -> ExitCode {
             logging::init(format, &env);
             commands::serve::execute(&ctx)
         }
+        Some(Command::Health) => {
+            logging::init(format, &env);
+            commands::health::execute(&ctx)
+        }
         Some(Command::Vault(cmd)) => {
             // `--config` and `--log-format` are global for the grammar, but the vault has fixed
             // paths (ADR 0006) and does not log: a flag that would be ignored is refused, as it

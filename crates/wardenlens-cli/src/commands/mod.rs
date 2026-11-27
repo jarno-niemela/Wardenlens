@@ -7,6 +7,7 @@
 //! layout and keeps its own error type and terminal handling.
 
 pub(crate) mod config;
+pub(crate) mod health;
 pub(crate) mod import;
 pub(crate) mod secrets;
 pub(crate) mod serve;

@@ -82,6 +82,24 @@ fn example_file_parses() {
     }
 }
 
+#[test]
+fn container_config_parses_and_needs_the_unspecified_flag() {
+    // docs/config.docker.toml is what compose.yaml mounts (#69): it must stay valid, and its
+    // all-interfaces listen address must be allowed by the flag and by nothing else.
+    let text = include_str!("../../../../docs/config.docker.toml");
+    let c = parse(text).unwrap();
+    assert_eq!(c.listen(), "0.0.0.0:8080".parse().unwrap());
+    assert!(c.allow_unspecified_bind());
+    assert_eq!(c.hot_root(), Path::new("/srv/wardenlens/hot"));
+    assert_eq!(c.archive_root(), Path::new("/srv/wardenlens/archive"));
+    assert_eq!(c.key_file(), Path::new("/run/secrets/wardenlens_vault_key"));
+    let without = text.replace(
+        "allow_unspecified_bind = true",
+        "allow_unspecified_bind = false",
+    );
+    assert!(parse(&without).is_err());
+}
+
 // --- invariant: LAN-only bind, through the config -------------------------------------------
 
 #[test]
