@@ -2212,6 +2212,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardenlens-recorder"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rusqlite",
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wardenlens-core",
+ "wardenlens-fsutil",
+ "wardenlens-index",
+ "wardenlens-ingest",
+ "wardenlens-mp4",
+]
+
+[[package]]
 name = "wardenlens-secrets"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,185 @@
+//! The file side of the recorder as a port, so the recorder logic is tested without a disk.
+
+use rustix::io::Errno;
+use wardenlens_core::time::UnixMs;
+use wardenlens_fsutil::FsError;
+use wardenlens_mp4::DurationPatch;
+
+/// A failed file operation. No variant carries a path (paths name cameras and times).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StoreError {
+    /// The volume is full (`ENOSPC`) or the quota is used up (`EDQUOT`).
+    #[error("no space left on the hot volume")]
+    NoSpace,
+    /// A file with the segment's name already exists.
+    #[error("a file with this name already exists")]
+    NameTaken,
+    /// A path-confined file operation failed.
+    #[error("file operation failed: {0}")]
+    Fs(FsError),
+    /// A plain I/O call on an open segment failed.
+    #[error("{op} failed: {kind}")]
+    Io {
+        /// What was being done.
+        op: &'static str,
+        /// The error kind.
+        kind: std::io::ErrorKind,
+    },
+}
+
+impl StoreError {
+    /// Classifies a raw errno: full volume, name taken, or neither.
+    fn from_errno(errno: Errno) -> Option<Self> {
+        match errno {
+            Errno::NOSPC | Errno::DQUOT => Some(Self::NoSpace),
+            Errno::EXIST => Some(Self::NameTaken),
+            _ => None,
+        }
+    }
+
+    /// Maps an `fsutil` error, recognising "volume full" and "name taken".
+    #[must_use]
+    pub fn from_fs(e: FsError) -> Self {
+        e.errno().and_then(Self::from_errno).unwrap_or(Self::Fs(e))
+    }
+
+    /// Maps an `std::io::Error` from a call on an open file.
+    #[must_use]
+    pub fn from_io(op: &'static str, e: &std::io::Error) -> Self {
+        e.raw_os_error()
+            .and_then(|n| Self::from_errno(Errno::from_raw_os_error(n)))
+            .unwrap_or(Self::Io { op, kind: e.kind() })
+    }
+}
+
+/// Reads and writes the segment files of one camera on the hot volume (ADR 0005 section 3).
+///
+/// At most one writer is open at a time (the caller's duty), so a crash leaves at most one
+/// `.part` per camera.
+pub trait SegmentStore {
+    /// An open `.part` file.
+    type Writer;
+
+    /// Whether a file (finished or `.part`) with the name of `key` exists.
+    ///
+    /// # Errors
+    /// Anything but "not found" that stops the answer (the key is then not assumed free).
+    fn key_taken(&mut self, key: UnixMs) -> Result<bool, StoreError>;
+
+    /// Creates the camera and day directories (mode `0700`, parents fsynced) and the `.part` file
+    /// (mode `0600`, never an existing name) and writes `head` (`ftyp` + `moov`) to it.
+    ///
+    /// # Errors
+    /// [`StoreError::NameTaken`] when the name exists, [`StoreError::NoSpace`], or another failure.
+    /// No `.part` is left behind on failure.
+    fn create(&mut self, key: UnixMs, head: &[u8]) -> Result<Self::Writer, StoreError>;
+
+    /// Appends `bytes` to the file.
+    ///
+    /// # Errors
+    /// [`StoreError::NoSpace`] or another write failure; the caller then aborts the segment.
+    fn append(&mut self, writer: &mut Self::Writer, bytes: &[u8]) -> Result<(), StoreError>;
+
+    /// Closes the segment: patches the duration in `mvhd` and `mehd` with `pwrite`, fsyncs the
+    /// file, renames `.part` to `.mp4` with `RENAME_NOREPLACE`, and fsyncs the directory. Returns
+    /// the length of the finished file.
+    ///
+    /// # Errors
+    /// Any step failing. Neither `.part` nor `.mp4` is left behind then (best effort).
+    fn commit(&mut self, writer: Self::Writer, patch: &DurationPatch) -> Result<u64, StoreError>;
+
+    /// Throws the segment away: removes the `.part`. Best effort.
+    fn abort(&mut self, writer: Self::Writer);
+
+    /// Moves the finished file of `key` to quarantine (ADR 0005 section 9).
+    ///
+    /// # Errors
+    /// The move failed; the file stays where it is.
+    fn quarantine(&mut self, key: UnixMs) -> Result<(), StoreError>;
+
+    /// Bytes available to the recorder on the volume.
+    ///
+    /// # Errors
+    /// The volume could not be queried.
+    fn available_bytes(&mut self) -> Result<u64, StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io(errno: Errno) -> std::io::Error {
+        std::io::Error::from_raw_os_error(errno.raw_os_error())
+    }
+
+    #[test]
+    fn a_full_volume_and_a_quota_are_no_space_from_a_file_or_a_path_operation() {
+        for e in [Errno::NOSPC, Errno::DQUOT] {
+            assert!(matches!(
+                StoreError::from_io("write", &io(e)),
+                StoreError::NoSpace
+            ));
+            let fs = FsError::Io {
+                op: "mkdir",
+                source: e,
+            };
+            assert!(matches!(StoreError::from_fs(fs), StoreError::NoSpace));
+        }
+    }
+
+    #[test]
+    fn an_existing_name_is_name_taken() {
+        assert!(matches!(
+            StoreError::from_io("write", &io(Errno::EXIST)),
+            StoreError::NameTaken
+        ));
+        let fs = FsError::Io {
+            op: "create file",
+            source: Errno::EXIST,
+        };
+        assert!(matches!(StoreError::from_fs(fs), StoreError::NameTaken));
+    }
+
+    #[test]
+    fn other_failures_keep_their_kind_and_are_not_mistaken_for_a_full_volume() {
+        for e in [
+            Errno::IO,
+            Errno::ACCESS,
+            Errno::ROFS,
+            Errno::FBIG,
+            Errno::NOENT,
+        ] {
+            assert!(matches!(
+                StoreError::from_io("write", &io(e)),
+                StoreError::Io { .. }
+            ));
+            let fs = FsError::Io { op: "x", source: e };
+            assert!(matches!(StoreError::from_fs(fs), StoreError::Fs(_)));
+        }
+        assert!(matches!(
+            StoreError::from_fs(FsError::InvalidComponent),
+            StoreError::Fs(FsError::InvalidComponent)
+        ));
+        let e = std::io::Error::other("no errno");
+        assert!(matches!(
+            StoreError::from_io("fsync", &e),
+            StoreError::Io { op: "fsync", .. }
+        ));
+    }
+
+    #[test]
+    fn no_message_carries_a_path() {
+        for e in [
+            StoreError::NoSpace,
+            StoreError::NameTaken,
+            StoreError::Fs(FsError::NotRegular),
+            StoreError::Io {
+                op: "write",
+                kind: std::io::ErrorKind::Other,
+            },
+        ] {
+            assert!(!e.to_string().contains('/'), "{e}");
+        }
+    }
+}

@@ -1,0 +1,299 @@
+//! The close sequence's failure paths (index retry and quarantine, a full volume, write errors)
+//! and the size limits (hard maximum, fragment cap), against real files and a real index.
+
+#![expect(
+    clippy::unwrap_used,
+    reason = "test code on small synthetic values; a panic is a failure; one table per invariant"
+)]
+
+mod common;
+
+use common::rig::*;
+use common::*;
+use rusqlite::ErrorCode;
+use wardenlens_core::mp4box::{SliceSource, summarize};
+use wardenlens_core::recording::SegmentConfig;
+use wardenlens_index::IndexError;
+use wardenlens_recorder::{ChannelSource, HoldReason, Recorder, RecorderState, StoreError};
+
+fn io_error() -> StoreError {
+    StoreError::Io {
+        op: "write",
+        kind: std::io::ErrorKind::Other,
+    }
+}
+
+/// One 2-frame segment with these insert errors queued, then a graceful stop.
+fn one_segment(
+    errors: Vec<IndexError>,
+    config: wardenlens_recorder::RecorderConfig,
+) -> (Done, u32) {
+    let mut r = Rig::build(config, None, |_, _| {});
+    r.index.lock().unwrap().insert_errors = errors.into();
+    r.start();
+    r.feed(Slice::P);
+    let script = r.index.clone();
+    let d = r.finish();
+    let attempts = script.lock().unwrap().attempts;
+    (d, attempts)
+}
+
+fn transient() -> Vec<fn() -> IndexError> {
+    vec![
+        || IndexError::Busy { op: "insert" },
+        || IndexError::Sqlite {
+            op: "insert",
+            code: Some(ErrorCode::SystemIoFailure),
+        },
+        || IndexError::Sqlite {
+            op: "insert",
+            code: Some(ErrorCode::DiskFull),
+        },
+        || IndexError::Sqlite {
+            op: "insert",
+            code: Some(ErrorCode::OutOfMemory),
+        },
+    ]
+}
+
+fn permanent() -> Vec<fn() -> IndexError> {
+    vec![
+        || IndexError::Duplicate,
+        || IndexError::Constraint { op: "insert" },
+        || IndexError::InvalidRecord { field: "bytes" },
+        || IndexError::Damaged,
+        || IndexError::Sqlite {
+            op: "insert",
+            code: Some(ErrorCode::ReadOnly),
+        },
+        || IndexError::Sqlite {
+            op: "insert",
+            code: None,
+        },
+    ]
+}
+
+#[test]
+fn a_transient_insert_error_is_retried_and_the_segment_is_indexed() {
+    for make in transient() {
+        let (d, attempts) = one_segment(vec![make(), make(), make()], fast());
+        assert_eq!(attempts, 4);
+        assert_eq!(d.end.segments_indexed, 1);
+        assert_eq!(d.rows.len(), 1);
+    }
+}
+
+#[test]
+fn a_transient_error_that_never_ends_stops_at_the_bound_and_keeps_the_file() {
+    for make in transient() {
+        for retries in [0u32, 1, 5] {
+            let config = fast().with_insert_retries(retries, std::time::Duration::ZERO);
+            let (d, attempts) = one_segment((0..20).map(|_| make()).collect(), config);
+            assert_eq!(attempts, retries + 1, "bound {retries}");
+            assert_eq!(d.end.segments_unindexed, 1);
+            assert_eq!(d.end.segments_quarantined, 0);
+            assert_eq!(d.rows.len(), 0);
+            // The finished file stays for the reconciliation pass of the next start.
+            let names = tree(&d.root);
+            assert_eq!(names.len(), 1, "{names:?}");
+            assert!(names[0].contains(".mp4") && !names[0].contains("_quarantine"));
+        }
+    }
+}
+
+#[test]
+fn a_permanent_insert_error_quarantines_the_file_without_a_retry() {
+    for make in permanent() {
+        let (d, attempts) = one_segment(vec![make()], fast());
+        assert_eq!(attempts, 1);
+        assert_eq!(d.end.segments_quarantined, 1);
+        assert_eq!(d.end.segments_indexed, 0);
+        let names = tree(&d.root);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(
+            names[0].starts_with(&format!("_quarantine/cam1/{DAY}/")),
+            "{names:?}"
+        );
+        assert!(names[0].contains(".mp4"));
+    }
+}
+
+#[test]
+fn a_full_volume_when_a_segment_starts_holds_and_retries_once_space_is_back() {
+    let mut r = Rig::new();
+    r.store.lock().unwrap().create_error = Some(StoreError::NoSpace);
+    r.start();
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::StorageFull));
+    assert_eq!(tree(&r.root).len(), 0);
+    r.store.lock().unwrap().available = Some(0);
+    for _ in 0..5 {
+        r.feed(Slice::Idr);
+    }
+    // No space: the store is not asked to create again.
+    assert_eq!(r.store.lock().unwrap().creates, 1);
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::StorageFull));
+    r.store.lock().unwrap().available = Some(1 << 30);
+    r.feed(Slice::Idr);
+    assert_eq!(r.store.lock().unwrap().creates, 2);
+    assert_eq!(r.state(), RecorderState::Recording);
+    r.feed(Slice::P);
+    let d = r.finish();
+    assert_eq!(d.frames(), [2]);
+    assert_eq!(d.end.segments_aborted, 1);
+}
+
+#[test]
+fn a_full_volume_mid_segment_aborts_it_removes_the_part_and_resumes_later() {
+    let mut r = Rig::new();
+    r.start();
+    for _ in 1..20 {
+        r.feed(Slice::P);
+    }
+    {
+        let mut s = r.store.lock().unwrap();
+        s.appends_until_error = Some(0);
+        s.append_error = Some(StoreError::NoSpace);
+        s.available = Some(0);
+    }
+    r.feed(Slice::Idr); // the fragment flush fails
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::StorageFull));
+    assert_eq!(part_files(&r.root).len(), 0);
+    assert_eq!(r.store.lock().unwrap().aborts, 1);
+    for _ in 0..30 {
+        r.feed(Slice::P);
+    }
+    r.feed(Slice::Idr);
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::StorageFull));
+    r.store.lock().unwrap().available = Some(1 << 30);
+    r.feed(Slice::Idr);
+    r.feed(Slice::P);
+    assert_eq!(r.state(), RecorderState::Recording);
+    let d = r.finish();
+    assert_eq!(d.frames(), [2], "only the complete segment is indexed");
+    assert_eq!(d.end.segments_aborted, 1);
+    assert_eq!(tree(&d.root).len(), 1);
+}
+
+#[test]
+fn a_full_volume_while_closing_loses_the_segment_and_leaves_no_file() {
+    let mut r = Rig::new();
+    r.start();
+    r.feed(Slice::P);
+    r.store.lock().unwrap().commit_error = Some(StoreError::NoSpace);
+    let d = r.finish();
+    assert_eq!(d.rows.len(), 0);
+    assert_eq!(tree(&d.root).len(), 0);
+    assert_eq!(d.end.state, RecorderState::Held(HoldReason::StorageFull));
+    assert_eq!(d.end.segments_aborted, 1);
+}
+
+#[test]
+fn another_write_error_aborts_the_segment_and_retries_at_the_next_keyframe() {
+    let mut r = Rig::new();
+    r.start();
+    for _ in 1..20 {
+        r.feed(Slice::P);
+    }
+    {
+        let mut s = r.store.lock().unwrap();
+        s.appends_until_error = Some(0);
+        s.append_error = Some(io_error());
+        s.available = Some(0); // irrelevant: not a full volume
+    }
+    r.feed(Slice::Idr);
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::WriteFailed));
+    assert_eq!(part_files(&r.root).len(), 0);
+    r.feed(Slice::P);
+    r.feed(Slice::Idr);
+    assert_eq!(r.state(), RecorderState::Recording);
+    r.feed(Slice::P);
+    let d = r.finish();
+    assert_eq!(d.frames(), [2]);
+}
+
+#[test]
+fn a_failed_close_for_another_reason_is_a_write_failure() {
+    let mut r = Rig::new();
+    r.start();
+    r.feed(Slice::P);
+    r.store.lock().unwrap().commit_error = Some(io_error());
+    let d = r.finish();
+    assert_eq!(d.end.state, RecorderState::Held(HoldReason::WriteFailed));
+    assert_eq!(tree(&d.root).len(), 0);
+}
+
+#[test]
+fn a_lost_race_for_the_name_takes_the_next_key() {
+    let mut r = Rig::new();
+    r.store.lock().unwrap().create_error = Some(StoreError::NameTaken);
+    r.start();
+    r.feed(Slice::P);
+    r.feed(Slice::Idr);
+    r.feed(Slice::P);
+    let d = r.finish();
+    assert_eq!(d.frames(), [4]);
+    assert_eq!(d.rows[0].record.started_at_ms.as_i64(), T0 + 101);
+}
+
+// ---- size limits ----
+
+#[test]
+fn the_hard_maximum_closes_the_segment_on_the_frame_and_waits_for_a_keyframe() {
+    // Target 10 s, hard maximum 20 s.
+    let config = fast().with_segment(SegmentConfig::new(10, 1 << 30).unwrap());
+    let mut r = Rig::build(config, None, |_, _| {});
+    r.start();
+    for _ in 1..250 {
+        r.feed(Slice::P);
+    }
+    r.feed(Slice::Idr);
+    for _ in 0..4 {
+        r.feed(Slice::P);
+    }
+    let d = r.finish();
+    assert_eq!(d.frames(), [200, 5]);
+    assert_eq!(d.durations(), [20_000, 500]);
+    assert_eq!(d.end.frames_dropped, 50);
+}
+
+#[test]
+fn a_gop_over_the_fragment_cap_is_split_into_fragments_and_stays_valid() {
+    let mut r = Rig::new();
+    r.start();
+    for _ in 0..20 {
+        let s = r.spec(Slice::P).with_size(1 << 20);
+        r.push(&s);
+    }
+    let d = r.finish();
+    let file = d.file(0);
+    let moofs = file.windows(4).filter(|w| *w == b"moof").count();
+    assert_eq!(moofs, 2, "one GOP over 16 MiB is cut once");
+    let sum = summarize(&mut SliceSource(&file)).unwrap();
+    assert_eq!(sum.frame_count, 21);
+    assert_eq!(d.rows[0].record.frame_count, 21);
+    assert_eq!(d.rows[0].record.bytes, u64::try_from(file.len()).unwrap());
+    assert_eq!(d.rows[0].record.duration_ms, sum.duration_ms);
+}
+
+// ---- the channel source ----
+
+#[test]
+fn the_channel_source_ends_the_recording_when_the_sender_is_dropped() {
+    let dir = private_tempdir();
+    let (store, _) = TestStore::new(&hot_root(dir.path()));
+    let (index, _) = TestIndex::open(dir.path());
+    let (recorder, health) = Recorder::new(cam(), fast(), store, index, None).unwrap();
+    let mut feeder = Feeder::new();
+    let frames = stream(&mut feeder, 30, 10, 20);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let producer = std::thread::spawn(move || {
+        for f in frames {
+            tx.blocking_send(f).unwrap();
+        }
+    });
+    let end = recorder.run(ChannelSource::new(rx));
+    producer.join().unwrap();
+    assert_eq!(end.segments_indexed, 1);
+    assert_eq!(health.borrow().segments_indexed, 1);
+    assert_eq!(health.borrow().state, RecorderState::Waiting);
+}
