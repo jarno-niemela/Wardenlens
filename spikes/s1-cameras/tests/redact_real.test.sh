@@ -19,7 +19,7 @@ export WARDENLENS_BIN="$tdir/debug/wardenlens"
 
 PW='Sy:nth/et1c%41-pw'
 export HOME="$fx/home"; mkdir -p "$HOME"; chmod 700 "$HOME"
-unset WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY
+unset WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS XDG_CONFIG_HOME XDG_DATA_HOME BASH_ENV ENV
 "$WARDENLENS_BIN" vault init >/dev/null 2>&1 || { echo "FAIL vault init"; exit 1; }
 printf '192.0.2.44\n' | "$WARDENLENS_BIN" vault set cam:reolink-1:host --kind host >/dev/null 2>&1 || { echo "FAIL set host"; exit 1; }
 printf 'operator-synthetic\n%s\n' "$PW" | "$WARDENLENS_BIN" vault set cam:reolink-1:credential --kind credential >/dev/null 2>&1 || { echo "FAIL set credential"; exit 1; }

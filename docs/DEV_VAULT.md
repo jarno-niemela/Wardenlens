@@ -85,7 +85,7 @@ service key (`/etc/wardenlens/vault.key`) is covered by the deployment docs. Che
 
 Camera display names, hosts, MAC addresses, serials and credentials never go in a script, test, fixture or doc, not
 even a short name the vault scan cannot match (`vault list` marks those `unscannable`). Scripts take inventory ids
-(`reolink-1`, `xr`, ...) or read the value from the vault at runtime (`wardenlens vault get`); tests use clearly
+(`cam-x`, ...) or read the value from the vault at runtime (`wardenlens vault get`); tests use clearly
 synthetic names and documentation addresses. The spike scripts take the ids from `CAMERAS` or list them with
 `cam_ids` (the `cam:<id>:host` entries in the vault). Rewriting git history is human-only, so earlier commits still
 hold the names that #190 removed.

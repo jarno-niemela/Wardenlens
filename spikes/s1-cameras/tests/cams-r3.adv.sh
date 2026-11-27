@@ -2,11 +2,11 @@
 # Round-3 adversarial cases for #190: rtsp_url's path guard, the call sites, and the hermeticity of the spike
 # tests that scripts/gate now runs. Synthetic data only, a temporary HOME, stub vault and stub tools; never contacts
 # a camera and never reads the real vault. FAIL lines are findings.
-# shellcheck disable=SC2016,SC2034,SC1091,SC2329,SC2329
+# shellcheck disable=SC2016,SC2034,SC1091,SC2329
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Hermetic: nothing from the caller reaches the real vault, binary or a camera.
-unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS XDG_CONFIG_HOME XDG_DATA_HOME BASH_ENV ENV
 while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
 fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-cams3.XXXXXX") || exit 1
 trap 'rm -rf "$fx"' EXIT

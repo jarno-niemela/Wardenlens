@@ -7,7 +7,7 @@ set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
 # Hermetic: nothing from the caller reaches the real vault, binary or a camera.
-unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS XDG_CONFIG_HOME XDG_DATA_HOME BASH_ENV ENV
 while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
 fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-cams.XXXXXX") || exit 1
 trap 'rm -rf "$fx"' EXIT
@@ -41,7 +41,7 @@ source "$here/lib.sh"
 check "selected_cams: default lists every vault host id" '[[ $(selected_cams | sort | tr "\n" " ") == "reolink-1 tapo xr " ]]'
 check "selected_cams: CAMERAS picks exactly those ids, in order" '[[ $(CAMERAS="xr tapo" selected_cams | tr "\n" " ") == "xr tapo " ]]'
 check "selected_cams: a display name in CAMERAS is refused" '! CAMERAS="Front Door Cam" selected_cams >/dev/null 2>&1'
-for v in 'xr;touch PWNED' '$(touch PWNED)' '`touch PWNED`' '../xr' 'XR' 'xr:host' '-xr' 'xr_1' $'xr\x01'; do
+for v in 'xr;touch PWNED' '$(touch PWNED)' '`touch PWNED`' '../xr' 'CAM-X' 'Cam-Y1' 'xr:host' '-xr' 'xr_1' $'xr\x01'; do
   check "selected_cams: hostile CAMERAS entry refused, nothing run: $(printf %q "$v")" \
     '( cd "$fx" && ! CAMERAS="$v" selected_cams >/dev/null 2>&1 ) && [[ ! -e $fx/PWNED ]]'
 done

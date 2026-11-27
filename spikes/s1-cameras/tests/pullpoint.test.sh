@@ -4,7 +4,7 @@
 # host (any port) with no userinfo. Pure string checks with TEST-NET-1 addresses; never contacts anything.
 set -uo pipefail
 # Hermetic: nothing from the caller reaches the real vault, binary or a camera.
-unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS XDG_CONFIG_HOME XDG_DATA_HOME BASH_ENV ENV
 while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=../lib.sh

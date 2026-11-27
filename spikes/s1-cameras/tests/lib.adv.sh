@@ -6,7 +6,7 @@
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Hermetic: nothing from the caller reaches the real vault, binary or a camera.
-unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS
+unset WARDENLENS_BIN WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY CAMERAS XDG_CONFIG_HOME XDG_DATA_HOME BASH_ENV ENV
 while read -r v; do unset "$v"; done < <(compgen -e | grep "^ONVIF_" || true)
 fx=$(mktemp -d "${TMPDIR:-/tmp}/s1-adv.XXXXXX") || exit 1
 trap 'rm -rf "$fx"' EXIT
