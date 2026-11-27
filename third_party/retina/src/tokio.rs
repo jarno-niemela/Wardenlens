@@ -121,6 +121,9 @@ pub(crate) struct Connection {
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
 
+    /// Most unfinished data `read_buf` may hold before the connection fails.
+    max_buffered: usize,
+
     /// Write buffer for outgoing messages, appended to by `start_send` and
     /// [`Connection::queue_data`] and drained by `poll_flush`.
     ///
@@ -252,11 +255,17 @@ impl Connection {
                 .max_message_size(max_message_size)
                 .build(),
             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
+            max_buffered: usize::MAX,
             write_buf: BytesMut::new(),
             written: 0,
             write_failed: None,
             write_waiters: Vec::new(),
         }
+    }
+
+    /// Fails the connection once more than `n` bytes of unfinished data are held.
+    pub(crate) fn set_max_buffered(&mut self, n: usize) {
+        self.max_buffered = n;
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {
@@ -507,6 +516,14 @@ impl Stream for Connection {
                         e,
                     ))));
                 }
+            }
+
+            // A peer that never ends an access unit pins everything it sends.
+            if this.read_buf.buffered_len() > this.max_buffered {
+                return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::BufferLimit {
+                    conn_ctx: this.ctx,
+                    limit: this.max_buffered,
+                }))));
             }
 
             // Need more data. Read from the stream into the ring buffer

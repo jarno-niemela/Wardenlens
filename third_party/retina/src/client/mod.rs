@@ -489,6 +489,8 @@ pub struct SessionOptions {
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
     max_message_size: Option<usize>,
+    max_buffered_bytes: Option<usize>,
+    allow_basic_auth: bool,
     receiver_reports: ReceiverReportPolicy,
     bind_addr: Option<std::net::IpAddr>,
     backchannel: bool,
@@ -759,6 +761,32 @@ impl SessionOptions {
     /// See [`ReceiverReportPolicy`].
     pub fn receiver_reports(mut self, policy: ReceiverReportPolicy) -> Self {
         self.receiver_reports = policy;
+        self
+    }
+
+    /// Limits the bytes of unfinished data retina holds for the connection
+    /// (local patch, see ADR 0002).
+    ///
+    /// A peer that sends the packets of one access unit and never ends it makes
+    /// retina keep all of them, so memory grows with what the peer sends. Once
+    /// more than this many bytes (plus up to one read) are held, the session
+    /// fails; see `Error::is_buffer_limit`. Choose more than the largest
+    /// access unit you accept, as RTP headers count too.
+    ///
+    /// There's no limit by default.
+    pub fn max_buffered_bytes(mut self, max_buffered_bytes: usize) -> Self {
+        self.max_buffered_bytes = Some(max_buffered_bytes);
+        self
+    }
+
+    /// Allows answering a Basic-only challenge with the password in the clear
+    /// (local patch, see ADR 0002). Defaults to false.
+    ///
+    /// By default a challenge whose best scheme is Basic fails the session
+    /// before any credentials are sent; see `Error::is_basic_auth_refused`. A
+    /// challenge that also offers Digest is answered with Digest regardless.
+    pub fn allow_basic_auth(mut self, allow: bool) -> Self {
+        self.allow_basic_auth = allow;
         self
     }
 
@@ -1405,6 +1433,26 @@ fn backchannel_require() -> msg::HeaderValue {
         .expect("BACKCHANNEL_REQUIRE is checked to be a valid header value at compile time")
 }
 
+/// Why a `WWW-Authenticate` header was not adopted.
+enum ChallengeError {
+    Unparseable(String),
+    /// The best scheme offered is Basic and `allow_basic_auth` is off.
+    BasicRefused,
+}
+
+/// Parses a `WWW-Authenticate` challenge list. `http-auth` prefers Digest when
+/// both are offered, so only a Basic-only list can come back as Basic.
+fn parse_challenge(
+    header: &str,
+    allow_basic: bool,
+) -> Result<http_auth::PasswordClient, ChallengeError> {
+    let c = http_auth::PasswordClient::try_from(header).map_err(ChallengeError::Unparseable)?;
+    if !allow_basic && matches!(c, http_auth::PasswordClient::Basic(_)) {
+        return Err(ChallengeError::BasicRefused);
+    }
+    Ok(c)
+}
+
 impl RtspConnection {
     async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
         let host =
@@ -1418,6 +1466,10 @@ impl RtspConnection {
         )
         .await
         .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        let mut inner = inner;
+        if let Some(n) = options.max_buffered_bytes {
+            inner.set_max_buffered(n);
+        }
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
@@ -1549,9 +1601,17 @@ impl RtspConnection {
                     })
                 }
                 let www_authenticate: &str = www_authenticate;
-                *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
+                *requested_auth = match parse_challenge(www_authenticate, options.allow_basic_auth)
+                {
                     Ok(c) => Some(c),
-                    Err(e) => bail!(ErrorInt::RtspResponseError {
+                    Err(ChallengeError::BasicRefused) => bail!(ErrorInt::BasicAuthRefused {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status_code,
+                    }),
+                    Err(ChallengeError::Unparseable(e)) => bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
                         msg_ctx,
                         method: req.method().clone(),
@@ -2680,7 +2740,7 @@ impl Session<Playing> {
                         && let Some(h) = response.headers.get("WWW-Authenticate")
                     {
                         let h: &str = h;
-                        match http_auth::PasswordClient::try_from(h) {
+                        match parse_challenge(h, inner.options.allow_basic_auth) {
                             Ok(c) => {
                                 *inner.requested_auth = Some(c);
                                 if !retried {
@@ -2698,7 +2758,10 @@ impl Session<Playing> {
                                     retrying = true;
                                 }
                             }
-                            Err(e) => {
+                            Err(ChallengeError::BasicRefused) => {
+                                warn!("keepalive: Basic authentication refused");
+                            }
+                            Err(ChallengeError::Unparseable(e)) => {
                                 warn!("keepalive: can't understand WWW-Authenticate: {e}");
                             }
                         }

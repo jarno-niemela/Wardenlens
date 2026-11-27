@@ -414,6 +414,14 @@ impl MarkBuf {
         self.ring.capacity()
     }
 
+    /// Bytes the buffer must keep: from the oldest mark (or the unparsed
+    /// position) to the end. This is what a hostile peer grows by sending an
+    /// access unit that never ends; `spare_capacity` reclaims everything else.
+    pub fn buffered_len(&self) -> usize {
+        let floor = self.registry.earliest().unwrap_or(self.unparsed);
+        usize::try_from(self.ring.end().saturating_sub(floor)).unwrap_or(usize::MAX)
+    }
+
     /// Returns data at `[pos, pos+len)` as a [`Split`].
     ///
     /// # Panics

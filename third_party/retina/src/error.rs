@@ -24,9 +24,23 @@ impl Error {
     /// Returns the status code, if the error was generated from a response.
     pub fn status_code(&self) -> Option<u16> {
         match self.0.as_ref() {
-            ErrorInt::RtspResponseError { status, .. } => Some((*status).into()),
+            ErrorInt::RtspResponseError { status, .. }
+            | ErrorInt::BasicAuthRefused { status, .. } => Some((*status).into()),
             _ => None,
         }
+    }
+
+    /// True if the session failed because the peer's only offered
+    /// authentication scheme was Basic and `SessionOptions::allow_basic_auth`
+    /// was not set. No credentials were sent. (Local patch, see ADR 0002.)
+    pub fn is_basic_auth_refused(&self) -> bool {
+        matches!(self.0.as_ref(), ErrorInt::BasicAuthRefused { .. })
+    }
+
+    /// True if the session failed because the peer sent more unfinished data
+    /// than `SessionOptions::max_buffered_bytes`. (Local patch, see ADR 0002.)
+    pub fn is_buffer_limit(&self) -> bool {
+        matches!(self.0.as_ref(), ErrorInt::BufferLimit { .. })
     }
 }
 
@@ -131,6 +145,25 @@ pub(crate) enum ErrorInt {
 
     #[display("Timeout")]
     Timeout,
+
+    /// The peer sent more than `SessionOptions::max_buffered_bytes` that retina must hold
+    /// (an access unit that does not end).
+    #[display("Buffered more than {limit} bytes of unfinished data\n\nconn: {conn_ctx}")]
+    BufferLimit {
+        conn_ctx: ConnectionContext,
+        limit: usize,
+    },
+
+    /// The peer asked for Basic authentication, which is refused unless
+    /// `SessionOptions::allow_basic_auth` is set. No credentials were sent.
+    #[display("Basic authentication refused\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
+    BasicAuthRefused {
+        conn_ctx: ConnectionContext,
+        msg_ctx: RtspMessageContext,
+        method: crate::rtsp::msg::Method,
+        cseq: u32,
+        status: crate::rtsp::msg::StatusCode,
+    },
 
     #[display("Unsupported: {_0}")]
     Unsupported(#[error(not(source))] String),
