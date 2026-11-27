@@ -184,18 +184,20 @@ fn a_reused_inode_of_an_unlinked_index_is_never_refused() {
                     let idx = Index::open(&old.path().join("index.db")).unwrap();
                     // Unlinked while open: its inode is freed by the close in the drop below.
                     std::fs::remove_dir_all(old.path()).unwrap();
-                    let fresh = private_tempdir();
-                    let path = fresh.path().join("index.db");
-                    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+                    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let racer = std::thread::spawn({
-                        let start = std::sync::Arc::clone(&start);
+                        let done = std::sync::Arc::clone(&done);
                         move || {
-                            start.wait();
-                            Index::open(&path).map(drop)
+                            // Fresh files keep taking inode numbers, as the storage tests do.
+                            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                                let fresh = private_tempdir();
+                                Index::open(&fresh.path().join("index.db")).map(drop)?;
+                            }
+                            Ok::<(), IndexError>(())
                         }
                     });
-                    start.wait();
                     drop(idx);
+                    done.store(true, std::sync::atomic::Ordering::Release);
                     let r = racer.join().unwrap();
                     assert!(r.is_ok(), "{r:?}");
                 }
