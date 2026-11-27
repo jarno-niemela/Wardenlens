@@ -1,0 +1,18 @@
+# wardenlens.toml for the container (compose.yaml, docs/deploy.md). Synthetic paths are the in-container mount points.
+# The API listens on all container interfaces; compose publishes the port to ONE host address (WARDENLENS_LAN_ADDR).
+# With `network_mode: host` use a specific LAN address instead and set allow_unspecified_bind = false.
+
+[api]
+listen = "0.0.0.0:8080"
+allow_unspecified_bind = true
+
+[storage]
+hot_root = "/srv/wardenlens/hot"
+archive_root = "/srv/wardenlens/archive"
+
+[database]
+path = "/var/lib/wardenlens/index.db"
+
+[secrets]
+# The compose secret (outside the work tree on the host). Must equal WARDENLENS_VAULT_KEY_FILE in compose.yaml.
+key_file = "/run/secrets/wardenlens_vault_key"
