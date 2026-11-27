@@ -309,7 +309,7 @@ the path and refuses a registered identity **before opening any descriptor of th
 descriptor would drop the first handle's locks); otherwise it opens its own descriptor, `fstat`s it and inserts the key, so a
 symlinked directory or a hard link cannot dodge the check (a name swapped in between the `stat` and the open is caught by the
 `fstat` key; that one descriptor is then parked, not closed, so the first handle keeps its locks, at the price of one leaked descriptor per attempt). A `-shm`, `-wal` or `-journal` path whose base file is registered is refused by the same `stat` step. A file that does not exist yet is created by that open and
-registered from its descriptor. The entry is removed when the `Index` drops, after its descriptor has closed, and on every
+registered from its descriptor. When the `Index` drops, its descriptor closes and then the entry is removed, both under the registry mutex that every open holds (#210: a freed inode reused by a new file must not meet a stale key), and the entry is also removed on every
 error path of `open`. Other processes are still excluded by the `flock` taken during `open`.
 
 **Sidecars and identity (#49 rounds 2 and 3, defect pattern P3).** SQLite replays a hot `-journal` and a `-wal` on the

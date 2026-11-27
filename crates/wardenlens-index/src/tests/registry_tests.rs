@@ -144,3 +144,67 @@ fn sidecar_name_table_beside_a_live_index() {
         }
     }
 }
+
+/// Ticket #210: dropping an `Index` closes its registered descriptor and removes its key under
+/// the registry mutex. While another thread holds that mutex the descriptor must still be open
+/// (the close may not run ahead of the lock), so no open can see a closed-but-registered file.
+#[test]
+fn dropping_an_index_closes_the_descriptor_only_under_the_registry_lock() {
+    let (f, idx) = open_new();
+    assert!(fds_on(&f.path) >= 1);
+    let guard = crate::registry::registry_for_test();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        tx.send(()).unwrap();
+        drop(idx);
+    });
+    rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The connection's own descriptors may close first; the registered one must not.
+    assert!(
+        fds_on(&f.path) >= 1,
+        "the descriptor closed before the registry lock was taken"
+    );
+    drop(guard);
+    t.join().unwrap();
+    assert_eq!(fds_on(&f.path), 0);
+}
+
+/// Ticket #210, the field symptom: a file unlinked before its `Index` drops frees its inode at
+/// the close; a fresh file that reuses the inode must never be refused as already open. Bounded
+/// stress (about a second): threads create, open, unlink, drop and open a fresh file.
+#[test]
+fn a_reused_inode_of_an_unlinked_index_is_never_refused() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                while std::time::Instant::now() < deadline {
+                    let old = private_tempdir();
+                    let idx = Index::open(&old.path().join("index.db")).unwrap();
+                    // Unlinked while open: its inode is freed by the close in the drop below.
+                    std::fs::remove_dir_all(old.path()).unwrap();
+                    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let racer = std::thread::spawn({
+                        let done = std::sync::Arc::clone(&done);
+                        move || {
+                            // Fresh files keep taking inode numbers, as the storage tests do.
+                            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                                let fresh = private_tempdir();
+                                Index::open(&fresh.path().join("index.db")).map(drop)?;
+                            }
+                            Ok::<(), IndexError>(())
+                        }
+                    });
+                    drop(idx);
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                    let r = racer.join().unwrap();
+                    assert!(r.is_ok(), "{r:?}");
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+}

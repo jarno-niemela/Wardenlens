@@ -24,8 +24,10 @@
 //!    closing it would drop the first handle's locks. A failed `fstat` parks it the same way,
 //!    since it cannot be told apart from a registered file.
 //!
-//! The [`Registration`] is dropped after the descriptor it describes ([`Held`] field order), and
-//! on every error path of the open, so the entry never outlives the file handle and never leaks.
+//! [`Held`] closes its descriptor and then removes its key, both while holding the registry
+//! mutex (#210), so no open can see a closed-but-registered file (a freed inode reused by a new
+//! file would be refused). The entry is also removed on every error path of the open, so it never
+//! leaks.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -49,31 +51,43 @@ fn registry() -> MutexGuard<'static, HashSet<Key>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The entry of one open index file; removes it on drop.
-#[derive(Debug)]
-pub(crate) struct Registration {
+/// The index descriptor and its registry entry. Dropping it takes the registry mutex, closes the
+/// descriptor and removes the key, all while holding the lock (#210). Opens hold the same mutex
+/// across their `stat`, open and insert, so none can observe the state "descriptor closed, key
+/// still registered": were the inode freed by that close and reused by a new file, a fresh file
+/// would be refused as already open. The close still comes before the removal, so the key never
+/// disappears while a descriptor of the file is open (another handle could then open it and lose
+/// its POSIX locks at the close). Only `close(2)` runs under the lock.
+pub(crate) struct Held {
+    /// `None` only inside `Drop` and after the test-only `into_file`.
+    file: Option<PrivateFile>,
     key: Key,
 }
 
-impl Drop for Registration {
-    fn drop(&mut self) {
-        registry().remove(&self.key);
-    }
-}
-
-/// The index descriptor and its registration. Field order is the drop order: the descriptor
-/// closes first, then the entry goes.
-pub(crate) struct Held {
-    pub(crate) file: PrivateFile,
-    _registration: Registration,
-}
-
 impl Held {
+    /// The descriptor. It is present for the whole life of the value, so the error is
+    /// unreachable; it exists to keep this path free of panics.
+    pub(crate) fn file(&self) -> Result<&PrivateFile, IndexError> {
+        self.file.as_ref().ok_or(IndexError::Io {
+            op: "using index file",
+            kind: std::io::ErrorKind::Other,
+        })
+    }
+
     /// Test only: releases the registry entry and keeps the descriptor, so a test can stand in
     /// for another process holding the file.
     #[cfg(test)]
-    pub(crate) fn into_file(self) -> PrivateFile {
-        self.file
+    pub(crate) fn into_file(mut self) -> Option<PrivateFile> {
+        self.file.take()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut set = registry();
+        // Close first, key second, both under the lock (see the type's docs).
+        drop(self.file.take());
+        set.remove(&self.key);
     }
 }
 
@@ -151,8 +165,8 @@ pub(crate) fn open_registered(path: &Path) -> Result<Held, IndexError> {
         return Err(IndexError::AlreadyOpenInProcess);
     }
     Ok(Held {
-        file,
-        _registration: Registration { key },
+        file: Some(file),
+        key,
     })
 }
 
