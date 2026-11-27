@@ -45,7 +45,8 @@ pub struct Index {
     // WAL shared lock, so none of them may close while the connection is live.
     conn: Db,
     _lock: FileLock,
-    // Last: the registry entry goes after the descriptor closes.
+    // Last: on drop it closes the descriptor, then removes the registry entry, under the
+    // registry mutex (#210).
     _held: Held,
 }
 
@@ -139,7 +140,7 @@ impl Index {
 pub(crate) struct Foreign {
     _conn: Db,
     _lock: FileLock,
-    _file: wardenlens_fsutil::PrivateFile,
+    _file: Option<wardenlens_fsutil::PrivateFile>,
 }
 
 #[cfg(test)]
