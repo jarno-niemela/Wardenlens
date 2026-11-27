@@ -111,6 +111,29 @@ salvage such a file (section 9) but the format allows it later.
    segment is closed at that frame (a closed fMP4 does not need to end on a GOP boundary), and frames are dropped until
    the next keyframe starts a new segment. The loss is counted as a gap. Also forced: the byte cap `max_segment_bytes`
    (default 1 GiB; 120 s of the highest-bitrate camera is about 130 MB, so this is a sanity bound).
+   **3a. Arrival-span bound (amendment, ticket #103).** The media-time bounds of rules 2 and 3 rely on the camera's RTP
+   clock. A camera whose timestamp freezes or keeps drifting backward is clamped to +1 tick per frame (the `MediaClock`
+   below), so media time hardly advances and neither the target nor the hard maximum is reached. A segment is therefore
+   also bounded by **arrival time**: when the arrival span of a segment, from its first frame to the current frame,
+   reaches **2 x the hard maximum** (240 s with the defaults, 4 x the configured target), the segment is closed by the
+   same mechanism as the hard maximum: a keyframe starts the next segment and closes this one, any other frame closes
+   the segment and is dropped, with frames dropped until the next keyframe (a segment always starts at a keyframe, so
+   there is no "resume mid-GOP"; the loss counts as a gap). The factor 2 leaves a healthy stream untouched: its arrival
+   span tracks its media span, which is cut at 60 s (120 s at the latest) long before. A crash therefore loses at most
+   120 s of a stream with a sound clock and at most 240 s plus one GOP of one with a frozen or drifting clock.
+   - *Clock.* `arrival` is the wall-clock `UnixMs` of the `Clock` trait (#46). Because the wall clock can step, the
+     segmenter does not subtract first from last arrival. It **sums the forward steps** between consecutive frames of
+     the open segment; a step backward adds 0 and the next frame measures from the stepped value. A clock that stalls
+     (equal arrivals) adds 0, so the media-time bounds still apply. A forward step adds its full size, so a step of
+     more than 240 s closes the segment at that frame: a gap that long is a discontinuity anyway, and cutting early
+     only costs a segment boundary. A backward step cannot lengthen a segment more than the forward time that really
+     passed.
+   - *Interaction.* The byte cap, the media-time maximum and the arrival bound are one test (`forced`) per frame:
+     whichever is reached first closes the segment, and a frame closes at most one segment (it is `StartNew` with the
+     old record, or `Drop` with the record, never both).
+   - *`duration_ms`.* It stays the **media** duration (unchanged definition, so the 600 s `CHECK` and the sums of
+     section 2 still hold) and may be far below the arrival span when the bound fires. Consumers needing wall
+     coverage of such a segment have the next segment's `started_at_ms`; no wall duration is stored.
 4. **Fragment** = one GOP. A fragment is also flushed early when it reaches 16 MiB, so no `mdat` approaches the u32
    size limit. A single frame larger than 8 MiB is treated as a stream error (a discontinuity, #57).
 5. A discontinuity (reconnect), an SPS/PPS change (resolution, profile) or a write error closes the segment cleanly
