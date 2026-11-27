@@ -20,9 +20,15 @@
 //!   content or a bad option is 1; a file that cannot be used, or any other failure, is 2. A file
 //!   readable by others draws a warning on stderr; the file is never changed. The buffer is
 //!   zeroised on drop.
-//! * `--dry-run` parses and prints, and touches no file: not the index, not the vault, not the key
-//!   (their statuses are `would import`; whether a camera is new is only known by opening the
-//!   index, which creates files).
+//! * `--dry-run` parses and prints, and writes no byte: not the vault, not the key, and not the
+//!   index. It reads an existing index with `Index::open_read_only` (no migration, no pragma, no
+//!   file created, no lock), so it applies the same row guard as the real run and reports the same
+//!   skips; it keeps the real open's refusals (a stray sidecar, a damaged file). A missing or empty
+//!   index counts as no rows. An index that the real run would first migrate (older schema) or
+//!   recover (a `-wal` with no `-shm`) is not entered: every camera is reported as `would import
+//!   (the real run would first migrate the index ...)` and no row is compared. **The dry run does
+//!   not check the registry capacity** (`MAX_CAMERAS`): a real run that would exceed it fails on
+//!   the row that does.
 //! * A real run needs the key file. A missing file points at `wardenlens secrets init`.
 //! * Per camera, in this order: remove the vault login of an earlier run, write the vault host and
 //!   name, write the new vault login last (none when the file has no login), then the registry
@@ -86,7 +92,7 @@ use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
 use wardenlens_core::time::UnixMs;
 use wardenlens_fsutil::{FsError, is_symlink_refusal, open_regular_nofollow};
-use wardenlens_index::{CameraRecord, Index, IndexError, StoredCamera};
+use wardenlens_index::{CameraRecord, Index, IndexError, ReadOnlyIndex, StoredCamera};
 use wardenlens_secrets::{Credentials, KeyFile, SecretsError};
 use wardenlens_vault::{Scan, Value, Vault, VaultError};
 use zeroize::Zeroizing;
@@ -231,6 +237,8 @@ impl ImportError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Status {
     WouldImport,
+    /// A dry run over an index that the real run would first change.
+    WouldImportAfter(Prelude),
     Imported,
     Updated,
     Skipped(SkipWhy),
@@ -286,6 +294,14 @@ impl Status {
     fn text(&self) -> String {
         match self {
             Self::WouldImport => "would import".to_owned(),
+            Self::WouldImportAfter(Prelude::Migrate) => {
+                "would import (the real run would first migrate the index; existing rows not compared)"
+                    .to_owned()
+            }
+            Self::WouldImportAfter(Prelude::Recover) => {
+                "would import (the real run would first recover the index; existing rows not compared)"
+                    .to_owned()
+            }
             Self::Imported => "imported".to_owned(),
             Self::Updated => "updated".to_owned(),
             Self::Skipped(why) => format!("skipped: {}", why.text()),
@@ -400,17 +416,18 @@ fn agentdvr(
     let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &catalogue, &choice)?;
     rows.extend(parsed.skipped.iter().map(skipped_row));
     if dry_run {
-        let index = open_existing_index(&config)?;
+        let registry = open_for_dry_run(&config)?;
         for r in &ready {
-            let existing = match &index {
-                Some(i) => i
+            let existing = match &registry {
+                Registry::Reader(i) => i
                     .get_camera(&r.draft.id, &catalogue)
                     .map_err(ImportError::Index)?,
-                None => None,
+                Registry::None | Registry::Changes(_) => None,
             };
-            rows.push(match conflict(existing.as_ref(), r) {
-                Some(why) => row_of(&r.draft, None, Status::Skipped(why)),
-                None => row(r, Status::WouldImport),
+            rows.push(match (&registry, conflict(existing.as_ref(), r)) {
+                (_, Some(why)) => row_of(&r.draft, None, Status::Skipped(why)),
+                (Registry::Changes(p), None) => row(r, Status::WouldImportAfter(*p)),
+                _ => row(r, Status::WouldImport),
             });
         }
     } else {
@@ -421,16 +438,40 @@ fn agentdvr(
     print_table(&rows, &mut io::stdout().lock()).map_err(ImportError::Output)
 }
 
-/// The index at `database.path`, or none when the file does not exist (nothing is created).
-fn open_existing_index(config: &Config) -> Result<Option<Index>, ImportError> {
-    if std::fs::symlink_metadata(config.database_path())
-        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-    {
-        return Ok(None);
+/// What the dry run knows of the registry (see [`open_for_dry_run`]).
+enum Registry {
+    /// No index yet (a missing or zero-length file): the real run creates it.
+    None,
+    /// The index, opened read-only.
+    Reader(ReadOnlyIndex),
+    /// The real run would first change the index, so no row is compared.
+    Changes(Prelude),
+}
+
+/// What the real run does to the index before it writes a row, which a read-only dry run only
+/// reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Prelude {
+    /// An older schema: migrated first.
+    Migrate,
+    /// An unrecovered `-wal`: recovered first.
+    Recover,
+}
+
+/// Opens the registry for the dry run with [`Index::open_read_only`]: it writes nothing (no
+/// migration, no pragma, no file, no lock), so a dry run leaves the state directory byte-identical
+/// whatever it finds. It keeps the real open's refusals (a stray sidecar, a bad owner or mode, a
+/// damaged file), which are errors here as in the real run. States the real run would change first
+/// are reported, not entered.
+fn open_for_dry_run(config: &Config) -> Result<Registry, ImportError> {
+    match Index::open_read_only(config.database_path()) {
+        Ok(r) => Ok(Registry::Reader(r)),
+        Err(IndexError::Fs(e)) if e.is_not_found() => Ok(Registry::None),
+        Err(IndexError::Uninitialised) => Ok(Registry::None),
+        Err(IndexError::NeedsMigration) => Ok(Registry::Changes(Prelude::Migrate)),
+        Err(IndexError::NeedsRecovery) => Ok(Registry::Changes(Prelude::Recover)),
+        Err(e) => Err(ImportError::Index(e)),
     }
-    Index::open(config.database_path())
-        .map(Some)
-        .map_err(ImportError::Index)
 }
 
 /// Why the row that the registry holds must be left alone, if so (see the module docs): it is
@@ -1577,14 +1618,14 @@ key_file = "/srv/wl/keys/secrets.key"
         }
     }
 
-    /// The dry run reads an existing index and reports the same skip as the real run; with no
-    /// index it creates none.
+    /// The dry run reads an existing index read-only and reports the same skip as the real run;
+    /// with no index, or an empty file, it creates and changes nothing.
     #[test]
-    fn a_dry_run_opens_an_existing_index_and_creates_none() {
+    fn a_dry_run_reads_an_existing_index_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         make_dirs(dir.path());
         let config = site_config(dir.path());
-        assert!(open_existing_index(&config).unwrap().is_none());
+        assert!(matches!(open_for_dry_run(&config), Ok(Registry::None)));
         assert!(!config.database_path().exists());
         let cat = catalogue();
         let d = one_draft("/stream1");
@@ -1594,12 +1635,33 @@ key_file = "/srv/wl/keys/secrets.key"
         };
         let key = KeyFile::generate(config.key_file()).unwrap();
         write_all(&config, key, &[mk(model("acme", "c1"))], &cat).unwrap();
-        let index = open_existing_index(&config).unwrap().unwrap();
+        let before = dir_bytes(dir.path());
+        let Ok(Registry::Reader(index)) = open_for_dry_run(&config) else {
+            panic!("not a reader");
+        };
         let existing = index.get_camera(&d.id, &cat).unwrap();
         assert!(conflict(existing.as_ref(), &mk(model("acme", "c2"))).is_some());
         assert!(conflict(existing.as_ref(), &mk(default_model().unwrap())).is_some());
         assert!(conflict(existing.as_ref(), &mk(model("acme", "c1"))).is_none());
         assert!(conflict(None, &mk(model("acme", "c1"))).is_none());
+        drop(index);
+        assert_eq!(dir_bytes(dir.path()), before);
+    }
+
+    /// Name and bytes of every file under `dir`, recursively.
+    fn dir_bytes(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(dir_bytes(&p));
+            } else {
+                let b = std::fs::read(&p).unwrap();
+                out.push((p, b));
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
@@ -1646,5 +1708,48 @@ key_file = "/srv/wl/keys/secrets.key"
         assert_eq!(sorted.len(), texts.len(), "{texts:?}");
         assert!(texts[0].contains("entry 3"));
         assert!(texts[3].contains("acme/c1") && texts[5].contains("acme/c1"));
+    }
+
+    /// Every id the parser produces starts with the prefix that `camera add` refuses, whatever
+    /// the entry's `id` attribute is (numeric, duplicate, missing, not a number, hostile).
+    #[test]
+    fn every_parser_id_has_the_reserved_prefix() {
+        let cam = |attrs: &str, n: u32| {
+            format!(
+                "<camera {attrs} name=\"Cam {n}\"><settings><videosourcestring>\
+                 rtsp://192.0.2.{n}/s</videosourcestring></settings></camera>"
+            )
+        };
+        let xml = format!(
+            "<objects><cameras>{}</cameras></objects>",
+            [
+                cam("id=\"1\"", 1),
+                cam("id=\"1\"", 2),
+                cam("", 3),
+                cam("id=\"x\"", 4),
+                cam("id=\"-5\"", 5),
+                cam("id=\"99999999999999\"", 6),
+                cam("id=\"../etc\"", 7),
+                cam("id=\"\"", 8),
+            ]
+            .concat()
+        );
+        let parsed = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
+        assert!(parsed.cameras.len() >= 4, "{}", parsed.cameras.len());
+        for d in &parsed.cameras {
+            assert!(
+                d.id.as_str().starts_with(RESERVED_ID_PREFIX),
+                "{} does not start with the reserved prefix",
+                d.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_over_an_index_the_real_run_changes_first_says_so() {
+        for (p, word) in [(Prelude::Migrate, "migrate"), (Prelude::Recover, "recover")] {
+            let t = Status::WouldImportAfter(p).text();
+            assert!(t.starts_with("would import") && t.contains(word), "{t}");
+        }
     }
 }

@@ -107,6 +107,11 @@ pub(crate) enum ImportCommand {
     /// query is skipped. A path that several models list is skipped, never guessed. Cameras
     /// removed from the file are not removed from the registry or the vault (use
     /// `wardenlens camera remove`).
+    ///
+    /// The `agentdvr-` id prefix is reserved for this command (`camera add` refuses it). An install that
+    /// hand-added `agentdvr-*` cameras before this release should remove or rename them before
+    /// importing: the registry cannot tell them from imported ones, and a re-import replaces their
+    /// host, name, login and main path.
     Agentdvr {
         /// The `objects.xml` to read.
         file: PathBuf,
@@ -118,7 +123,8 @@ pub(crate) enum ImportCommand {
         /// example `agentdvr-3=vendor/model`. Repeatable.
         #[arg(long, value_name = "ID=VENDOR/MODEL")]
         camera_model: Vec<String>,
-        /// Parse and print what would be done; write nothing (the key file is not read).
+        /// Parse and print what would be done; write nothing (the key file is not read, the index is
+        /// only read).
         #[arg(long)]
         dry_run: bool,
     },

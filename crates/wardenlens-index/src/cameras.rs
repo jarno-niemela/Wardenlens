@@ -193,6 +193,38 @@ fn path_col(
     vet_path(field, model, catalogue, text)
 }
 
+pub(crate) fn get_camera(
+    conn: &crate::sql::Db,
+    id: &CameraId,
+    catalogue: &[CatalogueEntry],
+) -> Result<Option<StoredCamera>, IndexError> {
+    let mut stmt = sql::prepare(conn, sql::GET_CAMERA).map_err(IndexError::sqlite("get camera"))?;
+    let mut rows = stmt
+        .query([id.as_str()])
+        .map_err(IndexError::sqlite("get camera"))?;
+    match rows.next().map_err(IndexError::sqlite("get camera"))? {
+        Some(row) => decode(row, catalogue).map(Some),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn list_cameras(
+    conn: &crate::sql::Db,
+    catalogue: &[CatalogueEntry],
+) -> Result<Vec<StoredCamera>, IndexError> {
+    let limit = i64::try_from(MAX_CAMERAS).unwrap_or(i64::MAX);
+    let mut stmt =
+        sql::prepare(conn, sql::LIST_CAMERAS).map_err(IndexError::sqlite("list cameras"))?;
+    let mut rows = stmt
+        .query([limit])
+        .map_err(IndexError::sqlite("list cameras"))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(IndexError::sqlite("list cameras"))? {
+        out.push(decode(row, catalogue)?);
+    }
+    Ok(out)
+}
+
 /// Decodes the column list of `sql::GET_CAMERA` and `sql::LIST_CAMERAS`.
 fn decode(
     row: &rusqlite::Row<'_>,
@@ -336,15 +368,7 @@ impl Index {
         id: &CameraId,
         catalogue: &[CatalogueEntry],
     ) -> Result<Option<StoredCamera>, IndexError> {
-        let mut stmt =
-            sql::prepare(&self.conn, sql::GET_CAMERA).map_err(IndexError::sqlite("get camera"))?;
-        let mut rows = stmt
-            .query([id.as_str()])
-            .map_err(IndexError::sqlite("get camera"))?;
-        match rows.next().map_err(IndexError::sqlite("get camera"))? {
-            Some(row) => decode(row, catalogue).map(Some),
-            None => Ok(None),
-        }
+        get_camera(&self.conn, id, catalogue)
     }
 
     /// Every camera, ordered by id (at most [`MAX_CAMERAS`] rows). One bad row fails the call.
@@ -355,17 +379,7 @@ impl Index {
         &self,
         catalogue: &[CatalogueEntry],
     ) -> Result<Vec<StoredCamera>, IndexError> {
-        let limit = i64::try_from(MAX_CAMERAS).unwrap_or(i64::MAX);
-        let mut stmt = sql::prepare(&self.conn, sql::LIST_CAMERAS)
-            .map_err(IndexError::sqlite("list cameras"))?;
-        let mut rows = stmt
-            .query([limit])
-            .map_err(IndexError::sqlite("list cameras"))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(IndexError::sqlite("list cameras"))? {
-            out.push(decode(row, catalogue)?);
-        }
-        Ok(out)
+        list_cameras(&self.conn, catalogue)
     }
 
     /// Removes the registry row of `id`; `true` when there was one. **Segments are not touched**:

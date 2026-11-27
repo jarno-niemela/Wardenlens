@@ -162,6 +162,22 @@ pub fn open_private_file(path: &Path) -> Result<PrivateFile, FsError> {
     })
 }
 
+/// Like [`open_private_file`] but never creates: a missing file is the `open` error with
+/// [`FsError::is_not_found`] true. The same checks (regular, owner, mode, `O_NOFOLLOW`).
+///
+/// # Errors
+/// As [`open_private_file`], and not found.
+pub fn open_existing_private_file(path: &Path) -> Result<PrivateFile, FsError> {
+    let fd = open_existing(path).map_err(FsError::io("open"))?;
+    let st = fstat(&fd).map_err(FsError::io("fstat"))?;
+    check_stat(&st)?;
+    Ok(PrivateFile {
+        file: File::from(fd),
+        identity: FileIdentity::of(&st),
+        created: false,
+    })
+}
+
 fn open_existing(path: &Path) -> Result<rustix::fd::OwnedFd, Errno> {
     // O_NONBLOCK so that a planted FIFO cannot block the open; fstat then rejects it.
     openat(

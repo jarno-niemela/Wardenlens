@@ -267,3 +267,65 @@ fn a_directory_as_input_is_refused_as_not_a_regular_file() {
         text(&out.stderr)
     );
 }
+
+/// Every byte under `dir`, by path, sidecars included.
+fn bytes_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(bytes_under(&p));
+        } else {
+            out.push((p.clone(), fs::read(&p).unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn a_dry_run_writes_no_byte_over_an_index_a_zero_length_file_or_none() {
+    let (model, _) = listed_query_path();
+    let site = Site::new();
+    let file = site.xml(&[(1, "/a")]);
+    // No index at all.
+    let before = bytes_under(site.dir.path());
+    assert!(site.import(&file, &["--dry-run"]).status.success());
+    assert_eq!(bytes_under(site.dir.path()), before);
+    // A zero-length file: the real run formats it; the dry run leaves it empty.
+    let index = site.p("state/index.db");
+    fs::write(&index, b"").unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = bytes_under(site.dir.path());
+    let out = site.import(&file, &["--dry-run"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("would import"));
+    assert_eq!(bytes_under(site.dir.path()), before);
+    assert_eq!(fs::metadata(&index).unwrap().len(), 0);
+    // A current-schema index with a row, in every conflict state.
+    assert!(site.import(&file, &["--model", &model]).status.success());
+    let before = bytes_under(site.dir.path());
+    for extra in [vec!["--dry-run"], vec!["--dry-run", "--model", &model]] {
+        let out = site.import(&file, &extra);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(bytes_under(site.dir.path()), before, "{extra:?}");
+    }
+}
+
+/// A sidecar that the real open refuses is refused the same way by the dry run (same message,
+/// same exit code), with nothing written.
+#[test]
+fn a_dry_run_refuses_a_bad_sidecar_exactly_as_the_real_run_does() {
+    let site = Site::new();
+    let file = site.xml(&[(1, "/a")]);
+    let wal = site.p("state/index.db-wal");
+    fs::write(&wal, b"not a wal").unwrap();
+    fs::set_permissions(&wal, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = bytes_under(&site.p("state"));
+    let dry = site.import(&file, &["--dry-run"]);
+    assert_eq!(bytes_under(&site.p("state")), before);
+    let real = site.import(&file, &[]);
+    assert_eq!(dry.status.code(), Some(2), "{}", text(&dry.stderr));
+    assert_eq!(dry.status.code(), real.status.code());
+    assert_eq!(text(&dry.stderr), text(&real.stderr));
+}

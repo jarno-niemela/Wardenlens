@@ -124,6 +124,24 @@ pub enum IndexError {
         "the index's -wal and -shm kept changing while it was opened (another process was closing it); nothing was modified; try again"
     )]
     SidecarsChanging,
+    /// [`crate::Index::open_read_only`]: the file has zero length. The read-write open would
+    /// format it; the read-only open never writes, so it reports it.
+    #[error(
+        "the index file is empty; the read-write open would initialise it; nothing was modified"
+    )]
+    Uninitialised,
+    /// [`crate::Index::open_read_only`]: the schema is older than this build's. The read-write
+    /// open would migrate it first (a one-way step); the read-only open never does.
+    #[error(
+        "the index schema is older than this build's; the read-write open would migrate it first; nothing was modified"
+    )]
+    NeedsMigration,
+    /// [`crate::Index::open_read_only`]: a `-wal` holds data and no `-shm` exists, so reading
+    /// would create the `-shm`. The read-write open would recover it first.
+    #[error(
+        "the index has an unrecovered -wal; the read-write open would recover it first; nothing was modified"
+    )]
+    NeedsRecovery,
     /// The schema (every `sqlite_master` row) is not the one of its `user_version`.
     #[error(
         "index schema differs from its version; nothing was modified; keep the file and restore a backup, or move it aside (the index can be rebuilt from the recordings)"
