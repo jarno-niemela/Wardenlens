@@ -39,6 +39,12 @@ const MAX_RTSP_MESSAGE_BYTES: usize = 256 * 1024;
 /// section 13.
 const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 
+/// Most NALs in one access unit. Real cameras send a handful (slices, SEI, parameter sets). retina
+/// keeps 28 bytes of metadata per NAL however short it is, which `MAX_BUFFERED_BYTES` does not
+/// see (a 2-byte NAL costs 4 ring bytes), so this bounds that metadata to well under 1 MiB. More
+/// fails the session. Needs the patched retina of ADR 0002 section 13.
+pub const MAX_NALS_PER_ACCESS_UNIT: usize = 4096;
+
 /// What `select_video_stream` needs to know about one SDP media section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamInfo<'a> {
@@ -222,6 +228,7 @@ async fn open_session(
     let stream_i = select_video_stream(&infos)?;
     drop(infos);
     let setup = SetupOptions::default()
+        .max_nals_per_access_unit(MAX_NALS_PER_ACCESS_UNIT)
         .transport(Transport::Tcp(TcpTransportOptions::default()))
         .frame_format(FrameFormat::MP4);
     session

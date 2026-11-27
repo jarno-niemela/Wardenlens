@@ -311,8 +311,12 @@ Option 2.
     its RTP headers, still passes, and an oversize one is still dropped and counted. Residual: the limit is on the
     ring's data, not on the ring. The ring grows to the next power of two, so it stays at or under 16 MiB per
     session (that is why the limit is 64 KiB short of 16 MiB: a read of up to 4 KiB must not tip it to 32 MiB);
-    while a frame is handed over, retina also copies it, so the peak is about twice that (up to about 32 MiB), plus
-    the depacketizer's piece metadata. Not 8 MiB.
+    while a frame is handed over, retina also copies it, so the peak is about twice that (up to about 32 MiB). The
+    depacketizer also keeps 12 bytes per NAL and 16 per piece however short they are, which the byte limit does not
+    see (a STAP-A of 2-byte NALs is 4 ring bytes and 28 metadata bytes per NAL: about 127 MiB per session before this
+    was bounded). The retina change therefore also fails the session when one access unit has more than 4096 NALs (or
+    65536 pieces, which fragmented NALs add), so that metadata stays under about 1.5 MiB. Real cameras send a handful
+    of NALs per access unit. The worst case per session is thus about 32 MiB, not 8 MiB.
 13. **Vendored, patched `retina` 0.4.22 (#155).** Cargo cannot narrow the `basic-scheme` feature of `http-auth`
     (features are additive and retina enables the defaults), and retina has no option for either problem, so the
     workspace carries a patched copy through `[patch.crates-io]` (`third_party/retina`, excluded from the
@@ -320,9 +324,11 @@ Option 2.
     `0d28bd1d1f3c477d6a98ae9f62862e505124da7b71575a8d351cefd7b1cbfc55` (from `Cargo.lock`), upstream commit
     `2b6b7fe0a6f6a5bf69d5e9c8d4fd785ccd090873` (`.cargo_vcs_info.json`). The first commit of #155 is the package
     unmodified; the second is the patch, kept also as `third_party/retina-0.4.22.patch` (a `diff -ru` against the
-    package, 4 files, about 100 added lines, no new dependency). The pristine copy leaves out the package's `Cargo.lock`. It adds:
+    package, 6 files, about 180 added lines, no new dependency). The pristine copy leaves out the package's `Cargo.lock`. It adds:
     - `SessionOptions::max_buffered_bytes(n)`: the connection fails (`Error::is_buffer_limit`) once the read ring must
-      keep more than `n` bytes (from the oldest pinned packet to the end). `wardenlens-ingest` sets 16 MiB.
+      keep more than `n` bytes (from the oldest pinned packet to the end). `wardenlens-ingest` sets just under 16 MiB.
+    - `SetupOptions::max_nals_per_access_unit(n)`: an H.264 access unit with more than `n` NALs, or `16 * n` pieces,
+      fails the session. `wardenlens-ingest` sets 4096 (`MAX_NALS_PER_ACCESS_UNIT`).
     - `SessionOptions::allow_basic_auth(bool)`, default false: a `WWW-Authenticate` list whose best scheme is Basic
       (`http-auth` prefers Digest when both are offered) fails the session with `Error::is_basic_auth_refused`
       before any credentials are sent. At the first challenge this fails the session. A Basic re-challenge at a

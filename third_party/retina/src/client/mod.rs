@@ -834,9 +834,23 @@ impl SessionOptions {
 pub struct SetupOptions {
     transport: Transport,
     frame_format: Option<crate::codec::FrameFormat>,
+    max_nals_per_access_unit: Option<usize>,
 }
 
 impl SetupOptions {
+    /// Limits the NALs in one H.264 access unit (local patch, see ADR 0002).
+    ///
+    /// Each NAL costs 12 bytes of depacketizer metadata and each piece 16,
+    /// however short, so a flood of tiny NALs costs several times its bytes
+    /// and `SessionOptions::max_buffered_bytes` does not see it. An access unit
+    /// with more than `n` NALs (or more than `16 * n` pieces, which a
+    /// fragmented NAL adds) fails the session. No limit by default.
+    #[inline]
+    pub fn max_nals_per_access_unit(mut self, n: usize) -> Self {
+        self.max_nals_per_access_unit = Some(n);
+        self
+    }
+
     /// Sets the underlying transport to use.
     #[inline]
     pub fn transport(mut self, transport: Transport) -> Self {
@@ -2110,6 +2124,11 @@ impl Session<Described> {
             && let Ok(d) = &mut stream.depacketizer
         {
             d.set_frame_format(format);
+        }
+        if let Some(n) = options.max_nals_per_access_unit
+            && let Ok(d) = &mut stream.depacketizer
+        {
+            d.set_max_nals(n);
         }
         if sending {
             *inner.flags |= SessionFlag::Backchannel as u8;

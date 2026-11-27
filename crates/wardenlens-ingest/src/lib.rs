@@ -13,7 +13,7 @@
 //! Everything a camera sends is untrusted: nothing here panics and errors carry no camera data
 //! (see [`IngestError`]). The 8 MiB frame cap ([`MAX_FRAME_BYTES`]) applies to a frame after
 //! retina has assembled it; the assembly itself is bounded by the patched retina of ADR 0002 section 13
-//! (the session fails once retina holds 16 MiB of unfinished data). The same patch refuses a Basic-only
+//! (the session fails once retina holds just under 16 MiB of unfinished data). The same patch refuses a Basic-only
 //! authentication challenge unless [`OpenOptions::allow_basic_auth`] is set. The crate does not log.
 //! retina logs through the `log` facade and some of its records (for example the unassigned-channel
 //! warning) include peer addresses, so the binary caps the `retina` target at `error` (`logging.rs`).
@@ -32,8 +32,8 @@ pub use frame::{
     MAX_PARAM_SET_BYTES, MapError, RawParams, RawVideoFrame, contains_b_slice,
 };
 pub use session::{
-    FRAME_TIMEOUT, FrameStream, OPEN_TIMEOUT, OpenOptions, StreamInfo, open_stream,
-    open_stream_with, select_video_stream,
+    FRAME_TIMEOUT, FrameStream, MAX_NALS_PER_ACCESS_UNIT, OPEN_TIMEOUT, OpenOptions, StreamInfo,
+    open_stream, open_stream_with, select_video_stream,
 };
 pub use sps::{NoReorderReason, ReorderVerdict, SpsError, SpsSummary, parse_sps, sps_reordering};
 pub use supervisor::{

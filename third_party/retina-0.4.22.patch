@@ -66,7 +66,31 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
      fn get_max_message_size(&self) -> usize {
          self.max_message_size.unwrap_or(usize::MAX)
      }
-@@ -1405,6 +1438,26 @@
+@@ -801,9 +834,23 @@
+ pub struct SetupOptions {
+     transport: Transport,
+     frame_format: Option<crate::codec::FrameFormat>,
++    max_nals_per_access_unit: Option<usize>,
+ }
+ 
+ impl SetupOptions {
++    /// Limits the NALs in one H.264 access unit (local patch, see ADR 0002).
++    ///
++    /// Each NAL costs 12 bytes of depacketizer metadata and each piece 16,
++    /// however short, so a flood of tiny NALs costs several times its bytes
++    /// and `SessionOptions::max_buffered_bytes` does not see it. An access unit
++    /// with more than `n` NALs (or more than `16 * n` pieces, which a
++    /// fragmented NAL adds) fails the session. No limit by default.
++    #[inline]
++    pub fn max_nals_per_access_unit(mut self, n: usize) -> Self {
++        self.max_nals_per_access_unit = Some(n);
++        self
++    }
++
+     /// Sets the underlying transport to use.
+     #[inline]
+     pub fn transport(mut self, transport: Transport) -> Self {
+@@ -1405,6 +1452,26 @@
          .expect("BACKCHANNEL_REQUIRE is checked to be a valid header value at compile time")
  }
  
@@ -93,7 +117,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
  impl RtspConnection {
      async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
          let host =
-@@ -1418,6 +1471,10 @@
+@@ -1418,6 +1485,10 @@
          )
          .await
          .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
@@ -104,7 +128,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
          Ok(Self {
              inner,
              channels: ChannelMappings::default(),
-@@ -1549,9 +1606,17 @@
+@@ -1549,9 +1620,17 @@
                      })
                  }
                  let www_authenticate: &str = www_authenticate;
@@ -124,7 +148,19 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
                          conn_ctx: *self.inner.ctx(),
                          msg_ctx,
                          method: req.method().clone(),
-@@ -2680,7 +2745,7 @@
+@@ -2046,6 +2125,11 @@
+         {
+             d.set_frame_format(format);
+         }
++        if let Some(n) = options.max_nals_per_access_unit
++            && let Ok(d) = &mut stream.depacketizer
++        {
++            d.set_max_nals(n);
++        }
+         if sending {
+             *inner.flags |= SessionFlag::Backchannel as u8;
+         }
+@@ -2680,7 +2764,7 @@
                          && let Some(h) = response.headers.get("WWW-Authenticate")
                      {
                          let h: &str = h;
@@ -133,7 +169,7 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
                              Ok(c) => {
                                  *inner.requested_auth = Some(c);
                                  if !retried {
-@@ -2698,7 +2763,10 @@
+@@ -2698,7 +2782,10 @@
                                      retrying = true;
                                  }
                              }
@@ -145,6 +181,107 @@ diff -ru a/src/client/mod.rs b/src/client/mod.rs
                                  warn!("keepalive: can't understand WWW-Authenticate: {e}");
                              }
                          }
+diff -ru a/src/codec/h264.rs b/src/codec/h264.rs
+--- a/src/codec/h264.rs
++++ b/src/codec/h264.rs
+@@ -118,6 +118,11 @@
+ 
+     /// Output format controlling NAL framing and parameter set insertion.
+     frame_format: super::FrameFormat,
++
++    /// Most NALs one access unit may have; more is an error. Each NAL costs 12
++    /// bytes of `nals` and at least 16 of `pieces`, whatever its length.
++    /// (Local patch, see ADR 0002.)
++    max_nals: usize,
+ }
+ 
+ #[derive(Debug)]
+@@ -170,6 +175,7 @@
+     pieces: &'a mut Vec<BufRange>,
+     nals: &'a mut Vec<Nal>,
+     in_progress: &'a mut Option<InProgressNal>,
++    max_nals: usize,
+ }
+ 
+ impl super::h26x::NalHandler for H264NalHandler<'_> {
+@@ -192,6 +198,9 @@
+             .as_mut()
+             .ok_or_else(|| "piece without start".to_string())?;
+         ip.pieces_bytes += usize::from(piece.len);
++        if self.pieces.len() >= self.max_nals.saturating_mul(16) {
++            return Err("too many pieces in one access unit".to_string());
++        }
+         self.pieces.push(piece);
+         Ok(())
+     }
+@@ -201,6 +210,9 @@
+             .in_progress
+             .take()
+             .ok_or_else(|| "end without start".to_string())?;
++        if self.nals.len() >= self.max_nals {
++            return Err("too many NALs in one access unit".to_string());
++        }
+         self.nals.push(Nal {
+             hdr: ip.hdr,
+             next_piece_idx: u32::try_from(self.pieces.len())
+@@ -318,9 +330,15 @@
+             seen_inconsistent_fu_a_nal_hdr: false,
+             seen_single_fragment_fu_a: false,
+             frame_format: Default::default(),
++            max_nals: usize::MAX,
+         })
+     }
+ 
++    /// Limits the NALs (and, at 16 times that, the pieces) of one access unit.
++    pub(super) fn set_max_nals(&mut self, n: usize) {
++        self.max_nals = n;
++    }
++
+     /// Sets the frame format for output assembly.
+     ///
+     /// If existing parameters were parsed with a different framing, they are
+@@ -599,6 +617,7 @@
+                                 pieces: &mut self.pieces,
+                                 nals: &mut self.nals,
+                                 in_progress: &mut fu_a.in_progress,
++                                max_nals: self.max_nals,
+                             },
+                         )?;
+                         if !end {
+@@ -624,6 +643,7 @@
+                                 pieces: &mut self.pieces,
+                                 nals: &mut self.nals,
+                                 in_progress: &mut fu_a.in_progress,
++                                max_nals: self.max_nals,
+                             },
+                         )?;
+                         if !end {
+@@ -695,6 +715,7 @@
+                 pieces: &mut self.pieces,
+                 nals: &mut self.nals,
+                 in_progress: &mut in_progress,
++                max_nals: self.max_nals,
+             },
+         )
+     }
+diff -ru a/src/codec/mod.rs b/src/codec/mod.rs
+--- a/src/codec/mod.rs
++++ b/src/codec/mod.rs
+@@ -965,6 +965,14 @@
+         }
+     }
+ 
++    /// Limits the NALs per access unit (H.264 only; local patch, see ADR 0002).
++    #[doc(hidden)]
++    pub fn set_max_nals(&mut self, n: usize) {
++        if let DepacketizerInner::H264(d) = &mut self.0 {
++            d.set_max_nals(n);
++        }
++    }
++
+     /// Sets the frame format for output assembly.
+     ///
+     /// Controls H.26x NAL framing (length-prefixed vs Annex B) and parameter
 diff -ru a/src/error.rs b/src/error.rs
 --- a/src/error.rs
 +++ b/src/error.rs

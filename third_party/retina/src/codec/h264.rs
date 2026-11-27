@@ -118,6 +118,11 @@ pub(crate) struct Depacketizer {
 
     /// Output format controlling NAL framing and parameter set insertion.
     frame_format: super::FrameFormat,
+
+    /// Most NALs one access unit may have; more is an error. Each NAL costs 12
+    /// bytes of `nals` and at least 16 of `pieces`, whatever its length.
+    /// (Local patch, see ADR 0002.)
+    max_nals: usize,
 }
 
 #[derive(Debug)]
@@ -170,6 +175,7 @@ struct H264NalHandler<'a> {
     pieces: &'a mut Vec<BufRange>,
     nals: &'a mut Vec<Nal>,
     in_progress: &'a mut Option<InProgressNal>,
+    max_nals: usize,
 }
 
 impl super::h26x::NalHandler for H264NalHandler<'_> {
@@ -192,6 +198,9 @@ impl super::h26x::NalHandler for H264NalHandler<'_> {
             .as_mut()
             .ok_or_else(|| "piece without start".to_string())?;
         ip.pieces_bytes += usize::from(piece.len);
+        if self.pieces.len() >= self.max_nals.saturating_mul(16) {
+            return Err("too many pieces in one access unit".to_string());
+        }
         self.pieces.push(piece);
         Ok(())
     }
@@ -201,6 +210,9 @@ impl super::h26x::NalHandler for H264NalHandler<'_> {
             .in_progress
             .take()
             .ok_or_else(|| "end without start".to_string())?;
+        if self.nals.len() >= self.max_nals {
+            return Err("too many NALs in one access unit".to_string());
+        }
         self.nals.push(Nal {
             hdr: ip.hdr,
             next_piece_idx: u32::try_from(self.pieces.len())
@@ -318,7 +330,13 @@ impl Depacketizer {
             seen_inconsistent_fu_a_nal_hdr: false,
             seen_single_fragment_fu_a: false,
             frame_format: Default::default(),
+            max_nals: usize::MAX,
         })
+    }
+
+    /// Limits the NALs (and, at 16 times that, the pieces) of one access unit.
+    pub(super) fn set_max_nals(&mut self, n: usize) {
+        self.max_nals = n;
     }
 
     /// Sets the frame format for output assembly.
@@ -599,6 +617,7 @@ impl Depacketizer {
                                 pieces: &mut self.pieces,
                                 nals: &mut self.nals,
                                 in_progress: &mut fu_a.in_progress,
+                                max_nals: self.max_nals,
                             },
                         )?;
                         if !end {
@@ -624,6 +643,7 @@ impl Depacketizer {
                                 pieces: &mut self.pieces,
                                 nals: &mut self.nals,
                                 in_progress: &mut fu_a.in_progress,
+                                max_nals: self.max_nals,
                             },
                         )?;
                         if !end {
@@ -695,6 +715,7 @@ impl Depacketizer {
                 pieces: &mut self.pieces,
                 nals: &mut self.nals,
                 in_progress: &mut in_progress,
+                max_nals: self.max_nals,
             },
         )
     }

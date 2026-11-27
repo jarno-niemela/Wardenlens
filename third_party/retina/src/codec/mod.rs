@@ -965,6 +965,14 @@ impl Depacketizer {
         }
     }
 
+    /// Limits the NALs per access unit (H.264 only; local patch, see ADR 0002).
+    #[doc(hidden)]
+    pub fn set_max_nals(&mut self, n: usize) {
+        if let DepacketizerInner::H264(d) = &mut self.0 {
+            d.set_max_nals(n);
+        }
+    }
+
     /// Sets the frame format for output assembly.
     ///
     /// Controls H.26x NAL framing (length-prefixed vs Annex B) and parameter

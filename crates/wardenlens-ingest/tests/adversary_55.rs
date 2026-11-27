@@ -27,9 +27,9 @@ use wardenlens_core::camera::{Credential, Host, RtspPath};
 use wardenlens_core::catalogue::StreamRole;
 use wardenlens_core::time::{Clock, Timestamp};
 use wardenlens_ingest::{
-    IngestError, MAX_FRAME_BYTES, MapError, NoReorderReason, OpenOptions, ReorderVerdict,
-    RetinaSource, SpsError, StreamSource, contains_b_slice, open_stream, open_stream_with,
-    parse_sps, sps_reordering,
+    IngestError, MAX_FRAME_BYTES, MAX_NALS_PER_ACCESS_UNIT, MapError, NoReorderReason, OpenOptions,
+    ReorderVerdict, RetinaSource, SpsError, StreamSource, contains_b_slice, open_stream,
+    open_stream_with, parse_sps, sps_reordering,
 };
 
 const USER: &str = "adv-user-q7";
@@ -402,6 +402,36 @@ async fn basic_and_digest_challenge_is_answered_with_digest() {
         .collect();
     assert_ne!(auth.len(), 0);
     assert!(auth.iter().all(|a| a.starts_with("Digest ")), "{auth:?}");
+}
+
+/// An access unit of exactly `MAX_NALS_PER_ACCESS_UNIT` NALs is delivered; one more fails the
+/// session (the depacketizer metadata bound of ADR 0002 item 12).
+#[tokio::test]
+async fn nal_count_limit_passes_at_the_limit_and_fails_one_over() {
+    for (count, ok) in [
+        (MAX_NALS_PER_ACCESS_UNIT, true),
+        (MAX_NALS_PER_ACCESS_UNIT + 1, false),
+    ] {
+        let nal = [0x41_u8, 0x9a];
+        let nals: Vec<&[u8]> = vec![&nal; count];
+        let pkts = vec![
+            (100, 90_000, true, IDR.to_vec()),
+            (101, 93_600, true, stap_a(&nals)),
+        ];
+        let server = spawn(Script {
+            challenge: Challenge::Digest,
+            after: After::Packets(pkts),
+        })
+        .await;
+        let mut s = open_with(&server, &cred()).await.unwrap();
+        assert!(s.next_frame().await.unwrap().is_some());
+        let second = s.next_frame().await;
+        if ok {
+            assert!(matches!(second, Ok(Some(_))), "{count} NALs: {second:?}");
+        } else {
+            assert_eq!(second, Err(IngestError::StreamFailed), "{count} NALs");
+        }
+    }
 }
 
 /// The hostile camera of #155: one access unit that never ends. retina must stop buffering it,

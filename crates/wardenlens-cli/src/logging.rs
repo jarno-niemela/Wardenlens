@@ -33,8 +33,8 @@ fn build_filter(rust_log: Option<&OsStr>) -> (EnvFilter, bool) {
     let Some(v) = rust_log else {
         return (EnvFilter::new("info"), false);
     };
-    // An empty value would mean "nothing but errors"; it is the same as no value.
-    if v.is_empty() {
+    // An empty or blank value would mean "nothing but errors"; it is the same as no value.
+    if v.to_str().is_some_and(|t| t.trim().is_empty()) {
         return (EnvFilter::new("info"), false);
     }
     match v.to_str().map(EnvFilter::try_new) {
@@ -128,6 +128,14 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// Rows of the table below whose filter does not enable the bare `retina` target.
+    const SUB_TARGET_OR_SPAN_ONLY: [Option<&str>; 4] = [
+        Some("retina::client=trace"),
+        Some("retina[span]=trace"),
+        Some("retina:=trace"),
+        Some("[sp]=trace"),
+    ];
+
     /// Whichever `RUST_LOG` the user sets, retina prints `error` records and nothing quieter.
     #[test]
     fn the_retina_target_is_filtered_below_error() {
@@ -158,10 +166,15 @@ mod tests {
             for quiet in ["r-warn", "r-info", "r-debug", "r-trace", "192.0.2.7"] {
                 assert!(!out.contains(quiet), "{rust_log:?}: {quiet} in {out}");
             }
-            // With a bare level, errors still get through. A directive that names other targets
-            // (`retina::client=trace`) leaves the unnamed ones off, as for any target.
-            if rust_log.is_none_or(|l| matches!(l, "" | "info" | "debug" | "trace" | "warn")) {
+            // Errors still get through wherever the filter enables retina at error. A directive
+            // that names only other targets, or only spans (`retina::client=trace`, `[sp]=trace`),
+            // leaves the unnamed ones off, as for any target; the sub-target still prints its error.
+            if !SUB_TARGET_OR_SPAN_ONLY.contains(&rust_log) {
                 assert!(out.contains("r-error"), "{rust_log:?}: {out}");
+            }
+            if rust_log == Some("retina::client=trace")
+                || !SUB_TARGET_OR_SPAN_ONLY.contains(&rust_log)
+            {
                 assert!(out.contains("rc-error"), "{rust_log:?}: {out}");
             }
         }
@@ -204,8 +217,8 @@ mod tests {
         assert!(!build_filter(None).1);
     }
 
-    /// Adversary #155: directive spellings that `names_retina` does not recognise but that
-    /// tracing-subscriber matches against the `retina` target (prefix matching, span scopes).
+    /// Adversary #155: directive spellings that tracing-subscriber matches against the `retina`
+    /// target in unexpected ways (prefix matching, span scopes), with the events inside a span.
     fn printed_in_span(rust_log: &str) -> String {
         let (filter, _) = build_filter(Some(OsStr::new(rust_log)));
         let cap = Capture::default();
@@ -250,5 +263,82 @@ mod tests {
             "retina records below error printed:\n{}",
             leaks.join("\n")
         );
+    }
+
+    /// Emits through `subscriber` with `rust_log` and `format`, returns what was printed.
+    fn capture_with(rust_log: &str, format: LogFormat, f: impl FnOnce()) -> String {
+        let (filter, _) = build_filter(Some(OsStr::new(rust_log)));
+        let cap = Capture::default();
+        let sub = subscriber(format, filter, cap.clone());
+        tracing::subscriber::with_default(sub, f);
+        let bytes = cap.0.lock().map_or_else(|_| Vec::new(), |v| v.clone());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Adversary #155 r2: span-scoped directives still work for other targets through the `And`
+    /// combinator (span enter/exit must reach the `EnvFilter`).
+    #[test]
+    fn adv_r2_span_scoped_directive_still_enables_other_targets() {
+        for format in [LogFormat::Text, LogFormat::Json] {
+            let out = capture_with("warn,[camera]=debug", format, || {
+                tracing::debug!(target: "other", "outside-debug");
+                let span = tracing::info_span!("camera", id = 1);
+                let _g = span.enter();
+                tracing::debug!(target: "other", "inside-debug");
+                tracing::debug!(target: "retina::client", "r-inside-debug");
+            });
+            assert!(out.contains("inside-debug"), "{out}");
+            assert!(!out.contains("outside-debug"), "{out}");
+            assert!(!out.contains("r-inside-debug"), "{out}");
+        }
+    }
+
+    /// Adversary #155 r2: span field-value directives (dynamic filtering) still work.
+    #[test]
+    fn adv_r2_field_value_span_directive_still_works() {
+        let out = capture_with("warn,[camera{id=7}]=debug", LogFormat::Text, || {
+            let a = tracing::info_span!("camera", id = 7);
+            a.in_scope(|| tracing::debug!(target: "other", "seven-debug"));
+            let b = tracing::info_span!("camera", id = 8);
+            b.in_scope(|| tracing::debug!(target: "other", "eight-debug"));
+            a.in_scope(|| tracing::debug!(target: "retina", "r-seven-debug"));
+        });
+        assert!(out.contains("seven-debug"), "{out}");
+        assert!(!out.contains("eight-debug"), "{out}");
+        assert!(!out.contains("r-seven-debug"), "{out}");
+    }
+
+    /// Adversary #155 r2: retina records in JSON at every level, with `retina` in a span name or
+    /// field, and an event whose fields name retina, never pass below error.
+    #[test]
+    fn adv_r2_json_cap_matrix() {
+        for rust_log in [
+            "trace",
+            "retina=trace",
+            "retina::client=trace",
+            "[retina]=trace",
+            "retina:=trace",
+            "  ",
+        ] {
+            let out = capture_with(rust_log, LogFormat::Json, || {
+                let span = tracing::error_span!(target: "retina", "retina", peer = "192.0.2.9");
+                let _g = span.enter();
+                tracing::warn!(target: "retina", peer = "192.0.2.7", "r-warn");
+                tracing::info!(target: "retina::client::rtp", "r-info");
+                tracing::trace!(target: "retina", "r-trace");
+            });
+            for q in ["r-warn", "r-info", "r-trace", "192.0.2.7"] {
+                assert!(!out.contains(q), "{rust_log:?}: {q} in {out}");
+            }
+        }
+    }
+
+    /// Adversary #155 r2: a whitespace-only value is treated like an empty one (the default info).
+    #[test]
+    fn adv_r2_whitespace_only_rust_log_means_the_default() {
+        let out = capture_with("  ", LogFormat::Text, || {
+            tracing::info!(target: "other", "o-info");
+        });
+        assert!(out.contains("o-info"), "{out:?}");
     }
 }
