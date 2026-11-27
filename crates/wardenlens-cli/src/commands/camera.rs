@@ -106,7 +106,7 @@ pub(crate) enum CameraCmdError {
     PathQuery,
     /// As [`Self::PathQuery`], but the catalogue lists a path with the same head.
     #[error(
-        "a stream path has a query string that the catalogue does not list for this model; the catalogue's path {listed} can be used instead"
+        "a stream path has a query string that the catalogue does not list for this model; the catalogue lists {listed} for this stream (the catalogue's paths are used when the camera does not answer ONVIF)"
     )]
     PathQueryListed { listed: String },
     /// The key file does not exist.

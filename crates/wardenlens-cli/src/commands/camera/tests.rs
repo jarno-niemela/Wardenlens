@@ -442,6 +442,10 @@ fn dahua_onvif_answers_with_unicast_and_proto_are_stored_as_given() {
         cams[0].record().streams().sub.as_ref().unwrap().as_str(),
         DAHUA_SUB
     );
+    // `serve`'s loader accepts the ONVIF forms through the same `query_allowed`.
+    let index = Index::open(site.config.database_path()).unwrap();
+    let inputs = camera_inputs(&site.config, &index, site.key()).unwrap();
+    assert_eq!(inputs.len(), 1);
 }
 
 /// SEC-10 still holds for Dahua: reordered, extra, missing or swapped parameters are refused.
@@ -534,6 +538,10 @@ fn the_fallback_stores_a_catalogue_path_with_its_listed_query() {
     assert_eq!(
         cams[0].record().streams().main.as_str(),
         "/cam/realmonitor?channel=1&subtype=0"
+    );
+    assert_eq!(
+        cams[0].record().streams().sub.as_ref().unwrap().as_str(),
+        "/cam/realmonitor?channel=1&subtype=1"
     );
     // `serve` lists the registry with the catalogue too, so the stored query does not break it.
     let index = Index::open(site.config.database_path()).unwrap();
@@ -1252,3 +1260,161 @@ fn import_updates_its_own_rows_and_keeps_a_row_mapped_to_another_model() {
 
 mod adversary;
 mod adversary_163;
+
+// ---- adversary #218 ----
+
+const DAHUA_MAIN_PLAIN: &str = "/cam/realmonitor?channel=1&subtype=0";
+const DAHUA_SUB_PLAIN: &str = "/cam/realmonitor?channel=1&subtype=1";
+
+fn dahua_entry() -> wardenlens_core::catalogue::CatalogueEntry {
+    let entries = catalogue::load().unwrap();
+    catalogue::find(&entries, &ModelRef::new("dahua", "ipc-hfw4431r-z").unwrap())
+        .unwrap()
+        .clone()
+}
+
+/// The refusal for a *main* stream answer must name a main (subtype=0) path, never the sub one.
+#[test]
+fn adv218_reordered_main_query_names_a_main_path_not_the_sub_path() {
+    let e = dahua_entry();
+    for bad in [
+        "/cam/realmonitor?subtype=0&channel=1&unicast=true&proto=Onvif",
+        "/cam/realmonitor?channel=1",
+        "/cam/realmonitor?x=1",
+    ] {
+        let named = catalogue::listed_like(&e, bad).unwrap();
+        assert!(
+            named.contains("subtype=0"),
+            "{bad}: named {named}, a sub stream path, for a main stream answer"
+        );
+    }
+}
+
+/// End to end: a reordered main answer names a main path in the printed error.
+#[test]
+fn adv218_reordered_main_answer_error_does_not_point_at_the_sub_path() {
+    let site = Site::new();
+    let fake = cam(
+        &xml("rtsp://127.0.0.1:554/cam/realmonitor?subtype=0&channel=1&unicast=true&proto=Onvif"),
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_SUB}")),
+    );
+    let a = args("dahua-1", "127.0.0.1", DAHUA, Some(fake.port()));
+    let err = run_add(&site, &foreign(), &a, &pw()).result.unwrap_err();
+    let text = error_chain(&err);
+    assert!(!text.contains("subtype=1"), "{text}");
+    assert_nothing_stored(&site);
+}
+
+/// Only reached for a path with a query (`query_allowed` passes every query-less path).
+#[test]
+fn adv218_listed_like_never_names_a_path_with_another_head() {
+    let e = dahua_entry();
+    for p in [
+        "/cam/realmonitorX?channel=1&subtype=0",
+        "/cam?channel=1&subtype=0",
+        "/CAM/realmonitor?channel=1&subtype=0",
+        "/cam/realmonitor/?channel=1&subtype=0",
+        "",
+        "?",
+    ] {
+        assert_eq!(catalogue::listed_like(&e, p), None, "{p:?}");
+    }
+}
+
+#[test]
+fn adv218_listed_like_handles_non_ascii_and_odd_input_without_panicking() {
+    let e = dahua_entry();
+    for p in [
+        "/cam/realmonitor?ü",
+        "/cäm/realmonitor?channel=1",
+        "/cam/realmonitor??",
+        "\u{202e}/cam?",
+        "/cam/realmonitor?\0",
+        "/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif&unicast=true&proto=Onvif",
+    ] {
+        let _ = catalogue::listed_like(&e, p);
+    }
+}
+
+/// A sub answer that is a near miss of the sub ONVIF form names the sub ONVIF form.
+#[test]
+fn adv218_sub_near_miss_names_the_sub_form() {
+    let e = dahua_entry();
+    assert_eq!(
+        catalogue::listed_like(
+            &e,
+            "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Rtsp"
+        ),
+        Some(DAHUA_SUB)
+    );
+    assert_eq!(
+        catalogue::listed_like(&e, "/cam/realmonitor?channel=1&subtype=0&unicast=false"),
+        Some(DAHUA_MAIN)
+    );
+}
+
+/// The first two listed paths are still the plain main and sub (the fallback order).
+#[test]
+fn adv218_rtsp_paths_still_returns_plain_main_and_sub() {
+    let e = dahua_entry();
+    assert_eq!(
+        catalogue::rtsp_paths(&e),
+        (Some(DAHUA_MAIN_PLAIN), Some(DAHUA_SUB_PLAIN))
+    );
+}
+
+#[test]
+fn adv218_dahua_fallback_stores_the_plain_paths_when_onvif_is_unreachable() {
+    let site = Site::new();
+    let a = args("dahua-1", "127.0.0.1", DAHUA, Some(closed_port()));
+    run_add(&site, &foreign(), &a, &pw()).result.unwrap();
+    let cams = site.cameras();
+    assert_eq!(cams[0].record().streams().main.as_str(), DAHUA_MAIN_PLAIN);
+    assert_eq!(
+        cams[0].record().streams().sub.as_ref().unwrap().as_str(),
+        DAHUA_SUB_PLAIN
+    );
+}
+
+/// The refusal never echoes the camera's own answer, host or password.
+#[test]
+fn adv218_refusal_does_not_echo_the_camera_answer_host_or_password() {
+    let site = Site::new();
+    let fake = cam(
+        &xml("rtsp://127.0.0.1:554/cam/realmonitor?channel=1&subtype=0&zz=leak4711"),
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_SUB}")),
+    );
+    let a = args("dahua-1", "127.0.0.1", DAHUA, Some(fake.port()));
+    let err = run_add(&site, &foreign(), &a, &pw()).result.unwrap_err();
+    let text = format!("{} | {err:?}", error_chain(&err));
+    for s in ["leak4711", "127.0.0.1", PASSWORD, USER] {
+        assert!(!text.contains(s), "{s} in {text}");
+    }
+}
+
+/// A mixed answer: the main stream in the plain form and the sub in the ONVIF form is accepted
+/// (each is listed); a sub stream answer in the main form is accepted too (query-only check).
+#[test]
+fn adv218_mixed_forms_are_each_accepted() {
+    let site = Site::new();
+    let fake = cam(
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_MAIN_PLAIN}")),
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_SUB}")),
+    );
+    let a = args("dahua-1", "127.0.0.1", DAHUA, Some(fake.port()));
+    run_add(&site, &foreign(), &a, &pw()).result.unwrap();
+}
+
+/// Another model must not gain the Dahua ONVIF query forms.
+#[test]
+fn adv218_other_models_still_refuse_the_dahua_onvif_query() {
+    let site = Site::new();
+    let fake = cam(
+        &xml(&format!("rtsp://127.0.0.1:554{DAHUA_MAIN}")),
+        "rtsp://127.0.0.1:554/x",
+    );
+    let a = args("yard", "127.0.0.1", "reolink/rlc-520a", Some(fake.port()));
+    let err = run_add(&site, &foreign(), &a, &pw()).result.unwrap_err();
+    assert!(matches!(err, CameraCmdError::PathQuery), "{err:?}");
+    assert_nothing_stored(&site);
+}
