@@ -8,6 +8,8 @@ services:
       dockerfile: docker/Dockerfile
     image: wardenlens:local
     restart: unless-stopped
+    # `serve` flushes and stops within 10 s of SIGTERM; Docker's default 10 s grace would SIGKILL it at that edge.
+    stop_grace_period: 15s
     # A fixed non-root uid (ADR 0005: the floor arithmetic relies on f_bavail and the ext4 reserve).
     user: "${WARDENLENS_UID:-10001}:${WARDENLENS_GID:-10001}"
     read_only: true
@@ -70,4 +72,4 @@ services:
 secrets:
   wardenlens_vault_key:
     # Outside every work tree (ADR 0006 section 6), excluded from backups. Never ./secrets/ inside the repository.
-    file: ${WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/vault.key}
+    file: ${WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/key/vault.key}

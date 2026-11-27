@@ -32,7 +32,8 @@ RUN apt-get update \
  && groupadd --system --gid 10001 wardenlens \
  && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin wardenlens
 
-# Self-test image (not the default target): the fsutil tests as the service uid.
+# Self-test image (not the default target): the fsutil tests. The default user is the service uid; scripts/docker-selftest
+# overrides it with the host uid (--user) so the bind-mounted temporary directory is writable.
 FROM base AS selftest
 COPY --from=fsutil-tests-build /out/ /selftest/
 USER 10001:10001

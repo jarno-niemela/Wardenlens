@@ -13,40 +13,74 @@ tag with `docker buildx imagetools inspect <image:tag>`, review it and edit `doc
 (`scripts/tests/docker.test.sh` fails on an unpinned `FROM`). The service runs as the fixed non-root **uid/gid 10001**. There is no
 `curl`: the healthcheck is `wardenlens health`.
 
-No secret is in the image or in an environment variable. `.dockerignore` and `.gitignore` exclude `/secrets/`, `*.key`,
-`*.secret*`, `*.local.*` and `.env*`.
+No secret is in the image or in an environment variable. `.dockerignore` excludes `/secrets/`, `*.key`, `*.secret*`, `*.local.*` and
+`.env*` at any depth (Docker matches its patterns from the context root, so the nested `**/` forms are listed too), and `.gitignore`
+excludes `/secrets/`, `*.key`, `*.secret*`, `*.local.*` and `.env*`.
 
 ## Host preparation (once)
 
 Everything the service writes must belong to the service uid (default 10001; set `WARDENLENS_UID` / `WARDENLENS_GID` in `.env` to
-run as another user). The floor arithmetic relies on a non-root user (ADR 0005).
+run as another user, and use that uid below). The floor arithmetic relies on a non-root user (ADR 0005).
 
 ```sh
 sudo install -d -o 10001 -g 10001 -m 0700 /srv/wardenlens/state        # index and vault: private
-sudo install -d -o 10001 -g 10001 -m 0755 /srv/wardenlens/recordings   # hot root
+sudo install -d -o 10001 -g 10001 -m 0750 /srv/wardenlens/recordings   # hot root
+sudo install -d -o 10001 -g 10001 -m 0750 /srv/wardenlens/archive      # mount point; the archive disk is mounted onto it
 sudo install -d -o root  -g root  -m 0755 /etc/wardenlens
 sudo install -m 0644 docs/config.docker.toml /etc/wardenlens/wardenlens.toml   # then edit it
-sudo install -m 0400 -o 10001 -g 10001 /dev/null /etc/wardenlens/vault.key     # see "The key file"
 cp docker/env.example .env                                              # then edit it; .env is git-ignored
 ```
 
 ### The key file
 
-The vault key is a raw 32-byte file, outside every work tree. Compose delivers it as the secret `wardenlens_vault_key`, a read-only
-bind mount at `/run/secrets/wardenlens_vault_key`; the config's `secrets.key_file` and `WARDENLENS_VAULT_KEY_FILE` name that path.
+The vault key is a raw 32-byte file, outside every work tree, in a **key directory owned by the service uid with mode 0700**. Compose
+delivers it as the secret `wardenlens_vault_key`, a read-only bind mount at `/run/secrets/wardenlens_vault_key`; the config's
+`secrets.key_file` is that path. The entrypoint reads the path from the config (`wardenlens config check`), refuses a
+`WARDENLENS_VAULT_KEY_FILE` that names another path, and runs `wardenlens vault check-key` on it before `serve`; a refusal is fatal.
 
-* The strict key check (`wardenlens vault check-key`) requires a regular file, **owned by the uid the container runs as**, with no
-  group or other permission bits, exactly 32 bytes. Compose in non-swarm mode does **not** change owner or mode (the `uid:` and
-  `mode:` options are ignored), so the host file must already be owned by the container uid with mode `0400` or `0600`.
-  Create it as that user: `sudo -u '#10001' wardenlens secrets init` with a config whose `secrets.key_file` is the host path (or
-  `wardenlens vault key import`), then `chown`/`chmod` as needed. A file owned by someone else, or mode `0644`, makes the
-  container refuse to start: **the entrypoint runs `wardenlens vault check-key` before `serve`** and a refusal is fatal.
-* The host path defaults to `/etc/wardenlens/vault.key`; override it with `WARDENLENS_KEY_FILE_HOST` in `.env`. Never put it inside the
-  repository (`./secrets/` is refused; the key check also refuses a path inside a git work tree).
-* **Exclude the key path from backups.** A backup that holds the key and the vault (`/srv/wardenlens/state`) gives no protection.
-  Keep a copy in the password manager (`wardenlens vault key export`, on a terminal).
-* **Rotation: stop, rekey, start.** `docker compose stop`, run `wardenlens vault rekey` **on the host** against the host key file and the
-  host state directory, then `docker compose start`. The container never rotates in place.
+The strict key check requires a regular file, **owned by the uid the container runs as**, with no group or other permission bits,
+exactly 32 bytes. Compose in non-swarm mode does **not** change owner or mode (the `uid:` and `mode:` options are ignored), so the
+host file must already be owned by the container uid with mode `0400` or `0600`. A file owned by someone else, or mode `0644`, makes
+the container refuse to start. Do not pre-create an empty file: `secrets init` never overwrites an existing file and a zero-byte key
+is refused.
+
+1. Get a `wardenlens` binary on the host (glibc 2.36 or later, e.g. Ubuntu 24.04), from the image. It, and the config below, must be readable by the service uid, so they go in `/tmp` (remove them afterwards):
+
+   ```sh
+   docker create --name wl-bin wardenlens:local && docker cp wl-bin:/usr/local/bin/wardenlens /tmp/wardenlens && docker rm wl-bin
+   ```
+
+2. Create the key directory and generate the key **as the service uid**, with a config whose `secrets.key_file` is the host path
+   (`secrets init` creates the file with mode 0600 and never overwrites one):
+
+   ```sh
+   sudo install -d -o 10001 -g 10001 -m 0700 /etc/wardenlens/key
+   sed 's#/run/secrets/wardenlens_vault_key#/etc/wardenlens/key/vault.key#' docs/config.docker.toml > /tmp/wl-host.toml
+   chmod 0644 /tmp/wl-host.toml
+   sudo -u '#10001' /tmp/wardenlens --config /tmp/wl-host.toml secrets init
+   sudo -u '#10001' /tmp/wardenlens vault check-key /etc/wardenlens/key/vault.key   # what the entrypoint will run
+   ```
+
+   (Root alternative: create the file as root, then `chown 10001:10001` and `chmod 0400`.) Keep a copy in the password manager
+   (`wardenlens vault key export`, on a terminal). The host path defaults to `/etc/wardenlens/key/vault.key`; override it with
+   `WARDENLENS_KEY_FILE_HOST` in `.env`. It must never be inside the repository (`./secrets/` is refused; the key check also refuses a
+   path inside a git work tree).
+
+* **Exclude the key path (and the vault in the state directory) from backups.** A backup that holds the key and the vault gives no
+  protection.
+* **Rotation: stop, rekey, recreate.** `docker compose stop`, then run `rekey` **on the host as the service uid, on a terminal**, with the
+  deploy paths (the vault is `vault.db` next to `database.path`):
+
+  ```sh
+  sudo -u '#10001' env WARDENLENS_VAULT=/srv/wardenlens/state/vault.db WARDENLENS_VAULT_KEY_FILE=/etc/wardenlens/key/vault.key \
+      /tmp/wardenlens vault rekey
+  docker compose up -d --force-recreate
+  ```
+
+  `rekey` takes a lock and creates `<key>.next` **in the key directory**, which is why that directory belongs to the service uid with
+  mode 0700. It replaces the key file by rename, and a container keeps the old file mounted (the bind mount follows the old inode), so
+  the container must be **recreated**, not just started. The container never rotates in place. The rotation procedure is exercised by
+  the test `the_deploy_guide_key_procedure_yields_a_key_that_passes_check_key_and_rekeys` (temp paths, the current uid).
 
 ## Configuration
 
@@ -72,8 +106,8 @@ bind mount at `/run/secrets/wardenlens_vault_key`; the config's `secrets.key_fil
 
 ### The archive mount
 
-The archive must be a **separate filesystem** from the hot root and must carry the marker file `.wardenlens-archive` (a regular file
-in its root, owned by the service uid), or the service starts in `archive_unavailable` mode and keeps everything on the hot tier.
+The archive must be a **separate filesystem** from the hot root (the directory created above is the mount point: mount the archive disk
+onto it) and must carry the marker file `.wardenlens-archive` (a regular file in its root, owned by the service uid), or the service starts in `archive_unavailable` mode and keeps everything on the hot tier.
 Create the marker once on the mounted archive: `sudo install -o 10001 -g 10001 -m 0644 /dev/null /srv/wardenlens/archive/.wardenlens-archive`
 (the `wardenlens storage mark-archive` subcommand named in ADR 0005 does not exist yet).
 
@@ -102,7 +136,8 @@ docker compose down
   cannot fill the disk with logs.
 * **Hardening.** Read-only root filesystem, all capabilities dropped, `no-new-privileges`, `tmpfs` at `/tmp`. The default Docker seccomp
   profile allows `openat2` and `renameat2`, and the host kernel must be 5.6 or later.
-* `restart: unless-stopped`.
+* `restart: unless-stopped`, and `stop_grace_period: 15s`: on SIGTERM `serve` flushes the open segments and exits within 10 s, so Docker's
+  default 10 s grace would SIGKILL it at the edge.
 
 ## Runtime self-test
 

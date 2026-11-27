@@ -25,6 +25,9 @@ check_dockerignore() { # FILE -> prints one message per problem
   for e in 'target/' 'spikes/' '.git' '*.secret*' '*.local.*' '/secrets/' '*.key' '.env'; do
     has "$f" "$e" || echo "dockerignore lacks $e"
   done
+  for e in '**/secrets/' '**/*.key' '**/*.secret*' '**/*.local.*' '**/.env' '**/.env.*'; do
+    has "$f" "$e" || echo "dockerignore lacks the nested form $e"
+  done
   for e in 'cameras' 'cameras/' '/cameras' '/cameras/'; do
     has "$f" "$e" && echo "dockerignore excludes the camera catalogue ($e)"
   done
@@ -72,8 +75,11 @@ check_compose() {
   contains "$f" 'max-size:' || echo "logging max-size missing"
   contains "$f" 'test: \["CMD", "wardenlens", "health"\]' || echo "healthcheck is not 'wardenlens health'"
   contains "$f" 'propagation: rslave' || echo "archive bind lacks rslave propagation"
-  contains "$f" 'read_only: true' || echo "read-only config mount / rootfs missing"
-  contains "$f" '^ +file: \$\{WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/vault\.key\}$' || echo "key secret source is not \${WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/vault.key}"
+  contains "$f" '^    read_only: true$' || echo "the service rootfs is not read_only"
+  contains "$f" '^    stop_grace_period: 15s$' || echo "stop_grace_period 15s missing"
+  ncontains "$f" 'privileged:|network_mode: *host' && echo "privileged or host network"
+  contains "$f" '^        read_only: true$' || echo "the config mount is not read_only"
+  contains "$f" '^ +file: \$\{WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/key/vault\.key\}$' || echo "key secret source is not \${WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/key/vault.key}"
   contains "$f" 'WARDENLENS_VAULT_KEY_FILE: /run/secrets/wardenlens_vault_key' || echo "WARDENLENS_VAULT_KEY_FILE missing"
   contains "$f" '^ +- "\$\{WARDENLENS_LAN_ADDR:-127\.0\.0\.1\}:' || echo "the published port is not on \${WARDENLENS_LAN_ADDR:-127.0.0.1}"
   ncontains "$f" '0\.0\.0\.0' && echo "compose.yaml names 0.0.0.0"
@@ -95,6 +101,10 @@ expect_clean "the Dockerfile is pinned, multi-stage, non-root and curl-free" che
 expect_clean "compose.yaml carries every required setting" check_compose "$cf"
 
 # Mutants: each check must be able to fail.
+for e in '**/secrets/' '**/*.key' '**/*.secret*' '**/*.local.*' '**/.env' '**/.env.*'; do
+  grep -vxF -- "$e" "$di" >"$tmp/di"
+  expect_flagged "dockerignore without $e is flagged" "nested form" check_dockerignore "$tmp/di"
+done
 for e in 'target/' 'spikes/' '.git' '*.secret*' '*.local.*' '/secrets/' '*.key' '.env'; do
   grep -vxF -- "$e" "$di" >"$tmp/di"
   expect_flagged "dockerignore without $e is flagged" "lacks" check_dockerignore "$tmp/di"
@@ -123,13 +133,21 @@ expect_flagged "an unlocked build is flagged" "locked build" check_dockerfile "$
 expect_flagged "curl in the image is flagged" "curl-free" check_dockerfile "$tmp/df"
 sed -E '/^ENV NVIDIA_DRIVER_CAPABILITIES/d' "$df" >"$tmp/df"
 expect_flagged "missing driver capabilities are flagged" "NVIDIA_DRIVER_CAPABILITIES" check_dockerfile "$tmp/df"
-for pat in 'restart: unless-stopped' 'driver: nvidia' 'nofile:' 'max-size:' 'propagation: rslave'; do
+for pat in 'restart: unless-stopped' 'driver: nvidia' 'nofile:' 'max-size:' 'propagation: rslave' 'stop_grace_period: 15s'; do
   grep -vF -- "$pat" "$cf" >"$tmp/cf"
   expect_flagged "compose without '$pat' is flagged" "missing\|lacks\|nofile\|max-size" check_compose "$tmp/cf"
 done
+sed -E 's/^    stop_grace_period: 15s$/    stop_grace_period: 10s/' "$cf" >"$tmp/cf"
+expect_flagged "a 10 s grace period is flagged" "stop_grace_period" check_compose "$tmp/cf"
+grep -vxF '    read_only: true' "$cf" >"$tmp/cf"
+expect_flagged "a writable rootfs is flagged although the config mount is read_only" "rootfs" check_compose "$tmp/cf"
+sed -E 's/^    restart: unless-stopped$/    restart: unless-stopped\n    privileged: true/' "$cf" >"$tmp/cf"
+expect_flagged "privileged is flagged" "privileged" check_compose "$tmp/cf"
+sed -E 's/^    restart: unless-stopped$/    restart: unless-stopped\n    network_mode: host/' "$cf" >"$tmp/cf"
+expect_flagged "host networking is flagged" "host network" check_compose "$tmp/cf"
 sed -E 's/\$\{WARDENLENS_LAN_ADDR:-127\.0\.0\.1\}/0.0.0.0/' "$cf" >"$tmp/cf"
 expect_flagged "a 0.0.0.0 publish is flagged" "0.0.0.0" check_compose "$tmp/cf"
-sed -E 's#file: \$\{WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/vault.key\}#file: ./secrets/vault.key#' "$cf" >"$tmp/cf"
+sed -E 's#file: \$\{WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/key/vault.key\}#file: ./secrets/vault.key#' "$cf" >"$tmp/cf"
 expect_flagged "a key inside the work tree is flagged" "work tree" check_compose "$tmp/cf"
 sed -E 's#test: \["CMD", "wardenlens", "health"\]#test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]#' "$cf" >"$tmp/cf"
 expect_flagged "a curl healthcheck is flagged" "healthcheck" check_compose "$tmp/cf"
@@ -144,30 +162,41 @@ if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
     bad "docker compose config: $resolved"
   fi
   yes "the port defaults to 127.0.0.1" grep -q 'host_ip: 127.0.0.1' <<<"$resolved"
-  yes "the key source defaults to /etc/wardenlens/vault.key" grep -q '/etc/wardenlens/vault.key' <<<"$resolved"
+  yes "the key source defaults to /etc/wardenlens/key/vault.key" grep -q '/etc/wardenlens/key/vault.key' <<<"$resolved"
   no "the resolved config never names 0.0.0.0" grep -q '0\.0\.0\.0' <<<"$resolved"
 else
   echo "skip docker compose config (docker compose is not installed)"
 fi
 
-# The entrypoint: check-key first, serve only when it passes, arguments forwarded, no variable no start.
+# The entrypoint: the key path is the config's secrets.key_file; check-key first, serve only when it passes.
 ep=$root/docker/entrypoint.sh
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/wardenlens" <<'STUB'
 #!/bin/sh
 echo "$*" >>"$STUB_LOG"
-if [ "$1 $2" = "vault check-key" ] && [ "${STUB_CHECK:-ok}" != ok ]; then exit 1; fi
+case "$1 $2" in
+  "config check")
+    [ "${STUB_CONFIG:-ok}" = ok ] || exit 1
+    printf 'listen: 0.0.0.0:8080\nkey_file: %s\n' "${STUB_KEY-/run/secrets/k}" ;;
+  "vault check-key") [ "${STUB_CHECK:-ok}" = ok ] || exit 1 ;;
+esac
 exit 0
 STUB
 chmod +x "$tmp/bin/wardenlens"
 run_ep() { : >"$tmp/log"; env -i PATH="$tmp/bin:/usr/bin:/bin" STUB_LOG="$tmp/log" "$@" sh "$ep" serve 2>/dev/null; }
 logged() { [[ $(cat "$tmp/log") == "$1" ]]; }
 yes "the entrypoint starts with a good key" run_ep WARDENLENS_VAULT_KEY_FILE=/run/secrets/k
-yes "the entrypoint checks the key, then serves" logged $'vault check-key /run/secrets/k\nserve'
+yes "the entrypoint checks the configured key, then serves" logged $'config check\nvault check-key /run/secrets/k\nserve'
+yes "the key path comes from the config when the variable is unset" run_ep
+yes "check-key got the config's path" logged $'config check\nvault check-key /run/secrets/k\nserve'
 no "a refused key makes the entrypoint fail" run_ep WARDENLENS_VAULT_KEY_FILE=/run/secrets/k STUB_CHECK=bad
-yes "a refused key stops before serve" logged 'vault check-key /run/secrets/k'
-no "no key variable, no start" run_ep
-yes "nothing ran without the key variable" test ! -s "$tmp/log"
+yes "a refused key stops before serve" logged $'config check\nvault check-key /run/secrets/k'
+no "a config that differs from WARDENLENS_VAULT_KEY_FILE is refused" run_ep WARDENLENS_VAULT_KEY_FILE=/run/secrets/other
+yes "nothing was checked or served on drift" logged 'config check'
+no "an invalid config stops the entrypoint" run_ep STUB_CONFIG=bad
+yes "an invalid config stops before check-key" logged 'config check'
+no "no key_file line stops the entrypoint" run_ep STUB_KEY=
+yes "an empty key path is never checked" logged 'config check'
 yes "the entrypoint is executable" test -x "$ep"
 
 exit $fail

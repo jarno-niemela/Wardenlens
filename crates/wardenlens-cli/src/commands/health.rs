@@ -46,6 +46,9 @@ pub(crate) enum HealthError {
     /// The HTTP exchange failed.
     #[error("the answer is not valid HTTP")]
     Http(#[source] hyper::Error),
+    /// The request could not be built (an invalid host header value; not expected for an address).
+    #[error("the probe request cannot be built")]
+    Request(#[source] hyper::http::Error),
     /// The status was not 200.
     #[error("the service answered status {0}")]
     Status(u16),
@@ -91,6 +94,17 @@ async fn probe(listen: SocketAddr, deadline: Duration) -> Result<(), HealthError
         .map_err(|_| HealthError::Timeout)?
 }
 
+/// The probe request for a `Host` header value. Fails only if the value is not a valid header.
+fn build_request(host: &str) -> Result<Request<Body>, HealthError> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(PATH)
+        .header(header::HOST, host)
+        .header(header::CONNECTION, "close")
+        .body(Body::empty())
+        .map_err(HealthError::Request)
+}
+
 async fn exchange(addr: SocketAddr) -> Result<(), HealthError> {
     let stream = TcpStream::connect(addr)
         .await
@@ -101,14 +115,7 @@ async fn exchange(addr: SocketAddr) -> Result<(), HealthError> {
     // Driving the connection ends when the sender is dropped or the peer closes; the task is
     // aborted with the runtime at process exit.
     let driver = tokio::spawn(connection);
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(PATH)
-        .header(header::HOST, addr.to_string())
-        .header(header::CONNECTION, "close")
-        .body(Body::empty())
-        // The method, a constant path and a formatted address are always valid.
-        .map_err(|_| HealthError::Status(0))?;
+    let request = build_request(&addr.to_string())?;
     let response = sender
         .send_request(request)
         .await
@@ -258,6 +265,15 @@ mod tests {
             probe(addr, SHORT).await,
             Err(HealthError::Connect(_))
         ));
+    }
+
+    #[test]
+    fn a_bad_host_value_is_a_request_error_not_a_status() {
+        assert!(matches!(
+            build_request("bad\nhost"),
+            Err(HealthError::Request(_))
+        ));
+        assert!(build_request("127.0.0.1:8080").is_ok());
     }
 
     #[test]

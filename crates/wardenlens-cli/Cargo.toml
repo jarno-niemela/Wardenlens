@@ -39,6 +39,8 @@ wardenlens-vault = { path = "../wardenlens-vault" }
 zeroize = "1"
 
 [dev-dependencies]
+# A pseudo-terminal for the `vault rekey` test of the deploy procedure (#69).
+rustix = { workspace = true, features = ["pty"] }
 tempfile = { workspace = true }
 # Tests drive the real accept loop with raw sockets, and build the storage loop on one filesystem.
 tokio = { version = "1.54.1", default-features = false, features = ["io-util"] }
