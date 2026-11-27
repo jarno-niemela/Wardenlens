@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# third_party holds the vendored, patched retina (ADR 0002 section 13); it is not a workspace member.
+exclude = ["third_party"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +23,11 @@ tempfile = "3.27.0"
 secrecy = "0.10"
 # Already locked (via regex); the import screen uses one multi-pattern search per path.
 aho-corasick = { version = "1.1.5", default-features = false, features = ["std"] }
+
+# ADR 0002 section 13: retina 0.4.22 plus a small patch (bounded read buffer, Basic auth refused by default).
+# The patch is third_party/retina-0.4.22.patch; delete both when upstream has the options.
+[patch.crates-io]
+retina = { path = "third_party/retina" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
