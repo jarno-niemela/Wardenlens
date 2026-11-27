@@ -119,18 +119,24 @@ salvage such a file (section 9) but the format allows it later.
    same mechanism as the hard maximum: a keyframe starts the next segment and closes this one, any other frame closes
    the segment and is dropped, with frames dropped until the next keyframe (a segment always starts at a keyframe, so
    there is no "resume mid-GOP"; the loss counts as a gap). The factor 2 leaves a healthy stream untouched: its arrival
-   span tracks its media span, which is cut at 60 s (120 s at the latest) long before. A crash therefore loses at most
-   120 s of a stream with a sound clock and at most 240 s plus one GOP of one with a frozen or drifting clock.
-   - *Clock.* `arrival` is the wall-clock `UnixMs` of the `Clock` trait (#46). Because the wall clock can step, the
-     segmenter does not subtract first from last arrival. It **sums the forward steps** between consecutive frames of
-     the open segment; a step backward adds 0 and the next frame measures from the stepped value. A clock that stalls
-     (equal arrivals) adds 0, so the media-time bounds still apply. A forward step adds its full size, so a step of
-     more than 240 s closes the segment at that frame: a gap that long is a discontinuity anyway, and cutting early
-     only costs a segment boundary. A backward step cannot lengthen a segment more than the forward time that really
-     passed.
+   span tracks its media span, which is cut at 60 s (120 s at the latest) long before. A crash loses at most 120 s of
+   a stream with a sound clock; with a frozen or drifting RTP clock it loses at most 240 s, plus a gap of up to one
+   GOP at each forced cut.
+   - *Clock.* `arrival` is the wall-clock `UnixMs` of the `Clock` trait (#46), which can step. The segmenter does not
+     subtract first from last arrival. For each frame it adds the **forward progress** of the arrival clock to the
+     span, under three rules: (1) only progress beyond the **high-water mark** (the latest arrival seen in this
+     segment) counts, so a clock oscillating around true time (two time daemons, +500 ms / -500 ms) adds the real
+     forward time and not the sum of its forward steps; (2) one frame adds **at most 10 s**, the same per-step limit
+     as the media clock (`MAX_STEP_TICKS`), so a step of the host clock (NTP at first sync, a manual change) counts
+     as one long frame gap, not as the size of the step: a healthy stream is not cut by it, although repeated large
+     steps do advance the span 10 s at a time and can still cut a healthy stream, which is accepted; (3) a step
+     **backward of more than 10 s** re-anchors the high-water mark at the new arrival, so a clock stepped far back
+     cannot hide the time that passes afterwards (a smaller backward step keeps the mark and delays the span by at
+     most that step in total). A stalled clock (equal arrivals) adds 0, so the media-time bounds still apply.
    - *Interaction.* The byte cap, the media-time maximum and the arrival bound are one test (`forced`) per frame:
      whichever is reached first closes the segment, and a frame closes at most one segment (it is `StartNew` with the
-     old record, or `Drop` with the record, never both).
+     old record, or `Drop` with the record, never both). A frozen RTP clock together with a host whose clock also
+     stalls is bounded only by the byte cap; that case is out of scope here.
    - *`duration_ms`.* It stays the **media** duration (unchanged definition, so the 600 s `CHECK` and the sums of
      section 2 still hold) and may be far below the arrival span when the bound fires. Consumers needing wall
      coverage of such a segment have the next segment's `started_at_ms`; no wall duration is stored.
