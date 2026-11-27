@@ -8,6 +8,17 @@ use super::tree::{Children, Reader, find_path};
 
 /// Largest `moov` or `moof` payload that is read (1 MiB).
 pub const MAX_PAYLOAD_LEN: u64 = 1024 * 1024;
+/// Bytes of a `moof` payload besides the `trun` sample entries: `mfhd`, `traf` header, `tfhd`,
+/// `tfdt` and the `trun` header are 80 bytes; this leaves slack.
+const MOOF_FIXED_BYTES: u64 = 128;
+/// Bytes per sample in the writer's `trun` (duration, size and flags, 4 bytes each).
+const TRUN_SAMPLE_BYTES: u64 = 12;
+
+/// Most samples one fragment may hold so that its `moof` stays within [`MAX_PAYLOAD_LEN`] and the
+/// adoption walk can read it. The writer (`wardenlens-mp4`) and the recorder take their bound
+/// from here, so writer and parser cannot drift apart.
+pub const MAX_SAMPLES_PER_FRAGMENT: u64 = (MAX_PAYLOAD_LEN - MOOF_FIXED_BYTES) / TRUN_SAMPLE_BYTES;
+
 /// Largest file that is accepted (1 GiB).
 pub const MAX_FILE_LEN: u64 = 1024 * 1024 * 1024;
 /// Most fragments (`moof` boxes) a file may hold.

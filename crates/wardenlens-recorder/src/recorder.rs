@@ -3,17 +3,17 @@
 use tokio::sync::watch;
 use wardenlens_core::camera::CameraId;
 use wardenlens_core::recording::{Decision, FrameMeta, Pushed, Segmenter};
-use wardenlens_core::storage::SegmentIndex;
+use wardenlens_core::storage::{SegmentIndex, TransientFault};
 use wardenlens_core::time::UnixMs;
-use wardenlens_ingest::{Frame, H264Params as IngestParams, contains_b_slice};
+use wardenlens_core::video::{self, Frame};
 use wardenlens_mp4::{H264Params, InitSegment, init_segment};
 
 use crate::config::RecorderConfig;
-use crate::fault::IndexFault;
-use crate::health::{HoldReason, RecorderHealth, RecorderState};
+use crate::health::RecorderHealth;
 use crate::keys::KeyAlloc;
 use crate::pending::Pending;
 use crate::source::FrameSource;
+use crate::state::Conditions;
 use crate::store::SegmentStore;
 
 /// Why a recorder could not be built.
@@ -23,12 +23,12 @@ pub enum RecorderError {
     /// The newest `started_at_ms` of the camera could not be read from the index (the seed of
     /// the unique-key rule).
     #[error("could not read the newest segment of the camera from the index: {0}")]
-    Seed(String),
+    Seed(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// The parameter sets of the stream and the init segment built from them.
 pub(crate) struct Active {
-    raw: IngestParams,
+    raw: video::H264Params,
     pub(crate) init: InitSegment,
 }
 
@@ -36,12 +36,13 @@ pub(crate) struct Active {
 pub(crate) struct Open<W> {
     pub(crate) writer: W,
     pub(crate) init: InitSegment,
-    pub(crate) key: UnixMs,
     pub(crate) pending: Pending,
     /// Next `mfhd` sequence number.
     pub(crate) sequence: u32,
     /// Sum of the durations of the fragments written so far, in ticks.
     pub(crate) written_ticks: u64,
+    /// Bytes written to the `.part` so far (the init segment and the fragments).
+    pub(crate) bytes_written: u64,
     /// Media time of the latest sample, ticks since the segment start.
     pub(crate) last_dts: u64,
     /// Step before the latest sample (the last sample of a segment reuses it).
@@ -71,16 +72,16 @@ pub struct Recorder<S: SegmentStore, I: SegmentIndex> {
     pub(crate) params: Option<Active>,
     pub(crate) open: Option<Open<S::Writer>>,
     pub(crate) health: RecorderHealth,
-    pub(crate) b_hold: bool,
-    /// The volume was full; keyframes wait for `resume_free_bytes`.
-    pub(crate) awaiting_space: bool,
+    pub(crate) cond: Conditions,
+    /// Full-volume failures since the last segment that closed: the back-off exponent.
+    pub(crate) full_failures: u32,
     pub(crate) scratch: Vec<u8>,
     tx: watch::Sender<RecorderHealth>,
 }
 
 impl<S: SegmentStore, I: SegmentIndex> Recorder<S, I>
 where
-    I::Error: IndexFault,
+    I::Error: TransientFault + std::error::Error + Send + Sync + 'static,
 {
     /// A recorder for `camera`.
     ///
@@ -100,7 +101,7 @@ where
     ) -> Result<(Self, watch::Receiver<RecorderHealth>), RecorderError> {
         let indexed = index
             .latest_started_at(&camera)
-            .map_err(|e| RecorderError::Seed(e.to_string()))?;
+            .map_err(|e| RecorderError::Seed(Box::new(e)))?;
         let health = RecorderHealth::new();
         let (tx, rx) = watch::channel(health);
         let recorder = Self {
@@ -113,8 +114,8 @@ where
             params: None,
             open: None,
             health,
-            b_hold: false,
-            awaiting_space: false,
+            cond: Conditions::default(),
+            full_failures: 0,
             scratch: Vec::new(),
             tx,
         };
@@ -144,7 +145,8 @@ where
         self.health
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        self.health.state = self.cond.state(self.open.is_some());
         let now = self.health;
         self.tx.send_if_modified(|h| {
             let changed = *h != now;
@@ -153,11 +155,7 @@ where
         });
     }
 
-    pub(crate) fn set_hold(&mut self, reason: HoldReason) {
-        self.health.state = RecorderState::Held(reason);
-    }
-
-    fn drop_frame(&mut self) {
+    pub(crate) fn drop_frame(&mut self) {
         self.health.frames_dropped = self.health.frames_dropped.saturating_add(1);
     }
 
@@ -171,30 +169,21 @@ where
             // does, the file is not trusted.
             self.abort_segment(open);
         }
-        self.settle();
-    }
-
-    /// After a segment closed with nothing open: a recording state becomes waiting.
-    pub(crate) fn settle(&mut self) {
-        if self.open.is_none() && self.health.state == RecorderState::Recording {
-            self.health.state = RecorderState::Waiting;
-        }
     }
 
     fn handle(&mut self, frame: Frame) {
-        if self.b_hold {
+        if self.cond.b_frames {
             self.drop_frame();
             return;
         }
         // Parameter sets are taken from every frame, also from one that is dropped below: ingest
         // sends them once per session, and a frame lost to a hold must not lose them.
         self.update_params(&frame);
-        match contains_b_slice(&frame.data) {
+        match video::contains_b_slice(&frame.data) {
             Ok(false) => {}
             Ok(true) => {
                 self.close_open();
-                self.b_hold = true;
-                self.set_hold(HoldReason::BFramesDetected);
+                self.cond.b_frames = true;
                 self.drop_frame();
                 return;
             }
@@ -207,13 +196,11 @@ where
         }
         let Ok(arrival) = UnixMs::try_from(frame.arrival) else {
             self.close_open();
-            self.set_hold(HoldReason::ClockOutOfRange);
+            self.cond.clock = true;
             self.drop_frame();
             return;
         };
-        if self.health.state == RecorderState::Held(HoldReason::ClockOutOfRange) {
-            self.health.state = RecorderState::Waiting;
-        }
+        self.cond.clock = false;
         if self.params.is_none() {
             self.drop_frame();
             return;
@@ -249,12 +236,10 @@ where
                 raw: raw.clone(),
                 init,
             });
-            if self.health.state == RecorderState::Held(HoldReason::BadParameters) {
-                self.health.state = RecorderState::Waiting;
-            }
+            self.cond.params = false;
         } else {
             self.params = None;
-            self.set_hold(HoldReason::BadParameters);
+            self.cond.params = true;
         }
     }
 
@@ -268,10 +253,7 @@ where
         match pushed.decision {
             Decision::StartNew => self.begin(frame, arrival),
             Decision::Append => self.append(frame, &pushed),
-            _ => {
-                self.drop_frame();
-                self.settle();
-            }
+            _ => self.drop_frame(),
         }
     }
 }

@@ -297,3 +297,177 @@ fn the_channel_source_ends_the_recording_when_the_sender_is_dropped() {
     assert_eq!(health.borrow().segments_indexed, 1);
     assert_eq!(health.borrow().state, RecorderState::Waiting);
 }
+
+// ---- round 2: insert that commits and then fails, durability, back-off, index probe ----
+
+#[test]
+fn a_transient_error_after_the_row_was_committed_does_not_quarantine_the_segment() {
+    // SQLite's checkpoint inside COMMIT can fail after the row is durable: the retry then meets
+    // its own row as a duplicate.
+    for make in transient() {
+        let mut r = Rig::new();
+        r.index.lock().unwrap().commit_then_error = vec![make()].into();
+        r.start();
+        r.feed(Slice::P);
+        let d = r.finish();
+        assert_eq!(d.end.segments_indexed, 1, "{:?}", d.end);
+        assert_eq!(d.end.segments_quarantined, 0);
+        assert_eq!(d.rows.len(), 1);
+        assert_eq!(tree(&d.root).len(), 1);
+        assert!(!tree(&d.root)[0].contains("_quarantine"));
+    }
+}
+
+#[test]
+fn the_committed_row_is_found_even_when_the_retries_run_out() {
+    let config = fast().with_insert_retries(0, std::time::Duration::ZERO);
+    let mut r = Rig::build(config, None, |_, _| {});
+    r.index.lock().unwrap().commit_then_error = vec![IndexError::Busy { op: "insert" }].into();
+    r.start();
+    r.feed(Slice::P);
+    let d = r.finish();
+    assert_eq!((d.end.segments_indexed, d.end.segments_unindexed), (1, 0));
+}
+
+#[test]
+fn a_duplicate_after_a_transient_error_without_a_matching_row_still_quarantines() {
+    // Busy, then Duplicate, and no row exists: nothing indexes this file.
+    let mut r = Rig::new();
+    r.index.lock().unwrap().insert_errors =
+        vec![IndexError::Busy { op: "insert" }, IndexError::Duplicate].into();
+    r.start();
+    r.feed(Slice::P);
+    let d = r.finish();
+    assert_eq!((d.end.segments_indexed, d.end.segments_quarantined), (0, 1));
+}
+
+#[test]
+fn a_directory_that_cannot_be_synced_keeps_the_file_and_skips_the_insert() {
+    let mut r = Rig::new();
+    r.store.lock().unwrap().not_durable = true;
+    r.start();
+    r.feed(Slice::P);
+    let attempts = r.index.clone();
+    let d = r.finish();
+    assert_eq!(attempts.lock().unwrap().attempts, 0);
+    assert_eq!((d.end.segments_indexed, d.end.segments_unindexed), (0, 1));
+    assert_eq!(d.end.segments_aborted, 0);
+    assert_eq!(d.rows.len(), 0);
+    let names = tree(&d.root);
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].contains(".mp4") && !names[0].contains(".part"));
+}
+
+#[test]
+fn a_file_planted_at_the_final_name_mid_segment_is_skipped_and_the_segment_is_kept() {
+    let mut r = Rig::new();
+    r.start();
+    r.feed(Slice::P);
+    let planted = r
+        .root
+        .join(wardenlens_core::recording::RelPath::new(&cam(), ms(T0 + 100)).to_string());
+    std::fs::write(&planted, b"foreign").unwrap();
+    let d = r.finish();
+    assert_eq!(std::fs::read(&planted).unwrap(), b"foreign");
+    assert_eq!(d.rows.len(), 1);
+    assert_eq!(d.rows[0].record.started_at_ms.as_i64(), T0 + 101);
+    assert_eq!(tree(&d.root).len(), 2);
+}
+
+#[test]
+fn a_volume_that_cannot_be_freed_is_retried_with_a_growing_back_off_not_in_a_loop() {
+    // Creating works and statvfs shows room (a quota, or a volume refilled by someone else),
+    // but every write fails with ENOSPC. The recorder must not create and delete a segment at
+    // every keyframe.
+    let mut r = Rig::new();
+    {
+        let mut s = r.store.lock().unwrap();
+        s.appends_until_error = Some(0);
+        s.appends_always_full = true;
+        s.available = Some(1 << 40);
+    }
+    r.start();
+    for k in 1..400u32 {
+        // A keyframe every 10 frames, 1 s apart.
+        for _ in 0..9 {
+            r.feed(Slice::P);
+        }
+        r.feed(Slice::Idr);
+        assert!(part_files(&r.root).len() <= 1, "{k}");
+    }
+    let creates = r.store.lock().unwrap().creates;
+    let aborts = r.store.lock().unwrap().aborts;
+    // Back-off 1, 2, 4, 8, 16, 32 keyframes, then every 33rd: about 17 attempts in 400.
+    assert!(creates <= 20, "{creates} creates in 400 keyframes");
+    assert!(creates >= 8, "{creates}: it must keep trying");
+    assert_eq!(creates, aborts);
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::StorageFull));
+    // Space that is real: it recovers.
+    {
+        let mut s = r.store.lock().unwrap();
+        s.appends_until_error = None;
+    }
+    for _ in 0..40 {
+        for _ in 0..9 {
+            r.feed(Slice::P);
+        }
+        r.feed(Slice::Idr);
+    }
+    assert_eq!(r.state(), RecorderState::Recording);
+    let d = r.finish();
+    assert_eq!(d.rows.len(), 1);
+}
+
+#[test]
+fn the_aborted_segments_size_must_be_free_again_before_a_retry() {
+    // The abort freed the segment's own bytes, so seeing them free proves nothing.
+    let config = fast().with_resume_free_bytes(1_000);
+    let mut r = Rig::build(config, None, |_, _| {});
+    r.start();
+    for _ in 1..20 {
+        r.feed(Slice::P);
+    }
+    {
+        let mut s = r.store.lock().unwrap();
+        s.appends_until_error = Some(0);
+        s.append_error = Some(StoreError::NoSpace);
+    }
+    r.feed(Slice::Idr); // the flush of 20 frames fails
+    r.feed(Slice::P);
+    r.feed(Slice::Idr); // consumed by the back-off
+    // Written so far: the init segment and nothing else (the first fragment failed), so the
+    // need is the margin plus the init segment's length (a few hundred bytes).
+    r.store.lock().unwrap().available = Some(1_000);
+    r.feed(Slice::Idr);
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::StorageFull));
+    r.store.lock().unwrap().available = Some(1_000_000);
+    r.feed(Slice::Idr);
+    assert_eq!(r.state(), RecorderState::Recording);
+}
+
+#[test]
+fn an_index_that_cannot_answer_holds_with_its_own_reason_and_recovers() {
+    let mut r = Rig::new();
+    r.index.lock().unwrap().list_errors = 1;
+    r.start();
+    assert_eq!(r.state(), RecorderState::Held(HoldReason::IndexUnavailable));
+    assert_eq!(tree(&r.root).len(), 0);
+    r.feed(Slice::P);
+    r.feed(Slice::Idr);
+    assert_eq!(r.state(), RecorderState::Recording);
+    let d = r.finish();
+    assert_eq!(d.rows.len(), 1);
+}
+
+#[test]
+fn the_seed_error_keeps_its_source() {
+    let dir = private_tempdir();
+    let (store, _) = TestStore::new(&hot_root(dir.path()));
+    let (index, script) = TestIndex::open(dir.path());
+    script.lock().unwrap().seed_error = Some(IndexError::Busy { op: "x" });
+    let e = Recorder::new(cam(), fast(), store, index, None)
+        .err()
+        .unwrap();
+    let source = std::error::Error::source(&e).unwrap();
+    assert!(source.to_string().contains("busy"));
+}

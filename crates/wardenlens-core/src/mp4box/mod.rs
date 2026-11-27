@@ -28,4 +28,6 @@ mod tests;
 pub use error::{Mp4BoxError, SourceError};
 pub use header::{BoxHeader, HEADER_LEN, parse_header};
 pub use source::{ByteSource, SliceSource};
-pub use walk::{MAX_FILE_LEN, MAX_FRAGMENTS, MAX_PAYLOAD_LEN, Mp4Summary, summarize};
+pub use walk::{
+    MAX_FILE_LEN, MAX_FRAGMENTS, MAX_PAYLOAD_LEN, MAX_SAMPLES_PER_FRAGMENT, Mp4Summary, summarize,
+};

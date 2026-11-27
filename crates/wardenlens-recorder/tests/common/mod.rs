@@ -28,7 +28,7 @@ use wardenlens_ingest::{Frame, FrameMapper, RawParams, RawVideoFrame};
 use wardenlens_mp4::DurationPatch;
 
 pub mod rig;
-use wardenlens_recorder::{HotStore, HotWriter, SegmentStore, StoreError};
+use wardenlens_recorder::{HotStore, HotWriter, Sealed, SegmentStore, StoreError};
 
 /// A 16x16 baseline SPS and its PPS.
 pub const SPS_A: [u8; 7] = [0x67, 0x42, 0xc0, 0x0a, 0xf8, 0x41, 0xa2];
@@ -253,6 +253,11 @@ pub struct IndexScript {
     pub attempts: u32,
     /// `latest_started_at` fails with this once.
     pub seed_error: Option<IndexError>,
+    /// The next inserts really commit the row and then fail with these (a checkpoint error
+    /// inside `COMMIT`: the row is durable, the caller sees an error).
+    pub commit_then_error: VecDeque<IndexError>,
+    /// `list` fails this many times.
+    pub list_errors: u32,
 }
 
 pub type SharedScript = Arc<Mutex<IndexScript>>;
@@ -287,6 +292,11 @@ impl SegmentIndex for TestIndex {
             if let Some(e) = s.insert_errors.pop_front() {
                 return Err(e);
             }
+            if let Some(e) = s.commit_then_error.pop_front() {
+                drop(s);
+                self.inner.insert(record, tier)?;
+                return Err(e);
+            }
         }
         self.inner.insert(record, tier)
     }
@@ -303,6 +313,13 @@ impl SegmentIndex for TestIndex {
         limit: usize,
         cursor: Option<&SegmentCursor>,
     ) -> Result<SegmentPage, IndexError> {
+        {
+            let mut s = self.script.lock().unwrap();
+            if s.list_errors > 0 {
+                s.list_errors -= 1;
+                return Err(IndexError::Busy { op: "list" });
+            }
+        }
         self.inner.list(camera, from, to, limit, cursor)
     }
 
@@ -372,6 +389,11 @@ pub struct StoreScript {
     pub append_error: Option<StoreError>,
     /// `commit` fails with this once.
     pub commit_error: Option<StoreError>,
+    /// `commit` reports the directory fsync as failed (the file is kept).
+    pub not_durable: bool,
+    /// Once `appends_until_error` reaches 0, every append fails with `NoSpace` (a volume that
+    /// cannot be freed, or a quota that `statvfs` does not show).
+    pub appends_always_full: bool,
     /// What `available_bytes` reports.
     pub available: Option<u64>,
     pub creates: u32,
@@ -436,6 +458,7 @@ impl SegmentStore for TestStore {
         {
             let mut s = self.script.lock().unwrap();
             match s.appends_until_error {
+                Some(0) if s.appends_always_full => return Err(StoreError::NoSpace),
                 Some(0) => {
                     s.appends_until_error = None;
                     if let Some(e) = s.append_error.take() {
@@ -449,14 +472,18 @@ impl SegmentStore for TestStore {
         self.inner.append(writer, bytes)
     }
 
-    fn commit(&mut self, writer: HotWriter, patch: &DurationPatch) -> Result<u64, StoreError> {
+    fn commit(&mut self, writer: HotWriter, patch: &DurationPatch) -> Result<Sealed, StoreError> {
         let err = self.script.lock().unwrap().commit_error.take();
         self.script.lock().unwrap().open_now -= 1;
         if let Some(e) = err {
             self.inner.abort(writer);
             return Err(e);
         }
-        self.inner.commit(writer, patch)
+        let mut sealed = self.inner.commit(writer, patch)?;
+        if self.script.lock().unwrap().not_durable {
+            sealed.durable = false;
+        }
+        Ok(sealed)
     }
 
     fn abort(&mut self, writer: HotWriter) {

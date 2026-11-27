@@ -21,6 +21,9 @@ pub enum HoldReason {
     /// The camera's SPS or PPS did not validate, so no segment can be written. Ends when valid
     /// parameter sets arrive.
     BadParameters,
+    /// The index could not be asked whether a key is free, or no free key was found, so no
+    /// segment can be started safely. Retried at the next keyframe.
+    IndexUnavailable,
 }
 
 /// The recorder's current state.
@@ -47,8 +50,9 @@ pub struct RecorderHealth {
     pub segments_aborted: u64,
     /// Finished files moved to quarantine because the index refused them permanently.
     pub segments_quarantined: u64,
-    /// Finished files left in place because the index stayed busy through every retry; the
-    /// reconciliation pass at the next start adopts them (ADR 0005 section 9).
+    /// Finished files left in place without a row: the index stayed busy through every retry,
+    /// the directory fsync failed, or every quarantine name was taken. The reconciliation pass at
+    /// the next start judges them (ADR 0005 section 9).
     pub segments_unindexed: u64,
     /// Frames that were not written.
     pub frames_dropped: u64,

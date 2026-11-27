@@ -1,7 +1,7 @@
 //! Where frames come from.
 
 use tokio::sync::mpsc;
-use wardenlens_ingest::Frame;
+use wardenlens_core::video::Frame;
 
 /// A blocking source of frames. `None` ends the recording: the open segment is flushed and
 /// indexed (graceful stop). To stop a recorder, end its source.

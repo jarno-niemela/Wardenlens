@@ -39,6 +39,11 @@ impl KeyAlloc {
         }
     }
 
+    /// Records a key a file was finished under (it may be later than the one picked).
+    pub(crate) fn note(&mut self, key: UnixMs) {
+        self.max_seen = Some(self.max_seen.map_or(key, |m| m.max(key)));
+    }
+
     /// `arrival`, plus 1 ms repeated until `taken` says the key is free (no row and no file has
     /// it). Every candidate is probed, so a file that is not in the index (an orphan or a stale
     /// `.part`) is found whatever the seed says, and a forward step of the clock does not

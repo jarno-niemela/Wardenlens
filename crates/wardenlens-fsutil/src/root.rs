@@ -11,6 +11,8 @@ use rustix::fs::{
     fstatvfs, fsync, mkdirat, openat, openat2, renameat_with, unlinkat,
 };
 
+use rustix::io::Errno;
+
 use crate::error::FsError;
 
 /// Kind of a file system object.
@@ -351,6 +353,31 @@ impl RootDir {
             Ok(())
         } else {
             Err(FsError::NotRegular)
+        }
+    }
+
+    /// Whether anything is named `name` in this directory (one component): a regular file, a directory,
+    /// a FIFO, a device node or a symlink all count as "there". The entry is opened with
+    /// `O_PATH`, so nothing is read, no device routine runs, no read permission is needed on the
+    /// file, and `atime` does not change; `RESOLVE_NO_SYMLINKS` makes a symlink answer
+    /// `ELOOP`, which is "there" too (the link itself exists; with one component it cannot be a
+    /// parent).
+    ///
+    /// # Errors
+    /// Invalid component, or a kernel refusal other than `ENOENT` and `ELOOP` (for example
+    /// `EACCES` on this directory): the answer is unknown and the caller must not assume the name
+    /// is free.
+    pub fn exists(&self, name: &str) -> Result<bool, FsError> {
+        match openat2(
+            &self.fd,
+            component(name)?,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            BENEATH,
+        ) {
+            Ok(_) | Err(Errno::LOOP) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(FsError::io("open path")(e)),
         }
     }
 

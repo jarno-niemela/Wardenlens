@@ -933,6 +933,8 @@ documents are not edited here.**
   shared by the `mp4` writer's tests (replacing a private test-only parser) and by the `storage` adoption walk. The
   **writer** stays in `wardenlens-mp4`.
 
+**The frame type lives in core.** `Frame` (one H.264 access unit as AVCC bytes with its timing and parameter sets), `H264Params`, the B-slice check `contains_b_slice` and the error classification of the index port (`TransientFault`) are in `core` (`core::video`, `core::storage`), so `ingest` (producer) and `recorder` (consumer) meet only through core types and `recorder` depends on neither `ingest` nor `index` (ticket #57).
+
 Resulting edges: `index -> core, fsutil`; `vault -> core, secrets, fsutil`; `storage -> core, fsutil`; `recorder -> core,
 mp4, fsutil`; `mp4 -> core`; `api -> core`; `fsutil -> core`; `cli -> all`.
 

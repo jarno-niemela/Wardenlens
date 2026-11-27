@@ -15,6 +15,9 @@ pub enum StoreError {
     /// A file with the segment's name already exists.
     #[error("a file with this name already exists")]
     NameTaken,
+    /// Every quarantine name is taken: the file was left where it is.
+    #[error("every quarantine name is taken")]
+    QuarantineExhausted,
     /// A path-confined file operation failed.
     #[error("file operation failed: {0}")]
     Fs(FsError),
@@ -53,6 +56,20 @@ impl StoreError {
     }
 }
 
+/// A closed segment file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sealed {
+    /// The key the file was finished under: the key given at `create`, or a later one when
+    /// another file appeared at the final name meanwhile.
+    pub key: UnixMs,
+    /// The length of the finished file.
+    pub len: u64,
+    /// Whether the directory fsync after the rename succeeded. A file that is not durable is
+    /// complete and visible but may vanish in a crash, so it is not indexed.
+    pub durable: bool,
+}
+
 /// Reads and writes the segment files of one camera on the hot volume (ADR 0005 section 3).
 ///
 /// At most one writer is open at a time (the caller's duty), so a crash leaves at most one
@@ -82,12 +99,17 @@ pub trait SegmentStore {
     fn append(&mut self, writer: &mut Self::Writer, bytes: &[u8]) -> Result<(), StoreError>;
 
     /// Closes the segment: patches the duration in `mvhd` and `mehd` with `pwrite`, fsyncs the
-    /// file, renames `.part` to `.mp4` with `RENAME_NOREPLACE`, and fsyncs the directory. Returns
-    /// the length of the finished file.
+    /// file, renames `.part` to `.mp4` with `RENAME_NOREPLACE` (at the next free key when another
+    /// file appeared at the name), and fsyncs the directory.
+    ///
+    /// A failed directory fsync is not an error: the finished file is kept (it is complete and
+    /// is adopted by reconciliation, ADR 0005 section 9) and [`Sealed::durable`] is false.
     ///
     /// # Errors
-    /// Any step failing. Neither `.part` nor `.mp4` is left behind then (best effort).
-    fn commit(&mut self, writer: Self::Writer, patch: &DurationPatch) -> Result<u64, StoreError>;
+    /// A step before the rename failing, or no free name. The `.part` is removed then (best
+    /// effort); no `.mp4` was created.
+    fn commit(&mut self, writer: Self::Writer, patch: &DurationPatch)
+    -> Result<Sealed, StoreError>;
 
     /// Throws the segment away: removes the `.part`. Best effort.
     fn abort(&mut self, writer: Self::Writer);
@@ -95,7 +117,8 @@ pub trait SegmentStore {
     /// Moves the finished file of `key` to quarantine (ADR 0005 section 9).
     ///
     /// # Errors
-    /// The move failed; the file stays where it is.
+    /// The move failed or every quarantine name is taken
+    /// ([`StoreError::QuarantineExhausted`]); the file stays where it is.
     fn quarantine(&mut self, key: UnixMs) -> Result<(), StoreError>;
 
     /// Bytes available to the recorder on the volume.

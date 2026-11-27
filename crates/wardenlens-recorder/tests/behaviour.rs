@@ -412,16 +412,19 @@ fn plant(root: &Path, key: i64, suffix: &str) -> PathBuf {
 #[test]
 fn foreign_files_at_a_key_are_never_touched_or_replaced() {
     type Plant = fn(&Path);
-    let table: [(&str, Plant); 5] = [
+    let table: [(&str, Plant); 6] = [
         ("an orphan .mp4", |p| std::fs::write(p, b"orphan").unwrap()),
         ("a stale .part", |p| std::fs::write(p, b"stale").unwrap()),
         ("a dangling symlink", |p| {
             std::os::unix::fs::symlink("/nonexistent-wardenlens-target", p).unwrap();
         }),
         ("a directory", |p| std::fs::create_dir(p).unwrap()),
+        ("a file nobody may read", |p| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(p, b"locked").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }),
         ("a fifo", |p| {
-            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
-            let _ = c;
             std::process::Command::new("mkfifo")
                 .arg(p)
                 .status()

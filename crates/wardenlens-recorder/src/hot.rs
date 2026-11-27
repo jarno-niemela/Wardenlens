@@ -8,12 +8,14 @@ use std::os::unix::fs::FileExt;
 use wardenlens_core::camera::CameraId;
 use wardenlens_core::recording::RelPath;
 use wardenlens_core::time::UnixMs;
-use wardenlens_fsutil::{FsError, RootDir, quarantine};
+use wardenlens_fsutil::{FsError, QuarantineOutcome, RootDir, quarantine};
 use wardenlens_mp4::DurationPatch;
 
-use crate::store::{SegmentStore, StoreError};
+use crate::store::{Sealed, SegmentStore, StoreError};
 
 const PART_SUFFIX: &str = ".part";
+/// How many keys `commit` tries when another file appeared at the final name.
+const RENAME_TRIES: u32 = 8;
 
 /// The three components of a segment's path below the hot root.
 struct Names {
@@ -47,7 +49,9 @@ pub struct HotWriter {
     file: File,
     dir: RootDir,
     part: String,
-    name: String,
+    key: UnixMs,
+    /// The day directory name, to stay in it when the key is bumped.
+    day: String,
 }
 
 /// The hot tier of one camera.
@@ -94,18 +98,6 @@ impl HotStore {
             Err(e) => Err(StoreError::from_fs(e)),
         }
     }
-
-    /// Whether `file` exists in `dir`. Anything that is there counts as taken, a symlink (which
-    /// `RESOLVE_NO_SYMLINKS` refuses with `ELOOP`) or a FIFO included; any other error than
-    /// ENOENT is an error (the key is never assumed free).
-    fn exists(dir: &RootDir, file: &str) -> Result<bool, StoreError> {
-        match dir.open_read(&[file]) {
-            Ok(_) | Err(FsError::NotRegular) => Ok(true),
-            Err(e) if e.errno() == Some(rustix::io::Errno::LOOP) => Ok(true),
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(StoreError::from_fs(e)),
-        }
-    }
 }
 
 impl SegmentStore for HotStore {
@@ -116,7 +108,10 @@ impl SegmentStore for HotStore {
         let Some(dir) = self.existing_day_dir(&names)? else {
             return Ok(false);
         };
-        Ok(Self::exists(&dir, &names.file)? || Self::exists(&dir, &names.part())?)
+        // `O_PATH`: a device node or FIFO planted at the name is never opened, and a file without
+        // read permission is still found.
+        Ok(dir.exists(&names.file).map_err(StoreError::from_fs)?
+            || dir.exists(&names.part()).map_err(StoreError::from_fs)?)
     }
 
     fn create(&mut self, key: UnixMs, head: &[u8]) -> Result<HotWriter, StoreError> {
@@ -128,7 +123,8 @@ impl SegmentStore for HotStore {
             file,
             dir,
             part,
-            name: names.file,
+            key,
+            day: names.day,
         };
         if let Err(e) = self.append(&mut writer, head) {
             self.abort(writer);
@@ -145,8 +141,8 @@ impl SegmentStore for HotStore {
             .map_err(|e| StoreError::from_io("write", &e))
     }
 
-    fn commit(&mut self, writer: HotWriter, patch: &DurationPatch) -> Result<u64, StoreError> {
-        let result = seal(&writer, patch);
+    fn commit(&mut self, writer: HotWriter, patch: &DurationPatch) -> Result<Sealed, StoreError> {
+        let result = seal(&writer, &self.camera, patch, RootDir::sync);
         if result.is_err() {
             self.abort(writer);
         }
@@ -165,9 +161,11 @@ impl SegmentStore for HotStore {
 
     fn quarantine(&mut self, key: UnixMs) -> Result<(), StoreError> {
         let names = Names::new(&self.camera, key)?;
-        quarantine(&self.root, &[&names.camera, &names.day, &names.file])
-            .map(|_| ())
-            .map_err(StoreError::from_fs)
+        match quarantine(&self.root, &[&names.camera, &names.day, &names.file]) {
+            Ok(QuarantineOutcome::Exhausted) => Err(StoreError::QuarantineExhausted),
+            Ok(_) => Ok(()),
+            Err(e) => Err(StoreError::from_fs(e)),
+        }
     }
 
     fn available_bytes(&mut self) -> Result<u64, StoreError> {
@@ -177,7 +175,17 @@ impl SegmentStore for HotStore {
 }
 
 /// Steps 2 to 5 of the close sequence (ADR 0005 section 3), on the open `.part`.
-fn seal(w: &HotWriter, patch: &DurationPatch) -> Result<u64, StoreError> {
+///
+/// The rename never replaces: when a file appeared at the final name meanwhile, the next keys
+/// are tried (within the same day directory, at most [`RENAME_TRIES`]). A failed directory fsync
+/// keeps the finished file and says so in [`Sealed::durable`]. `sync_dir` is a parameter so a
+/// test can make it fail.
+fn seal(
+    w: &HotWriter,
+    camera: &CameraId,
+    patch: &DurationPatch,
+    sync_dir: fn(&RootDir) -> Result<(), FsError>,
+) -> Result<Sealed, StoreError> {
     let io = |op| move |e: std::io::Error| StoreError::from_io(op, &e);
     w.file
         .write_all_at(&patch.mvhd_value, patch.mvhd_offset)
@@ -187,13 +195,151 @@ fn seal(w: &HotWriter, patch: &DurationPatch) -> Result<u64, StoreError> {
         .map_err(io("patch mehd"))?;
     w.file.sync_all().map_err(io("fsync file"))?;
     let len = w.file.metadata().map_err(io("fstat"))?.len();
-    w.dir
-        .rename_noreplace(&w.part, &w.dir, &w.name)
-        .map_err(StoreError::from_fs)?;
-    if let Err(e) = w.dir.sync() {
-        // Not durable, so not indexed: take the finished name away again (best effort).
-        let _ = w.dir.unlink(&w.name);
-        return Err(StoreError::from_fs(e));
+    let mut key = w.key;
+    for _ in 0..RENAME_TRIES {
+        let names = Names::new(camera, key)?;
+        if names.day != w.day {
+            break; // the bumped key crossed midnight: another directory, not handled here
+        }
+        match w.dir.rename_noreplace(&w.part, &w.dir, &names.file) {
+            Ok(()) => {
+                let durable = sync_dir(&w.dir).is_ok();
+                return Ok(Sealed { key, len, durable });
+            }
+            Err(e) if e.errno() == Some(rustix::io::Errno::EXIST) => {}
+            Err(e) => return Err(StoreError::from_fs(e)),
+        }
+        key = key
+            .as_i64()
+            .checked_add(1)
+            .and_then(|ms| UnixMs::new(ms).ok())
+            .ok_or(StoreError::NameTaken)?;
     }
-    Ok(len)
+    Err(StoreError::NameTaken)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: i64 = 1_700_000_000_000;
+
+    fn camera() -> CameraId {
+        CameraId::new("cam1").unwrap()
+    }
+
+    fn patch() -> DurationPatch {
+        let init = wardenlens_mp4::init_segment(
+            &wardenlens_mp4::H264Params::new(
+                &[0x67, 0x42, 0xc0, 0x0a, 0xf8, 0x41, 0xa2],
+                &[0x68, 0xce, 0x38, 0x80],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        init.duration_patch(90_000).unwrap()
+    }
+
+    fn written(root: &std::path::Path, key: i64) -> (HotStore, HotWriter) {
+        let mut store = HotStore::new(RootDir::open(root).unwrap(), camera());
+        let init = wardenlens_mp4::init_segment(
+            &wardenlens_mp4::H264Params::new(
+                &[0x67, 0x42, 0xc0, 0x0a, 0xf8, 0x41, 0xa2],
+                &[0x68, 0xce, 0x38, 0x80],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let w = store
+            .create(UnixMs::new(key).unwrap(), init.bytes())
+            .unwrap();
+        (store, w)
+    }
+
+    fn files(root: &std::path::Path) -> Vec<String> {
+        let day = root.join("cam1").join("2023-11-14");
+        let mut v: Vec<String> = std::fs::read_dir(day)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_failed_directory_fsync_keeps_the_finished_file_and_says_it_is_not_durable() {
+        let d = tempfile::tempdir().unwrap();
+        let (_store, w) = written(d.path(), KEY);
+        let failing = |_: &RootDir| {
+            Err(FsError::Io {
+                op: "fsync dir",
+                source: rustix::io::Errno::IO,
+            })
+        };
+        let sealed = seal(&w, &camera(), &patch(), failing).unwrap();
+        assert!(!sealed.durable);
+        assert_eq!(sealed.key, UnixMs::new(KEY).unwrap());
+        assert_eq!(files(d.path()), ["221320-000.mp4"]);
+        assert_eq!(
+            std::fs::metadata(d.path().join("cam1/2023-11-14/221320-000.mp4"))
+                .unwrap()
+                .len(),
+            sealed.len
+        );
+    }
+
+    #[test]
+    fn a_synced_directory_is_durable() {
+        let d = tempfile::tempdir().unwrap();
+        let (_store, w) = written(d.path(), KEY);
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync).unwrap();
+        assert!(sealed.durable);
+    }
+
+    #[test]
+    fn a_file_that_appeared_at_the_final_name_is_skipped_not_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        let (_store, w) = written(d.path(), KEY);
+        let day = d.path().join("cam1/2023-11-14");
+        std::fs::write(day.join("221320-000.mp4"), b"foreign").unwrap();
+        std::fs::write(day.join("221320-001.mp4"), b"foreign").unwrap();
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync).unwrap();
+        assert_eq!(sealed.key, UnixMs::new(KEY + 2).unwrap());
+        assert_eq!(
+            std::fs::read(day.join("221320-000.mp4")).unwrap(),
+            b"foreign"
+        );
+        assert_eq!(
+            std::fs::read(day.join("221320-001.mp4")).unwrap(),
+            b"foreign"
+        );
+        assert_eq!(
+            files(d.path()),
+            ["221320-000.mp4", "221320-001.mp4", "221320-002.mp4"]
+        );
+    }
+
+    #[test]
+    fn running_out_of_free_names_is_name_taken_and_leaves_the_part_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut store, w) = written(d.path(), KEY);
+        let day = d.path().join("cam1/2023-11-14");
+        for n in 0..RENAME_TRIES {
+            std::fs::write(day.join(format!("221320-{n:03}.mp4")), b"foreign").unwrap();
+        }
+        let e = store.commit(w, &patch()).unwrap_err();
+        assert!(matches!(e, StoreError::NameTaken));
+        assert!(files(d.path()).iter().all(|f| !f.contains(".part")));
+    }
+
+    #[test]
+    fn a_bumped_key_never_leaves_the_day_directory() {
+        let d = tempfile::tempdir().unwrap();
+        // 23:59:59.999 UTC on 2023-11-14; the next key is in the next day.
+        let key = 1_700_006_399_999;
+        let (_store, w) = written(d.path(), key);
+        std::fs::write(d.path().join("cam1/2023-11-14/235959-999.mp4"), b"foreign").unwrap();
+        let e = seal(&w, &camera(), &patch(), RootDir::sync).unwrap_err();
+        assert!(matches!(e, StoreError::NameTaken));
+    }
 }

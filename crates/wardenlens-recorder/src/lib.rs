@@ -3,7 +3,8 @@
 //! A [`Recorder`] takes the frames of one camera from a [`FrameSource`], lets the core
 //! `Segmenter` cut them into segments, writes each segment as a fragmented MP4 with
 //! `wardenlens-mp4` through a [`SegmentStore`], and indexes it through the core `SegmentIndex`
-//! port. There is no decoding and no re-encoding.
+//! port. The crate depends on core, mp4 and fsutil only (ADR 0005 section 11); the frame type and
+//! the B-slice check are in `wardenlens_core::video`, and the index adapter is wired by the caller. There is no decoding and no re-encoding.
 //!
 //! The logic is generic over the two ports ([`SegmentStore`], `SegmentIndex`), so it is tested
 //! without a disk and without SQLite; [`HotStore`] and `wardenlens_index::Index` are the real
@@ -26,20 +27,20 @@
 
 mod close;
 mod config;
-mod fault;
 mod health;
 mod hot;
 mod keys;
 mod pending;
+mod probe;
 mod recorder;
 mod source;
+mod state;
 mod store;
 mod write;
 
 pub use config::RecorderConfig;
-pub use fault::IndexFault;
 pub use health::{HoldReason, RecorderHealth, RecorderState};
 pub use hot::{HotStore, HotWriter};
 pub use recorder::{Recorder, RecorderError};
 pub use source::{ChannelSource, FrameSource};
-pub use store::{SegmentStore, StoreError};
+pub use store::{Sealed, SegmentStore, StoreError};

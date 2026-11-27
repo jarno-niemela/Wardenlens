@@ -8,8 +8,15 @@ use crate::error::Mp4Error;
 /// Largest single sample (one frame) accepted: 8 MiB (ADR 0005 section 2).
 pub const MAX_SAMPLE_LEN: usize = 8 * 1024 * 1024;
 
-/// Most samples in one fragment. A GOP is far smaller; this bounds the `trun` table.
-pub const MAX_SAMPLES_PER_FRAGMENT: usize = 100_000;
+/// Most samples in one fragment. A GOP is far smaller; this bounds the `trun` table so the `moof`
+/// stays within the payload cap of the adoption parser (`core::mp4box`), the one source of it.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "const context (`usize::try_from` is not const); the value is below 2^17"
+)]
+pub const MAX_SAMPLES_PER_FRAGMENT: usize =
+    wardenlens_core::mp4box::MAX_SAMPLES_PER_FRAGMENT as usize;
 
 /// The track id used by [`crate::init_segment`] and every fragment.
 pub(crate) const TRACK_ID: u32 = 1;
