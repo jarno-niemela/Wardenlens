@@ -66,6 +66,36 @@ pub(super) fn rtsp_paths(entry: &CatalogueEntry) -> (Option<&str>, Option<&str>)
     (paths.next(), paths.next())
 }
 
+/// The entry's RTSP path with the same part before `?` as `path` that shares the longest prefix
+/// with it (so a sub stream's answer is pointed at the sub stream's path), for a refusal to name.
+pub(super) fn listed_like<'a>(entry: &'a CatalogueEntry, path: &str) -> Option<&'a str> {
+    fn head(p: &str) -> &str {
+        p.split_once('?').map_or(p, |(h, _)| h)
+    }
+    let same = |l: &&str| head(l) == head(path);
+    let common = |l: &&str| {
+        l.bytes()
+            .zip(path.bytes())
+            .take_while(|(x, y)| x == y)
+            .count()
+    };
+    // The first listed path among equals: `max_by_key` would take the last.
+    let mut best: Option<(&str, usize)> = None;
+    for l in entry
+        .protocols
+        .iter()
+        .filter(|p| p.kind == ProtocolKind::Rtsp)
+        .flat_map(|p| p.paths.iter().map(String::as_str))
+        .filter(same)
+    {
+        let c = common(&l);
+        if best.is_none_or(|(_, bc)| c > bc) {
+            best = Some((l, c));
+        }
+    }
+    best.map(|(l, _)| l)
+}
+
 fn port_of(entry: &CatalogueEntry, kind: ProtocolKind, default: NonZeroU16) -> NonZeroU16 {
     entry
         .protocols

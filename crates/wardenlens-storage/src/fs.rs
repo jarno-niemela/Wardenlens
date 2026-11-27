@@ -41,6 +41,33 @@ pub struct Opened {
     pub allocated: u64,
 }
 
+/// Bytes read at a time when two files are compared.
+const COMPARE_CHUNK: usize = 64 * 1024;
+
+/// Whether two opened files hold the same bytes (compared in bounded chunks). `None` when either
+/// could not be read to the end: no conclusion, so the caller deletes nothing on it (#195).
+pub(crate) fn same_bytes(first: &mut Opened, second: &mut Opened) -> Option<bool> {
+    if first.len != second.len {
+        return Some(false);
+    }
+    first.file.seek(io::SeekFrom::Start(0)).ok()?;
+    second.file.seek(io::SeekFrom::Start(0)).ok()?;
+    let mut left_buf = vec![0u8; COMPARE_CHUNK];
+    let mut right_buf = vec![0u8; COMPARE_CHUNK];
+    let mut left = first.len;
+    while left > 0 {
+        let n = usize::try_from(left).map_or(COMPARE_CHUNK, |l| l.min(COMPARE_CHUNK));
+        let (xs, ys) = (left_buf.get_mut(..n)?, right_buf.get_mut(..n)?);
+        first.file.read_exact(xs).ok()?;
+        second.file.read_exact(ys).ok()?;
+        if xs != ys {
+            return Some(false);
+        }
+        left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+    Some(true)
+}
+
 /// The `.part` file being written.
 pub trait PartFile: Send {
     /// Write all of `buf`.

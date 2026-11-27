@@ -249,7 +249,34 @@ durations are in 90 kHz ticks and fit the 32-bit `mvhd` field: 13.25 h is far ab
 `.part` to `.mp4` (`RENAME_NOREPLACE`), (5) `fsync` the directory, (6) only then `Index::insert`. If the insert fails for
 any reason, the recorder first **retries transient errors** (`SQLITE_BUSY`, I/O errors) a bounded number of times
 (default 5, with a short back-off) and **quarantines** the file (section 9) only on a constraint violation or a
-permanent error, never in an unbounded loop. The order makes a visible
+permanent error, never in an unbounded loop. **Three exceptions to "any failure quarantines" (#195):**
+(a) **the rename never lands on a row's key**: when `RENAME_NOREPLACE` finds the name taken and the recorder
+tries the next key (at most 8 keys, within the same day directory), it asks the index about every key after the one it
+created the `.part` under and skips a key a row holds, so a finished file is never put under another segment's key. **A
+finished recording is never deleted for a question that was not answered or a name that was not free:** (i) when the index
+cannot answer for a key, the key is used (the file's name is still never replaced), the segment is counted unindexed and
+gets no row (`Sealed::key_checked` is false), and reconciliation judges it at the next start (a file at a row's key
+whose size differs is invalid and is quarantined; one of the row's size is a twin, section 9, and is never deleted
+unless byte-identical); (ii) when every key tried is taken (by a file or a row), the sealed `.part` is moved into the hot
+quarantine under its `.mp4.part` name (`StoreError::NoFreeName`, counted `segments_quarantined`); if that move fails
+the sealed file is renamed in place to `<name>.mp4.unsealed` (same outcome), a name the start-up `.part` rule does not
+delete and the walk reports `unknown_left`; only if both moves fail is the `.part` left as it is, never unlinked, and the
+segment counts as aborted. A quarantined `.mp4.part` or an `.mp4.unsealed` is a complete segment, not matched by the
+section 9 walk (it is `unknown_left`) and not evicted: an operator can rename it back; (b) **a read-only index volume holds the recorder, it does not quarantine**:
+`SQLITE_READONLY` and `SQLITE_CANTOPEN` and the I/O error kinds `ReadOnlyFilesystem` and `PermissionDenied` (the index
+error's `is_unwritable`) are permanent for the run but say nothing about the file, so the file is kept in place (it has no row; the
+next start adopts it, section 9), it counts as unindexed, and the recorder reports `Held(IndexReadOnly)`. While held, a
+keyframe starts a segment only after 32 skipped keyframes, as a probe: the probe's insert, if the index accepts it, ends
+the hold; a refused probe keeps it. **The cost is real:** with a 60 s target and 2 s GOPs roughly every other segment is
+still recorded during a hold (about half of the video is kept unindexed, the rest is dropped), unindexed files are not
+visible to the API or to eviction until the next start's reconciliation, and the volume's own `StorageFull` hold is the
+backstop when they pile up. **Classification, not reclassified here:** an ext4 `remount-ro` after an error shows up as
+`SQLITE_IOERR`, which stays transient (retried, file kept, no hold); only the codes above are "unwritable". (c) **the segment is closed before the file could pass what
+the adoption parser accepts** (section 9): the segmenter's byte cap counts frame bytes only, so the recorder also
+bounds the file: before a frame is added, the bytes written, the open fragment and the new frame, each with an upper bound
+of its container overhead (136 bytes per fragment, 12 per sample), must stay at most 1 GiB less 16 MiB, and the fragment count
+at most 99,000 (100,000 is the parser's limit). The closing runs before the segmenter sees the frame, so the segment's
+record does not count it; a keyframe starts the next segment at once, a delta frame is dropped until one does. The order makes a visible
 `.mp4` always complete, and an indexed row always point at a complete, durable file. A crash before step 2 leaves a
 `.part` with duration 0, which is deleted anyway. When a day directory (or camera directory) is created, its parent is fsynced as well. A graceful stop
 runs steps 1-6 for the open segment. ENOSPC aborts the segment: the `.part` is unlinked and the recorder waits for the
@@ -660,9 +687,11 @@ a successful move resets the count. Everything else is **not** the archive's fau
   and continue;
 - an **index error** (M8, or reading the row): skip the segment for this tick; after 3 consecutive ticks with index
   errors raise a health error (the index is the problem, not the archive);
-- **`EEXIST` at M6** (`RENAME_NOREPLACE` found an `A/R`): if `A/R` has the row's size, **roll forward** (it is a
-  stale complete copy from an earlier attempt: fsync it and its directory, delete `A/R.part`, continue with M8);
-  otherwise quarantine the stale `A/R` and retry M6 once.
+- **`EEXIST` at M6** (`RENAME_NOREPLACE` found an `A/R`): if `A/R` has the row's size **and is byte-identical to the
+  `A/R.part` just written**, **roll forward** (it is a stale complete copy from an earlier attempt: fsync it and its
+  directory, delete `A/R.part`, continue with M8); otherwise (another size, or the same size with other bytes: a name is
+  not an identity, section 9) quarantine the stale `A/R` and retry M6 once. When the two cannot be compared (a read
+  error) the segment is `unverified`, the `.part` is removed and nothing else changes (#195).
 
 The mover **never retries the same failed segment within a tick** and runs the rest of the plan. Required #58 tests:
 an M4 **read** failure leaves the archive available and deletes no hot video; a stale complete `A/R` at M6 is rolled
@@ -792,6 +821,19 @@ another. Definitions:
   twin is valid and whose row says the file lives elsewhere) and `.part` files are deleted.
 - *keep row* means the row, **and therefore its `id`, is unchanged**. An id is never reassigned while a row exists, and
   a deleted row's id is never reused (`AUTOINCREMENT`, section 5).
+- ***Twins are identical or they are not twins*** (#195). A name is not an identity: a file at the same key as a row's
+  may be a different recording (the recorder's rename bump, section 3, or a planted file). Every cell that deletes `H`
+  because a valid `A` exists (`(archive, valid, valid)`, `(hot, valid, valid)`'s roll forward, and `(none, valid, valid)`
+  with equal sizes) deletes `H` **only when `H` and `A` are byte-identical** (compared in bounded chunks; a read
+  failure or short read leaves both as they are and the key `unverified`). A valid `H` of the same size whose bytes
+  differ is a **foreign file at the key**: it is **quarantined, never deleted**, the row and `A` stay as they are, and
+  the report counts it as `foreign_twins`, which is a health error (an alert). **The one exception is a `tier = hot` row
+  with a valid `H` and a valid `A` that differ:** the row says `H` is the segment, so the row is never pointed at the
+  other file; the row and `H` stay and **`A` is quarantined** (`foreign_twins`). The same rule runs in the "archive
+  returned" pass. The mover's `EEXIST` at M6 (section 7) applies it too: a stale `A/R` of the row's size is the earlier
+  attempt's copy only when it is byte-identical to the `.part` just written; otherwise it is quarantined and the move
+  completes with the real bytes. The 1,000-name quarantine bound applies as for any
+  quarantine. Sizes alone still decide the (none, valid, valid) case of unequal sizes (quarantine).
 - *quarantine X*: `renameat2` with `RENAME_NOREPLACE` into `<its root>/_quarantine/<camera>/<day>/<name>` (the same
   relative path, same filesystem). If the target exists (`EEXIST`), the name gets a numeric suffix, `<name>.1`,
   `<name>.2`, and so on, up to a bound of 1,000; **when the bound is exhausted the file is left in place and counted `unverified`: nothing is
@@ -898,7 +940,7 @@ the file was fully synced before its rename (section 3), so it is real video tha
 the "indexed or quarantined" choice of #59.
 
 **Result.** A report with counts per category (`part_deleted`, `rolled_forward`, `rolled_back`, `missing`, `adopted`,
-`quarantined`, `size_mismatch`, `unverified`, `unknown_left`, `archive_unavailable`), logged by tier only, and the
+`quarantined`, `size_mismatch`, `foreign_twins`, `unverified`, `unknown_left`, `archive_unavailable`), logged by tier only, and the
 post-condition (archive available) "every row has exactly one file, on its tier, and every `.mp4` has a row". Quarantined
 files stay out of the index, count against the floor and are the first eviction candidates (section 6). Periodic
 scrubbing and bit-rot checks are out of scope.

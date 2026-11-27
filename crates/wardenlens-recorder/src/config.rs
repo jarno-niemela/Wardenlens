@@ -2,7 +2,18 @@
 
 use std::time::Duration;
 
+use wardenlens_core::mp4box::{MAX_FILE_LEN, MAX_FRAGMENTS};
 use wardenlens_core::recording::SegmentConfig;
+
+/// Largest finished segment file the recorder writes, in bytes: the adoption parser's limit
+/// ([`MAX_FILE_LEN`]) less a margin of 16 MiB (two largest frames), so a file that is finished is
+/// a file reconciliation can adopt (#195). The segmenter's own byte cap counts frame bytes only;
+/// this limit counts the file, container overhead included.
+pub(crate) const MAX_FILE_BYTES: u64 = MAX_FILE_LEN - (16 << 20);
+
+/// Most fragments the recorder writes into one segment: the adoption parser's limit
+/// ([`MAX_FRAGMENTS`]) less a margin of 1,000.
+pub(crate) const MAX_FRAGMENTS_PER_SEGMENT: u64 = MAX_FRAGMENTS - 1_000;
 
 /// Settings of one recorder.
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +30,10 @@ pub struct RecorderConfig {
     /// available to the recorder. Default 32 MiB, twice the fragment cap. 0 retries at every
     /// keyframe.
     pub resume_free_bytes: u64,
+    /// Not public: the limits can only be lowered (see [`Self::with_file_limits`]), never set
+    /// above the adoption parser's, so a finished file is always adoptable.
+    pub(crate) max_file_bytes: u64,
+    pub(crate) max_fragments: u64,
 }
 
 impl Default for RecorderConfig {
@@ -28,6 +43,8 @@ impl Default for RecorderConfig {
             insert_retries: 5,
             retry_backoff: Duration::from_millis(50),
             resume_free_bytes: 32 << 20,
+            max_file_bytes: MAX_FILE_BYTES,
+            max_fragments: MAX_FRAGMENTS_PER_SEGMENT,
         }
     }
 }
@@ -53,5 +70,64 @@ impl RecorderConfig {
     pub fn with_resume_free_bytes(mut self, bytes: u64) -> Self {
         self.resume_free_bytes = bytes;
         self
+    }
+}
+
+impl RecorderConfig {
+    /// Lowers the file-size and fragment-count limits of a segment. They can never be raised
+    /// above the adoption parser's (less a margin), so a finished file is always adoptable, and a
+    /// fragment limit of 0 is raised to 1. A segment is closed before it would pass either; a
+    /// first frame that alone cannot fit the byte limit is dropped (a stream error), so with a
+    /// byte limit below one frame nothing is recorded.
+    #[must_use]
+    pub fn with_file_limits(mut self, max_file_bytes: u64, max_fragments: u64) -> Self {
+        self.max_file_bytes = max_file_bytes.min(MAX_FILE_BYTES);
+        self.max_fragments = max_fragments.clamp(1, MAX_FRAGMENTS_PER_SEGMENT);
+        self
+    }
+
+    /// The largest finished segment file, bytes, container overhead included.
+    #[must_use]
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
+    }
+
+    /// The most fragments in one segment.
+    #[must_use]
+    pub fn max_fragments(&self) -> u64 {
+        self.max_fragments
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_limits_leave_a_margin_under_the_adoption_parser() {
+        const {
+            // One largest frame (8 MiB) fits the margin.
+            assert!(MAX_FILE_BYTES + (8 << 20) <= MAX_FILE_LEN);
+            assert!(MAX_FRAGMENTS_PER_SEGMENT < MAX_FRAGMENTS);
+        }
+        let d = RecorderConfig::default();
+        assert_eq!(
+            (d.max_file_bytes, d.max_fragments),
+            (MAX_FILE_BYTES, MAX_FRAGMENTS_PER_SEGMENT)
+        );
+    }
+
+    #[test]
+    fn the_limits_can_be_lowered_never_raised() {
+        let c = RecorderConfig::default().with_file_limits(u64::MAX, u64::MAX);
+        assert_eq!(
+            (c.max_file_bytes, c.max_fragments),
+            (MAX_FILE_BYTES, MAX_FRAGMENTS_PER_SEGMENT)
+        );
+        let c = RecorderConfig::default().with_file_limits(1000, 3);
+        assert_eq!((c.max_file_bytes(), c.max_fragments()), (1000, 3));
+        // A fragment count of 0 would cut every segment before its first frame.
+        let c = RecorderConfig::default().with_file_limits(1000, 0);
+        assert_eq!(c.max_fragments(), 1);
     }
 }

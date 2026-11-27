@@ -132,3 +132,19 @@ impl Done {
 pub fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
+
+/// A rig with an archive-tier row at `T0 + 101`, a segment started at `T0 + 100` and a foreign
+/// file planted at `T0 + 100`'s final name, so the rename is bumped and `T0 + 101` is a row's key.
+pub fn bumped_rig() -> (Rig, PathBuf) {
+    use wardenlens_core::recording::SegmentRecord;
+    use wardenlens_core::storage::{SegmentIndex, Tier};
+    let mut r = Rig::build(fast(), None, |_, index| {
+        let rec = SegmentRecord::new(cam(), ms(T0 + 101), 1_000, 4_096, 10);
+        index.insert(&rec, Tier::Archive).unwrap();
+    });
+    r.start();
+    r.feed(Slice::P);
+    let planted = r.root.join(RelPath::new(&cam(), ms(T0 + 100)).to_string());
+    std::fs::write(&planted, b"foreign").unwrap();
+    (r, planted)
+}

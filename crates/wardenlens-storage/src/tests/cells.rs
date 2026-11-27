@@ -397,6 +397,9 @@ fn delete_unlinks_fsyncs_each_directory_and_removes_the_row_last() {
         log,
         vec![
             Op::Open(Tier::Archive), // the twin is looked at before anything is unlinked
+            Op::Open(Tier::Hot),     // the row's own file, to compare the bytes (#195)
+            Op::Read,
+            Op::Read,
             Op::Unlink(Tier::Hot),
             Op::SyncDir(Tier::Hot),
             Op::Unlink(Tier::Archive),
@@ -482,4 +485,26 @@ fn delete_leaves_the_archive_alone_while_it_is_unavailable() {
         "archive rows are kept"
     );
     assert!(env.arch_file("cam-1", 1).exists());
+}
+
+/// A twin that cannot be compared with the row's own file is not deleted: `DeleteFailed`, both
+/// files and the row stay (#195).
+#[test]
+fn delete_with_a_twin_that_cannot_be_compared_deletes_nothing() {
+    for eof in [false, true] {
+        let env = Env::new();
+        let id = env.add("cam-1", 0, 100, Tier::Hot);
+        let ap = env.arch_file("cam-1", 0);
+        std::fs::create_dir_all(ap.parent().unwrap()).unwrap();
+        std::fs::write(&ap, pattern(100)).unwrap();
+        let fault = Fault {
+            sticky: true,
+            eof,
+            ..Fault::once(Op::Read, 1)
+        };
+        let (lp, _) = build(&env, Some(fault));
+        assert_eq!(lp.delete_now(id, true), Outcome::DeleteFailed, "eof {eof}");
+        assert_eq!(env.tier_of(id), Some(Tier::Hot));
+        assert!(env.hot_file("cam-1", 0).exists() && ap.exists());
+    }
 }

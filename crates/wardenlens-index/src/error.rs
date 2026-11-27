@@ -327,8 +327,31 @@ impl IndexError {
     }
 }
 
+impl IndexError {
+    /// True when the index cannot be written until the operator acts: `SQLITE_READONLY` (a
+    /// read-only volume or file) or `SQLITE_CANTOPEN`, or the same as an I/O error kind. Not
+    /// transient, and not about the record being written.
+    #[must_use]
+    pub fn is_unwritable(&self) -> bool {
+        match self {
+            Self::Sqlite { code, .. } => {
+                matches!(code, Some(ErrorCode::ReadOnly | ErrorCode::CannotOpen))
+            }
+            Self::Io { kind, .. } => matches!(
+                kind,
+                std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied
+            ),
+            _ => false,
+        }
+    }
+}
+
 impl wardenlens_core::storage::TransientFault for IndexError {
     fn is_transient(&self) -> bool {
         IndexError::is_transient(self)
+    }
+
+    fn is_unwritable(&self) -> bool {
+        IndexError::is_unwritable(self)
     }
 }

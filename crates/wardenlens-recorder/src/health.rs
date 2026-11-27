@@ -24,6 +24,11 @@ pub enum HoldReason {
     /// The index could not be asked whether a key is free, or no free key was found, so no
     /// segment can be started safely. Retried at the next keyframe.
     IndexUnavailable,
+    /// The index refused a write because it cannot be written at all (a read-only volume, or the
+    /// file cannot be opened for writing). The finished file was kept in place, not quarantined:
+    /// the next start adopts it (ADR 0005 section 9). Recording is held: a keyframe starts a
+    /// segment only once in a while, as a probe, and a probe the index accepts ends the hold.
+    IndexReadOnly,
 }
 
 /// The recorder's current state.
