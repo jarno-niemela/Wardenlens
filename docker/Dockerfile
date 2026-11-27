@@ -9,6 +9,8 @@ FROM rust:1.100.0-slim-bookworm@sha256:bb875b0f8ce726053e259034848c471840e96bfe5
 WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The camera catalogue is embedded in the CLI with include_str! (#67).
+COPY cameras ./cameras
 RUN cargo build --release --locked -p wardenlens-cli
 
 # Test executables of the crate that uses openat2 / renameat2 (ADR 0005 section 11), built here and run by

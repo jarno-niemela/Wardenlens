@@ -1,5 +1,5 @@
-# Backstop for the Docker build context (#69). The Dockerfile copies only Cargo.*, rust-toolchain.toml and
-# crates/, so everything else is excluded anyway; these entries keep a stray secret out of the context.
+# Backstop for the Docker build context (#69). The Dockerfile copies only Cargo.*, rust-toolchain.toml,
+# crates/ and cameras/, so everything else is excluded anyway; these entries keep a stray secret out of the context.
 target/
 **/target/
 spikes/
@@ -7,7 +7,6 @@ spikes/
 .github/
 .claude/
 .githooks/
-cameras/
 docs/
 scripts/
 # Secrets and local overrides (ADR 0006 section 6: a compose secret source lives outside the work tree).
