@@ -184,6 +184,7 @@ exit 0
 STUB
 chmod +x "$tmp/bin/wardenlens"
 run_ep() { : >"$tmp/log"; env -i PATH="$tmp/bin:/usr/bin:/bin" STUB_LOG="$tmp/log" "$@" sh "$ep" serve 2>/dev/null; }
+run_ep_args() { : >"$tmp/log"; env -i PATH="$tmp/bin:/usr/bin:/bin" STUB_LOG="$tmp/log" sh "$ep" "$@" >/dev/null 2>&1; }
 logged() { [[ $(cat "$tmp/log") == "$1" ]]; }
 yes "the entrypoint starts with a good key" run_ep WARDENLENS_VAULT_KEY_FILE=/run/secrets/k
 yes "the entrypoint checks the configured key, then serves" logged $'config check\nvault check-key /run/secrets/k\nserve'
@@ -197,6 +198,14 @@ no "an invalid config stops the entrypoint" run_ep STUB_CONFIG=bad
 yes "an invalid config stops before check-key" logged 'config check'
 no "no key_file line stops the entrypoint" run_ep STUB_KEY=
 yes "an empty key path is never checked" logged 'config check'
+# refuses EP ARGS...: the entrypoint exits non-zero and runs nothing.
+refuses() { local e=$1; shift; : >"$tmp/log"; ! env -i PATH="$tmp/bin:/usr/bin:/bin" STUB_LOG="$tmp/log" sh "$e" "$@" >/dev/null 2>&1 && [[ ! -s $tmp/log ]]; }
+yes "a forwarded --config is refused" refuses "$ep" --config /other.toml serve
+yes "a forwarded --config=PATH is refused" refuses "$ep" serve --config=/other.toml
+# Mutant: the same entrypoint without the refusal loop must be flagged.
+sed '/^for arg in/,/^done$/d' "$ep" >"$tmp/ep-mutant.sh"
+no "an entrypoint without the --config refusal is flagged" refuses "$tmp/ep-mutant.sh" --config /other.toml serve
+yes "an argument merely containing config is accepted" run_ep_args config check
 yes "the entrypoint is executable" test -x "$ep"
 
 exit $fail

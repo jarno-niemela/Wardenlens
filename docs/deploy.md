@@ -44,10 +44,18 @@ host file must already be owned by the container uid with mode `0400` or `0600`.
 the container refuse to start. Do not pre-create an empty file: `secrets init` never overwrites an existing file and a zero-byte key
 is refused.
 
-1. Get a `wardenlens` binary on the host (glibc 2.36 or later, e.g. Ubuntu 24.04), from the image. It, and the config below, must be readable by the service uid, so they go in `/tmp` (remove them afterwards):
+The commands below run as the service uid **without a host account for it**: `sudo setpriv --reuid=10001 --regid=10001 --clear-groups ...`
+(sudo's numeric-uid form does not work, because sudo refuses a uid that has no passwd entry). `sudo` resets the environment, so any variable
+is passed with `sudo env NAME=value ... setpriv ...`. If you prefer a host account, `sudo useradd --system --uid 10001 --user-group
+--no-create-home --shell /usr/sbin/nologin wardenlens` and `sudo -u wardenlens` work as well.
+
+1. Stage a `wardenlens` binary on the host (glibc 2.36 or later, e.g. Ubuntu 24.04), taken from the image, in a private directory made
+   with `mktemp -d` (never a fixed name in `/tmp`, which another local user could pre-create). It is opened up to `0755` so the service
+   uid can read the files in it. Remove the directory when you are done.
 
    ```sh
-   docker create --name wl-bin wardenlens:local && docker cp wl-bin:/usr/local/bin/wardenlens /tmp/wardenlens && docker rm wl-bin
+   d=$(mktemp -d) && chmod 0755 "$d"
+   docker create --name wl-bin wardenlens:local && docker cp wl-bin:/usr/local/bin/wardenlens "$d"/wardenlens && docker rm wl-bin
    ```
 
 2. Create the key directory and generate the key **as the service uid**, with a config whose `secrets.key_file` is the host path
@@ -55,16 +63,24 @@ is refused.
 
    ```sh
    sudo install -d -o 10001 -g 10001 -m 0700 /etc/wardenlens/key
-   sed 's#/run/secrets/wardenlens_vault_key#/etc/wardenlens/key/vault.key#' docs/config.docker.toml > /tmp/wl-host.toml
-   chmod 0644 /tmp/wl-host.toml
-   sudo -u '#10001' /tmp/wardenlens --config /tmp/wl-host.toml secrets init
-   sudo -u '#10001' /tmp/wardenlens vault check-key /etc/wardenlens/key/vault.key   # what the entrypoint will run
+   sed 's#/run/secrets/wardenlens_vault_key#/etc/wardenlens/key/vault.key#' docs/config.docker.toml > "$d"/host.toml
+   chmod 0644 "$d"/host.toml
+   sudo setpriv --reuid=10001 --regid=10001 --clear-groups "$d"/wardenlens --config "$d"/host.toml secrets init
+   sudo setpriv --reuid=10001 --regid=10001 --clear-groups "$d"/wardenlens vault check-key /etc/wardenlens/key/vault.key   # what the entrypoint will run
    ```
 
-   (Root alternative: create the file as root, then `chown 10001:10001` and `chmod 0400`.) Keep a copy in the password manager
-   (`wardenlens vault key export`, on a terminal). The host path defaults to `/etc/wardenlens/key/vault.key`; override it with
-   `WARDENLENS_KEY_FILE_HOST` in `.env`. It must never be inside the repository (`./secrets/` is refused; the key check also refuses a
-   path inside a git work tree).
+   (Root alternative: create the file as root, then `chown 10001:10001` and `chmod 0400`.)
+
+3. Keep a copy of the key in the password manager. `vault key export` prints it to a terminal, and it must be pointed at the deploy key
+   (without the variable it would export the developer key of the account running it):
+
+   ```sh
+   sudo env WARDENLENS_VAULT=/srv/wardenlens/state/vault.db WARDENLENS_VAULT_KEY_FILE=/etc/wardenlens/key/vault.key \
+       setpriv --reuid=10001 --regid=10001 --clear-groups "$d"/wardenlens vault key export
+   ```
+
+   The host path defaults to `/etc/wardenlens/key/vault.key`; override it with `WARDENLENS_KEY_FILE_HOST` in `.env`. It must never be
+   inside the repository (`./secrets/` is refused; the key check also refuses a path inside a git work tree).
 
 * **Exclude the key path (and the vault in the state directory) from backups.** A backup that holds the key and the vault gives no
   protection.
@@ -72,15 +88,16 @@ is refused.
   deploy paths (the vault is `vault.db` next to `database.path`):
 
   ```sh
-  sudo -u '#10001' env WARDENLENS_VAULT=/srv/wardenlens/state/vault.db WARDENLENS_VAULT_KEY_FILE=/etc/wardenlens/key/vault.key \
-      /tmp/wardenlens vault rekey
+  sudo env WARDENLENS_VAULT=/srv/wardenlens/state/vault.db WARDENLENS_VAULT_KEY_FILE=/etc/wardenlens/key/vault.key \
+      setpriv --reuid=10001 --regid=10001 --clear-groups "$d"/wardenlens vault rekey
   docker compose up -d --force-recreate
   ```
 
   `rekey` takes a lock and creates `<key>.next` **in the key directory**, which is why that directory belongs to the service uid with
   mode 0700. It replaces the key file by rename, and a container keeps the old file mounted (the bind mount follows the old inode), so
   the container must be **recreated**, not just started. The container never rotates in place. The rotation procedure is exercised by
-  the test `the_deploy_guide_key_procedure_yields_a_key_that_passes_check_key_and_rekeys` (temp paths, the current uid).
+  the test `the_deploy_guide_key_procedure_yields_a_key_that_passes_check_key_and_rekeys` (temp paths and the current uid, because a test
+  cannot switch uid unprivileged; everything else is the same command sequence).
 
 ## Configuration
 
@@ -92,6 +109,8 @@ is refused.
 * **Host networking and WS-Discovery.** WS-Discovery multicast does not cross the default bridge network. If you use
   `network_mode: host` for discovery, remove the `ports:` entry, set `api.listen` to the host's specific LAN address and leave
   `allow_unspecified_bind = false`: the API must not bind `0.0.0.0` then.
+* The config is chosen with `WARDENLENS_CONFIG` (set in `compose.yaml`). The entrypoint refuses a `--config` in the container command, because
+  it checks the key of the configured file and the exec'd command must use that same file.
 * Paths are the in-container mount points: hot `/srv/wardenlens/hot`, archive `/srv/wardenlens/archive`, index and vault in
   `/var/lib/wardenlens` (not on a recordings volume).
 

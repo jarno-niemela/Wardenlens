@@ -269,7 +269,8 @@ fn health_against_a_real_serve_is_healthy_and_turns_unhealthy_after_sigterm() {
 }
 
 /// A pseudo-terminal: `rekey` needs a terminal on stdout. The slave end becomes the child's stdout
-/// and the master is kept open (and drained) until the child is done.
+/// and the master is kept open until the child is done. The master is not read: the child writes
+/// a few hundred bytes at most, far below the pty buffer, so it never blocks on a full buffer.
 fn pty() -> (std::fs::File, std::fs::File) {
     use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
     let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
@@ -286,7 +287,9 @@ fn pty() -> (std::fs::File, std::fs::File) {
 
 #[test]
 fn the_deploy_guide_key_procedure_yields_a_key_that_passes_check_key_and_rekeys() {
-    // docs/deploy.md "The key file", with temp paths and the current uid in place of 10001:
+    // docs/deploy.md "The key file", with temp paths and the current uid in place of 10001 (the
+    // `sudo setpriv --reuid=10001 ...` uid switch is the one step a test cannot do unprivileged;
+    // the commands, arguments and variables are otherwise the guide's):
     //   1. a key directory owned by the service uid, mode 0700 (`keys/`, made by `Cfg::new`);
     //   2. `wardenlens --config <host config> secrets init` as that uid, with NO pre-created file;
     //   3. the key passes `vault check-key` (what the entrypoint runs);
@@ -321,6 +324,21 @@ fn the_deploy_guide_key_procedure_yields_a_key_that_passes_check_key_and_rekeys(
     let ck = check(&key);
     assert!(ck.status.success(), "check-key after init: {ck:?}");
     let before = fs::read(&key).unwrap();
+
+    // Step 3 of the guide: `vault key export` with the deploy variables, on a terminal.
+    let (master, slave) = pty();
+    let export = Command::new(bin)
+        .env_clear()
+        .env("WARDENLENS_VAULT", &db)
+        .env("WARDENLENS_VAULT_KEY_FILE", &key)
+        .args(["vault", "key", "export"])
+        .stdin(Stdio::null())
+        .stdout(slave)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    drop(master);
+    assert!(export.status.success(), "export: {export:?}");
 
     let vault_key = wardenlens_secrets::KeyFile::load(&key).unwrap();
     drop(wardenlens_vault::Vault::create(&db, vault_key).unwrap());
