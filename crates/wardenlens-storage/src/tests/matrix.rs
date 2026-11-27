@@ -255,6 +255,62 @@ fn stale_wrong_size_archive_copy_at_m6_is_quarantined_and_m6_retried_once() {
     assert!(env.hot_file("cam-1", 0).exists());
 }
 
+/// A stale `A/R` of the row's size is the earlier attempt's copy only when it holds the same
+/// bytes (#195): another recording of the same size is quarantined, the move completes with the
+/// real bytes, and the foreign file is never deleted.
+#[test]
+fn a_same_size_stale_archive_copy_with_other_bytes_is_quarantined_not_trusted() {
+    let env = Env::new();
+    let id = env.add("cam-1", 0, 5000, Tier::Hot);
+    let a = env.arch_file("cam-1", 0);
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    let mut other = pattern(5000);
+    other[4999] ^= 0xFF;
+    std::fs::write(&a, &other).unwrap();
+    let (lp, _) = build(&env, None);
+    assert_eq!(lp.move_now(id, true), Outcome::Moved);
+    assert_eq!(env.tier_of(id), Some(Tier::Archive));
+    assert_eq!(std::fs::read(&a).unwrap(), pattern(5000), "the moved bytes");
+    assert_eq!(
+        Env::quarantined(&env.arch),
+        vec![other],
+        "kept, not deleted"
+    );
+    assert!(!env.hot_file("cam-1", 0).exists());
+}
+
+/// When the stale copy cannot be compared (a read error, or a short read) nothing is concluded:
+/// the stale file stays, the hot copy stays, the `.part` goes.
+#[test]
+fn a_stale_archive_copy_that_cannot_be_compared_leaves_everything_and_is_unverified() {
+    // Reads of a healthy move without a stale copy: the copy itself.
+    let env = Env::new();
+    let id = env.add("cam-1", 0, 5000, Tier::Hot);
+    let (lp, state) = build(&env, None);
+    assert_eq!(lp.move_now(id, true), Outcome::Moved);
+    let copy_reads = count(&state, Op::Read);
+    for eof in [false, true] {
+        let env = Env::new();
+        let id = env.add("cam-1", 0, 5000, Tier::Hot);
+        let a = env.arch_file("cam-1", 0);
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::write(&a, pattern(5000)).unwrap();
+        let fault = Fault {
+            sticky: true,
+            eof,
+            ..Fault::once(Op::Read, copy_reads + 1)
+        };
+        let (lp, state) = build(&env, Some(fault));
+        assert_eq!(lp.move_now(id, true), Outcome::Unverified, "eof {eof}");
+        assert!(state.lock().unwrap().fired);
+        assert_eq!(std::fs::read(&a).unwrap(), pattern(5000));
+        assert_eq!(env.tier_of(id), Some(Tier::Hot));
+        assert!(env.hot_file("cam-1", 0).exists());
+        assert_eq!(Env::quarantined(&env.arch).len(), 0);
+        assert!(!a.with_extension("mp4.part").exists());
+    }
+}
+
 #[test]
 fn eexist_at_m6_with_an_unquarantinable_stale_copy_is_an_m6_failure() {
     let env = Env::new();

@@ -4,13 +4,13 @@ use wardenlens_core::recording::Pushed;
 use wardenlens_core::storage::{SegmentIndex, TransientFault};
 use wardenlens_core::time::UnixMs;
 use wardenlens_core::video::Frame;
-use wardenlens_mp4::Mp4Error;
+use wardenlens_mp4::{InitSegment, Mp4Error};
 
 use crate::keys::KeyError;
-use crate::pending::Pending;
+use crate::pending::{Pending, fragment_bound};
 use crate::probe::{Unknown, key_taken};
 use crate::recorder::{Open, Recorder};
-use crate::state::FullHold;
+use crate::state::{FullHold, READ_ONLY_SKIP_KEYFRAMES};
 use crate::store::{SegmentStore, StoreError};
 
 /// How often `create` is retried with the next key when its name turned out to be taken.
@@ -41,12 +41,14 @@ where
 {
     /// The frame starts a new segment (a keyframe, the previous segment is already closed).
     pub(crate) fn begin(&mut self, frame: Frame, arrival: UnixMs) {
-        let Some(init) = self.params.as_ref().map(|a| a.init.clone()) else {
-            self.cond.params = true;
-            self.fail_start();
+        let Some(init) = self.start_prechecks(frame.data.len()) else {
             return;
         };
         if !self.volume_ready() {
+            self.hold_start();
+            return;
+        }
+        if !self.read_only_probe_due() {
             self.hold_start();
             return;
         }
@@ -118,6 +120,71 @@ where
         }
         self.cond.write = true;
         self.fail_start();
+    }
+
+    /// Closes the open segment, before `frame_len` more bytes are added to it, when the file (or
+    /// its fragment count) could pass what the adoption parser accepts (#195). The segmenter's
+    /// byte cap counts frame bytes only, so this counts the file: the bytes already written, the
+    /// open fragment and the new frame, each with an upper bound of its container overhead. It
+    /// runs before the segmenter sees the frame, so the closed segment's record does not include
+    /// it; a keyframe then starts the next segment at once, any other frame is dropped until
+    /// one does.
+    pub(crate) fn cut_if_full(&mut self, frame_len: usize) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let new = fragment_bound(1, u64::try_from(frame_len).unwrap_or(u64::MAX));
+        let size = open
+            .bytes_written
+            .saturating_add(open.pending.bound())
+            .saturating_add(new);
+        let pending = u64::from(!open.pending.is_empty());
+        let fragments = u64::from(open.sequence.saturating_sub(1))
+            .saturating_add(pending)
+            .saturating_add(1);
+        if size > self.config.max_file_bytes || fragments > self.config.max_fragments {
+            self.close_open();
+        }
+    }
+
+    /// The init segment to start with, or `None` (the start is already put off) when there are no
+    /// valid parameter sets or the first frame cannot fit the file limit even alone: a file of the
+    /// init segment and that one frame would pass `max_file_bytes`, so the frame is refused as a
+    /// stream error (#195).
+    fn start_prechecks(&mut self, frame_len: usize) -> Option<InitSegment> {
+        let Some(init) = self.params.as_ref().map(|a| a.init.clone()) else {
+            self.cond.params = true;
+            self.fail_start();
+            return None;
+        };
+        let first = u64::try_from(init.bytes().len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(fragment_bound(
+                1,
+                u64::try_from(frame_len).unwrap_or(u64::MAX),
+            ));
+        if first > self.config.max_file_bytes {
+            self.health.stream_errors = self.health.stream_errors.saturating_add(1);
+            self.hold_start();
+            return None;
+        }
+        Some(init)
+    }
+
+    /// While the index cannot be written only every few keyframes starts a segment, as a probe:
+    /// false when this keyframe is one of the skipped ones.
+    fn read_only_probe_due(&mut self) -> bool {
+        match self.cond.index_read_only {
+            None => true,
+            Some(skip) if skip > 0 => {
+                self.cond.index_read_only = Some(skip.saturating_sub(1));
+                false
+            }
+            Some(_) => {
+                self.cond.index_read_only = Some(READ_ONLY_SKIP_KEYFRAMES);
+                true
+            }
+        }
     }
 
     /// After a full volume a segment is only tried again when the back-off is over and the

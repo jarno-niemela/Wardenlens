@@ -124,6 +124,15 @@ pub struct TierTotals {
 pub trait TransientFault {
     /// True when the same call may succeed later: the database was busy or an I/O error occurred.
     fn is_transient(&self) -> bool;
+
+    /// True when the index cannot be written at all and will not be until something outside the
+    /// program changes: its volume is mounted read-only, or the file cannot be opened for
+    /// writing. It is permanent like a constraint failure but says nothing about the record that
+    /// was refused, so the recorder keeps that record's file and holds itself (health state)
+    /// instead of judging the file (ADR 0005 section 3, #195). Defaults to `false`.
+    fn is_unwritable(&self) -> bool {
+        false
+    }
 }
 
 /// The segment index.

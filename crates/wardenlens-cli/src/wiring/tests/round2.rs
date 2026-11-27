@@ -51,6 +51,7 @@ fn only_a_held_storage_full_state_is_full() {
         (RecorderState::Held(HoldReason::WriteFailed), false),
         (RecorderState::Held(HoldReason::BadParameters), false),
         (RecorderState::Held(HoldReason::IndexUnavailable), false),
+        (RecorderState::Held(HoldReason::IndexReadOnly), false),
     ];
     for (state, full) in table {
         assert_eq!(state_is_full(state), full, "{state:?}");

@@ -76,6 +76,8 @@ pub(crate) enum Mode {
 /// * `quarantined`: a file moved into `_quarantine` (invalid, or an adoption that failed).
 /// * `size_mismatch`: a regular file of a key that has a row whose size is not the row's.
 /// * `duplicates_deleted`: a valid twin deleted.
+/// * `foreign_twins`: a hot copy of the same size as a valid archive copy but not byte-identical to
+///   it (another recording under the same name): quarantined, never deleted. A health error.
 /// * `unverified`: no conclusion was drawn (an error that is not `ENOENT`, a non-regular object,
 ///   an archive that is not observable, an exhausted quarantine bound, a failed index call, or a
 ///   part of the walk that was not seen).
@@ -108,6 +110,9 @@ pub struct ReconcileReport {
     pub size_mismatch: u32,
     /// Valid twins deleted.
     pub duplicates_deleted: u32,
+    /// Hot files quarantined because they were not byte-identical to the archive copy of the
+    /// same key, though valid by size (a foreign file at the key).
+    pub foreign_twins: u32,
     /// Keys, directories or rows from which no conclusion was drawn.
     pub unverified: u32,
     /// Objects that are not ours, left in place.
@@ -125,11 +130,11 @@ pub struct ReconcileReport {
 }
 
 impl ReconcileReport {
-    /// A health error: the pass could not see everything it should (the entry cap), or the index
-    /// failed.
+    /// A health error: the pass could not see everything it should (the entry cap), the index
+    /// failed, or a foreign file sat at a key (`foreign_twins`).
     #[must_use]
     pub const fn health_error(&self) -> bool {
-        self.walk_cap_exceeded || self.index_errors > 0
+        self.walk_cap_exceeded || self.index_errors > 0 || self.foreign_twins > 0
     }
 }
 

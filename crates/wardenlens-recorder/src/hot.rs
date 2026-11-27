@@ -100,6 +100,42 @@ impl HotStore {
     }
 }
 
+impl HotStore {
+    /// A sealed `.part` that found no free name: moved into `_quarantine` (the file is real
+    /// video). When that fails it is renamed in place to `<name>.mp4.unsealed`, a name the
+    /// start-up reconciliation does not delete (it deletes `.part` files, and leaves what it does
+    /// not know as `unknown_left`). Either way [`StoreError::NoFreeName`]: the file is kept. Only
+    /// when both moves fail is the `.part` left as it is (never unlinked) and the error says why.
+    fn keep_unnamed(&mut self, writer: HotWriter) -> Result<Sealed, StoreError> {
+        let HotWriter {
+            file,
+            dir,
+            part,
+            day,
+            ..
+        } = writer;
+        drop(file);
+        let moved = quarantine(
+            &self.root,
+            &[self.camera.as_str(), day.as_str(), part.as_str()],
+        );
+        if matches!(moved, Ok(QuarantineOutcome::Moved { .. })) {
+            return Err(StoreError::NoFreeName);
+        }
+        let unsealed = format!(
+            "{}.unsealed",
+            part.strip_suffix(PART_SUFFIX).unwrap_or(&part)
+        );
+        if dir.rename_noreplace(&part, &dir, &unsealed).is_ok() {
+            return Err(StoreError::NoFreeName);
+        }
+        match moved {
+            Ok(_) => Err(StoreError::QuarantineExhausted),
+            Err(e) => Err(StoreError::from_fs(e)),
+        }
+    }
+}
+
 impl SegmentStore for HotStore {
     type Writer = HotWriter;
 
@@ -141,12 +177,22 @@ impl SegmentStore for HotStore {
             .map_err(|e| StoreError::from_io("write", &e))
     }
 
-    fn commit(&mut self, writer: HotWriter, patch: &DurationPatch) -> Result<Sealed, StoreError> {
-        let result = seal(&writer, &self.camera, patch, RootDir::sync);
-        if result.is_err() {
-            self.abort(writer);
+    fn commit(
+        &mut self,
+        writer: HotWriter,
+        patch: &DurationPatch,
+        row_holds: &mut dyn FnMut(UnixMs) -> Option<bool>,
+    ) -> Result<Sealed, StoreError> {
+        let result = seal(&writer, &self.camera, patch, RootDir::sync, row_holds);
+        match result {
+            // The file is finished and fsynced but no key was free: keep it (#195).
+            Err(StoreError::NameTaken) => self.keep_unnamed(writer),
+            Err(e) => {
+                self.abort(writer);
+                Err(e)
+            }
+            ok => ok,
         }
-        result
     }
 
     fn abort(&mut self, writer: HotWriter) {
@@ -177,14 +223,16 @@ impl SegmentStore for HotStore {
 /// Steps 2 to 5 of the close sequence (ADR 0005 section 3), on the open `.part`.
 ///
 /// The rename never replaces: when a file appeared at the final name meanwhile, the next keys
-/// are tried (within the same day directory, at most [`RENAME_TRIES`]). A failed directory fsync
-/// keeps the finished file and says so in [`Sealed::durable`]. `sync_dir` is a parameter so a
-/// test can make it fail.
+/// are tried (within the same day directory, at most [`RENAME_TRIES`]). A bumped key that
+/// `row_holds` says an index row holds is skipped without a rename: the file is never finished
+/// under another segment's key (#195). A failed directory fsync keeps the finished file and says
+/// so in [`Sealed::durable`]. `sync_dir` is a parameter so a test can make it fail.
 fn seal(
     w: &HotWriter,
     camera: &CameraId,
     patch: &DurationPatch,
     sync_dir: fn(&RootDir) -> Result<(), FsError>,
+    row_holds: &mut dyn FnMut(UnixMs) -> Option<bool>,
 ) -> Result<Sealed, StoreError> {
     let io = |op| move |e: std::io::Error| StoreError::from_io(op, &e);
     w.file
@@ -196,18 +244,35 @@ fn seal(
     w.file.sync_all().map_err(io("fsync file"))?;
     let len = w.file.metadata().map_err(io("fstat"))?.len();
     let mut key = w.key;
+    let mut key_checked = true;
     for _ in 0..RENAME_TRIES {
         let names = Names::new(camera, key)?;
         if names.day != w.day {
             break; // the bumped key crossed midnight: another directory, not handled here
         }
-        match w.dir.rename_noreplace(&w.part, &w.dir, &names.file) {
-            Ok(()) => {
-                let durable = sync_dir(&w.dir).is_ok();
-                return Ok(Sealed { key, len, durable });
+        // The key chosen at `create` was probed against the index then; a bumped one was not.
+        let held = if key == w.key {
+            false
+        } else {
+            row_holds(key).unwrap_or_else(|| {
+                key_checked = false;
+                false
+            })
+        };
+        if !held {
+            match w.dir.rename_noreplace(&w.part, &w.dir, &names.file) {
+                Ok(()) => {
+                    let durable = sync_dir(&w.dir).is_ok();
+                    return Ok(Sealed {
+                        key,
+                        len,
+                        durable,
+                        key_checked,
+                    });
+                }
+                Err(e) if e.errno() == Some(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(StoreError::from_fs(e)),
             }
-            Err(e) if e.errno() == Some(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(StoreError::from_fs(e)),
         }
         key = key
             .as_i64()
@@ -276,7 +341,7 @@ mod tests {
                 source: rustix::io::Errno::IO,
             })
         };
-        let sealed = seal(&w, &camera(), &patch(), failing).unwrap();
+        let sealed = seal(&w, &camera(), &patch(), failing, &mut |_| Some(false)).unwrap();
         assert!(!sealed.durable);
         assert_eq!(sealed.key, UnixMs::new(KEY).unwrap());
         assert_eq!(files(d.path()), ["221320-000.mp4"]);
@@ -292,7 +357,7 @@ mod tests {
     fn a_synced_directory_is_durable() {
         let d = tempfile::tempdir().unwrap();
         let (_store, w) = written(d.path(), KEY);
-        let sealed = seal(&w, &camera(), &patch(), RootDir::sync).unwrap();
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync, &mut |_| Some(false)).unwrap();
         assert!(sealed.durable);
     }
 
@@ -303,7 +368,7 @@ mod tests {
         let day = d.path().join("cam1/2023-11-14");
         std::fs::write(day.join("221320-000.mp4"), b"foreign").unwrap();
         std::fs::write(day.join("221320-001.mp4"), b"foreign").unwrap();
-        let sealed = seal(&w, &camera(), &patch(), RootDir::sync).unwrap();
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync, &mut |_| Some(false)).unwrap();
         assert_eq!(sealed.key, UnixMs::new(KEY + 2).unwrap());
         assert_eq!(
             std::fs::read(day.join("221320-000.mp4")).unwrap(),
@@ -320,16 +385,68 @@ mod tests {
     }
 
     #[test]
-    fn running_out_of_free_names_is_name_taken_and_leaves_the_part_removed() {
+    fn running_out_of_free_names_keeps_the_finished_file_in_quarantine() {
         let d = tempfile::tempdir().unwrap();
         let (mut store, w) = written(d.path(), KEY);
         let day = d.path().join("cam1/2023-11-14");
         for n in 0..RENAME_TRIES {
             std::fs::write(day.join(format!("221320-{n:03}.mp4")), b"foreign").unwrap();
         }
-        let e = store.commit(w, &patch()).unwrap_err();
-        assert!(matches!(e, StoreError::NameTaken));
+        let e = store.commit(w, &patch(), &mut |_| Some(false)).unwrap_err();
+        assert!(matches!(e, StoreError::NoFreeName));
+        // The sealed recording is kept, not unlinked: it left the day directory for quarantine.
         assert!(files(d.path()).iter().all(|f| !f.contains(".part")));
+        let q = d.path().join("_quarantine/cam1/2023-11-14");
+        let kept: Vec<_> = std::fs::read_dir(q).unwrap().collect();
+        assert_eq!(kept.len(), 1);
+        let bytes = std::fs::read(kept[0].as_ref().unwrap().path()).unwrap();
+        assert!(
+            bytes.windows(4).any(|w| w == b"moov"),
+            "the whole file, not a stub"
+        );
+    }
+
+    /// A key the index cannot answer for is used, not skipped, and says it is unchecked.
+    #[test]
+    fn an_unanswered_key_is_used_and_reported_unchecked() {
+        let d = tempfile::tempdir().unwrap();
+        let (_store, w) = written(d.path(), KEY);
+        std::fs::write(d.path().join("cam1/2023-11-14/221320-000.mp4"), b"foreign").unwrap();
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync, &mut |_| None).unwrap();
+        assert_eq!(sealed.key, UnixMs::new(KEY + 1).unwrap());
+        assert!(!sealed.key_checked);
+    }
+
+    /// The index is asked for the bumped keys only (the first key was probed at `create`), a held
+    /// key gets no rename, and the file lands on the first key that is free of file and row.
+    #[test]
+    fn a_bumped_key_a_row_holds_is_skipped_without_a_rename() {
+        let d = tempfile::tempdir().unwrap();
+        let (_store, w) = written(d.path(), KEY);
+        let day = d.path().join("cam1/2023-11-14");
+        std::fs::write(day.join("221320-000.mp4"), b"foreign").unwrap();
+        let mut asked = Vec::new();
+        let mut holds = |k: UnixMs| {
+            asked.push(k.as_i64() - KEY);
+            Some(k.as_i64() == KEY + 1 || k.as_i64() == KEY + 2)
+        };
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync, &mut holds).unwrap();
+        assert_eq!(sealed.key, UnixMs::new(KEY + 3).unwrap());
+        assert_eq!(
+            asked,
+            [1, 2, 3],
+            "never asked about the key given at create"
+        );
+        assert_eq!(files(d.path()), ["221320-000.mp4", "221320-003.mp4"]);
+    }
+
+    #[test]
+    fn a_free_first_key_never_asks_the_index() {
+        let d = tempfile::tempdir().unwrap();
+        let (_store, w) = written(d.path(), KEY);
+        let mut holds = |_: UnixMs| -> Option<bool> { panic!("asked") };
+        let sealed = seal(&w, &camera(), &patch(), RootDir::sync, &mut holds).unwrap();
+        assert_eq!(sealed.key, UnixMs::new(KEY).unwrap());
     }
 
     #[test]
@@ -339,7 +456,7 @@ mod tests {
         let key = 1_700_006_399_999;
         let (_store, w) = written(d.path(), key);
         std::fs::write(d.path().join("cam1/2023-11-14/235959-999.mp4"), b"foreign").unwrap();
-        let e = seal(&w, &camera(), &patch(), RootDir::sync).unwrap_err();
+        let e = seal(&w, &camera(), &patch(), RootDir::sync, &mut |_| Some(false)).unwrap_err();
         assert!(matches!(e, StoreError::NameTaken));
     }
 }
