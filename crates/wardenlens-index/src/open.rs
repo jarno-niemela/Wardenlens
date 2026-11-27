@@ -34,12 +34,12 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 use wardenlens_fsutil::{
-    FileLock, FsError, PrivateFile, check_parent, immutable_uri, open_private_file, open_sidecar,
-    sidecar_len,
+    FileLock, FsError, PrivateFile, check_parent, immutable_uri, open_sidecar, sidecar_len,
 };
 
 use crate::error::IndexError;
 use crate::migrate::{self, Migration};
+use crate::registry::{Held, open_registered};
 use crate::sql::{self, Db, ReadSql};
 
 /// `WLIX`, the `application_id` of an index file.
@@ -726,7 +726,8 @@ pub(crate) struct Opened {
     pub(crate) conn: Db,
     /// Unlocked, but its descriptor stays open for the life of the connection.
     pub(crate) lock: FileLock,
-    pub(crate) file: PrivateFile,
+    /// The descriptor and the registry entry (dropped after it).
+    pub(crate) held: Held,
 }
 
 /// The whole checked open. `between` runs after our own checks and before SQLite opens the path
@@ -739,7 +740,9 @@ pub(crate) fn open(
     hook: &mut dyn FnMut(Stage),
 ) -> Result<Opened, IndexError> {
     check_parent(crate::parent_of(path))?;
-    let file = open_private_file(path)?;
+    // Declared first so it drops last: the registry entry outlives every use of the descriptor.
+    let held = open_registered(path)?;
+    let file = &held.file;
     // Two names of one index file would each get their own `-wal` and `-shm`, so two processes
     // would not see each other's SQLite locks and would overwrite each other's commits. Refused
     // before anything is written (#145). `discard_if_created` cannot apply: a file we just made
@@ -757,11 +760,11 @@ pub(crate) fn open(
     // probes and the read-write open must not interleave with another opener's (a `-shm` one of
     // us created must not be attached to by another process, and two first creators must not
     // both claim the file). Unlocked after migrations; the descriptor then lives on in `Opened`.
-    let lock = lock_file(&file, lock_wait)?;
-    let kind = match classify(path, &file, migrations, hook) {
+    let lock = lock_file(file, lock_wait)?;
+    let kind = match classify(path, file, migrations, hook) {
         Ok(kind) => kind,
         Err(e) => {
-            discard_if_created(path, &file);
+            discard_if_created(path, file);
             return Err(e);
         }
     };
@@ -781,7 +784,7 @@ pub(crate) fn open(
         Kind::New => {
             if let Err(e) = claim_new(&mut conn) {
                 drop(conn);
-                discard_if_created(path, &file);
+                discard_if_created(path, file);
                 return Err(e);
             }
         }
@@ -797,7 +800,7 @@ pub(crate) fn open(
     apply_pragmas(&conn)?;
     migrate::run(&mut conn, migrations)?;
     lock.unlock();
-    Ok(Opened { conn, lock, file })
+    Ok(Opened { conn, lock, held })
 }
 
 /// Removes the file this call created when the open is refused before anything was written, so a

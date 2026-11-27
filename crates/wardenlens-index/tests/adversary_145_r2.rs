@@ -192,12 +192,22 @@ fn a_link_made_while_an_index_is_open_blocks_later_opens_without_harm() {
     }
     std::fs::hard_link(&pa, &pb).unwrap();
     let before = snapshot(d.path());
-    assert!(matches!(Index::open(&pb), Err(IndexError::HardLinkedIndex)));
-    assert!(matches!(Index::open(&pa), Err(IndexError::HardLinkedIndex)));
+    // The same process has it open (#148): refused as such, through either name.
+    assert!(matches!(
+        Index::open(&pb),
+        Err(IndexError::AlreadyOpenInProcess)
+    ));
+    assert!(matches!(
+        Index::open(&pa),
+        Err(IndexError::AlreadyOpenInProcess)
+    ));
     assert!(before == snapshot(d.path()), "a refused open wrote");
     ia.insert(&rec("c", BASE + 50 * 10_000), Tier::Hot).unwrap();
     assert_eq!(count(&ia, "c"), 6);
     drop(ia);
+    // Once closed, the extra name is what refuses.
+    assert!(matches!(Index::open(&pb), Err(IndexError::HardLinkedIndex)));
+    assert!(matches!(Index::open(&pa), Err(IndexError::HardLinkedIndex)));
     std::fs::remove_file(&pb).unwrap();
     let idx = Index::open(&pa).unwrap();
     assert_eq!(count(&idx, "c"), 6);

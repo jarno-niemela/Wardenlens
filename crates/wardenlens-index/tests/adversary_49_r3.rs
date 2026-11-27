@@ -223,15 +223,22 @@ fn a_newer_version_only_in_the_wal_is_refused_with_main_and_wal_untouched_with_s
 // A live writer: the -shm of a live connection is never removed
 // ---------------------------------------------------------------------------------------------
 
-/// With another `Index` alive and its rows only in the `-wal`, a second open probes on the real
-/// files (the `-shm` exists), must not remove the live `-shm`, and both handles must keep seeing
-/// each other's commits.
+/// With another writer alive and its rows only in the `-wal`, an open probes on the real files
+/// (the `-shm` exists), must not remove the live `-shm`, and both must keep seeing each other's
+/// commits. (#148: the writer is a raw SQLite connection standing in for another process, since
+/// a second `Index` in this process is refused.)
 #[test]
 fn a_second_open_beside_a_live_writer_keeps_the_shared_wal_index() {
+    const RAW: &str = "INSERT INTO segments \
+        (camera_id, started_at_ms, duration_ms, ended_at_ms, bytes, frame_count, tier) \
+        VALUES ('cam1', ?1, 1000, ?2, 10, 1, 0)";
     let dir = private_tempdir();
     let path = dir.path().join("index.db");
-    let mut a = Index::open(&path).unwrap();
-    a.insert(&rec("cam1", BASE, 1000, 10), Tier::Hot).unwrap();
+    drop(Index::open(&path).unwrap());
+    let a = rusqlite::Connection::open(&path).unwrap();
+    a.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    a.execute(RAW, [BASE, BASE + 1000]).unwrap();
     assert!(sidecar(&path, "-wal").metadata().unwrap().len() > 32);
     assert!(sidecar(&path, "-shm").exists());
     let shm_ino = std::os::unix::fs::MetadataExt::ino(&sidecar(&path, "-shm").metadata().unwrap());
@@ -241,10 +248,12 @@ fn a_second_open_beside_a_live_writer_keeps_the_shared_wal_index() {
     assert_eq!(shm_ino, shm_after, "the live -shm was replaced");
     b.insert(&rec("cam1", BASE + 10_000, 1000, 10), Tier::Hot)
         .unwrap();
-    a.insert(&rec("cam1", BASE + 20_000, 1000, 10), Tier::Hot)
-        .unwrap();
-    assert_eq!(count(&a, "cam1"), 3);
+    a.execute(RAW, [BASE + 20_000, BASE + 21_000]).unwrap();
     assert_eq!(count(&b, "cam1"), 3);
+    let seen: i64 = a
+        .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seen, 3);
 }
 
 // ---------------------------------------------------------------------------------------------
