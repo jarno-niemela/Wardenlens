@@ -26,7 +26,7 @@
 //! flushes and indexes its open segment, the storage thread finishes its tick; all of it within
 //! the deadline ([`Tuning::shutdown_deadline`]). When a part overruns it, [`run`] returns
 //! [`ServeError::ShutdownTimeout`] and the caller must release the runtime with
-//! [`release_runtime`], which abandons blocking tasks instead of waiting for them: a tokio runtime
+//! [`release_runtime_within`], which abandons blocking tasks instead of waiting for them: a tokio runtime
 //! dropped normally waits without limit for `spawn_blocking` work (a storage tick of up to 64
 //! moves, a recorder stuck in `fsync`). Abandoning a tier move or a `.part` file is crash-safe
 //! (ADR 0005 sections 7 and 9: the same state a power cut leaves, repaired at the next start).
@@ -185,7 +185,7 @@ pub(crate) enum Stopped {
     Clean,
     /// The signal arrived during start-up: nothing was started, and blocking start-up work (a
     /// long reconciliation walk) may still be running. Release the runtime with
-    /// [`release_runtime`]`(runtime, false)`.
+    /// [`release_runtime_within`] with `clean = false`.
     Abandoned,
 }
 
@@ -286,7 +286,7 @@ async fn prepare<U: VolumeUsage + Send + 'static>(
 ///
 /// # Errors
 /// [`ServeError`]: a start-up refusal, or a shutdown that overran its deadline (the caller then
-/// calls [`release_runtime`] with `false`).
+/// calls [`release_runtime_within`] with `false`).
 pub(crate) async fn run<S, L, U>(
     config: &Config,
     index: Index,
