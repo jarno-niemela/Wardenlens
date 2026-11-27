@@ -255,10 +255,47 @@ impl Storage {
         U: VolumeUsage,
         F: Fs,
     {
+        let hot = RootDir::open(&cfg.hot_root).map_err(StorageError::HotRoot)?;
+        Self::open_on_with(hot, cfg, index, usage, wrap)
+    }
+
+    /// As [`open`](Self::open) on a hot root that the caller has already opened, so that the
+    /// caller (the service) opens the hot root once and shares it with its recorders.
+    /// `cfg.hot_root` is then not read.
+    ///
+    /// # Errors
+    /// [`StorageError::NoActions`].
+    pub fn open_on<I, U>(
+        hot: RootDir,
+        cfg: StorageConfig,
+        index: I,
+        usage: U,
+    ) -> Result<Built<I, RealFs, U>, StorageError>
+    where
+        I: SegmentIndex,
+        U: VolumeUsage,
+    {
+        Self::open_on_with(hot, cfg, index, usage, |fs| fs)
+    }
+
+    /// As [`open_on`](Self::open_on), with `wrap` applied to the real file system (private: only
+    /// `open_with` needs it).
+    fn open_on_with<I, U, F>(
+        hot: RootDir,
+        cfg: StorageConfig,
+        index: I,
+        usage: U,
+        wrap: impl FnOnce(RealFs) -> F,
+    ) -> Result<Built<I, F, U>, StorageError>
+    where
+        I: SegmentIndex,
+        U: VolumeUsage,
+        F: Fs,
+    {
         if cfg.max_actions_per_tick == 0 {
             return Err(StorageError::NoActions);
         }
-        let hot = Arc::new(RootDir::open(&cfg.hot_root).map_err(StorageError::HotRoot)?);
+        let hot = Arc::new(hot);
         let slot = Arc::new(ArchiveSlot::default());
         let index = SharedIndex::new(index);
         let files = StorageFiles::new(index.clone(), Arc::clone(&hot), Arc::clone(&slot));

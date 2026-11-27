@@ -15,6 +15,9 @@ use crate::fs::ArchiveSlot;
 
 /// The marker file the operator creates once on the mounted archive.
 pub const ARCHIVE_MARKER: &str = ".wardenlens-archive";
+/// The lock file of a running service, in the hot root (ADR 0005 section 8). Not a segment and not
+/// ours to report: the reconciliation walk skips it.
+pub const HOT_LOCK_FILE: &str = ".wardenlens.lock";
 /// The scratch file that clears a failure-based unavailability.
 pub const PROBE_FILE: &str = ".wl-probe";
 /// Consecutive archive-side move failures that make the archive unavailable.
