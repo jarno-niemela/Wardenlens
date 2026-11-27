@@ -44,7 +44,6 @@ impl Drop for Scratch {
 // /proc/self/fd. `OpenedSegment` derives `Debug`, so `{:?}` (e.g. a tracing
 // field) reveals the full path and root.
 #[test]
-#[ignore = "follow-up #133: OpenedSegment's derived Debug prints the handle (a File prints its path)"]
 fn opened_segment_debug_does_not_reveal_the_file_path() {
     let s = Scratch::new("debug", b"payload");
     let seg = OpenedSegment::from_handle(File::open(&s.0).unwrap(), Tier::Hot).unwrap();
@@ -135,11 +134,12 @@ fn file_handle_survives_unlink_with_the_measured_length() {
     assert_eq!(out, b"789");
 }
 
-// Observation for the doc claim "the length ... cannot disagree with what the
-// handle yields": it is a snapshot. Documented here as a passing test of the
-// snapshot semantics (len is fixed at open; consumers must bound reads by it).
+// The length is a snapshot taken at open (it holds for a regular, unmodified
+// file): the handle yields more bytes if the file grows afterwards, so a
+// consumer caps its reads at `len()` with `take(len)`, which is what keeps a
+// growing file from being over-read.
 #[test]
-fn length_is_a_snapshot_taken_at_open() {
+fn length_is_a_snapshot_so_consumers_cap_reads_at_len() {
     let s = Scratch::new("grow", b"abc");
     let seg = OpenedSegment::from_handle(File::open(&s.0).unwrap(), Tier::Hot).unwrap();
     OpenOptions::new()
@@ -149,9 +149,15 @@ fn length_is_a_snapshot_taken_at_open() {
         .write_all(b"def")
         .unwrap();
     assert_eq!(seg.len(), 3);
+    let len = seg.len();
+    let mut handle = seg.into_handle();
+    let mut capped = Vec::new();
+    (&mut handle).take(len).read_to_end(&mut capped).unwrap();
+    assert_eq!(capped, b"abc");
+    // Uncapped, the handle yields the grown file.
+    handle.seek(SeekFrom::Start(0)).unwrap();
     let mut out = Vec::new();
-    seg.into_handle().read_to_end(&mut out).unwrap();
-    // The handle yields 6 bytes although len() says 3.
+    handle.read_to_end(&mut out).unwrap();
     assert_eq!(out.len(), 6);
 }
 
@@ -203,7 +209,7 @@ mod fake {
     fn insert_replaces_failure_and_old_handle_keeps_old_bytes() {
         let fs = MemorySegmentFiles::new();
         let id = SegmentId::new(1);
-        fs.fail_with(id, io::ErrorKind::PermissionDenied);
+        fs.fail_with(id, Tier::Hot, io::ErrorKind::PermissionDenied);
         assert!(!fs.move_to(id, Tier::Archive));
         assert_eq!(
             fs.open_segment(id).unwrap_err(),

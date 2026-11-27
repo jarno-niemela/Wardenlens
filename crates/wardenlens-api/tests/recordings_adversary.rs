@@ -371,7 +371,11 @@ async fn error_paths_never_leak_download_slots() {
     inner.insert(SegmentId::new(1), Tier::Hot, &pattern(70_000));
     inner.insert(SegmentId::new(2), Tier::Archive, &pattern(10));
     inner.insert(SegmentId::new(3), Tier::Hot, &[]);
-    inner.fail_with(SegmentId::new(4), io::ErrorKind::PermissionDenied);
+    inner.fail_with(
+        SegmentId::new(4),
+        Tier::Hot,
+        io::ErrorKind::PermissionDenied,
+    );
     inner.set_archive_available(false);
     let (app, auth) = app_with(common::NoLister, Faulty { inner });
     let cases: [Case; 7] = [

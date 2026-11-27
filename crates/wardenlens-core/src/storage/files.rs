@@ -7,6 +7,7 @@
 //! defines the contract; `storage` (#58) implements it and `cli` (#68) wires
 //! it in as a generic.
 
+use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use super::types::{SegmentId, Tier};
@@ -51,13 +52,28 @@ impl SegmentOpenError {
 /// length and tier.
 ///
 /// The length is measured from the handle itself ([`OpenedSegment::from_handle`]),
-/// so it cannot disagree with what the handle yields. The fields are private
-/// and there is no accessor for a path or a writable view.
-#[derive(Debug)]
+/// so for a regular, unmodified file it equals what the handle yields. It is a
+/// **snapshot taken at open**: a file that grows or shrinks afterwards makes the
+/// handle yield more or fewer bytes than `len()`. A consumer therefore caps
+/// every read at `len()` (for example `handle.take(len)`) and treats a short
+/// read as a failure. The fields are private and there is no accessor for a
+/// path or a writable view.
+///
+/// `Debug` prints the length and the tier only. It never prints the handle: a
+/// `std::fs::File` prints its path, and the in-memory fake prints its bytes.
 pub struct OpenedSegment<H> {
     handle: H,
     len: u64,
     tier: Tier,
+}
+
+impl<H> fmt::Debug for OpenedSegment<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenedSegment")
+            .field("len", &self.len)
+            .field("tier", &self.tier)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<H: Read + Seek> OpenedSegment<H> {
@@ -111,9 +127,11 @@ impl<H: Read + Seek> OpenedSegment<H> {
 /// - Read the index row, derive the path from it and open the file of the
 ///   row's tier through the root handle (`RootDir`). For the archive tier use
 ///   **only the handle of the latest successful probe**.
-/// - Open with `O_NONBLOCK` and `O_NOFOLLOW` (through `openat2` with
-///   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) and `fstat` the descriptor; the
-///   file must be regular.
+/// - Open with `O_RDONLY | O_NONBLOCK` and `O_NOFOLLOW` (through `openat2`
+///   with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) and `fstat` the descriptor;
+///   the file must be **regular** (the length below is only meaningful for a
+///   regular file). A write through the returned handle must fail with
+///   `EBADF`; the implementation tests that.
 /// - On `ENOENT` (a move finished between the row read and the open) **re-read
 ///   the row once**; if the tier changed, open the other tier, otherwise fail
 ///   with [`SegmentOpenError::NotFound`]. Never loop.
@@ -125,18 +143,64 @@ impl<H: Read + Seek> OpenedSegment<H> {
 ///   matches the handle and the handle starts at byte 0. The reported tier is
 ///   the tier the file was actually opened from.
 ///
+/// **Deviation from ADR 0005 section 3.** The ADR takes the length from
+/// `fstat`; `from_handle` measures it by seeking to the end. For a regular file
+/// the two are equal, which is why the implementation must still check that the
+/// file is regular. Neither is a promise about later growth: the length is a
+/// snapshot at open (see [`OpenedSegment`]).
+///
+/// # Blocking
+///
+/// `open_segment` blocks: it reads the index (SQLite) and opens the file
+/// (`openat2`, and on the archive tier a possibly slow mount). A caller on an
+/// async runtime runs it in `spawn_blocking` (ADR 0004 section 4). It must also
+/// cap every read of the handle at [`OpenedSegment::len`] (`take(len)`), since
+/// the file may change after the open.
+///
 /// # Handle bounds
 ///
-/// `Handle` is `Read + Seek + Send`: `Read + Seek` serves single-range
-/// requests, and `Send` lets the API move the handle into a blocking task.
-/// There is no `Write`, `AsRawFd` or `AsFd` bound, so a consumer holding only
-/// this port cannot write or recover a path. A download that holds the handle
-/// keeps reading through a later `unlink` (POSIX semantics).
+/// `Handle` is `Read + Seek + Send + 'static`: `Read + Seek` serves
+/// single-range requests, and `Send + 'static` lets the API move the handle
+/// into a blocking task. A consumer that moves the port itself into
+/// `spawn_blocking` additionally needs `F: Send + Sync + 'static`. There is no
+/// `Write`, `AsRawFd` or `AsFd` bound, so a consumer holding only this port
+/// cannot write or recover a path; the doctest below keeps it that way. A
+/// download that holds the handle keeps reading through a later `unlink`
+/// (POSIX semantics).
+///
+/// A generic consumer can read the handle:
+///
+/// ```
+/// use std::io::Read;
+/// use wardenlens_core::storage::{SegmentFiles, SegmentId};
+///
+/// fn consumer<F: SegmentFiles>(f: &F, id: SegmentId) {
+///     if let Ok(seg) = f.open_segment(id) {
+///         let mut handle = seg.into_handle();
+///         let mut buf = Vec::new();
+///         let _ = handle.read_to_end(&mut buf);
+///     }
+/// }
+/// ```
+///
+/// but cannot write to it (the same code with `write_all` does not compile):
+///
+/// ```compile_fail,E0599
+/// use std::io::Write;
+/// use wardenlens_core::storage::{SegmentFiles, SegmentId};
+///
+/// fn consumer<F: SegmentFiles>(f: &F, id: SegmentId) {
+///     if let Ok(seg) = f.open_segment(id) {
+///         let mut handle = seg.into_handle();
+///         let _ = handle.write_all(b"x");
+///     }
+/// }
+/// ```
 pub trait SegmentFiles {
     /// The read-only handle type.
-    type Handle: Read + Seek + Send;
+    type Handle: Read + Seek + Send + 'static;
 
-    /// Opens segment `id` for reading.
+    /// Opens segment `id` for reading. Blocks; see the trait docs.
     ///
     /// # Errors
     ///
@@ -153,6 +217,7 @@ pub use fake::{MemoryHandle, MemorySegmentFiles};
 #[cfg(any(test, feature = "test-support"))]
 mod fake {
     use std::collections::HashMap;
+    use std::fmt;
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
     use std::sync::{Arc, Mutex, PoisonError};
 
@@ -161,25 +226,64 @@ mod fake {
     /// A read-only in-memory handle. It implements `Read` and `Seek` only, and
     /// owns a shared copy of the bytes, so it keeps working after the segment
     /// is moved or removed from the fake.
-    #[derive(Debug)]
-    pub struct MemoryHandle(Cursor<Arc<[u8]>>);
+    ///
+    /// `Debug` prints the length and position, never the bytes.
+    pub struct MemoryHandle {
+        cursor: Cursor<Arc<[u8]>>,
+        fault: Option<ReadFault>,
+    }
+
+    impl fmt::Debug for MemoryHandle {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MemoryHandle")
+                .field("len", &self.cursor.get_ref().len())
+                .field("position", &self.cursor.position())
+                .finish_non_exhaustive()
+        }
+    }
 
     impl Read for MemoryHandle {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
+            let Some(fault) = self.fault else {
+                return self.cursor.read(buf);
+            };
+            let left = fault.after.saturating_sub(self.cursor.position());
+            if left == 0 {
+                return Err(io::Error::from(fault.kind));
+            }
+            // Never hand out more than the bytes left before the fault.
+            let allowed = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
+            match buf.get_mut(..allowed) {
+                Some(window) => self.cursor.read(window),
+                None => self.cursor.read(buf),
+            }
         }
     }
 
     impl Seek for MemoryHandle {
         fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-            self.0.seek(pos)
+            self.cursor.seek(pos)
         }
+    }
+
+    /// Reads fail with `kind` once the handle's position reaches `after`.
+    #[derive(Debug, Clone, Copy)]
+    struct ReadFault {
+        after: u64,
+        kind: io::ErrorKind,
     }
 
     #[derive(Debug, Clone)]
     enum Entry {
-        File { tier: Tier, bytes: Arc<[u8]> },
-        Fail(io::ErrorKind),
+        File {
+            tier: Tier,
+            bytes: Arc<[u8]>,
+            fault: Option<ReadFault>,
+        },
+        Fail {
+            tier: Tier,
+            kind: io::ErrorKind,
+        },
     }
 
     #[derive(Debug)]
@@ -219,12 +323,39 @@ mod fake {
         /// Stores (or replaces) a segment.
         pub fn insert(&self, id: SegmentId, tier: Tier, bytes: &[u8]) {
             let bytes: Arc<[u8]> = Arc::from(bytes);
-            self.with(|s| s.entries.insert(id, Entry::File { tier, bytes }));
+            self.with(|s| {
+                s.entries.insert(
+                    id,
+                    Entry::File {
+                        tier,
+                        bytes,
+                        fault: None,
+                    },
+                )
+            });
         }
 
-        /// Makes opening `id` fail with an I/O error of `kind`.
-        pub fn fail_with(&self, id: SegmentId, kind: io::ErrorKind) {
-            self.with(|s| s.entries.insert(id, Entry::Fail(kind)));
+        /// Makes opening `id` fail with an I/O error of `kind`, as a row on
+        /// `tier` would. On the archive tier an unavailable archive still wins
+        /// and gives [`SegmentOpenError::ArchiveUnavailable`], as in the real
+        /// implementation.
+        pub fn fail_with(&self, id: SegmentId, tier: Tier, kind: io::ErrorKind) {
+            self.with(|s| s.entries.insert(id, Entry::Fail { tier, kind }));
+        }
+
+        /// Makes reads of the stored segment `id` fail with `kind` once `after`
+        /// bytes have been read (counted by position, so a seek past `after`
+        /// fails at once). The open itself succeeds and `len()` is the full
+        /// length, as for a file that errors mid-download. Applies to handles
+        /// opened afterwards. Returns whether `id` was a stored file.
+        pub fn fail_reads_after(&self, id: SegmentId, after: u64, kind: io::ErrorKind) -> bool {
+            self.with(|s| match s.entries.get_mut(&id) {
+                Some(Entry::File { fault, .. }) => {
+                    *fault = Some(ReadFault { after, kind });
+                    true
+                }
+                _ => false,
+            })
         }
 
         /// Moves a stored segment to `tier`, as the mover would. Returns
@@ -258,18 +389,33 @@ mod fake {
             &self,
             id: SegmentId,
         ) -> Result<OpenedSegment<Self::Handle>, SegmentOpenError> {
-            let (tier, bytes) = self.with(|s| match s.entries.get(&id) {
-                None => Err(SegmentOpenError::NotFound),
-                Some(Entry::Fail(kind)) => Err(SegmentOpenError::Io { kind: *kind }),
-                Some(Entry::File { tier, bytes }) => {
-                    if *tier == Tier::Archive && !s.archive_available {
-                        Err(SegmentOpenError::ArchiveUnavailable)
-                    } else {
-                        Ok((*tier, Arc::clone(bytes)))
+            let (tier, bytes, fault) = self.with(|s| {
+                let archive_up = s.archive_available;
+                match s.entries.get(&id) {
+                    None => Err(SegmentOpenError::NotFound),
+                    Some(Entry::Fail { tier, kind }) => {
+                        if *tier == Tier::Archive && !archive_up {
+                            Err(SegmentOpenError::ArchiveUnavailable)
+                        } else {
+                            Err(SegmentOpenError::Io { kind: *kind })
+                        }
+                    }
+                    Some(Entry::File { tier, bytes, fault }) => {
+                        if *tier == Tier::Archive && !archive_up {
+                            Err(SegmentOpenError::ArchiveUnavailable)
+                        } else {
+                            Ok((*tier, Arc::clone(bytes), *fault))
+                        }
                     }
                 }
             })?;
-            OpenedSegment::from_handle(MemoryHandle(Cursor::new(bytes)), tier)
+            OpenedSegment::from_handle(
+                MemoryHandle {
+                    cursor: Cursor::new(bytes),
+                    fault,
+                },
+                tier,
+            )
         }
     }
 }
@@ -385,7 +531,7 @@ mod tests {
     #[test]
     fn io_not_found_kind_stays_io() {
         let fs = MemorySegmentFiles::new();
-        fs.fail_with(id(1), std::io::ErrorKind::NotFound);
+        fs.fail_with(id(1), Tier::Hot, std::io::ErrorKind::NotFound);
         assert_eq!(
             fs.open_segment(id(1)).unwrap_err(),
             SegmentOpenError::Io {
@@ -469,6 +615,156 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    // Debug prints the length and the tier, never the handle (a `File` prints
+    // its path; the fake prints its bytes).
+    #[test]
+    fn opened_segment_debug_shows_len_and_tier_only() {
+        struct Leaky(Cursor<Vec<u8>>);
+        impl std::fmt::Debug for Leaky {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Leaky(/secret/path)")
+            }
+        }
+        impl Read for Leaky {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(b)
+            }
+        }
+        impl Seek for Leaky {
+            fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(p)
+            }
+        }
+        let seg =
+            OpenedSegment::from_handle(Leaky(Cursor::new(b"/secret/path".to_vec())), Tier::Archive)
+                .unwrap();
+        // Sanity: the handle itself would leak.
+        assert!(format!("{:?}", Leaky(Cursor::new(Vec::new()))).contains("secret"));
+        let shown = format!("{seg:?}");
+        assert!(
+            shown.contains("len: 12") && shown.contains("Archive"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("secret") && !shown.contains("Leaky"),
+            "{shown}"
+        );
+        // The fake's own handle does not dump bytes either.
+        let fs = MemorySegmentFiles::new();
+        fs.insert(id(1), Tier::Hot, b"PAYLOADBYTES");
+        let h = fs.open_segment(id(1)).unwrap().into_handle();
+        assert!(!format!("{h:?}").contains("PAYLOAD"));
+    }
+
+    fn drain(h: &mut impl Read) -> (Vec<u8>, Option<std::io::ErrorKind>) {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 3];
+        loop {
+            match h.read(&mut buf) {
+                Ok(0) => return (out, None),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => return (out, Some(e.kind())),
+            }
+        }
+    }
+
+    // Mid-download failure: exactly `after` bytes arrive, then the chosen kind.
+    #[test]
+    fn reads_fail_after_n_bytes_with_the_chosen_kind() {
+        use std::io::ErrorKind as K;
+        let data = b"0123456789";
+        for (after, kind) in [
+            (0u64, K::PermissionDenied),
+            (1, K::TimedOut),
+            (4, K::BrokenPipe),
+            (9, K::Other),
+            (10, K::UnexpectedEof),
+        ] {
+            let fs = MemorySegmentFiles::new();
+            fs.insert(id(1), Tier::Hot, data);
+            assert!(fs.fail_reads_after(id(1), after, kind));
+            let seg = fs.open_segment(id(1)).unwrap();
+            assert_eq!(seg.len(), 10, "open succeeds with the full length");
+            let (got, err) = drain(&mut seg.into_handle());
+            let n = usize::try_from(after).unwrap();
+            assert_eq!(got, &data[..n], "after={after}");
+            assert_eq!(err, Some(kind), "after={after}");
+        }
+    }
+
+    #[test]
+    fn read_fault_follows_the_position_not_the_count() {
+        let fs = MemorySegmentFiles::new();
+        fs.insert(id(1), Tier::Hot, b"0123456789");
+        fs.fail_reads_after(id(1), 5, std::io::ErrorKind::TimedOut);
+        let mut h = fs.open_segment(id(1)).unwrap().into_handle();
+        // A range starting past the fault fails at once.
+        h.seek(SeekFrom::Start(7)).unwrap();
+        assert_eq!(
+            h.read(&mut [0u8; 2]).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        // A range below it reads, and reading may start before and stop at it.
+        h.seek(SeekFrom::Start(2)).unwrap();
+        let mut b = [0u8; 8];
+        assert_eq!(h.read(&mut b).unwrap(), 3);
+        assert_eq!(&b[..3], b"234");
+        assert!(h.read(&mut b).is_err());
+    }
+
+    #[test]
+    fn read_fault_is_per_segment_and_cleared_by_insert_and_kept_by_move() {
+        let fs = MemorySegmentFiles::new();
+        fs.insert(id(1), Tier::Hot, b"abcdef");
+        fs.insert(id(2), Tier::Hot, b"abcdef");
+        assert!(!fs.fail_reads_after(id(9), 1, std::io::ErrorKind::Other));
+        assert!(fs.fail_reads_after(id(1), 2, std::io::ErrorKind::Other));
+        let early = fs.open_segment(id(2)).unwrap();
+        assert_eq!(drain(&mut early.into_handle()), (b"abcdef".to_vec(), None));
+        assert!(fs.move_to(id(1), Tier::Archive));
+        let (got, err) = drain(&mut fs.open_segment(id(1)).unwrap().into_handle());
+        assert_eq!(
+            (got.as_slice(), err),
+            (&b"ab"[..], Some(std::io::ErrorKind::Other))
+        );
+        // Handles opened before the fault was set are unaffected.
+        let before = fs.open_segment(id(2)).unwrap();
+        fs.fail_reads_after(id(2), 0, std::io::ErrorKind::Other);
+        assert_eq!(read_all(before.into_handle()), b"abcdef");
+        // A fresh insert replaces the entry and its fault.
+        fs.insert(id(1), Tier::Hot, b"abcdef");
+        assert_eq!(
+            read_all(fs.open_segment(id(1)).unwrap().into_handle()),
+            b"abcdef"
+        );
+        // A failing-open entry is not a stored file.
+        fs.fail_with(id(3), Tier::Hot, std::io::ErrorKind::Other);
+        assert!(!fs.fail_reads_after(id(3), 1, std::io::ErrorKind::Other));
+    }
+
+    // fail_with names the tier: an archive-tier Io error, and the archive
+    // being unavailable still wins on that tier only.
+    #[test]
+    fn fail_with_a_tier_gives_an_io_error_on_that_tier() {
+        let kind = std::io::ErrorKind::PermissionDenied;
+        let fs = MemorySegmentFiles::new();
+        fs.fail_with(id(1), Tier::Archive, kind);
+        fs.fail_with(id(2), Tier::Hot, kind);
+        assert_eq!(
+            fs.open_segment(id(1)).unwrap_err(),
+            SegmentOpenError::Io { kind }
+        );
+        fs.set_archive_available(false);
+        assert_eq!(
+            fs.open_segment(id(1)).unwrap_err(),
+            SegmentOpenError::ArchiveUnavailable
+        );
+        assert_eq!(
+            fs.open_segment(id(2)).unwrap_err(),
+            SegmentOpenError::Io { kind }
+        );
     }
 
     // The port is usable generically with the documented bounds (Send for #62).
