@@ -72,6 +72,13 @@ pub enum IndexError {
         "index file has more than one hard link; nothing was modified; remove the extra name (keep one) and start again"
     )]
     HardLinkedIndex,
+    /// This process already has the index file open (under this or another name). A second
+    /// handle would drop the first one's POSIX locks when it closed its descriptor, so it is
+    /// refused (#148, ADR 0005 section 5). Share the one `Index` instead.
+    #[error(
+        "this process already has the index file open; nothing was modified; share the one open Index (a second open would drop the first one's locks)"
+    )]
+    AlreadyOpenInProcess,
     /// A sidecar exists that cannot belong to this database in its state: any sidecar next to an
     /// empty file, a `-wal` or `-shm` next to a rollback-mode file, or an empty `-journal`.
     /// Nothing was modified. Move it out of the directory (and delete it later when you know

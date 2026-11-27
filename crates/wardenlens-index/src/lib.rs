@@ -20,6 +20,7 @@ mod error;
 mod migrate;
 mod open;
 mod ops;
+mod registry;
 mod rows;
 mod sql;
 mod tokens;
@@ -27,8 +28,9 @@ mod tokens;
 use std::fmt;
 use std::path::Path;
 
+use crate::registry::Held;
 use crate::sql::Db;
-use wardenlens_fsutil::{FileLock, PrivateFile};
+use wardenlens_fsutil::FileLock;
 
 pub use cameras::{CameraRecord, MAX_CAMERAS, StoredCamera};
 pub use error::{CursorFault, IndexError};
@@ -43,7 +45,8 @@ pub struct Index {
     // WAL shared lock, so none of them may close while the connection is live.
     conn: Db,
     _lock: FileLock,
-    _file: PrivateFile,
+    // Last: the registry entry goes after the descriptor closes.
+    _held: Held,
 }
 
 impl fmt::Debug for Index {
@@ -86,6 +89,8 @@ impl Index {
     /// - [`IndexError::PragmaRefused`]: a pragma did not take its value.
     /// - [`IndexError::SidecarsChanging`]: the sidecars kept changing (a process was closing the
     ///   index) for every one of the bounded attempts; nothing was modified, try again.
+    /// - [`IndexError::AlreadyOpenInProcess`]: this process already has that file open (by any
+    ///   name); the first handle is untouched.
     /// - [`IndexError::Busy`]: another opener or writer held the file past the timeout.
     /// - [`IndexError::Sqlite`]: any other SQLite failure.
     ///
@@ -123,8 +128,33 @@ impl Index {
         Ok(Self {
             conn: opened.conn,
             _lock: opened.lock,
-            _file: opened.file,
+            _held: opened.held,
         })
+    }
+}
+
+/// Test only: the parts of an [`Index`] with its registry entry released, standing in for
+/// another process that has the file open (the registry refuses a second handle in this one).
+#[cfg(test)]
+pub(crate) struct Foreign {
+    _conn: Db,
+    _lock: FileLock,
+    _file: wardenlens_fsutil::PrivateFile,
+}
+
+#[cfg(test)]
+impl Index {
+    pub(crate) fn into_foreign(self) -> Foreign {
+        let Self {
+            conn,
+            _lock: lock,
+            _held: held,
+        } = self;
+        Foreign {
+            _conn: conn,
+            _lock: lock,
+            _file: held.into_file(),
+        }
     }
 }
 

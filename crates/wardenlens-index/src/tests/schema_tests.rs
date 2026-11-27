@@ -504,10 +504,14 @@ fn a_held_file_lock_makes_a_second_open_wait_then_report_busy() {
     assert_eq!(before, snapshot(f.dir.path()));
     drop(lock);
     drop(Index::open(&f.path).unwrap());
-    // And the lock is not kept after a successful open: a second handle opens beside the first.
+    // And the lock is not kept after a successful open: another process could open beside it. In
+    // this process a second handle is refused (#148), and is refused as such, not as `Busy`.
     let a = Index::open(&f.path).unwrap();
-    let b = Index::open(&f.path).unwrap();
-    drop((a, b));
+    assert!(matches!(
+        Index::open(&f.path),
+        Err(IndexError::AlreadyOpenInProcess)
+    ));
+    drop(a);
 }
 
 /// A busy database is `Busy`, not `Damaged` or `ForeignWal`, on every probe connection.
