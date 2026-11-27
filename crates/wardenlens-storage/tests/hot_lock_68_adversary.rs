@@ -127,7 +127,7 @@ fn open_on_uses_the_handed_root_not_the_config_path() {
 }
 
 #[test]
-fn open_on_with_zero_actions_per_tick_is_refused() {
+fn open_on_zero_actions_per_tick_is_refused() {
     let w = World::new();
     let index = Index::open(&w.idx.join("index.db")).unwrap();
     let hot = RootDir::open(&w.hot).unwrap();

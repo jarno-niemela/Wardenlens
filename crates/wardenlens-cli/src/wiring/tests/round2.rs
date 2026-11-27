@@ -283,6 +283,21 @@ async fn accept_errors_do_not_end_the_loop() {
 /// not started.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_signal_during_camera_start_up_does_not_wait_for_the_camera() {
+    /// Counts how often ingest opened it: a camera that was never started is never opened.
+    struct Counting(Arc<AtomicUsize>);
+
+    impl StreamSource for Counting {
+        type Stream = FakeStream;
+
+        fn open(
+            &mut self,
+            _idle: Duration,
+        ) -> impl Future<Output = Result<FakeStream, IngestError>> + Send {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err(IngestError::OpenFailed))
+        }
+    }
+
     let site = Site::new();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -295,12 +310,12 @@ async fn a_stop_signal_during_camera_start_up_does_not_wait_for_the_camera() {
         }
         let _ = release.lock().unwrap().recv();
     }));
-    let (tx, rx) = mpsc::unbounded_channel();
+    let opens = Arc::new(AtomicUsize::new(0));
     let svc = site
         .start(
             vec![CameraInput {
                 camera: camera("cam-ok", "192.0.2.10"),
-                source: Fake::Live(Some(rx)),
+                source: Counting(Arc::clone(&opens)),
             }],
             tuning,
         )
@@ -308,13 +323,13 @@ async fn a_stop_signal_during_camera_start_up_does_not_wait_for_the_camera() {
     tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
         .await
         .unwrap();
-    let (took, result) = svc.shutdown().await;
-    assert_eq!(result.unwrap(), Stopped::Clean);
-    assert!(took < Duration::from_secs(10), "{took:?}");
-    // The camera was never started: frames sent now are not recorded.
-    for f in frames(0, 3, now_ms() - 3_600_000) {
-        let _ = tx.send(f);
-    }
-    assert_eq!(site.files(".part") + site.files(".mp4"), 0);
+    let at = std::time::Instant::now();
+    let stopped = tokio::time::timeout(Duration::from_secs(10), svc.shutdown())
+        .await
+        .expect("the stop is not held by the camera that is being set up");
+    assert!(at.elapsed() < Duration::from_secs(10));
+    assert_eq!(stopped.1.unwrap(), Stopped::Clean);
+    // Let the abandoned set-up finish; its recorder is dropped, and ingest never opened it.
     let _ = release_tx.send(());
+    assert_eq!(opens.load(Ordering::SeqCst), 0, "the camera was started");
 }

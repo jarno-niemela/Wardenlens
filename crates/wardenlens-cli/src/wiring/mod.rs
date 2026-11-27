@@ -189,18 +189,46 @@ pub(crate) enum Stopped {
     Abandoned,
 }
 
-/// How long a clean release waits for blocking tasks that are still running (a DNS lookup that
+/// The most a clean release waits for blocking tasks that are still running (a DNS lookup that
 /// ingest started for a camera host, an API index read).
 const CLEAN_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a clean release may wait: [`CLEAN_GRACE`], but never more than what is left of the
+/// `limit` that started when the stop signal arrived (`signalled`), so that the whole exit stays
+/// within the ticket's 10 s. Pure, so it is tested with explicit instants.
+pub(crate) fn clean_budget(
+    signalled: std::time::Instant,
+    limit: Duration,
+    now: std::time::Instant,
+) -> Duration {
+    let remaining = signalled
+        .checked_add(limit)
+        .map_or(Duration::ZERO, |end| end.saturating_duration_since(now));
+    remaining.min(CLEAN_GRACE)
+}
 
 /// Releases the runtime after [`run`]; always with `shutdown_timeout`, never a plain drop,
 /// because dropping a multi-thread runtime waits without limit for `spawn_blocking` tasks (even
 /// after every part stopped in time, a hung `getaddrinfo` would hold the process). A clean stop
-/// waits at most [`CLEAN_GRACE`] for leftovers; after an overrun or an abandoned start-up it does
-/// not wait at all, so the 10 s deadline holds. What is abandoned is crash-safe (see the module
-/// docs).
+/// waits at most `budget` (see [`clean_budget`]) for leftovers; after an overrun or an abandoned
+/// start-up it does not wait at all, so the 10 s deadline holds. What is abandoned is crash-safe
+/// (see the module docs).
+pub(crate) fn release_runtime_within(
+    runtime: tokio::runtime::Runtime,
+    clean: bool,
+    budget: Duration,
+) {
+    runtime.shutdown_timeout(if clean {
+        budget.min(CLEAN_GRACE)
+    } else {
+        Duration::ZERO
+    });
+}
+
+/// [`release_runtime_within`] with the full [`CLEAN_GRACE`] (tests).
+#[cfg(test)]
 pub(crate) fn release_runtime(runtime: tokio::runtime::Runtime, clean: bool) {
-    runtime.shutdown_timeout(if clean { CLEAN_GRACE } else { Duration::ZERO });
+    release_runtime_within(runtime, clean, CLEAN_GRACE);
 }
 
 /// Aborts a task when dropped.

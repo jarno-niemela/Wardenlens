@@ -37,6 +37,7 @@ use super::*;
 mod accept;
 mod adversary;
 mod adversary_r2;
+mod adversary_r3;
 mod round2;
 mod storage;
 

@@ -21,6 +21,8 @@
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
 use tokio::net::TcpListener;
@@ -41,7 +43,8 @@ use super::import::vault_path;
 use super::{Context, report_error};
 use crate::config_file::{ConfigFileError, load, resolve_path};
 use crate::wiring::{
-    CameraInput, ServeError, Stopped, SystemClock, Tuning, raise_nofile_limit, release_runtime, run,
+    CameraInput, ServeError, Stopped, SystemClock, Tuning, clean_budget, raise_nofile_limit,
+    release_runtime_within, run,
 };
 
 /// Why `serve` failed.
@@ -119,17 +122,23 @@ fn start(ctx: &Context<'_>) -> Result<(), CommandError> {
         .enable_all()
         .build()
         .map_err(CommandError::Runtime)?;
+    let signalled = Arc::new(OnceLock::new());
+    let tuning = Tuning::default();
+    let limit = tuning.shutdown_deadline;
     let result = runtime.block_on(async {
         let listener = TcpListener::bind(config.listen())
             .await
             .map_err(CommandError::Bind)?;
         let mut term = signal(SignalKind::terminate()).map_err(CommandError::Runtime)?;
         let mut int = signal(SignalKind::interrupt()).map_err(CommandError::Runtime)?;
+        let at = Arc::clone(&signalled);
         let shutdown = async move {
             tokio::select! {
                 _ = term.recv() => {}
                 _ = int.recv() => {}
             }
+            // The 10 s of the deadline run from here.
+            let _ = at.set(Instant::now());
         };
         tracing::info!(port = config.listen().port(), "API listening");
         run(
@@ -138,23 +147,27 @@ fn start(ctx: &Context<'_>) -> Result<(), CommandError> {
             cameras,
             listener,
             shutdown,
-            Tuning::default(),
+            tuning,
             StatvfsUsage,
         )
         .await
         .map_err(CommandError::from)
     });
-    finish(runtime, result)
+    finish(runtime, result, signalled.get().copied(), limit)
 }
 
 /// The tail of [`start`]: releases the runtime, then reports the result. A clean stop gives
-/// blocking leftovers a short grace; anything else (an overrun, a signal during start-up, a
-/// refusal) abandons them, so the exit is never held by blocking tasks (see `release_runtime`).
+/// blocking leftovers a short grace taken out of what is left of the `limit` since the stop
+/// signal (`signalled`); anything else (an overrun, a signal during start-up, a refusal) abandons
+/// them, so the exit is never held by blocking tasks (see `release_runtime_within`).
 fn finish(
     runtime: tokio::runtime::Runtime,
     result: Result<Stopped, CommandError>,
+    signalled: Option<Instant>,
+    limit: Duration,
 ) -> Result<(), CommandError> {
-    release_runtime(runtime, matches!(result, Ok(Stopped::Clean)));
+    let budget = signalled.map_or(Duration::ZERO, |at| clean_budget(at, limit, Instant::now()));
+    release_runtime_within(runtime, matches!(result, Ok(Stopped::Clean)), budget);
     result.map(|_| ())
 }
 
@@ -454,7 +467,12 @@ mod tests {
         ];
         for (result, code, bound_ms) in bounds {
             let at = std::time::Instant::now();
-            let out = finish(runtime_with_a_stuck_blocking_task(), result);
+            let out = finish(
+                runtime_with_a_stuck_blocking_task(),
+                result,
+                Some(Instant::now()),
+                Duration::from_secs(10),
+            );
             assert!(
                 at.elapsed() < Duration::from_millis(bound_ms) + Duration::from_millis(100),
                 "{:?}",
@@ -466,6 +484,56 @@ mod tests {
                 (other, _) => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    /// The grace comes out of the remaining deadline: with explicit instants (no timers), the
+    /// budget is the full grace early on, what is left near the end, and nothing past it.
+    #[test]
+    fn the_clean_grace_is_taken_out_of_the_remaining_deadline() {
+        let t0 = Instant::now();
+        let limit = Duration::from_secs(10);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let table = [
+            (0, Duration::from_secs(1)),
+            (8_999, Duration::from_secs(1)),
+            (9_000, Duration::from_secs(1)),
+            (9_400, Duration::from_millis(600)),
+            (9_999, Duration::from_millis(1)),
+            (10_000, Duration::ZERO),
+            (12_000, Duration::ZERO),
+        ];
+        for (now_ms, want) in table {
+            assert_eq!(
+                clean_budget(t0, limit, at(now_ms)),
+                want,
+                "now = {now_ms} ms"
+            );
+        }
+    }
+
+    /// A clean stop that used most of the deadline releases within what is left of it, although a
+    /// blocking task is stuck: signalled 1.9 s ago of 2 s, so about 100 ms remain (the full grace
+    /// would take 1 s, as before this was taken out of the budget).
+    #[test]
+    fn a_late_clean_stop_releases_within_the_remaining_deadline() {
+        let limit = Duration::from_secs(2);
+        let signalled = Instant::now()
+            .checked_sub(Duration::from_millis(1900))
+            .unwrap();
+        let at = Instant::now();
+        finish(
+            runtime_with_a_stuck_blocking_task(),
+            Ok(Stopped::Clean),
+            Some(signalled),
+            limit,
+        )
+        .unwrap();
+        // The runtime was built (and a 50 ms warm-up run) inside the measured span as well.
+        assert!(
+            at.elapsed() < Duration::from_millis(700),
+            "{:?}",
+            at.elapsed()
+        );
     }
 
     #[test]
