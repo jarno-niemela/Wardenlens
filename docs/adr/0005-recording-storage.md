@@ -573,9 +573,11 @@ of the rules above; the planner is `wardenlens_core::storage::plan`.
   reserve (`emergency_reserve_bytes`) is capped at the largest accepted floor (`MinFreePercent::MAX`, 90 %).
   One core helper, `hot_floor`, implements this and is used by the planner, the status (`below_floor`), the
   breach counter and the quarantine eviction, so they cannot disagree. The reserve engages whatever the percentage
-  (a 0 % floor still keeps it free), and it never makes the floor unreachable: nothing is deleted or moved for a
-  reserve the volume cannot reach. That case is reported (`reserve_floor_unreachable`, state `Unsatisfiable`) and
-  alerted, not acted on.
+  (a 0 % floor still keeps it free), and it never makes the floor unreachable. Outside the rolling buffer nothing is
+  deleted or moved for a reserve the volume cannot reach: that case is reported (`reserve_floor_unreachable`, state
+  `Unsatisfiable`) and alerted, not acted on. Inside the rolling buffer (the percentage floor is also unreachable
+  and the archive cannot help) the #44 drain toward the reserve still applies, down to no hot video; the state is
+  `RollingBuffer` and the alert fires. Whether that drain should also be gated on reachability is tracked in #194.
 - *Small volumes.* On a volume smaller than the reserve the floor is 90 % of the capacity: a 1 GiB volume with the
   default 2 GiB reserve and nothing else on it keeps about 92 MiB of video and is otherwise quiet; it is not
   emptied on every tick. With foreign data such that `free + hot video` is below the capped reserve, the reserve is

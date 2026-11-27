@@ -119,10 +119,13 @@ pub(crate) fn select<F: Fs>(
 ) -> Option<Selection> {
     let sized = scan_sized(fs, tier);
     *incomplete |= sized.incomplete;
-    let removable = sized.total.saturating_add(deletable_bytes);
-    // Everything that could be removed counts toward the hot reserve's reachability.
-    let (floor, target) = tier_floor(tier, space, policy, removable)?;
-    let reachable = space.free_bytes.saturating_add(removable);
+    // The floor is judged by the same figures as in the planner and the status (free space plus
+    // the indexed video); the quarantine only counts toward what the eviction can restore.
+    let (floor, target) = tier_floor(tier, space, policy, deletable_bytes)?;
+    let reachable = space
+        .free_bytes
+        .saturating_add(sized.total)
+        .saturating_add(deletable_bytes);
     if reachable < floor {
         return None;
     }
@@ -142,7 +145,7 @@ pub(crate) fn percent_of(capacity: u64, percent: u64) -> Option<u64> {
 }
 
 /// The floor and target, in free bytes, of `tier`'s volume. The hot tier uses the one hot-floor
-/// rule (`hot_floor`: the reserve counts only when `free + removable` can reach it); the archive
+/// rule (`hot_floor`: the reserve counts only when `free + hot video` can reach it); the archive
 /// the plain percentage. `None` when the arithmetic does not fit.
 pub(crate) fn tier_floor(
     tier: Tier,

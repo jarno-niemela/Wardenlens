@@ -107,11 +107,10 @@ fn simulate_hot_only(capacity: u64, foreign: u64, seg_bytes: u64, policy: Policy
     segs.iter().map(|s| s.bytes).sum()
 }
 
-/// A 1 GiB hot volume with the default policy and 150 MiB (about 15 %) of non-video data (the
-/// index, logs, `lost+found`, the OS): the percentage floor (25 %) is easily reachable and
-/// before #108 about 600 MiB of video were kept. The reserve-raised floor is capped at 90 % of
-/// the capacity, not at what the volume can reach, so it is unreachable and the rolling buffer
-/// chases a reserve it can never meet: all hot video is deleted on every tick.
+/// Invariant: a 1 GiB hot volume with the default policy and 150 MiB (about 15 %) of non-video
+/// data (the index, logs, `lost+found`, the OS) keeps more than one tick of video. The percentage
+/// floor (25 %) is reachable, and the reserve (capped at 90 % of the capacity) is not part of the
+/// floor while the volume cannot reach it, so the rolling buffer never chases it.
 #[test]
 fn small_hot_volume_with_some_foreign_data_keeps_more_than_one_tick_of_video() {
     let held = simulate_hot_only(GIB, 150 * MIB, 10 * MIB, default_policy());
@@ -122,9 +121,9 @@ fn small_hot_volume_with_some_foreign_data_keeps_more_than_one_tick_of_video() {
     );
 }
 
-/// The same cliff on a volume larger than the reserve (no cap involved): 4 GiB, default policy,
-/// 2.1 GiB of other data. The plain 25 % floor (1 GiB) is reachable with ~0.9 GiB of video;
-/// the reserve-as-floor (2 GiB) is not, so every tick deletes all video.
+/// Invariant on a volume larger than the reserve (no cap involved): 4 GiB, default policy,
+/// 2.1 GiB of other data. The plain 25 % floor (1 GiB) is reachable with ~0.9 GiB of video; the
+/// 2 GiB reserve is not, so it is ignored and video is kept as without a reserve.
 #[test]
 fn four_gib_hot_volume_with_reachable_percentage_floor_keeps_video() {
     let foreign = 2 * GIB + 100 * MIB;

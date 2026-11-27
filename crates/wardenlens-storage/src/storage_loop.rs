@@ -498,9 +498,14 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         if report.is_some_and(|r| r.hot_probe_failed) {
             error = error.or(Some(TickErrorKind::HotVolume));
         }
-        match status::read_rows(&self.index) {
-            Some(rows) => self.rows = rows,
-            None => error = error.or(Some(TickErrorKind::Index)),
+        // The hot floor needs the hot bytes; when the rows cannot be read they count as 0 (as in
+        // `count_breaches`), never the bytes of an older read.
+        let rows = status::read_rows(&self.index);
+        let rows_read = rows.is_some();
+        if let Some(rows) = rows {
+            self.rows = rows;
+        } else {
+            error = error.or(Some(TickErrorKind::Index));
         }
         let policy = self.cfg.policy;
         let full = report.is_some_and(|r| r.archive_full);
@@ -516,7 +521,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         }
         self.snapshot.quarantined_total = self.quarantine_count.load(Ordering::Relaxed);
         let s = &mut self.snapshot;
-        s.hot = status::tier_status(Tier::Hot, probe.hot.ok(), &policy, &self.rows.0);
+        let mut hot_rows = self.rows.0;
+        if !rows_read {
+            hot_rows.bytes = 0;
+        }
+        s.hot = status::tier_status(Tier::Hot, probe.hot.ok(), &policy, &hot_rows);
         s.archive = status::tier_status(Tier::Archive, archive_space, &policy, &self.rows.1);
         s.archive_condition = status::archive_condition(&probe.archive, full);
         s.last_tick = Some(now);
@@ -936,7 +945,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             report.hot_alert = needs_hot_alert(
                 planned.hot,
                 planned.archive,
-                planned.reserve_floor_unreachable,
+                // From a truncated hot prefix the hot total, and so the reachability of the
+                // reserve, is understated: the flag is suppressed (`segments_truncated` reports
+                // the degraded plan).
+                planned.reserve_floor_unreachable && !truncated.hot,
             );
             report.archive_full = planned.archive == ArchiveStatus::Full;
             let mut hot_left = hot_total;

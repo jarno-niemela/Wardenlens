@@ -2306,3 +2306,128 @@ fn an_index_that_outgrows_the_used_space_does_not_lower_the_seed_or_start_deleti
     assert_eq!(r.deleted, 0, "{r:?}");
     assert_eq!((lp.rolling_budget(), lp.rolling_ceiling()), (None, None));
 }
+
+/// One row of the hot-floor wiring table (ticket #108): the planner, the status, the breach
+/// counter and the quarantine eviction must all use the one hot-floor rule.
+struct FloorRow {
+    pct: u8,
+    reserve: u64,
+    video: u64,
+    foreign: u64,
+    quarantine: u64,
+}
+
+/// The expected hot floor and target, written out independently of the core helper: the reserve
+/// (capped at 90 % of the capacity) raises the percentage floor only when `free + video` reaches it.
+fn expected_floor(cap: u64, pct: u64, reserve: u64, free: u64, video: u64) -> (u64, u64) {
+    let (pf, pt) = (cap * pct / 100, cap * (pct + 1) / 100);
+    let re = reserve.min(cap * 9 / 10);
+    if re > pf && free + video >= re {
+        (re, re + pt - pf)
+    } else {
+        (pf, pt)
+    }
+}
+
+#[test]
+fn hot_floor_wiring_agrees_across_status_breaches_planner_and_quarantine_eviction() {
+    const CAP: u64 = 100_000;
+    let mut rows = Vec::new();
+    for pct in [0_u8, 25] {
+        for reserve in [0_u64, 3_000, 30_000, 60_000, 95_000] {
+            for video in [4_000_u64, 40_000] {
+                for foreign in [0_u64, 50_000, 75_000, 90_000] {
+                    for quarantine in [0_u64, 1_000] {
+                        rows.push(FloorRow {
+                            pct,
+                            reserve,
+                            video,
+                            foreign,
+                            quarantine,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let (mut evicting, mut breaching, mut reserve_only_breach) = (0, 0, 0);
+    for row in &rows {
+        let FloorRow {
+            pct,
+            reserve,
+            video,
+            foreign,
+            quarantine,
+        } = *row;
+        let used = foreign + video + quarantine;
+        if used > CAP {
+            continue;
+        }
+        let free0 = CAP - used;
+        let env = Env::new();
+        env.set_cap("hot", CAP);
+        if foreign > 0 {
+            set_foreign(&env, usize::try_from(foreign).unwrap());
+        }
+        for n in 0..4 {
+            env.add("cam-1", n, usize::try_from(video / 4).unwrap(), Tier::Hot);
+        }
+        let q = env.hot.join("_quarantine/cam-1/2023-11-12/000000-000.mp4");
+        if quarantine > 0 {
+            std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+            std::fs::write(&q, pattern(usize::try_from(quarantine).unwrap())).unwrap();
+        }
+        let mut cfg = env.cfg().with_max_actions_per_tick(1);
+        cfg.policy.hot_min_free = wardenlens_core::storage::MinFreePercent::new(pct).unwrap();
+        cfg.policy.emergency_reserve_bytes = reserve;
+        let (mut lp, _) = Storage::open(cfg, env.index.clone(), env.usage.clone()).unwrap();
+        // Oracle. One action is allowed per tick: an eviction uses it up.
+        let pctu = u64::from(pct);
+        let (floor0, _) = expected_floor(CAP, pctu, reserve, free0, video);
+        let breach = free0 < floor0;
+        let mut free = free0;
+        let mut actions = 1_u32;
+        // The eviction judges reachability by the free space plus the quarantine plus the video.
+        let evict = breach && quarantine > 0 && free0 + quarantine + video >= floor0;
+        if evict {
+            free += quarantine;
+            actions -= 1;
+        }
+        let (floor1, target1) = expected_floor(CAP, pctu, reserve, free, video);
+        let mut left = video;
+        let mut moved = 0_u32;
+        if free < floor1 && actions > 0 {
+            // The plan moves the oldest segments until the target is covered; one action fits.
+            free += video / 4;
+            left -= video / 4;
+            moved = 1;
+            let _ = target1;
+        }
+        let (floor_end, _) = expected_floor(CAP, pctu, reserve, free, left);
+        let what = format!(
+            "pct {pct} reserve {reserve} video {video} foreign {foreign} quarantine {quarantine}"
+        );
+        let r = lp.tick(now()).unwrap();
+        assert_eq!(r.quarantine_evicted == 1, evict, "evict: {what}: {r:?}");
+        assert_eq!(r.moved, moved, "plan: {what}: {r:?}");
+        let snap = lp.snapshot();
+        assert_eq!(
+            snap.hot.volume.unwrap().below_floor(),
+            free < floor_end,
+            "status: {what}"
+        );
+        assert_eq!(
+            snap.floor_breaches_total,
+            u64::from(breach),
+            "breaches: {what}"
+        );
+        evicting += u32::from(evict);
+        breaching += u32::from(breach);
+        reserve_only_breach += u32::from(breach && floor0 > CAP * pctu / 100);
+    }
+    // The table reaches every branch: evictions, breaches, and breaches only the reserve makes.
+    assert!(
+        evicting > 5 && breaching > 20 && reserve_only_breach >= 5,
+        "{evicting} {breaching} {reserve_only_breach}"
+    );
+}

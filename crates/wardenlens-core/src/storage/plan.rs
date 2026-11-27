@@ -97,8 +97,9 @@ pub struct Plan {
     pub archive_below_floor: bool,
     /// The emergency reserve would raise the hot floor above the percentage floor but the
     /// volume cannot reach it (free space plus all hot video is below the reserve). The reserve
-    /// is then not part of the floor, so nothing is deleted or moved for it (`hot` is
-    /// `Unsatisfiable` unless the buffer is rolling). The adapter must alert on it whatever the
+    /// is then not part of the floor, so outside the rolling buffer nothing is deleted or
+    /// moved for it (`hot` is `Unsatisfiable`); inside it the #44 drain toward the reserve still
+    /// applies (`hot` is `RollingBuffer`). The adapter must alert on it whatever the
     /// archive state.
     pub reserve_floor_unreachable: bool,
 }

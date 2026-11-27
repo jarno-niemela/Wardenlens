@@ -209,9 +209,15 @@ proptest! {
         let (hot_after, _, left) = simulate(hot.free_bytes, with_archive.then_some(archive.free_bytes), &segs, &p);
         let remaining: u64 = left.iter().filter(|s| s.tier == Tier::Hot).map(|s| s.bytes).sum();
         if !with_archive {
-            // An unreachable reserve is not part of the floor: nothing is deleted for it.
-            prop_assert!(remaining == 0 || hot_after >= reserve || p.reserve_floor_unreachable,
+            // An unreachable reserve is not part of the floor: outside the rolling buffer (where
+            // the #44 drain still applies) the plan is the one without a reserve.
+            let ignored = p.reserve_floor_unreachable && p.hot != HotState::RollingBuffer;
+            prop_assert!(remaining == 0 || hot_after >= reserve || ignored,
                 "free {} reserve {} left {} plan {:?}", hot_after, reserve, remaining, p);
+        }
+        if p.reserve_floor_unreachable && p.hot != HotState::RollingBuffer {
+            let none = plan(&PlanInput { policy: Policy { emergency_reserve_bytes: 0, ..policy }, ..input }).unwrap();
+            prop_assert_eq!(&p.actions, &none.actions, "an ignored reserve changed the actions");
         }
         prop_assert_eq!(p.rolling_ceiling.is_some(), p.rolling_budget.is_some());
         if let (Some(b), Some(c)) = (p.rolling_budget, p.rolling_ceiling) {

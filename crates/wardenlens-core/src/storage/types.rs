@@ -181,7 +181,10 @@ pub struct HotFloor {
     pub target_bytes: u64,
     /// The emergency reserve would raise the floor but the volume cannot reach it (free space
     /// plus all hot video is below the reserve): the reserve is then not part of the floor, so it
-    /// never makes the floor unreachable and nothing is deleted for it.
+    /// never makes the floor unreachable. Outside the rolling buffer nothing is deleted or moved
+    /// for it; inside the rolling buffer (the percentage floor is also unreachable and the
+    /// archive cannot help) the #44 drain toward the reserve still applies and the state is
+    /// `RollingBuffer`. Either way the adapter alerts.
     pub reserve_unreachable: bool,
 }
 
