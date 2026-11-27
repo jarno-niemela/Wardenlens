@@ -9,6 +9,8 @@
 //! The input is untrusted camera data. Nothing here panics, indexes or allocates more than the
 //! input length ([`MAX_PARAM_SET_BYTES`] at most), and no error carries input bytes.
 
+use wardenlens_core::video::{Bits, BitsError, unescape};
+
 use crate::MAX_PARAM_SET_BYTES;
 
 /// Why an SPS could not be read. Never carries input bytes.
@@ -27,6 +29,15 @@ pub enum SpsError {
     /// A value is outside the range the specification allows.
     #[error("SPS has a value outside its allowed range")]
     OutOfRange,
+}
+
+impl From<BitsError> for SpsError {
+    fn from(e: BitsError) -> Self {
+        match e {
+            BitsError::OutOfRange => Self::OutOfRange,
+            _ => Self::Truncated,
+        }
+    }
 }
 
 /// The SPS fields that decide frame reordering.
@@ -130,94 +141,6 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsSummary, SpsError> {
 /// As [`parse_sps`].
 pub fn sps_reordering(nal: &[u8]) -> Result<ReorderVerdict, SpsError> {
     parse_sps(nal).map(|s| s.reordering())
-}
-
-/// Removes emulation prevention bytes (`00 00 03` becomes `00 00`, spec 7.4.1).
-pub(crate) fn unescape(escaped: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(escaped.len());
-    let mut zeros = 0_u8;
-    for &b in escaped {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros.saturating_add(1) } else { 0 };
-        out.push(b);
-    }
-    out
-}
-
-/// MSB-first bit reader over a byte slice. Every read either consumes input or fails.
-pub(crate) struct Bits<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Bits<'a> {
-    pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    pub(crate) fn bit(&mut self) -> Result<u32, SpsError> {
-        let byte = *self.data.get(self.pos / 8).ok_or(SpsError::Truncated)?;
-        let shift = 7_u32.saturating_sub(u32::try_from(self.pos % 8).unwrap_or(0));
-        self.pos = self.pos.saturating_add(1);
-        Ok(u32::from(byte.checked_shr(shift).unwrap_or(0) & 1))
-    }
-
-    /// Up to 32 bits as a number.
-    fn bits(&mut self, n: u32) -> Result<u32, SpsError> {
-        if n > 32 {
-            return Err(SpsError::OutOfRange);
-        }
-        let mut v = 0_u64;
-        for _ in 0..n {
-            v = (v << 1) | u64::from(self.bit()?);
-        }
-        u32::try_from(v).map_err(|_| SpsError::OutOfRange)
-    }
-
-    fn skip(&mut self, n: u32) -> Result<(), SpsError> {
-        self.bits(n).map(drop)
-    }
-
-    /// `ue(v)`: Exp-Golomb, at most 31 leading zeros so the value fits in `u32` (spec 9.1).
-    pub(crate) fn ue(&mut self) -> Result<u32, SpsError> {
-        let mut zeros = 0_u32;
-        while self.bit()? == 0 {
-            zeros = zeros.saturating_add(1);
-            if zeros > 31 {
-                return Err(SpsError::OutOfRange);
-            }
-        }
-        let suffix = u64::from(self.bits(zeros)?);
-        let base = (1_u64 << zeros).saturating_sub(1);
-        u32::try_from(base.saturating_add(suffix)).map_err(|_| SpsError::OutOfRange)
-    }
-
-    /// `ue(v)` that must not exceed `max`.
-    fn ue_max(&mut self, max: u32) -> Result<u32, SpsError> {
-        let v = self.ue()?;
-        if v > max {
-            return Err(SpsError::OutOfRange);
-        }
-        Ok(v)
-    }
-
-    /// `se(v)`: the signed mapping of `ue(v)` (spec 9.1.1), only needed to skip the value.
-    fn se(&mut self) -> Result<i64, SpsError> {
-        let k = i64::from(self.ue()?);
-        let magnitude = k.saturating_add(1) / 2;
-        Ok(if k % 2 == 1 {
-            magnitude
-        } else {
-            magnitude.saturating_neg()
-        })
-    }
-
-    fn flag(&mut self) -> Result<bool, SpsError> {
-        self.bit().map(|b| b == 1)
-    }
 }
 
 /// High family profiles carry the chroma and scaling list syntax (spec 7.3.2.1.1).
@@ -380,7 +303,7 @@ fn skip_hrd(r: &mut Bits<'_>) -> Result<(), SpsError> {
         r.ue()?;
         r.skip(1)?; // cbr_flag
     }
-    r.skip(20) // four 5-bit length fields
+    r.skip(20).map_err(SpsError::from) // four 5-bit length fields
 }
 
 #[cfg(test)]

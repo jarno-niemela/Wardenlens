@@ -298,3 +298,9 @@ impl IndexError {
         }
     }
 }
+
+impl wardenlens_core::storage::TransientFault for IndexError {
+    fn is_transient(&self) -> bool {
+        IndexError::is_transient(self)
+    }
+}

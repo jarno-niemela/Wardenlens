@@ -1,0 +1,30 @@
+[package]
+name = "wardenlens-recorder"
+description = "Per-camera passthrough recorder: ingest frames to fMP4 segments on the hot tier and the index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# ADR 0005 section 11: `recorder -> core, mp4, fsutil` only. The frame type and the B-slice check
+# live in core (`core::video`), the index is reached through the core `SegmentIndex` port.
+[dependencies]
+wardenlens-core.workspace = true
+wardenlens-fsutil = { path = "../wardenlens-fsutil" }
+wardenlens-mp4 = { path = "../wardenlens-mp4" }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.54.1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+# Tests drive the real index and build frames through ingest's mapper, as the service does.
+wardenlens-index = { path = "../wardenlens-index" }
+wardenlens-ingest = { path = "../wardenlens-ingest" }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+# Only to name the SQLite result codes the index error carries (`ErrorCode`); the same set the index uses.
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+
+[lints]
+workspace = true

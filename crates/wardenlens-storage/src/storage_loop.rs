@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wardenlens_core::storage::{
-    Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, MinFreePercent, PlanInput, Policy,
-    SegmentId, SegmentIndex, StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace,
-    plan,
+    Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, PlanInput, SegmentId, SegmentIndex,
+    StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace, hot_floor, plan,
 };
 use wardenlens_core::time::Timestamp;
 use wardenlens_fsutil::RootDir;
@@ -73,6 +72,12 @@ pub struct TickReport {
     pub archive_full: bool,
     /// The planner's state of the hot volume.
     pub hot: Option<HotState>,
+    /// The operator must be alerted about the hot volume, in three cases: the plan is in
+    /// `RollingBuffer`; or in `Unsatisfiable` while the archive is not `Available` (the buffer is
+    /// then rolling but this tick happened to delete nothing); or in `Unsatisfiable` because the
+    /// floor raised by the emergency reserve is unreachable, whatever the archive state. See
+    /// [`HotState::RollingBuffer`].
+    pub hot_alert: bool,
     /// Moves completed (M1-M9).
     pub moved: u32,
     /// Moves whose row committed but whose hot file could not be unlinked.
@@ -159,6 +164,7 @@ pub struct StorageLoop<I, F, U> {
     probe: Probe,
     failures: u32,
     rolling_budget: Option<u64>,
+    rolling_ceiling: Option<u64>,
     hot_after_last_tick: Option<u64>,
     index_error_ticks: u32,
     archive_was_available: Option<bool>,
@@ -272,6 +278,7 @@ impl Storage {
             probe,
             failures: 0,
             rolling_budget: None,
+            rolling_ceiling: None,
             hot_after_last_tick: None,
             index_error_ticks: 0,
             archive_was_available: None,
@@ -389,6 +396,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             cap_truncated: false,
             quarantine_incomplete: false,
             rolling_deletes_refused: false,
+            hot_alert: false,
             hot_probe_failed: false,
             returned: None,
             returned_pass_unfinished: false,
@@ -461,18 +469,27 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         u32::try_from(now.saturating_sub(before)).unwrap_or(u32::MAX)
     }
 
+    /// The hot video bytes the index totals report; 0 when they cannot be read. The one source
+    /// of the hot figure for the status, the breach counter and the truncated-index alert.
+    fn hot_video_bytes(&self) -> u64 {
+        self.index.totals().map_or(0, |t| t.hot.bytes)
+    }
+
     /// One more breach per volume the first probe of a tick found under its floor (saturating).
     fn count_breaches(&mut self, first: &ProbeResult) {
+        // Without the index totals the hot video counts as 0: the reserve then counts only when
+        // free space already meets it, so an index failure cannot invent a breach.
+        let hot_video = self.hot_video_bytes();
         let n = status::breaches(
-            first.hot.ok(),
-            self.cfg.policy.hot_min_free,
+            first.hot.ok().map(|s| (s, hot_video)),
+            &self.cfg.policy,
             &first.archive,
-            self.cfg.policy.archive_min_free,
         );
         self.snapshot.floor_breaches_total = self.snapshot.floor_breaches_total.saturating_add(n);
     }
 
-    /// Rebuild the snapshot after a tick. `report` is `None` when the tick failed before it had
+    /// Rebuild the snapshot after a tick. The hot floor is measured against the hot bytes of the
+    /// index totals (0 when they cannot be read, as in the breach counter). `report` is `None` when the tick failed before it had
     /// one. The index is read again here; when that fails the rows of the last good read stay and
     /// the error kind is `index` unless the tick had its own.
     fn record_tick(
@@ -488,9 +505,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         if report.is_some_and(|r| r.hot_probe_failed) {
             error = error.or(Some(TickErrorKind::HotVolume));
         }
-        match status::read_rows(&self.index) {
-            Some(rows) => self.rows = rows,
-            None => error = error.or(Some(TickErrorKind::Index)),
+        // The hot floor needs the hot bytes; when the rows cannot be read they count as 0 (as in
+        // `count_breaches`), never the bytes of an older read.
+        if let Some(rows) = status::read_rows(&self.index) {
+            self.rows = rows;
+        } else {
+            error = error.or(Some(TickErrorKind::Index));
         }
         let policy = self.cfg.policy;
         let full = report.is_some_and(|r| r.archive_full);
@@ -505,9 +525,13 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             self.add_unverified(unverified);
         }
         self.snapshot.quarantined_total = self.quarantine_count.load(Ordering::Relaxed);
+        let hot_video = self.hot_video_bytes();
         let s = &mut self.snapshot;
-        s.hot = status::tier_status(probe.hot.ok(), policy.hot_min_free, &self.rows.0);
-        s.archive = status::tier_status(archive_space, policy.archive_min_free, &self.rows.1);
+        // The hot bytes come from the index totals, the same figure as `count_breaches`.
+        let mut hot_rows = self.rows.0;
+        hot_rows.bytes = hot_video;
+        s.hot = status::tier_status(Tier::Hot, probe.hot.ok(), &policy, &hot_rows);
+        s.archive = status::tier_status(Tier::Archive, archive_space, &policy, &self.rows.1);
         s.archive_condition = status::archive_condition(&probe.archive, full);
         s.last_tick = Some(now);
         s.last_error = error;
@@ -626,6 +650,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         self.hot_after_last_tick
     }
 
+    /// Test hook: the rolling ceiling carried to the next tick.
+    #[cfg(test)]
+    pub(crate) const fn rolling_ceiling(&self) -> Option<u64> {
+        self.rolling_ceiling
+    }
+
     /// Test hook: the rolling budget carried to the next tick.
     #[cfg(test)]
     pub(crate) const fn rolling_budget(&self) -> Option<u64> {
@@ -688,6 +718,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             archive_only,
         } = mode;
         let hot_space = current.hot.map_err(TickError::HotVolume)?;
+        // No cap on `ingested`: it only seeds the rolling budget (`hot_total - ingested`), which
+        // matters only when the floor is unreachable, i.e. `free + hot_total < floor <= capacity`.
+        // An ingest above the used space (`capacity - free`) would give `hot_total >= ingested >
+        // capacity - free`, so `free + hot_total > capacity`: the floor is reachable and the
+        // seed is never used. A cap could therefore never change a plan.
         let ingested = self
             .hot_after_last_tick
             .map_or(0, |after| hot_total.saturating_sub(after));
@@ -704,16 +739,9 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         } else {
             segments
         };
-        let mut policy = self.cfg.policy;
-        if held {
-            // While the archive cannot relieve the hot tier, the emergency reserve is a floor
-            // too: the recorder keeps writing, and a reserve that only a rolling buffer keeps
-            // would let the volume run down to the plain floor and below between ticks.
-            // Unreachable goals fall to the planner's own rules (nothing is deleted for them).
-            if let Some(p) = reserve_percent(hot_space.capacity_bytes, policy) {
-                policy.hot_min_free = policy.hot_min_free.max(p);
-            }
-        }
+        // Held ticks plan with the archive unavailable: the planner's reserve floor and, when the
+        // floor is unreachable, the rolling buffer apply.
+        let policy = self.cfg.policy;
         plan(&PlanInput {
             hot: hot_space,
             archive: if archive_unknown || held {
@@ -726,6 +754,7 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             policy,
             ingested_bytes: ingested,
             rolling_budget: self.rolling_budget,
+            rolling_ceiling: self.rolling_ceiling,
         })
         .map_err(TickError::Plan)
     }
@@ -914,9 +943,26 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             // Only the budget is withheld when the hot deletes were refused (it was computed from
             // an understated total); the states are always reported.
             if !refuse_hot {
-                self.rolling_budget = planned.rolling_budget;
+                (self.rolling_budget, self.rolling_ceiling) =
+                    capped_budget(planned.rolling_budget, planned.rolling_ceiling);
             }
             report.hot = Some(planned.hot);
+            // From a truncated hot prefix the plan's hot total understates the video, so the
+            // reserve's reachability is judged by the true totals from the index instead.
+            let reserve_unreachable = if truncated.hot {
+                current.hot.is_ok_and(|space| {
+                    hot_floor(
+                        space.capacity_bytes,
+                        space.free_bytes,
+                        self.hot_video_bytes(),
+                        &self.cfg.policy,
+                    )
+                    .reserve_unreachable
+                })
+            } else {
+                planned.reserve_floor_unreachable
+            };
+            report.hot_alert = needs_hot_alert(planned.hot, planned.archive, reserve_unreachable);
             report.archive_full = planned.archive == ArchiveStatus::Full;
             let mut hot_left = hot_total;
             let mut replan = false;
@@ -1260,30 +1306,23 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             return;
         };
         for tier in [Tier::Hot, Tier::Archive] {
-            let (space, floor, deletable) = match tier {
-                Tier::Hot => (
-                    current.hot.ok(),
-                    self.cfg.policy.hot_min_free.get(),
-                    totals.hot.bytes,
-                ),
+            let (space, deletable) = match tier {
+                Tier::Hot => (current.hot.ok(), totals.hot.bytes),
                 _ => match current.archive {
-                    ArchiveProbe::Available(s) => (
-                        Some(s),
-                        self.cfg.policy.archive_min_free.get(),
-                        totals.archive.bytes,
-                    ),
-                    _ => (None, 0, 0),
+                    ArchiveProbe::Available(s) => (Some(s), totals.archive.bytes),
+                    _ => (None, 0),
                 },
             };
             let Some(space) = space else { continue };
-            if !evict::below_floor(&space, floor) {
+            let policy = self.cfg.policy;
+            if !evict::below_floor(tier, &space, &policy, totals.hot.bytes) {
                 continue;
             }
             let Some(sel) = evict::select(
                 &self.fs,
                 tier,
                 &space,
-                floor,
+                &policy,
                 deletable,
                 &mut report.quarantine_incomplete,
             ) else {
@@ -1402,46 +1441,77 @@ fn tier_space(p: &ProbeResult, tier: Tier) -> Option<VolumeSpace> {
     }
 }
 
-/// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
-/// accepted floor), or `None` for no reserve.
-fn reserve_percent(
-    capacity: u64,
-    policy: Policy,
-) -> Option<wardenlens_core::storage::MinFreePercent> {
-    let reserve = policy.emergency_reserve_bytes;
-    if reserve == 0 || capacity == 0 {
-        return None;
+/// Whether the plan's hot state calls for an operator alert: `RollingBuffer`, and `Unsatisfiable`
+/// while the archive is not `Available` (the buffer is rolling but this tick deleted nothing),
+/// and `Unsatisfiable` whenever the floor raised by the emergency reserve is unreachable,
+/// whatever the archive state.
+const fn needs_hot_alert(
+    hot: HotState,
+    archive: ArchiveStatus,
+    reserve_floor_unreachable: bool,
+) -> bool {
+    match hot {
+        HotState::RollingBuffer => true,
+        HotState::Unsatisfiable => {
+            reserve_floor_unreachable || !matches!(archive, ArchiveStatus::Available)
+        }
+        _ => false,
     }
-    let pct = u128::from(reserve)
-        .checked_mul(100)?
-        .div_ceil(u128::from(capacity));
-    let pct = u8::try_from(pct.min(u128::from(MinFreePercent::MAX))).ok()?;
-    MinFreePercent::new(pct).ok()
+}
+
+/// The budget and ceiling to feed back: both or neither, and the budget never above the ceiling,
+/// whatever the planner returned. The ceiling is the seed captured when the buffer was entered
+/// (the hot video held before that tick's ingest); the budget may ratchet below it and recover
+/// up to it.
+fn capped_budget(budget: Option<u64>, ceiling: Option<u64>) -> (Option<u64>, Option<u64>) {
+    match (budget, ceiling) {
+        (Some(b), Some(c)) => (Some(b.min(c)), Some(c)),
+        _ => (None, None),
+    }
 }
 
 #[cfg(test)]
 mod reserve_tests {
     use super::*;
 
-    fn pol(reserve: u64) -> Policy {
-        Policy {
-            emergency_reserve_bytes: reserve,
-            ..Policy::default()
+    #[test]
+    fn hot_alert_covers_the_rolling_buffer_and_an_unsatisfiable_floor_without_an_archive() {
+        use ArchiveStatus as A;
+        for hot in [
+            HotState::Ok,
+            HotState::Unsatisfiable,
+            HotState::RollingBuffer,
+        ] {
+            for archive in [
+                A::Available,
+                A::Unavailable,
+                A::Unusable,
+                A::Full,
+                A::BelowFloor,
+            ] {
+                for raised in [false, true] {
+                    let want = match hot {
+                        HotState::RollingBuffer => true,
+                        HotState::Unsatisfiable => raised || archive != A::Available,
+                        _ => false,
+                    };
+                    assert_eq!(
+                        needs_hot_alert(hot, archive, raised),
+                        want,
+                        "{hot:?} {archive:?} {raised}"
+                    );
+                }
+            }
         }
-    }
-    fn pct(capacity: u64, reserve: u64) -> Option<u8> {
-        reserve_percent(capacity, pol(reserve)).map(MinFreePercent::get)
     }
 
     #[test]
-    fn reserve_percent_covers_zero_rounding_and_the_cap() {
-        assert_eq!(pct(1000, 0), None, "no reserve");
-        assert_eq!(pct(0, 100), None, "zero capacity");
-        assert_eq!(pct(1000, 100), Some(10), "a whole percent");
-        assert_eq!(pct(1000, 101), Some(11), "rounds up");
-        assert_eq!(pct(1000, 1), Some(1), "a tiny reserve is one percent");
-        assert_eq!(pct(1000, 900), Some(90), "the cap exactly");
-        assert_eq!(pct(1000, 901), Some(90), "capped at the largest floor");
-        assert_eq!(pct(1000, u64::MAX), Some(90), "no overflow");
+    fn a_fed_back_budget_is_capped_at_the_ceiling_and_travels_with_it() {
+        assert_eq!(capped_budget(Some(5), Some(9)), (Some(5), Some(9)));
+        assert_eq!(capped_budget(Some(20), Some(9)), (Some(9), Some(9)));
+        assert_eq!(capped_budget(Some(0), Some(0)), (Some(0), Some(0)));
+        assert_eq!(capped_budget(None, None), (None, None));
+        assert_eq!(capped_budget(Some(5), None), (None, None));
+        assert_eq!(capped_budget(None, Some(5)), (None, None));
     }
 }

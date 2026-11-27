@@ -29,7 +29,7 @@ pub use files::{MemoryHandle, MemorySegmentFiles};
 pub use files::{OpenedSegment, SegmentFiles, SegmentOpenError};
 pub use index::{
     IndexedSegment, MAX_DURATION_MS, MAX_LIST_LIMIT, MAX_OLDEST, MAX_SEGMENT_BYTES, SegmentCursor,
-    SegmentIndex, SegmentPage, TierTotals, TierUsage,
+    SegmentIndex, SegmentPage, TierTotals, TierUsage, TransientFault,
 };
 pub use lister::{SegmentListError, SegmentLister};
 pub use plan::{
@@ -40,6 +40,6 @@ pub use status::{
     TickErrorKind, TierStatus, VolumeStatus, free_percent,
 };
 pub use types::{
-    ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, MinFreePercent, MinFreePercentError, Policy,
-    SegmentId, StoredSegment, Tier, VolumeSpace,
+    ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, HotFloor, MinFreePercent, MinFreePercentError,
+    Policy, SegmentId, StoredSegment, Tier, VolumeSpace, effective_reserve_bytes, hot_floor,
 };

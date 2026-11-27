@@ -24,8 +24,8 @@ use wardenlens_core::camera::{Credential, Host, RtspPath};
 use wardenlens_core::catalogue::StreamRole;
 use wardenlens_core::time::{Clock, Timestamp};
 use wardenlens_ingest::{
-    FRAME_TIMEOUT, IngestError, NoReorderReason, OPEN_TIMEOUT, ReorderVerdict, contains_b_slice,
-    open_stream,
+    FRAME_TIMEOUT, H264ParamsExt, IngestError, NoReorderReason, OPEN_TIMEOUT, ReorderVerdict,
+    contains_b_slice, open_stream,
 };
 
 const USER: &str = "alice-xyz";

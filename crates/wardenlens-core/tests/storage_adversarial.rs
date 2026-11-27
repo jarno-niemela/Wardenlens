@@ -56,6 +56,7 @@ fn run(
         policy,
         ingested_bytes: ingested,
         rolling_budget: None,
+        rolling_ceiling: None,
     })
 }
 
@@ -274,7 +275,12 @@ fn hot_exactly_at_floor_plans_nothing() {
         vol(1000, 250),
         ArchiveState::Unavailable,
         &segments,
-        no_age_policy(),
+        // Not the 2 GiB default: capped at 90 % of this 1000 B volume it is a 900 B floor, which
+        // 250 B free is under (ticket #108); this test is about the percentage floor.
+        Policy {
+            emergency_reserve_bytes: 0,
+            ..no_age_policy()
+        },
         1,
         0,
     )

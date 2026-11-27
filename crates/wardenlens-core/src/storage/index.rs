@@ -116,6 +116,16 @@ pub struct TierTotals {
     pub archive: TierUsage,
 }
 
+/// Whether a failed index call may succeed when retried.
+///
+/// The recorder retries a transient failure of `insert` a bounded number of times and treats any
+/// other (a constraint, a duplicate, a bad record, a permanent failure) as final (ADR 0005
+/// section 3). The index adapter implements it for its error type.
+pub trait TransientFault {
+    /// True when the same call may succeed later: the database was busy or an I/O error occurred.
+    fn is_transient(&self) -> bool;
+}
+
 /// The segment index.
 ///
 /// Every method that names a segment by id reports an unknown id as an error of the
