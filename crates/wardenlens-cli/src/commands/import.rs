@@ -425,7 +425,7 @@ pub(crate) fn vault_path(config: &Config) -> PathBuf {
     dir.join(VAULT_FILE_NAME)
 }
 
-fn open_vault(path: &Path, key: KeyFile) -> Result<Vault, VaultError> {
+pub(crate) fn open_vault(path: &Path, key: KeyFile) -> Result<Vault, VaultError> {
     if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
         Vault::create(path, key)
     } else {
