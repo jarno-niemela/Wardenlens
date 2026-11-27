@@ -752,6 +752,8 @@ fn remove_deletes_the_row_and_every_vault_entry_and_only_that_camera() {
             .len(),
         1
     );
+    // One handle per index file per process (#148): release this one before `add` opens it.
+    drop(index);
     // The id can be added again.
     add_closed(&site, "yard", "reolink/rlc-520a");
     assert_eq!(site.cameras().len(), 2);
@@ -1042,6 +1044,8 @@ fn a_vault_failure_part_way_removes_this_runs_row_and_entries_only() {
             "{fail_on}: {err:?}"
         );
         drop(vault);
+        // One handle per index file per process (#148): release this one before the helper opens it.
+        drop(index);
         let ids: Vec<String> = site
             .cameras()
             .iter()
