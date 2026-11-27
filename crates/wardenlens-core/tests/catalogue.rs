@@ -12,7 +12,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use wardenlens_core::catalogue::{CatalogueEntry, check_source, render_matrix, validate};
+use wardenlens_core::camera::{ModelRef, RtspPath};
+use wardenlens_core::catalogue::{
+    CatalogueEntry, check_source, query_allowed, render_matrix, validate,
+};
 
 fn cameras_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cameras")
@@ -110,5 +113,28 @@ fn published_docs_use_only_allowed_characters() {
     for name in ["README.md", "FORMAT.md"] {
         let text = fs::read_to_string(cameras_dir().join(name)).unwrap();
         check_source(&text).unwrap_or_else(|e| panic!("cameras/{name}: {e}"));
+    }
+}
+
+/// `serve`, `import` and `camera add` all gate a path's query through `query_allowed`: the
+/// Dahua ONVIF forms (#218) pass it, and near misses do not (SEC-10).
+#[test]
+fn dahua_onvif_query_forms_are_listed_and_near_misses_are_not() {
+    let entries: Vec<CatalogueEntry> = load_all().into_iter().map(|(_, e)| e).collect();
+    let model = ModelRef::new("dahua", "ipc-hfw4431r-z").unwrap();
+    let ok = |p: &str| query_allowed(&entries, &model, &RtspPath::new(p).unwrap());
+    for sub in 0..=1 {
+        assert!(ok(&format!(
+            "/cam/realmonitor?channel=1&subtype={sub}&unicast=true&proto=Onvif"
+        )));
+        assert!(ok(&format!("/cam/realmonitor?channel=1&subtype={sub}")));
+    }
+    for bad in [
+        "/cam/realmonitor?channel=1&subtype=0&proto=Onvif&unicast=true",
+        "/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif&x=1",
+        "/cam/realmonitor?channel=1&subtype=2&unicast=true&proto=Onvif",
+        "/cam/realmonitor?channel=1&subtype=0&unicast=true",
+    ] {
+        assert!(!ok(bad), "{bad}");
     }
 }

@@ -1307,6 +1307,30 @@ key_file = "/srv/wl/keys/secrets.key"
         }
     }
 
+    /// #218: a Dahua ONVIF-form path matches the Dahua model by the same listed-query rule.
+    #[test]
+    fn a_dahua_onvif_form_path_auto_matches_the_dahua_model() {
+        let dahua = model("dahua", "ipc-hfw4431r-z");
+        let cat = vec![entry(
+            "dahua",
+            "ipc-hfw4431r-z",
+            &[
+                "/cam/realmonitor?channel=1&subtype=0",
+                "/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif",
+            ],
+        )];
+        let default = default_model().unwrap();
+        let none = Choice::default();
+        let amp = "?channel=1&amp;subtype=0&amp;unicast=true&amp;proto=Onvif";
+        let d = one_draft(&format!("/cam/realmonitor{amp}"));
+        assert_eq!(resolve(&d, &cat, &none, &default), Ok(dahua));
+        let d = one_draft("/cam/realmonitor?proto=Onvif&amp;unicast=true");
+        assert_eq!(
+            resolve(&d, &cat, &none, &default),
+            Err(SkipWhy::QueryNotListed(None))
+        );
+    }
+
     #[test]
     fn a_listed_query_path_is_ready_and_an_unlisted_one_is_skipped_by_the_screen() {
         let cat = catalogue();
