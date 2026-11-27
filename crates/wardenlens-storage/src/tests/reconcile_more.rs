@@ -170,6 +170,37 @@ fn archive_mounted_while_running_keeps_every_archive_row_and_resolves_them_in_th
     );
 }
 
+/// The twin rule holds in the "archive returned" pass too (#195): a `tier = hot` row whose hot
+/// file is valid and whose newly mounted archive holds a different file of the same size keeps
+/// its row on the hot file, and the archive file is quarantined, not trusted.
+#[test]
+fn the_returned_pass_keeps_a_hot_row_on_its_hot_file_when_the_archive_copy_is_foreign() {
+    let env = Env::new();
+    unmount(&env);
+    let rel = Env::rel("cam-1", 0);
+    let id = env.row("cam-1", 0, good().len(), Tier::Hot);
+    put(&env.hot, &rel, &good());
+    let (mut lp, _) = build(&env, None);
+    lp.set_initial_archive_state(false);
+    std::fs::rename(&env.arch, env.tmp.path().join("covered")).unwrap();
+    std::fs::create_dir(&env.arch).unwrap();
+    std::fs::write(env.arch.join(ARCHIVE_MARKER), b"").unwrap();
+    let foreign = super::reconcile_cells::same_size_other_content();
+    put(&env.arch, &rel, &foreign);
+    let r = lp.tick(now()).unwrap();
+    let pass = r.returned.expect("the pass ran");
+    assert_eq!(
+        (pass.foreign_twins, pass.rolled_forward),
+        (1, 0),
+        "{pass:?}"
+    );
+    assert!(pass.health_error());
+    assert_eq!(env.tier_of(id), Some(Tier::Hot));
+    assert_eq!(std::fs::read(env.hot.join(&rel)).unwrap(), good());
+    assert!(!env.arch.join(&rel).exists());
+    assert_eq!(Env::quarantined(&env.arch), vec![foreign]);
+}
+
 #[test]
 fn the_returned_pass_touches_no_hot_file_no_hot_part_and_no_row_of_a_key_without_a_row() {
     let env = Env::new();

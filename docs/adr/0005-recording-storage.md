@@ -252,14 +252,24 @@ any reason, the recorder first **retries transient errors** (`SQLITE_BUSY`, I/O 
 permanent error, never in an unbounded loop. **Three exceptions to "any failure quarantines" (#195):**
 (a) **the rename never lands on a row's key**: when `RENAME_NOREPLACE` finds the name taken and the recorder
 tries the next key (at most 8 keys, within the same day directory), it asks the index about every key after the one it
-created the `.part` under and skips a key a row holds (and a key the index cannot answer for), so a finished file is
-never put under another segment's key; (b) **a read-only index volume holds the recorder, it does not quarantine**:
-`SQLITE_READONLY` and `SQLITE_CANTOPEN` (the index error's `is_unwritable`) are permanent for the run but say nothing about
-the file, so the file is kept in place (it has no row; the next start adopts it, section 9), it counts as unindexed, and
-the recorder reports `Held(IndexReadOnly)`. While held, a keyframe starts a segment only after 32 skipped keyframes, as a
-probe: the probe's insert, if the index accepts it, ends the hold; a refused probe keeps it. At most one probe segment
-per 32 keyframes is written, so a read-only index costs disk space slowly (and the volume's own `StorageFull` hold takes
-over) instead of destroying the position of every segment; (c) **the segment is closed before the file could pass what
+created the `.part` under and skips a key a row holds, so a finished file is never put under another segment's key. **A
+finished recording is never deleted for a question that was not answered or a name that was not free:** (i) when the index
+cannot answer for a key, the key is used (the file's name is still never replaced), the segment is counted unindexed and
+gets no row (`Sealed::key_checked` is false), and reconciliation judges it at the next start (a file at a row's key
+whose size differs is invalid and is quarantined; one of the row's size is a twin, section 9, and is never deleted
+unless byte-identical); (ii) when every key tried is taken (by a file or a row), the sealed `.part` is moved into the hot
+quarantine under its `.mp4.part` name (`StoreError::NoFreeName`, counted `segments_quarantined`); if even that move
+fails the `.part` is left where it is, never unlinked. A quarantined `.mp4.part` is a complete segment, not matched by the
+section 9 walk (it is `unknown_left`) and not evicted: an operator can rename it back; (b) **a read-only index volume holds the recorder, it does not quarantine**:
+`SQLITE_READONLY` and `SQLITE_CANTOPEN` and the I/O error kinds `ReadOnlyFilesystem` and `PermissionDenied` (the index
+error's `is_unwritable`) are permanent for the run but say nothing about the file, so the file is kept in place (it has no row; the
+next start adopts it, section 9), it counts as unindexed, and the recorder reports `Held(IndexReadOnly)`. While held, a
+keyframe starts a segment only after 32 skipped keyframes, as a probe: the probe's insert, if the index accepts it, ends
+the hold; a refused probe keeps it. **The cost is real:** with a 60 s target and 2 s GOPs roughly every other segment is
+still recorded during a hold (about half of the video is kept unindexed, the rest is dropped), unindexed files are not
+visible to the API or to eviction until the next start's reconciliation, and the volume's own `StorageFull` hold is the
+backstop when they pile up. **Classification, not reclassified here:** an ext4 `remount-ro` after an error shows up as
+`SQLITE_IOERR`, which stays transient (retried, file kept, no hold); only the codes above are "unwritable". (c) **the segment is closed before the file could pass what
 the adoption parser accepts** (section 9): the segmenter's byte cap counts frame bytes only, so the recorder also
 bounds the file: before a frame is added, the bytes written, the open fragment and the new frame, each with an upper bound
 of its container overhead (136 bytes per fragment, 12 per sample), must stay at most 1 GiB less 16 MiB, and the fragment count
@@ -675,9 +685,11 @@ a successful move resets the count. Everything else is **not** the archive's fau
   and continue;
 - an **index error** (M8, or reading the row): skip the segment for this tick; after 3 consecutive ticks with index
   errors raise a health error (the index is the problem, not the archive);
-- **`EEXIST` at M6** (`RENAME_NOREPLACE` found an `A/R`): if `A/R` has the row's size, **roll forward** (it is a
-  stale complete copy from an earlier attempt: fsync it and its directory, delete `A/R.part`, continue with M8);
-  otherwise quarantine the stale `A/R` and retry M6 once.
+- **`EEXIST` at M6** (`RENAME_NOREPLACE` found an `A/R`): if `A/R` has the row's size **and is byte-identical to the
+  `A/R.part` just written**, **roll forward** (it is a stale complete copy from an earlier attempt: fsync it and its
+  directory, delete `A/R.part`, continue with M8); otherwise (another size, or the same size with other bytes: a name is
+  not an identity, section 9) quarantine the stale `A/R` and retry M6 once. When the two cannot be compared (a read
+  error) the segment is `unverified`, the `.part` is removed and nothing else changes (#195).
 
 The mover **never retries the same failed segment within a tick** and runs the rest of the plan. Required #58 tests:
 an M4 **read** failure leaves the archive available and deletes no hot video; a stale complete `A/R` at M6 is rolled
@@ -811,9 +823,14 @@ another. Definitions:
   may be a different recording (the recorder's rename bump, section 3, or a planted file). Every cell that deletes `H`
   because a valid `A` exists (`(archive, valid, valid)`, `(hot, valid, valid)`'s roll forward, and `(none, valid, valid)`
   with equal sizes) deletes `H` **only when `H` and `A` are byte-identical** (compared in bounded chunks; a read
-  failure leaves both as they are and the key `unverified`). A valid `H` of the same size whose bytes differ is a
-  **foreign file at the key**: it is **quarantined, never deleted**, the row and `A` stay as they are, and the report
-  counts it as `foreign_twins`, which is a health error (an alert). The 1,000-name quarantine bound applies as for any
+  failure or short read leaves both as they are and the key `unverified`). A valid `H` of the same size whose bytes
+  differ is a **foreign file at the key**: it is **quarantined, never deleted**, the row and `A` stay as they are, and
+  the report counts it as `foreign_twins`, which is a health error (an alert). **The one exception is a `tier = hot` row
+  with a valid `H` and a valid `A` that differ:** the row says `H` is the segment, so the row is never pointed at the
+  other file; the row and `H` stay and **`A` is quarantined** (`foreign_twins`). The same rule runs in the "archive
+  returned" pass. The mover's `EEXIST` at M6 (section 7) applies it too: a stale `A/R` of the row's size is the earlier
+  attempt's copy only when it is byte-identical to the `.part` just written; otherwise it is quarantined and the move
+  completes with the real bytes. The 1,000-name quarantine bound applies as for any
   quarantine. Sizes alone still decide the (none, valid, valid) case of unequal sizes (quarantine).
 - *quarantine X*: `renameat2` with `RENAME_NOREPLACE` into `<its root>/_quarantine/<camera>/<day>/<name>` (the same
   relative path, same filesystem). If the target exists (`EEXIST`), the name gets a numeric suffix, `<name>.1`,

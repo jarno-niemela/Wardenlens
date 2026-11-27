@@ -15,6 +15,10 @@ pub enum StoreError {
     /// A file with the segment's name already exists.
     #[error("a file with this name already exists")]
     NameTaken,
+    /// Sealed (fsynced) but no free key: every key tried was taken by a file or an index row. The
+    /// finished file was moved into the hot quarantine, never deleted (#195).
+    #[error("no free name for the finished segment; it was kept in quarantine")]
+    NoFreeName,
     /// Every quarantine name is taken: the file was left where it is.
     #[error("every quarantine name is taken")]
     QuarantineExhausted,
@@ -68,6 +72,10 @@ pub struct Sealed {
     /// Whether the directory fsync after the rename succeeded. A file that is not durable is
     /// complete and visible but may vanish in a crash, so it is not indexed.
     pub durable: bool,
+    /// Whether the index answered for every bumped key tried (so none is a row's key). When it
+    /// could not, the file is complete and visible but its key is unchecked: it is not indexed
+    /// and reconciliation judges it (it never deletes a file that is not a byte-identical twin).
+    pub key_checked: bool,
 }
 
 /// Reads and writes the segment files of one camera on the hot volume (ADR 0005 section 3).
@@ -102,10 +110,14 @@ pub trait SegmentStore {
     /// file, renames `.part` to `.mp4` with `RENAME_NOREPLACE` (at the next free key when another
     /// file appeared at the name), and fsyncs the directory.
     ///
-    /// `row_holds` says whether an index row holds a key. It is asked for every key after the one
-    /// given at `create` (a bump), and a key it holds is skipped: a finished file is never put
-    /// under another segment's key. An answer that cannot be given must be `true` (the key is
-    /// then skipped, the safe side).
+    /// `row_holds` says whether an index row holds a key: `Some(true)` it does, `Some(false)` it
+    /// does not, `None` the index could not answer. It is asked for every key after the one given
+    /// at `create` (a bump), and a key a row holds is skipped: a finished file is never put under
+    /// another segment's key. On `None` the key is used (the finished recording is never thrown
+    /// away for a question that was not answered) and [`Sealed::key_checked`] is false.
+    ///
+    /// When no key is free the sealed file is moved to quarantine and
+    /// [`StoreError::NoFreeName`] is returned: a finished recording is never deleted.
     ///
     /// A failed directory fsync is not an error: the finished file is kept (it is complete and
     /// is adopted by reconciliation, ADR 0005 section 9) and [`Sealed::durable`] is false.
@@ -117,7 +129,7 @@ pub trait SegmentStore {
         &mut self,
         writer: Self::Writer,
         patch: &DurationPatch,
-        row_holds: &mut dyn FnMut(UnixMs) -> bool,
+        row_holds: &mut dyn FnMut(UnixMs) -> Option<bool>,
     ) -> Result<Sealed, StoreError>;
 
     /// Throws the segment away: removes the `.part`. Best effort.

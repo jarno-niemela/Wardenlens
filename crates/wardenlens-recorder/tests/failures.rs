@@ -532,10 +532,11 @@ fn a_segment_bumped_past_a_key_another_row_holds_is_indexed_under_a_free_key() {
 }
 
 /// Every key the bump passes is checked, however many rows hold consecutive keys, up to the
-/// rename bound; past it the segment is thrown away and no file is left under a held key.
+/// rename bound; past it the finished recording is kept in quarantine (never deleted), counted
+/// quarantined, and no file is left under a held key.
 #[test]
 fn a_run_of_held_keys_is_skipped_and_too_long_a_run_aborts_without_a_file_at_any_of_them() {
-    for (held, indexed, aborted) in [(3_i64, 1_u64, 0_u64), (6, 1, 0), (7, 0, 1)] {
+    for (held, indexed, quarantined) in [(3_i64, 1_u64, 0_u64), (6, 1, 0), (7, 0, 1)] {
         let mut r = Rig::build(fast(), None, |_, index| {
             for n in 1..=held {
                 let rec = SegmentRecord::new(cam(), ms(T0 + 100 + n), 1_000, 4_096, 10);
@@ -548,8 +549,12 @@ fn a_run_of_held_keys_is_skipped_and_too_long_a_run_aborts_without_a_file_at_any
         std::fs::write(&planted, b"foreign").unwrap();
         let d = r.finish();
         assert_eq!(
-            (d.end.segments_indexed, d.end.segments_aborted),
-            (indexed, aborted),
+            (
+                d.end.segments_indexed,
+                d.end.segments_quarantined,
+                d.end.segments_aborted
+            ),
+            (indexed, quarantined, 0),
             "{held} held keys: {:?}",
             d.end
         );
@@ -559,7 +564,18 @@ fn a_run_of_held_keys_is_skipped_and_too_long_a_run_aborts_without_a_file_at_any
                 .join(RelPath::new(&cam(), ms(T0 + 100 + n)).to_string());
             assert!(!k.exists(), "{held}: {:?}", tree(&d.root));
         }
-        assert_eq!(part_files(&d.root).len(), 0);
+        // No `.part` is left in the day directory; the sealed one is in quarantine, whole.
+        let parts = part_files(&d.root);
+        assert_eq!(
+            parts.len(),
+            usize::try_from(quarantined).unwrap(),
+            "{parts:?}"
+        );
+        assert!(parts.iter().all(|p| p.starts_with("_quarantine/")));
+        for p in &parts {
+            let bytes = std::fs::read(d.root.join(p)).unwrap();
+            summarize(&mut SliceSource(&bytes)).unwrap();
+        }
         assert_eq!(
             d.rows.len(),
             usize::try_from(held + i64::try_from(indexed).unwrap()).unwrap()

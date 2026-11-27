@@ -6,7 +6,7 @@ use wardenlens_core::storage::{SegmentIndex, Tier, TransientFault};
 use crate::probe::find_row;
 use crate::recorder::Recorder;
 use crate::state::READ_ONLY_SKIP_KEYFRAMES;
-use crate::store::SegmentStore;
+use crate::store::{SegmentStore, StoreError};
 
 /// The index's answer for one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,14 +47,15 @@ where
         };
         let bytes = open.bytes_written;
         let open_key = open.key;
-        // A bumped key is never a row's key. An index that cannot answer counts as "held".
+        // A bumped key is never a row's key. An index that cannot answer leaves the key unchecked:
+        // the file is kept, unindexed, and reconciliation judges it.
         let (camera, index) = (&self.camera, &self.index);
-        let mut row_holds = |k| find_row(index, camera, k).map_or(true, |r| r.is_some());
+        let mut row_holds = |k| find_row(index, camera, k).ok().map(|r| r.is_some());
         match self.store.commit(open.writer, &patch, &mut row_holds) {
             Ok(sealed) => {
                 self.keys.note(sealed.key);
                 self.full_failures = 0;
-                if !sealed.durable {
+                if !sealed.durable || !sealed.key_checked {
                     self.health.segments_unindexed =
                         self.health.segments_unindexed.saturating_add(1);
                     return;
@@ -69,6 +70,11 @@ where
                     record.frame_count,
                 );
                 self.index_segment(&row, sealed.key != open_key);
+            }
+            Err(StoreError::NoFreeName) => {
+                // The finished file is in quarantine: kept, not lost, and the volume works.
+                self.health.segments_quarantined =
+                    self.health.segments_quarantined.saturating_add(1);
             }
             Err(e) => {
                 self.health.segments_aborted = self.health.segments_aborted.saturating_add(1);

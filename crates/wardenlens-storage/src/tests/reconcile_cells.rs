@@ -620,7 +620,7 @@ fn none_valid_valid_one_byte_apart_is_not_a_duplicate() {
 
 /// A well-formed segment of the same length as [`good`] with other payload bytes: another
 /// recording that landed on the same name (the recorder bumped its key onto it).
-fn same_size_other_content() -> Vec<u8> {
+pub(super) fn same_size_other_content() -> Vec<u8> {
     let mut v = good();
     let n = v.len();
     v[n - 1] ^= 0xFF; // last byte of the mdat payload
@@ -629,7 +629,9 @@ fn same_size_other_content() -> Vec<u8> {
 
 /// The twin rule, one case per cell that used to delete H on the strength of its size: the hot
 /// copy is deleted only when it is byte-identical to the archive copy. Otherwise it is
-/// quarantined (never deleted), the row and A stay, and the report carries `foreign_twins`.
+/// quarantined (never deleted), the row and A stay, and the report carries `foreign_twins`. The
+/// exception is a `tier = hot` row: it says H is the segment, so H and the row stay and the
+/// archive copy is the one quarantined.
 #[test]
 fn a_hot_file_that_is_not_a_copy_of_the_archive_file_is_quarantined_never_deleted() {
     // (row tier, expected row tier afterwards, expected report)
@@ -644,11 +646,10 @@ fn a_hot_file_that_is_not_a_copy_of_the_archive_file_is_quarantined_never_delete
         ),
         (
             Some(Tier::Hot),
-            Tier::Archive,
+            Tier::Hot,
             rep(|r| {
                 r.foreign_twins = 1;
                 r.quarantined = 1;
-                r.rolled_forward = 1;
             }),
         ),
         (
@@ -673,9 +674,16 @@ fn a_hot_file_that_is_not_a_copy_of_the_archive_file_is_quarantined_never_delete
         let out = lp.reconcile_startup().unwrap();
         assert_eq!(out.report, want, "{row:?}");
         assert!(out.report.health_error(), "{row:?}: an alert");
-        assert!(!env.hot.join(&rel).exists(), "{row:?}");
-        assert_eq!(Env::quarantined(&env.hot), vec![foreign], "{row:?}: kept");
-        assert_eq!(std::fs::read(env.arch.join(&rel)).unwrap(), good());
+        if row == Some(Tier::Hot) {
+            assert_eq!(std::fs::read(env.hot.join(&rel)).unwrap(), foreign);
+            assert_eq!(Env::quarantined(&env.hot).len(), 0);
+            assert!(!env.arch.join(&rel).exists());
+            assert_eq!(Env::quarantined(&env.arch), vec![good()], "{row:?}: kept");
+        } else {
+            assert!(!env.hot.join(&rel).exists(), "{row:?}");
+            assert_eq!(Env::quarantined(&env.hot), vec![foreign], "{row:?}: kept");
+            assert_eq!(std::fs::read(env.arch.join(&rel)).unwrap(), good());
+        }
         let r = env.find("cam-1", 0).expect("the row is kept");
         assert_eq!(r.tier, after);
         if let Some(id) = id {
@@ -727,5 +735,139 @@ fn a_difference_anywhere_in_the_file_is_found() {
             vec![h],
             "at {at}: never deleted"
         );
+    }
+}
+
+// ---- adversary #195: the row's own copy in the (hot, valid, valid) cell ------------------------
+
+/// A `tier = hot` row says the hot file is the segment. When the archive file of the same size
+/// is NOT a byte-identical copy, the archive copy cannot be the migration's copy of this row, so
+/// the row must not be pointed at it and the row's own hot file must not be quarantined (the
+/// first eviction candidate). ADR 0005 section 9 (#195): "the row and A stay as they are".
+#[test]
+fn adversary_hot_row_with_a_foreign_archive_copy_keeps_the_row_on_its_hot_file() {
+    let env = Env::new();
+    let rel = Env::rel("cam-1", 0);
+    let id = env.row("cam-1", 0, good().len(), Tier::Hot);
+    let foreign = same_size_other_content();
+    put(&env.hot, &rel, &good());
+    put(&env.arch, &rel, &foreign);
+    let (mut lp, _) = build(&env, None);
+    let out = lp.reconcile_startup().unwrap();
+    assert!(out.report.health_error(), "an alert: {:?}", out.report);
+    let r = env.find("cam-1", 0).expect("the row is kept");
+    assert_eq!(r.id, id);
+    assert_eq!(
+        r.tier,
+        Tier::Hot,
+        "the row must not be moved onto a file that is not its recording: {:?}",
+        out.report
+    );
+    assert_eq!(
+        std::fs::read(env.hot.join(&rel)).ok(),
+        Some(good()),
+        "the row's own hot file must stay in place"
+    );
+}
+
+/// A foreign twin is settled once: a second pass over the result changes nothing, in all three
+/// cells, and the archive copy is untouched.
+#[test]
+fn adversary_identical_twins_compared_twice_are_a_fixed_point() {
+    for row in [Some(Tier::Archive), Some(Tier::Hot), None] {
+        let env = Env::new();
+        let rel = Env::rel("cam-1", 0);
+        if let Some(t) = row {
+            env.row("cam-1", 0, good().len(), t);
+        }
+        put(&env.hot, &rel, &same_size_other_content());
+        put(&env.arch, &rel, &good());
+        let (mut lp, _) = build(&env, None);
+        let first = lp.reconcile_startup().unwrap();
+        assert_eq!(first.report.foreign_twins, 1, "{row:?}");
+        let (mut again, _) = build(&env, None);
+        let second = again.reconcile_startup().unwrap();
+        assert_eq!(
+            second.report,
+            ReconcileReport::default(),
+            "{row:?}: a fixed point"
+        );
+        if row == Some(Tier::Hot) {
+            // The row's own hot file stays; the archive copy was quarantined by the first pass.
+            assert_eq!(Env::quarantined(&env.arch), vec![good()]);
+        } else {
+            assert_eq!(std::fs::read(env.arch.join(&rel)).unwrap(), good());
+        }
+    }
+}
+
+// ---- twins that cannot be compared (#195) -------------------------------------------------------
+
+/// When the bytes of two twins cannot be compared (a read error, or a file that ends early) no
+/// conclusion is drawn: H stays at its key with its bytes, the key is `unverified`, nothing is
+/// deleted and no foreign file is declared. One row per cell that compares.
+#[test]
+fn twins_that_cannot_be_compared_are_left_unverified_in_every_cell() {
+    use super::fault::{Fault, Op, count};
+
+    // Reads the adoption parser makes of one good file: a key without a row parses H and A
+    // before comparing, so the comparison's reads start after twice that.
+    let env = Env::new();
+    put(&env.hot, &Env::rel("cam-1", 0), &good());
+    let (mut lp, state) = build(&env, None);
+    lp.reconcile_startup().unwrap();
+    let parse_reads = count(&state, Op::Read);
+    assert!(parse_reads > 0);
+
+    // (row, reads before the comparison, expected row tier, expected report)
+    let rows: [(Option<Tier>, u32, Tier, ReconcileReport); 3] = [
+        (
+            Some(Tier::Archive),
+            0,
+            Tier::Archive,
+            rep(|r| r.unverified = 1),
+        ),
+        (Some(Tier::Hot), 0, Tier::Hot, rep(|r| r.unverified = 1)),
+        (
+            None,
+            parse_reads * 2,
+            Tier::Archive,
+            rep(|r| {
+                r.unverified = 1;
+                r.adopted = 1;
+            }),
+        ),
+    ];
+    for (row, before, tier, want) in rows {
+        for eof in [false, true] {
+            let what = format!("{row:?} eof {eof}");
+            let env = Env::new();
+            let rel = Env::rel("cam-1", 0);
+            let id = row.map(|t| env.row("cam-1", 0, good().len(), t));
+            put(&env.hot, &rel, &good());
+            put(&env.arch, &rel, &good());
+            let fault = Fault {
+                sticky: true,
+                eof,
+                ..Fault::once(Op::Read, before + 1)
+            };
+            let (mut lp, state) = build(&env, Some(fault));
+            let out = lp.reconcile_startup().unwrap();
+            assert!(state.lock().unwrap().fired, "{what}: the fault was reached");
+            assert_eq!(out.report, want, "{what}");
+            assert_eq!(std::fs::read(env.hot.join(&rel)).unwrap(), good(), "{what}");
+            assert_eq!(
+                std::fs::read(env.arch.join(&rel)).unwrap(),
+                good(),
+                "{what}"
+            );
+            assert_eq!(Env::quarantined(&env.hot).len(), 0, "{what}");
+            assert_eq!(Env::quarantined(&env.arch).len(), 0, "{what}");
+            let r = env.find("cam-1", 0).expect("a row exists");
+            assert_eq!(r.tier, tier, "{what}");
+            if let Some(id) = id {
+                assert_eq!(r.id, id, "{what}");
+            }
+        }
     }
 }

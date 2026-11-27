@@ -495,7 +495,7 @@ impl SegmentStore for TestStore {
         &mut self,
         writer: HotWriter,
         patch: &DurationPatch,
-        row_holds: &mut dyn FnMut(UnixMs) -> bool,
+        row_holds: &mut dyn FnMut(UnixMs) -> Option<bool>,
     ) -> Result<Sealed, StoreError> {
         let err = self.script.lock().unwrap().commit_error.take();
         self.script.lock().unwrap().open_now -= 1;

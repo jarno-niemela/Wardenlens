@@ -4,7 +4,7 @@ use wardenlens_core::recording::Pushed;
 use wardenlens_core::storage::{SegmentIndex, TransientFault};
 use wardenlens_core::time::UnixMs;
 use wardenlens_core::video::Frame;
-use wardenlens_mp4::Mp4Error;
+use wardenlens_mp4::{InitSegment, Mp4Error};
 
 use crate::keys::KeyError;
 use crate::pending::{Pending, fragment_bound};
@@ -41,9 +41,7 @@ where
 {
     /// The frame starts a new segment (a keyframe, the previous segment is already closed).
     pub(crate) fn begin(&mut self, frame: Frame, arrival: UnixMs) {
-        let Some(init) = self.params.as_ref().map(|a| a.init.clone()) else {
-            self.cond.params = true;
-            self.fail_start();
+        let Some(init) = self.start_prechecks(frame.data.len()) else {
             return;
         };
         if !self.volume_ready() {
@@ -147,6 +145,30 @@ where
         if size > self.config.max_file_bytes || fragments > self.config.max_fragments {
             self.close_open();
         }
+    }
+
+    /// The init segment to start with, or `None` (the start is already put off) when there are no
+    /// valid parameter sets or the first frame cannot fit the file limit even alone: a file of the
+    /// init segment and that one frame would pass `max_file_bytes`, so the frame is refused as a
+    /// stream error (#195).
+    fn start_prechecks(&mut self, frame_len: usize) -> Option<InitSegment> {
+        let Some(init) = self.params.as_ref().map(|a| a.init.clone()) else {
+            self.cond.params = true;
+            self.fail_start();
+            return None;
+        };
+        let first = u64::try_from(init.bytes().len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(fragment_bound(
+                1,
+                u64::try_from(frame_len).unwrap_or(u64::MAX),
+            ));
+        if first > self.config.max_file_bytes {
+            self.health.stream_errors = self.health.stream_errors.saturating_add(1);
+            self.hold_start();
+            return None;
+        }
+        Some(init)
     }
 
     /// While the index cannot be written only every few keyframes starts a segment, as a probe:

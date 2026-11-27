@@ -11,7 +11,7 @@ use rustix::io::Errno;
 use wardenlens_core::storage::{IndexedSegment, SegmentId, SegmentIndex, Tier};
 use wardenlens_fsutil::{FsError, QuarantineOutcome};
 
-use crate::fs::{Fs, Opened};
+use crate::fs::{Fs, Opened, same_bytes};
 use crate::index::{Rel, SharedIndex};
 
 /// Copy chunk of M4.
@@ -299,16 +299,32 @@ impl<F: Fs, I: SegmentIndex> Mover<'_, F, I> {
             self.drop_part(&dir, part);
             return Err(Outcome::Unverified);
         };
+        let mut stale = stale;
         if stale.len == row.record.bytes {
-            // A stale complete copy of an earlier attempt: fsync it and its directory, delete the
-            // `.part`, and go on with M8.
-            let mut stale = stale;
-            if stale.file.sync().is_err() || self.fs.sync_dir(Tier::Archive, &dir).is_err() {
+            // A stale complete copy of an earlier attempt, but only if it is the very bytes this
+            // move wrote: a name is not an identity (#195). Same size and other bytes is another
+            // recording and is quarantined below, never trusted as this row's copy.
+            let Ok(mut fresh) = self.fs.open_read(Tier::Archive, &[dir[0], dir[1], part]) else {
                 self.drop_part(&dir, part);
-                return Err(fail(Stage::M7));
+                return Err(Outcome::Unverified);
+            };
+            match same_bytes(&mut stale, &mut fresh) {
+                Some(true) => {
+                    // Fsync it and its directory, delete the `.part`, and go on with M8.
+                    if stale.file.sync().is_err() || self.fs.sync_dir(Tier::Archive, &dir).is_err()
+                    {
+                        self.drop_part(&dir, part);
+                        return Err(fail(Stage::M7));
+                    }
+                    self.drop_part(&dir, part);
+                    return Ok(true);
+                }
+                Some(false) => {}
+                None => {
+                    self.drop_part(&dir, part);
+                    return Err(Outcome::Unverified);
+                }
             }
-            self.drop_part(&dir, part);
-            return Ok(true);
         }
         drop(stale);
         match self.fs.quarantine(Tier::Archive, &rel.comps()) {

@@ -123,12 +123,13 @@ fn several_transient_errors_then_a_permanent_one_with_an_unreadable_index_keeps_
     }
 }
 
-/// The rename bump probes the index (#195): a key a row holds is skipped, and so is a key the
-/// index cannot answer for. The file lands one key further, is indexed there, and the held
-/// key's row and the planted file are untouched. (Before #195 the file was finished under the
-/// held key and left unindexed.)
+/// The rename bump probes the index (#195). A key the index cannot answer for is used, not
+/// skipped (a finished recording is never thrown away for an unanswered question): the file is
+/// kept at that key, unindexed and unchecked, and the archive row and the planted file are
+/// untouched. Reconciliation judges it at the next start (it never deletes a non-identical
+/// twin).
 #[test]
-fn a_bumped_key_with_an_unreadable_index_is_skipped_as_if_held() {
+fn a_bumped_key_with_an_unreadable_index_keeps_the_file_unchecked_and_unindexed() {
     let (r, planted) = bumped_rig();
     r.index.lock().unwrap().list_errors = 1;
     let d = r.finish();
@@ -138,18 +139,16 @@ fn a_bumped_key_with_an_unreadable_index_is_skipped_as_if_held() {
         (
             d.end.segments_indexed,
             d.end.segments_unindexed,
-            d.end.segments_quarantined
+            d.end.segments_quarantined,
+            d.end.segments_aborted
         ),
-        (1, 0, 0)
+        (0, 1, 0, 0)
     );
-    let held = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
-    assert!(!held.exists(), "{:?}", tree(&d.root));
-    let next = d.root.join(RelPath::new(&cam(), ms(T0 + 102)).to_string());
-    assert!(next.exists(), "{:?}", tree(&d.root));
-    // The archive row is untouched.
-    assert_eq!(d.rows.len(), 2);
+    let used = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
+    assert!(used.exists(), "{:?}", tree(&d.root));
+    // The archive row is untouched and no row was added.
+    assert_eq!(d.rows.len(), 1);
     assert_eq!(d.rows[0].record.bytes, 4_096);
-    assert_eq!(d.rows[1].record.started_at_ms, ms(T0 + 102));
 }
 
 /// Bumped past a held key, after transient insert failures: the segment is indexed under the

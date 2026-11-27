@@ -423,6 +423,8 @@ fn log_reconciliation(reconciled: &Reconciled) {
         quarantined = report.quarantined,
         missing = report.missing,
         size_mismatch = report.size_mismatch,
+        duplicates_deleted = report.duplicates_deleted,
+        foreign_twins = report.foreign_twins,
         unverified = report.unverified,
         archive_unavailable = report.archive_unavailable,
         walk_cap_exceeded = report.walk_cap_exceeded,

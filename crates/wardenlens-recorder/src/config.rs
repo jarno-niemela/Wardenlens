@@ -30,12 +30,10 @@ pub struct RecorderConfig {
     /// available to the recorder. Default 32 MiB, twice the fragment cap. 0 retries at every
     /// keyframe.
     pub resume_free_bytes: u64,
-    /// The segment is closed before it would pass this many bytes on disk, container overhead
-    /// included. Never above the adoption parser's limit less a margin.
-    pub max_file_bytes: u64,
-    /// The segment is closed before it would pass this many fragments. Never above the adoption
-    /// parser's limit less a margin.
-    pub max_fragments: u64,
+    /// Not public: the limits can only be lowered (see [`Self::with_file_limits`]), never set
+    /// above the adoption parser's, so a finished file is always adoptable.
+    pub(crate) max_file_bytes: u64,
+    pub(crate) max_fragments: u64,
 }
 
 impl Default for RecorderConfig {
@@ -76,13 +74,28 @@ impl RecorderConfig {
 }
 
 impl RecorderConfig {
-    /// Lowers the file-size and fragment-count limits of a segment (they can never be raised
-    /// above the adoption parser's, so a finished file is always adoptable).
+    /// Lowers the file-size and fragment-count limits of a segment. They can never be raised
+    /// above the adoption parser's (less a margin), so a finished file is always adoptable, and a
+    /// fragment limit of 0 is raised to 1. A segment is closed before it would pass either; a
+    /// first frame that alone cannot fit the byte limit is dropped (a stream error), so with a
+    /// byte limit below one frame nothing is recorded.
     #[must_use]
     pub fn with_file_limits(mut self, max_file_bytes: u64, max_fragments: u64) -> Self {
         self.max_file_bytes = max_file_bytes.min(MAX_FILE_BYTES);
-        self.max_fragments = max_fragments.min(MAX_FRAGMENTS_PER_SEGMENT);
+        self.max_fragments = max_fragments.clamp(1, MAX_FRAGMENTS_PER_SEGMENT);
         self
+    }
+
+    /// The largest finished segment file, bytes, container overhead included.
+    #[must_use]
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
+    }
+
+    /// The most fragments in one segment.
+    #[must_use]
+    pub fn max_fragments(&self) -> u64 {
+        self.max_fragments
     }
 }
 
@@ -112,6 +125,9 @@ mod tests {
             (MAX_FILE_BYTES, MAX_FRAGMENTS_PER_SEGMENT)
         );
         let c = RecorderConfig::default().with_file_limits(1000, 3);
-        assert_eq!((c.max_file_bytes, c.max_fragments), (1000, 3));
+        assert_eq!((c.max_file_bytes(), c.max_fragments()), (1000, 3));
+        // A fragment count of 0 would cut every segment before its first frame.
+        let c = RecorderConfig::default().with_file_limits(1000, 0);
+        assert_eq!(c.max_fragments(), 1);
     }
 }
