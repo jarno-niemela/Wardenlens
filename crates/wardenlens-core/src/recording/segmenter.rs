@@ -263,9 +263,9 @@ struct Open {
 ///
 /// Rules: frames before the first keyframe are dropped; a segment is cut at
 /// the first keyframe at or after the target; at the hard maximum (2x target),
-/// the byte cap or the arrival-span bound (2x the hard maximum of wall time
-/// between the first frame and this one, for a frozen or drifting RTP clock)
-/// the segment closes at that frame unless it is a keyframe,
+/// the byte cap or the arrival-span bound (the capped forward progress of the
+/// arrival clock reaching 2x the hard maximum, for a frozen or drifting RTP
+/// clock; ADR 0005 rule 3a) the segment closes at that frame unless it is a keyframe,
 /// and frames are dropped until the next keyframe. A frame of 0 bytes or more
 /// than 8 MiB is a stream error: the open segment closes and frames are dropped
 /// until the next keyframe.
@@ -986,12 +986,69 @@ mod tests {
         assert_eq!((r.frame_count, r.bytes), (5, 5000));
     }
 
+    /// Runs the span model (written out here: per frame, progress beyond the high-water mark,
+    /// at most 10 s, the mark re-anchored by a backward step of more than 10 s and at each
+    /// segment start) against the segmenter. Frames are `(keyframe, rtp mode, arrival delta ms)`.
+    /// Every appended frame keeps the span under the 40 s bound, and a close (on a `Drop` or on a
+    /// keyframe `StartNew`) happens only when a bound is really reached (minimality).
+    fn check_span_model(
+        frames: &[(bool, u32, i64)],
+        reanchor_at_start: bool,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let mut s = seg(10);
+        let mut model = MediaClock::default();
+        let mut rtp = 1000u32;
+        let mut at = T0;
+        let mut hw = T0;
+        let mut span = 0i64;
+        let mut start_dts = 0u64;
+        for &(key, rtp_mode, delta) in frames {
+            // rtp: frozen / 1 tick back / 1 s forward / normal 25 fps
+            rtp = match rtp_mode {
+                0 => rtp,
+                1 => rtp.wrapping_sub(1),
+                2 => rtp.wrapping_add(90_000),
+                _ => rtp.wrapping_add(3600),
+            };
+            at += delta;
+            let dts = model.push(rtp);
+            let p = s.push(frame(key, rtp, at, 100));
+            let mark = if hw - at > 10_000 { at } else { hw };
+            let would = span + (at - mark).clamp(0, 10_000);
+            hw = mark.max(at);
+            let media = dts - start_dts;
+            match p.decision {
+                Decision::StartNew => {
+                    if p.closed.is_some() {
+                        proptest::prop_assert!(
+                            would >= 40_000 || media >= 10 * 90_000,
+                            "keyframe cut without a bound: span {would}, media {media}"
+                        );
+                    }
+                    span = 0;
+                    start_dts = dts;
+                    if reanchor_at_start {
+                        hw = at; // a new segment anchors its mark at its first arrival
+                    }
+                }
+                Decision::Append => {
+                    span = would;
+                    proptest::prop_assert!(span < 40_000, "span {span}");
+                }
+                Decision::Drop if p.closed.is_some() => {
+                    proptest::prop_assert!(
+                        would >= 40_000 || media >= 20 * 90_000,
+                        "cut without a bound: span {would}, media {media}"
+                    );
+                }
+                Decision::Drop => {}
+            }
+        }
+        Ok(())
+    }
+
     proptest::proptest! {
-        /// Hostile RTP and arrival steps (frozen, backward, forward, wall-clock steps): every
-        /// frame appended keeps the arrival span under the 40 s bound, and a close (on a `Drop`
-        /// or on a keyframe `StartNew`) happens only when a bound is really reached (minimality).
-        /// The model of the span is written out here: per frame, progress beyond the high-water
-        /// mark, at most 10 s, with the mark re-anchored by a backward step of more than 10 s.
+        /// Hostile RTP and arrival steps (frozen, backward, forward, wall-clock steps).
         #[test]
         fn arrival_span_is_bounded_and_cuts_are_minimal(
             frames in proptest::collection::vec(
@@ -999,57 +1056,74 @@ mod tests {
                 1..600,
             ),
         ) {
-            let mut s = seg(10);
-            let mut model = MediaClock::default();
-            let mut rtp = 1000u32;
-            let mut at = T0;
-            let mut hw = T0;
-            let mut span = 0i64;
-            let mut start_dts = 0u64;
-            let mut closes = 0u32;
-            for (key, rtp_mode, dat) in frames {
-                // rtp: frozen / 1 tick back / 1 s forward / normal 25 fps
-                rtp = match rtp_mode {
-                    0 => rtp,
-                    1 => rtp.wrapping_sub(1),
-                    2 => rtp.wrapping_add(90_000),
-                    _ => rtp.wrapping_add(3600),
-                };
-                // mostly 40 ms; steps back (down to -20 s) and forward (up to 60 s)
-                at += if dat > 100 && dat < 30_000 { 40 } else { dat };
-                let dts = model.push(rtp);
-                let p = s.push(frame(key, rtp, at, 100));
-                let mark = if hw - at > 10_000 { at } else { hw };
-                let would = span + (at - mark).clamp(0, 10_000);
-                hw = mark.max(at);
-                let media = dts - start_dts;
-                match p.decision {
-                    Decision::StartNew => {
-                        if p.closed.is_some() {
-                            closes += 1;
-                            proptest::prop_assert!(
-                                would >= 40_000 || media >= 10 * 90_000,
-                                "keyframe cut without a bound: span {would}, media {media}"
-                            );
-                        }
-                        span = 0;
-                        start_dts = dts;
-                    }
-                    Decision::Append => {
-                        span = would;
-                        proptest::prop_assert!(span < 40_000, "span {span}");
-                    }
-                    Decision::Drop if p.closed.is_some() => {
-                        closes += 1;
-                        proptest::prop_assert!(
-                            would >= 40_000 || media >= 20 * 90_000,
-                            "cut without a bound: span {would}, media {media}"
-                        );
-                    }
-                    Decision::Drop => {}
-                }
+            // mostly 40 ms; steps back (down to -20 s) and forward (up to 60 s)
+            let frames: Vec<(bool, u32, i64)> = frames
+                .into_iter()
+                .map(|(k, r, d)| (k, r, if (101..30_000).contains(&d) { 40 } else { d }))
+                .collect();
+            check_span_model(&frames, true)?;
+        }
+
+        /// Phases of a frozen-RTP stream: a keyframe after a short backward step, a long run of
+        /// 40 ms frames, then large forward steps that close the segment. The next phase's keyframe
+        /// starts a segment below the old high-water mark, which a model that keeps the old mark
+        /// gets wrong.
+        #[test]
+        fn short_backward_step_then_long_runs_match_the_model(
+            phases in proptest::collection::vec((0i64..10_000, 1usize..1500, 0usize..6), 1..6),
+        ) {
+            let mut frames = Vec::new();
+            for (back, run, jumps) in phases {
+                frames.push((true, 0, -back));
+                frames.extend(std::iter::repeat_n((false, 0, 40), run));
+                frames.extend(std::iter::repeat_n((false, 0, 30_000), jumps));
             }
-            let _ = closes;
+            check_span_model(&frames, true)?;
+        }
+    }
+
+    /// The regime above fails against a model that keeps the high-water mark across segment
+    /// starts (the round-2 defect); this pins that the check can fail.
+    #[test]
+    fn the_stale_mark_model_is_caught_by_the_phase_regime() {
+        let mut frames = vec![(true, 0, 0)];
+        frames.extend(std::iter::repeat_n((false, 0, 30_000), 5));
+        frames.push((true, 0, -5000));
+        frames.extend(std::iter::repeat_n((false, 0, 40), 1200));
+        assert!(check_span_model(&frames, true).is_ok());
+        assert!(check_span_model(&frames, false).is_err());
+    }
+
+    #[test]
+    fn segment_after_a_backward_step_anchors_at_its_own_first_arrival() {
+        // Frozen RTP. 1: keyframe; 2: four 30 s steps (10 s each, the 4th closes at 40 s);
+        // 3: a keyframe 5 s before the last appended arrival; 4: 200 frames of 40 ms;
+        // 5: three 30 s steps; 6: 40 ms frames until the 40 s bound is reached.
+        let mut s = seg(10);
+        let mut at = T0;
+        assert_eq!(s.push(frame(true, 7, at, 10)).decision, Decision::StartNew);
+        for i in 0..4 {
+            at += 30_000;
+            let p = s.push(frame(false, 7, at, 10));
+            assert_eq!(p.decision == Decision::Drop, i == 3, "step {i}");
+        }
+        let kf = T0 + 90_000 - 5000; // 5 s below the last appended arrival (the old mark)
+        let k = s.push(frame(true, 7, kf, 10));
+        assert_eq!((k.decision, k.closed), (Decision::StartNew, None));
+        at = kf;
+        for _ in 0..200 {
+            at += 40;
+            assert_eq!(s.push(frame(false, 7, at, 10)).decision, Decision::Append);
+        }
+        for _ in 0..3 {
+            at += 30_000;
+            assert_eq!(s.push(frame(false, 7, at, 10)).decision, Decision::Append);
+        }
+        // span is 8 s + 3 x 10 s = 38 s; 40 ms frames add the last 2 s: the 50th closes.
+        for i in 1..=50 {
+            at += 40;
+            let p = s.push(frame(false, 7, at, 10));
+            assert_eq!(p.decision == Decision::Drop, i == 50, "frame {i}");
         }
     }
 

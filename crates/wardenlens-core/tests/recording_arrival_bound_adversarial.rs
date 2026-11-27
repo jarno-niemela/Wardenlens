@@ -145,7 +145,7 @@ fn healthy(n: u32, at: impl Fn(u32) -> i64) -> Vec<Pushed> {
 fn forward_wall_clock_step_on_a_healthy_stream_drops_no_frames() {
     // NTP steps the host clock forward one hour at frame 1030 (a non-keyframe, 41.2 s in),
     // as on a host without an RTC at first sync. The camera's RTP clock is sound: media time
-    // bounds the segment. ADR rule 3a says such a cut "only costs a segment boundary".
+    // bounds the segment. ADR rule 3a: one step adds at most the 10 s per-step cap, so no frame is dropped.
     let out = healthy(25 * 200, |i| {
         let t = i64::from(i) * 40;
         if i < 1030 { t } else { t + 3_600_000 }

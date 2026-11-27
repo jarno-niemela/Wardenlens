@@ -120,8 +120,9 @@ salvage such a file (section 9) but the format allows it later.
    the segment and is dropped, with frames dropped until the next keyframe (a segment always starts at a keyframe, so
    there is no "resume mid-GOP"; the loss counts as a gap). The factor 2 leaves a healthy stream untouched: its arrival
    span tracks its media span, which is cut at 60 s (120 s at the latest) long before. A crash loses at most 120 s of
-   a stream with a sound clock; with a frozen or drifting RTP clock it loses at most 240 s, plus a gap of up to one
-   GOP at each forced cut.
+   a stream with a sound clock; with a frozen or drifting RTP clock it loses at most 240 s of capped arrival time (the span below), plus a gap of
+   up to one GOP at each forced cut. That holds for frame gaps of at most 10 s and a host clock that does not lag and
+   catch up by steps (see #183).
    - *Clock.* `arrival` is the wall-clock `UnixMs` of the `Clock` trait (#46), which can step. The segmenter does not
      subtract first from last arrival. For each frame it adds the **forward progress** of the arrival clock to the
      span, under three rules: (1) only progress beyond the **high-water mark** (the latest arrival seen in this
@@ -132,11 +133,11 @@ salvage such a file (section 9) but the format allows it later.
      steps do advance the span 10 s at a time and can still cut a healthy stream, which is accepted; (3) a step
      **backward of more than 10 s** re-anchors the high-water mark at the new arrival, so a clock stepped far back
      cannot hide the time that passes afterwards (a smaller backward step keeps the mark and delays the span by at
-     most that step in total). A stalled clock (equal arrivals) adds 0, so the media-time bounds still apply.
+     most that step each time). A stalled clock (equal arrivals) adds 0, so the media-time bounds still apply.
    - *Interaction.* The byte cap, the media-time maximum and the arrival bound are one test (`forced`) per frame:
      whichever is reached first closes the segment, and a frame closes at most one segment (it is `StartNew` with the
      old record, or `Drop` with the record, never both). A frozen RTP clock together with a host whose clock also
-     stalls is bounded only by the byte cap; that case is out of scope here.
+     stalls, or lags and catches up by steps, is bounded only by the byte cap; that case is out of scope here (see #183).
    - *`duration_ms`.* It stays the **media** duration (unchanged definition, so the 600 s `CHECK` and the sums of
      section 2 still hold) and may be far below the arrival span when the bound fires. Consumers needing wall
      coverage of such a segment have the next segment's `started_at_ms`; no wall duration is stored.
