@@ -679,6 +679,42 @@ fn files_port_returns_typed_errors_and_the_tier_actually_opened() {
     ));
 }
 
+// Contract of the port (#133): the handle is read-only. A write through it fails with EBADF on
+// both tiers, and the segment's Debug shows neither the path nor the root.
+#[test]
+fn files_port_handle_is_read_only_and_its_debug_hides_the_path() {
+    use std::io::Write;
+    let env = Env::new();
+    let (l, files) =
+        Storage::open_with(env.cfg(), env.index.clone(), env.usage.clone(), |r| r).unwrap();
+    let mut lp = l;
+    lp.tick(now()).unwrap();
+    let hot = env.add("cam-1", 0, 300, Tier::Hot);
+    let arch = env.add("cam-1", 1, 200, Tier::Archive);
+    for (id, tier, path) in [
+        (hot, Tier::Hot, env.hot_file("cam-1", 0)),
+        (arch, Tier::Archive, env.arch_file("cam-1", 1)),
+    ] {
+        let opened = files.open_segment(id).unwrap();
+        let shown = format!("{opened:?}");
+        assert!(
+            !shown.contains(&*path.to_string_lossy()) && !shown.contains("cam-1"),
+            "{shown}"
+        );
+        assert_eq!(opened.tier(), tier);
+        let mut handle = opened.into_handle();
+        let err = handle.write(b"x").unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(rustix::io::Errno::BADF.raw_os_error())
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            pattern(if tier == Tier::Hot { 300 } else { 200 })
+        );
+    }
+}
+
 #[test]
 fn files_port_follows_a_move_that_finishes_between_the_row_read_and_the_open() {
     use std::io::Read;

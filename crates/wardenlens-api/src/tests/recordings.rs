@@ -63,6 +63,8 @@ struct DirFiles {
     failing: Mutex<HashSet<u64>>,
     archive_up: AtomicBool,
     open: Arc<AtomicUsize>,
+    /// Bytes appended to a file right after it is opened, as a growing file would.
+    grow_on_open: Mutex<Vec<u8>>,
 }
 
 impl DirFiles {
@@ -76,6 +78,7 @@ impl DirFiles {
             failing: Mutex::default(),
             archive_up: AtomicBool::new(true),
             open: Arc::default(),
+            grow_on_open: Mutex::default(),
         }
     }
 
@@ -126,13 +129,22 @@ impl SegmentFiles for SharedFiles {
         }
         let file = File::open(f.path(tier, raw)).map_err(|e| SegmentOpenError::io(&e))?;
         f.open.fetch_add(1, Ordering::SeqCst);
-        OpenedSegment::from_handle(
+        let opened = OpenedSegment::from_handle(
             CountedFile {
                 file,
                 open: Arc::clone(&f.open),
             },
             tier,
-        )
+        );
+        let extra = f.grow_on_open.lock().unwrap().clone();
+        if !extra.is_empty() {
+            let mut grow = fs::OpenOptions::new()
+                .append(true)
+                .open(f.path(tier, raw))
+                .unwrap();
+            io::Write::write_all(&mut grow, &extra).unwrap();
+        }
+        opened
     }
 }
 
@@ -453,6 +465,32 @@ async fn download_streams_the_whole_file() {
     assert_eq!(header_str(h, header::ACCEPT_RANGES), Some("bytes"));
     assert_eq!(header_str(h, header::CONTENT_RANGE), None);
     assert_eq!(bytes_of(resp).await, data);
+    wait_closed(&e.files).await;
+}
+
+// The length is a snapshot at open (port contract, #133): a file that grows after the open is
+// served up to the length reported at open, in the full response and in an open-ended range.
+#[tokio::test]
+async fn a_file_that_grows_after_the_open_is_served_only_up_to_its_opened_length() {
+    let e = env();
+    let data = pattern(100_000);
+    e.files.put(5, Tier::Hot, &data);
+    *e.files.grow_on_open.lock().unwrap() = vec![0xEE; 70_000];
+    let resp = e.file(5, None).await;
+    assert_eq!(
+        header_str(resp.headers(), header::CONTENT_LENGTH),
+        Some("100000")
+    );
+    assert_eq!(bytes_of(resp).await, data);
+    wait_closed(&e.files).await;
+    let resp = e.file(5, Some("bytes=99990-")).await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    // The second open sees the file already grown once, so the snapshot is 170000 bytes.
+    assert_eq!(
+        header_str(resp.headers(), header::CONTENT_RANGE),
+        Some("bytes 99990-169999/170000")
+    );
+    assert_eq!(bytes_of(resp).await.len(), 70_010);
     wait_closed(&e.files).await;
 }
 
