@@ -1,0 +1,75 @@
+# Wardenlens service (#69). See docs/deploy.md. Configure through `.env` (copy docker/env.example).
+name: wardenlens
+
+services:
+  wardenlens:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: wardenlens:local
+    restart: unless-stopped
+    # `serve` flushes and stops within 10 s of SIGTERM; Docker's default 10 s grace would SIGKILL it at that edge.
+    stop_grace_period: 15s
+    # A fixed non-root uid (ADR 0005: the floor arithmetic relies on f_bavail and the ext4 reserve).
+    user: "${WARDENLENS_UID:-10001}:${WARDENLENS_GID:-10001}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    environment:
+      WARDENLENS_CONFIG: /etc/wardenlens/wardenlens.toml
+      # A path, never key material (ADR 0006 section 6).
+      WARDENLENS_VAULT_KEY_FILE: /run/secrets/wardenlens_vault_key
+    secrets:
+      - wardenlens_vault_key
+    ports:
+      # Published on one host address, 127.0.0.1 unless .env names a LAN address; never 0.0.0.0 by default.
+      - "${WARDENLENS_LAN_ADDR:-127.0.0.1}:${WARDENLENS_API_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: ${WARDENLENS_HOT_HOST:-/srv/wardenlens/recordings}
+        target: /srv/wardenlens/hot
+      # rslave: an archive disk mounted on the host after the container started becomes visible (ADR 0005).
+      - type: bind
+        source: ${WARDENLENS_ARCHIVE_HOST:-/srv/wardenlens/archive}
+        target: /srv/wardenlens/archive
+        bind:
+          propagation: rslave
+      # Index and vault; not on a recordings volume.
+      - type: bind
+        source: ${WARDENLENS_STATE_HOST:-/srv/wardenlens/state}
+        target: /var/lib/wardenlens
+      - type: bind
+        source: ${WARDENLENS_CONFIG_HOST:-/etc/wardenlens/wardenlens.toml}
+        target: /etc/wardenlens/wardenlens.toml
+        read_only: true
+    ulimits:
+      # One descriptor per open segment and connection; `serve` raises its soft limit up to this.
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        # A flood of failed authentication requests must not fill the disk with Docker logs.
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # `wardenlens health` calls GET /api/v1/health (no token); the image has no curl.
+      test: ["CMD", "wardenlens", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+secrets:
+  wardenlens_vault_key:
+    # Outside every work tree (ADR 0006 section 6), excluded from backups. Never ./secrets/ inside the repository.
+    file: ${WARDENLENS_KEY_FILE_HOST:-/etc/wardenlens/key/vault.key}

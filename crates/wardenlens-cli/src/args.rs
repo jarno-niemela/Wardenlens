@@ -60,6 +60,10 @@ pub(crate) enum Command {
     /// be used, or when another instance holds the process lock (`wardenlens.lock` next to the index) or the lock inside the hot root. A missing, read-only or same-filesystem
     /// archive is not a refusal: the service starts in `archive_unavailable` mode.
     Serve,
+    /// Probe a running service: `GET /api/v1/health` on the `api.listen` address of the config
+    /// (an unspecified address is probed on loopback), 3 s timeout. Exits 0 when the service answers
+    /// 200, 1 otherwise. For the container healthcheck; needs no token and prints nothing on success.
+    Health,
     /// Find, add, list and remove cameras.
     #[command(subcommand)]
     Camera(CameraCommand),

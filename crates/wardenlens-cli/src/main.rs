@@ -75,6 +75,10 @@ fn main() -> ExitCode {
             logging::init(format, &env);
             commands::serve::execute(&ctx)
         }
+        Some(Command::Health) => {
+            logging::init(format, &env);
+            commands::health::execute(&ctx)
+        }
         Some(Command::Camera(cmd)) => {
             logging::init(format, &env);
             commands::camera::execute(&cmd, &ctx)

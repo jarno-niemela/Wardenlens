@@ -1,0 +1,27 @@
+# Backstop for the Docker build context (#69). The Dockerfile copies only Cargo.*, rust-toolchain.toml,
+# crates/ and cameras/, so everything else is excluded anyway; these entries keep a stray secret out of the context.
+target/
+**/target/
+spikes/
+.git
+.github/
+.claude/
+.githooks/
+docs/
+scripts/
+# Secrets and local overrides (ADR 0006 section 6: a compose secret source lives outside the work tree).
+# Docker matches these patterns from the context root, unlike .gitignore, so the nested forms are listed too.
+/secrets/
+**/secrets/
+*.key
+**/*.key
+*.secret*
+**/*.secret*
+*.local.*
+**/*.local.*
+.env
+**/.env
+.env.*
+**/.env.*
+**/*.rs.bk
+*.profraw
