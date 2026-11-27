@@ -5,6 +5,7 @@
 )]
 
 mod client;
+mod discovery;
 mod fixtures;
 mod leaks;
 mod limits;

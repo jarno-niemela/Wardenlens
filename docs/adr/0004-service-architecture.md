@@ -115,8 +115,8 @@ apply to `[dev-dependencies]`, which are unrestricted (test helpers never ship).
      answer that challenge, never for a local security decision (SEC-7: audited RustCrypto `sha1` and `base64`,
      nothing hand-rolled). `base64` is used with `default-features = false, features = ["std"]` to drop the
      `simd-unsafe` default.
-   - Discovery: WS-Discovery `Probe` multicast to `239.255.255.250:3702` using `tokio::net::UdpSocket` and
-     `join_multicast_v4` (multicast does not cross Docker's default bridge network, so in a container discovery needs
+   - Discovery: WS-Discovery `Probe` multicast to `239.255.255.250:3702` using `tokio::net::UdpSocket` (opened with
+     `socket2` to pick the outgoing interface with `IP_MULTICAST_IF`; no group is joined, because replies are unicast) (multicast does not cross Docker's default bridge network, so in a container discovery needs
      `network_mode: host`; see the bind address rules in section 9); replies parsed with quick-xml, deduplicated by endpoint reference, capped at 64 replies and
      a 4 s default window (a caller may raise it to at most 10 s), and only plain `http://` XAddrs are kept (`https://`
      ones are dropped, because this client has no TLS). Discovered addresses are suggestions that an operator confirms;
