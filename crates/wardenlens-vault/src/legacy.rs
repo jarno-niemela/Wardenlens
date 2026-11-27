@@ -4,10 +4,18 @@
 //! is guessed and nothing is dropped silently (ADR 0006 section 4). Ids come from inventory ids
 //! (or a per-file ordinal), never from a value (section 1). Reading the files is the CLI's job.
 //!
-//! **The CLI (#94) must import through [`map_legacy`]**, never by calling the two mappers and
-//! storing both results: `Vault::set` is an upsert, so two files that produce the same entry id
-//! (a JSON camera mapped to `tapo` and a `[cameras.tapo]` section both give `cam:tapo:name`)
-//! would silently overwrite each other. [`map_legacy`] checks the union and refuses any overlap.
+//! **The CLI imports through [`resolve_ids`], then [`Resolution::into_ids`], then
+//! [`map_legacy_with_ids`]** (#188): every JSON camera is joined to a real inventory id (by name,
+//! or by `--map`) and an unmatched or ambiguous camera is refused, never guessed. Never call the
+//! two mappers and store both results: `Vault::set` is an upsert, so two files that produce the
+//! same entry id (a JSON camera mapped to `tapo` and a `[cameras.tapo]` section both give
+//! `cam:tapo:name`) would silently overwrite each other. [`map_legacy_with_ids`] checks the union
+//! and refuses any overlap.
+//!
+//! [`map_legacy`] and [`map_secret_json`] keep the older name-only lookup with the
+//! `import-json-<n>` ordinal fallback for a camera the inventory does not name. They are **not
+//! for importing**: they would write credentials under ordinal ids (the #188 defect). They stay
+//! for library callers and tests that exercise the mapping itself.
 //!
 //! An inventory id or section name starting with `import-` is reserved for ordinals: it falls
 //! back to an ordinal id and is reported by name. The two files use distinct ordinal namespaces (`import-json-<n>` and `import-toml-<n>`), so
@@ -24,7 +32,7 @@ use wardenlens_secrets::Credentials;
 use crate::store::Value;
 use crate::validate::{check_credential, display_name_text, normalize_text};
 
-pub mod resolve;
+mod resolve;
 pub use resolve::{Basis, Resolution, Row, resolve_ids};
 
 /// Most cameras accepted from one legacy file (SEC-2).
@@ -36,7 +44,7 @@ const MAX_REPORTED_KEY_LEN: usize = 64;
 /// The longest field suffix an inventory id must leave room for.
 const LONGEST_FIELD: &str = "credential";
 /// Ids starting with this are the ordinal fallbacks; real ids never use it.
-const RESERVED_PREFIX: &str = "import-";
+pub(crate) const RESERVED_PREFIX: &str = "import-";
 
 /// An entry ready for `Vault::set`.
 #[derive(Debug)]
@@ -56,6 +64,9 @@ pub struct NewEntry {
 pub struct LegacyImport {
     /// Entries for the mapped fields.
     pub entries: Vec<NewEntry>,
+    /// Kept for diagnostics and tests; the CLI reports [`LegacyImport::unused_fields`], which
+    /// groups the same fields by name.
+    ///
     /// Everything not imported, as `<inventory id>.<key>` (or the bare key for a top-level TOML
     /// key): unknown keys; skipped or shadowed fields (a `password` without a login, a `username`
     /// shadowed by a different `login`, a `display_name` next to a `name`, a JSON `name` of a
@@ -220,10 +231,10 @@ pub fn map_legacy(
 }
 
 /// [`map_legacy`] with the inventory id of every JSON camera already decided (see
-/// [`resolve_ids`] and [`map_secret_json_with_ids`]). `ids` is ignored when `json` is `None`.
+/// [`resolve_ids`] and `map_secret_json_with_ids`). `ids` is ignored when `json` is `None`.
 ///
 /// # Errors
-/// As [`map_legacy`] and [`map_secret_json_with_ids`].
+/// As [`map_legacy`] and `map_secret_json_with_ids`.
 pub fn map_legacy_with_ids(
     json: Option<&serde_json::Value>,
     ids: &[String],
@@ -360,7 +371,7 @@ pub fn map_secret_json(
 ///
 /// # Errors
 /// As [`map_secret_json`]; [`LegacyError::InvalidId`] if `ids` is not one usable id per camera.
-pub fn map_secret_json_with_ids(
+pub(crate) fn map_secret_json_with_ids(
     json: &serde_json::Value,
     ids: &[String],
     names_to_ids: &BTreeMap<String, String>,

@@ -188,7 +188,8 @@ fn a_failure_part_way_rolls_back_every_entry() {
     assert_eq!(text(&v, "cam:a:host"), "192.0.2.10");
 }
 
-/// An id that merely starts with the source id is not part of the camera.
+/// An id that merely starts with the source id, or whose field holds a further colon (camera
+/// `a:b`), is not part of the camera.
 #[test]
 fn a_camera_whose_id_extends_the_source_is_untouched() {
     let (_t, mut v) = fresh();
@@ -198,6 +199,59 @@ fn a_camera_whose_id_extends_the_source_is_untouched() {
     v.rename_camera(&cam("a"), &cam("z")).unwrap();
     let got = ids(&v);
     assert!(got.contains(&"cam:a-1:host".to_owned()), "{got:?}");
-    assert!(got.contains(&"cam:z:b:extra".to_owned()), "{got:?}");
-    assert!(!got.iter().any(|i| i.starts_with("cam:a:")), "{got:?}");
+    assert!(got.contains(&"cam:a:b:extra".to_owned()), "{got:?}");
+    assert!(!got.iter().any(|i| i.starts_with("cam:z:b")), "{got:?}");
+    assert!(got.contains(&"cam:z:host".to_owned()), "{got:?}");
+}
+
+#[test]
+fn a_target_in_the_reserved_ordinal_namespace_is_refused() {
+    let (_t, mut v) = fresh();
+    seed(&mut v, "a");
+    let before = ids(&v);
+    for to in ["import-json-1", "import-x"] {
+        let err = v.rename_camera(&cam("a"), &cam(to)).unwrap_err();
+        assert!(matches!(err, VaultError::RenameReservedTarget), "{err:?}");
+    }
+    assert_eq!(ids(&v), before);
+    // Moving out of the ordinal namespace is the point of `mv`.
+    seed(&mut v, "import-json-2");
+    v.rename_camera(&cam("import-json-2"), &cam("porch"))
+        .unwrap();
+}
+
+/// A record that does not authenticate stops the move; the entries before it do not move either.
+#[test]
+fn a_corrupt_source_entry_is_reported_and_nothing_moves() {
+    let (t, mut v) = fresh();
+    seed(&mut v, "a");
+    drop(v);
+    let path = t.path().join("v.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // `cam:a:mac` sorts after `credential` and `host`, so those would already be re-sealed.
+        let mut record: Vec<u8> = conn
+            .query_row(
+                "SELECT record FROM entries WHERE id = 'cam:a:mac'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let last = record.len() - 1;
+        record[last] ^= 0xff;
+        conn.execute(
+            "UPDATE entries SET record = ?1 WHERE id = 'cam:a:mac'",
+            [record],
+        )
+        .unwrap();
+    }
+    let mut v = Vault::open(&path, KeyFile::load(&t.path().join("k")).unwrap()).unwrap();
+    let before = ids(&v);
+    let err = v.rename_camera(&cam("a"), &cam("b")).unwrap_err();
+    assert!(
+        matches!(&err, VaultError::CorruptEntry { id } if id == "cam:a:mac"),
+        "{err:?}"
+    );
+    assert_eq!(ids(&v), before);
+    assert_eq!(text(&v, "cam:a:host"), "192.0.2.10");
 }

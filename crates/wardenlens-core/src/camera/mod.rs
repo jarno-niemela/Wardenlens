@@ -33,5 +33,5 @@ pub use host::{Host, MAX_HOST_LEN};
 pub use id::{CameraId, MAX_CAMERA_ID_LEN};
 pub use model::{Camera, DEFAULT_RTSP_PORT, RtspUrl, StreamSet};
 pub use modelref::{MAX_SLUG_LEN, ModelRef};
-pub use name::{DisplayName, MAX_NAME_LEN};
+pub use name::{DisplayName, MAX_NAME_LEN, is_combining_mark};
 pub use path::{MAX_PATH_LEN, REDACTED_VALUE, RtspPath, ends_with_credential_param_name};

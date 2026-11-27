@@ -1073,7 +1073,8 @@ fn import_legacy_imports_mapped_fields_and_lists_unknown_keys_by_name() {
     }
     assert!(out.contains("not imported"), "{out}");
     for key in ["site_note", "colour", "onvif", "name"] {
-        assert!(out.contains(key), "{key} missing: {out}");
+        let line = format!("  {key}: 1");
+        assert!(out.lines().any(|l| l == line), "{line:?} missing: {out}");
     }
     let list = ok(&h, &["list"], Fake::pipe());
     for id in [
@@ -1862,6 +1863,23 @@ fn vault_mv_renames_every_entry_and_prints_ids_only() {
         "Front Gate"
     );
     assert_eq!(password(&h, "reolink-1"), "pw-synthetic-41");
+}
+
+#[test]
+fn vault_mv_refuses_a_reserved_import_target() {
+    let h = Home::new();
+    h.init();
+    seed_ordinal(&h);
+    let before = ok(&h, &["list"], Fake::pipe());
+    let err = cmd(
+        &h.env(),
+        &["mv", "import-json-1", "import-json-2"],
+        &mut Fake::pipe(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("reserved prefix"), "{err}");
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(ok(&h, &["list"], Fake::pipe()), before);
 }
 
 #[test]

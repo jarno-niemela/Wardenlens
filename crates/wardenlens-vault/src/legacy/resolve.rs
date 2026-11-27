@@ -18,11 +18,15 @@
 
 use std::collections::BTreeMap;
 
+use wardenlens_core::camera::is_combining_mark;
+
 use super::{LegacyError, MAX_LEGACY_CAMERAS, inventory_id, printable, string_field};
 use crate::validate::display_name_text;
 
 /// Most candidate ids named in one ambiguity report.
 const MAX_LISTED_IDS: usize = 8;
+/// Most words of a display name that are compared; a longer name matches nothing.
+const MAX_NAME_WORDS: usize = 64;
 
 /// How a camera got its id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,9 +132,11 @@ fn fold(raw: &str) -> String {
     display_name_text(raw).to_lowercase()
 }
 
+/// Words are runs of letters, digits and combining marks: a mark never splits a word, so the
+/// composed and decomposed spellings of one name give the same words.
 fn words(folded: &str) -> Vec<String> {
     folded
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !(c.is_alphanumeric() || is_combining_mark(c)))
         .filter(|w| !w.is_empty())
         .map(str::to_owned)
         .collect()
@@ -208,6 +214,13 @@ pub fn resolve_ids(
     if cameras.len() > MAX_LEGACY_CAMERAS {
         return Err(LegacyError::TooMany);
     }
+    if table
+        .and_then(|t| t.get("cameras"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|c| c.len() > MAX_LEGACY_CAMERAS)
+    {
+        return Err(LegacyError::TooMany);
+    }
     let inventory = candidates(table);
     let mut chosen: BTreeMap<usize, &str> = BTreeMap::new();
     for (index, id) in explicit {
@@ -234,6 +247,12 @@ pub fn resolve_ids(
         }
         let folded = name.map_or_default(fold);
         let name_words = words(&folded);
+        // A name of absurd length is not a camera name: no match, and no work for the scorer.
+        let folded = if name_words.len() > MAX_NAME_WORDS {
+            String::new()
+        } else {
+            folded
+        };
         let scored: Vec<((u8, usize), &Candidate)> = inventory
             .iter()
             .filter(|_| !folded.is_empty())
@@ -298,6 +317,11 @@ pub(super) fn unresolved_text(missing: &[usize], ambiguous: &[(usize, Vec<String
         parts.push(format!(
             "camera index {index} matches several ids equally ({})",
             list_ids(ids)
+        ));
+    }
+    if !missing.is_empty() {
+        parts.push(String::from(
+            "each JSON camera needs a [cameras.<id>] section in the inventory, and --map can only name an id that has one",
         ));
     }
     parts.push(String::from("map each with --map <index>=<id>"));
@@ -619,6 +643,54 @@ host = "192.0.2.12"
             resolve_ids(&json(&["x"]), Some(&table(&inv)), &[(1, "import-7".into())]).unwrap_err(),
             LegacyError::MapUnknownId
         );
+    }
+
+    #[test]
+    fn an_oversized_inventory_is_refused_before_scoring() {
+        let mut inv = String::new();
+        for i in 0..=MAX_LEGACY_CAMERAS {
+            let _ = writeln!(inv, "[cameras.c{i}]");
+        }
+        assert_eq!(
+            resolve_ids(&json(&["c1"]), Some(&table(&inv)), &[]).unwrap_err(),
+            LegacyError::TooMany
+        );
+        // Exactly the cap is fine.
+        let inv: String = (0..MAX_LEGACY_CAMERAS).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "[cameras.c{i}]");
+            s
+        });
+        assert_eq!(rows(&["c1"], &inv, &[]), [mapped("c1", Basis::Exact)]);
+    }
+
+    #[test]
+    fn a_name_of_too_many_words_matches_nothing() {
+        let inv = "[cameras.yard]\n";
+        let long = format!("yard {}", "w ".repeat(MAX_NAME_WORDS));
+        assert_eq!(rows(&[long.as_str()], inv, &[]), [Row::NoMatch]);
+        let ok = format!("yard {}", "w ".repeat(MAX_NAME_WORDS - 2));
+        assert_eq!(
+            rows(&[ok.as_str()], inv, &[]),
+            [mapped("yard", Basis::Token)]
+        );
+    }
+
+    #[test]
+    fn a_missing_section_is_explained_in_the_message() {
+        let err = resolve_ids(&json(&["Mystery"]), None, &[])
+            .unwrap()
+            .check()
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("[cameras.<id>] section"), "{text}");
+        // A pure ambiguity does not claim a section is missing.
+        let inv = "[cameras.a]\nvendor = \"Acme\"\n[cameras.b]\nvendor = \"Acme\"\n";
+        let text = resolve_ids(&json(&["Acme"]), Some(&table(inv)), &[])
+            .unwrap()
+            .check()
+            .unwrap_err()
+            .to_string();
+        assert!(!text.contains("needs a [cameras"), "{text}");
     }
 
     #[test]

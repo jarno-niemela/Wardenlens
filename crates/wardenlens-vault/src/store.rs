@@ -991,13 +991,16 @@ impl Vault {
         Ok(n > 0)
     }
 
-    /// Moves every entry `cam:<from>:*` to `cam:<to>:*`, keeping kind, value and the
+    /// Moves every entry `cam:<from>:<field>` (one field token, no further colon) to
+    /// `cam:<to>:<field>`; only camera-id-shaped ids (`CameraId`) are addressed, so the entries of
+    /// an inventory camera named `a:b` are never taken for camera `a`. Keeps kind, value and the
     /// `unscannable` flag, in one transaction: either all move or none. Each record is opened
     /// under its old id and re-sealed under the new one (the id is bound into the cipher text).
     /// Returns the new ids. No value is returned or printed.
     ///
     /// # Errors
-    /// [`VaultError::RenameSame`], [`VaultError::NothingToRename`] (no `cam:<from>:` entry),
+    /// [`VaultError::RenameSame`], [`VaultError::RenameReservedTarget`] (the target starts with
+    /// the reserved `import-` prefix), [`VaultError::NothingToRename`] (no `cam:<from>:<field>` entry),
     /// [`VaultError::RenameTargetExists`] (any target id is taken; nothing is overwritten),
     /// [`VaultError::InvalidId`] (a target id would be invalid, for example over the length
     /// cap), [`VaultError::CorruptEntry`] or a store failure.
@@ -1008,6 +1011,9 @@ impl Vault {
     ) -> Result<Vec<EntryId>, VaultError> {
         if from == to {
             return Err(VaultError::RenameSame);
+        }
+        if to.as_str().starts_with(crate::legacy::RESERVED_PREFIX) {
+            return Err(VaultError::RenameReservedTarget);
         }
         let from_prefix = format!("cam:{from}:");
         let to_prefix = format!("cam:{to}:");
@@ -1031,6 +1037,15 @@ impl Vault {
             .collect::<Result<_, _>>()
             .map_err(VaultError::sqlite("rename list"))?
         };
+        // Only `cam:<from>:<field>` with one field token: `cam:a:b:host` belongs to a camera
+        // named `a:b`, not to `a`.
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(id, _, _)| {
+                id.strip_prefix(from_prefix.as_str())
+                    .is_some_and(|field| !field.is_empty() && !field.contains(':'))
+            })
+            .collect();
         if rows.is_empty() {
             return Err(VaultError::NothingToRename);
         }

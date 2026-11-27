@@ -106,6 +106,9 @@ pub enum VaultError {
         /// The id of the existing target entry.
         id: String,
     },
+    /// `rename_camera` was asked to use an id of the reserved `import-` ordinal namespace as target.
+    #[error("the target camera id starts with the reserved prefix import-")]
+    RenameReservedTarget,
     /// `rename_camera` was asked to move a camera onto itself.
     #[error("source and target camera are the same")]
     RenameSame,
