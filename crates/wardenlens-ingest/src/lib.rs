@@ -28,8 +28,8 @@ mod testsupport;
 
 pub use error::IngestError;
 pub use frame::{
-    Frame, FrameMapper, H264_CLOCK_RATE_HZ, H264Params, MAX_FRAME_BYTES, MAX_PARAM_SET_BYTES,
-    MapError, RawParams, RawVideoFrame, contains_b_slice,
+    Frame, FrameMapper, H264_CLOCK_RATE_HZ, H264Params, H264ParamsExt, MAX_FRAME_BYTES,
+    MAX_PARAM_SET_BYTES, MapError, RawParams, RawVideoFrame, contains_b_slice,
 };
 pub use session::{
     FRAME_TIMEOUT, FrameStream, OPEN_TIMEOUT, StreamInfo, open_stream, select_video_stream,

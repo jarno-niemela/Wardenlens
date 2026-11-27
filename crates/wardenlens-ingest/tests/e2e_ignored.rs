@@ -21,7 +21,7 @@ use url::Url;
 use wardenlens_core::camera::{Host, RtspPath};
 use wardenlens_core::catalogue::StreamRole;
 use wardenlens_core::time::{Clock, Timestamp};
-use wardenlens_ingest::{ReorderVerdict, contains_b_slice, open_stream, parse_sps};
+use wardenlens_ingest::{H264ParamsExt, ReorderVerdict, contains_b_slice, open_stream, parse_sps};
 
 const FRAMES_TO_OBSERVE: usize = 300;
 

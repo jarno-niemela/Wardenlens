@@ -15,6 +15,7 @@ pub mod storage;
 pub mod text;
 pub mod time;
 pub mod token_store;
+pub mod video;
 
 /// Crate version, taken from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

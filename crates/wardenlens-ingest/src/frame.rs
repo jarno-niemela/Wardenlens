@@ -3,11 +3,27 @@
 //! [`FrameMapper::map`] takes plain values, not retina types, so every branch is unit tested with
 //! synthetic input. The retina adapter in `session` only copies fields into [`RawVideoFrame`].
 
-use core::fmt;
-
 use wardenlens_core::time::Timestamp;
+use wardenlens_core::video::{self, nal_units};
+pub use wardenlens_core::video::{Frame, H264Params};
 
-use crate::sps::{self, Bits, ReorderVerdict, SpsError};
+use crate::sps::{ReorderVerdict, SpsError, sps_reordering};
+
+/// Reordering verdict of a parameter set pair (ADR 0005 open risk 1). `H264Params` lives in core,
+/// so the SPS reader of this crate extends it through a trait; import it to call `reordering`.
+pub trait H264ParamsExt {
+    /// Whether this SPS allows frame reordering.
+    ///
+    /// # Errors
+    /// [`SpsError`] when the SPS cannot be read; the stream is still delivered.
+    fn reordering(&self) -> Result<ReorderVerdict, SpsError>;
+}
+
+impl H264ParamsExt for H264Params {
+    fn reordering(&self) -> Result<ReorderVerdict, SpsError> {
+        sps_reordering(&self.sps)
+    }
+}
 
 /// Largest accepted frame (AVCC bytes). A bigger frame is dropped and counted (ADR 0005 section 2).
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -18,71 +34,6 @@ pub const MAX_PARAM_SET_BYTES: usize = 4096;
 
 /// The RTP clock rate of H.264 video (RFC 6184 section 8.2.1).
 pub const H264_CLOCK_RATE_HZ: u32 = 90_000;
-
-/// The parameter sets that a decoder or an MP4 muxer needs, as raw NAL units (one byte NAL header,
-/// no start code, no length prefix).
-#[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct H264Params {
-    /// The sequence parameter set NAL unit.
-    pub sps: Vec<u8>,
-    /// The picture parameter set NAL unit.
-    pub pps: Vec<u8>,
-}
-
-impl H264Params {
-    /// Whether this SPS allows frame reordering (ADR 0005 open risk 1).
-    ///
-    /// # Errors
-    /// [`SpsError`] when the SPS cannot be read; the stream is still delivered.
-    pub fn reordering(&self) -> Result<ReorderVerdict, SpsError> {
-        sps::sps_reordering(&self.sps)
-    }
-}
-
-impl fmt::Debug for H264Params {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("H264Params")
-            .field("sps_len", &self.sps.len())
-            .field("pps_len", &self.pps.len())
-            .finish()
-    }
-}
-
-/// One video access unit.
-#[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Frame {
-    /// The NAL units in AVCC form: each preceded by its length as a 4 byte big-endian number.
-    /// Parameter sets are not inline; they are in [`Frame::params`].
-    pub data: Vec<u8>,
-    /// A random access point: decoding can start here.
-    pub is_keyframe: bool,
-    /// The low 32 bits of the RTP timestamp, 90 kHz ticks. It wraps; the `MediaClock` unwraps it.
-    pub rtp_ts_90k: u32,
-    /// When the last packet of the frame arrived, from the injected wall `Clock`.
-    pub arrival: Timestamp,
-    /// The parameter sets, on the first frame of a session and on every frame that changes them.
-    /// `Some` is also the signal that a parameter change begins here: close the segment.
-    pub params: Option<H264Params>,
-    /// Frames may be missing before this one: it is the first of a session, RTP packets were lost
-    /// before it, or an oversized frame was dropped before it.
-    pub discontinuity: bool,
-}
-
-impl fmt::Debug for Frame {
-    /// Prints sizes, never video bytes.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Frame")
-            .field("len", &self.data.len())
-            .field("is_keyframe", &self.is_keyframe)
-            .field("rtp_ts_90k", &self.rtp_ts_90k)
-            .field("arrival", &self.arrival)
-            .field("params", &self.params)
-            .field("discontinuity", &self.discontinuity)
-            .finish()
-    }
-}
 
 /// The parameter sets as retina reports them, before the size check.
 #[derive(Clone, PartialEq, Eq)]
@@ -196,24 +147,21 @@ impl FrameMapper {
         self.params_delivered |= params.is_some();
         let discontinuity = self.pending_discontinuity || raw.loss > 0;
         self.pending_discontinuity = false;
-        Ok(Some(Frame {
-            data: raw.data,
-            is_keyframe: raw.is_random_access_point,
-            rtp_ts_90k: rtp_low_32(raw.rtp_timestamp),
+        Ok(Some(Frame::new(
+            raw.data,
+            raw.is_random_access_point,
+            rtp_low_32(raw.rtp_timestamp),
             arrival,
             params,
             discontinuity,
-        }))
+        )))
     }
 }
 
 fn convert_params(raw: RawParams) -> Result<H264Params, MapError> {
     let ok = |n: &[u8]| !n.is_empty() && n.len() <= MAX_PARAM_SET_BYTES;
     if ok(&raw.sps) && ok(&raw.pps) {
-        Ok(H264Params {
-            sps: raw.sps,
-            pps: raw.pps,
-        })
+        Ok(H264Params::new(raw.sps, raw.pps))
     } else {
         Err(MapError::BadParameterSet)
     }
@@ -222,38 +170,6 @@ fn convert_params(raw: RawParams) -> Result<H264Params, MapError> {
 /// The 32 bits an RTP header carries.
 fn rtp_low_32(unwrapped: i64) -> u32 {
     u32::try_from(unwrapped.rem_euclid(1_i64 << 32)).unwrap_or(0)
-}
-
-/// Why AVCC data is not well formed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AvccError;
-
-/// The NAL units of AVCC data (4 byte big-endian lengths). Yields an error and then stops when a
-/// length is zero, or runs past the end. No allocation.
-pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = Result<&[u8], AvccError>> {
-    let mut rest = data;
-    core::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let parsed = rest
-            .split_first_chunk::<4>()
-            .and_then(|(len, tail)| {
-                let len = usize::try_from(u32::from_be_bytes(*len)).ok()?;
-                (len > 0 && len <= tail.len()).then(|| tail.split_at(len))
-            })
-            .ok_or(AvccError);
-        match parsed {
-            Ok((nal, tail)) => {
-                rest = tail;
-                Some(Ok(nal))
-            }
-            Err(e) => {
-                rest = &[];
-                Some(Err(e))
-            }
-        }
-    })
 }
 
 fn check_avcc(data: &[u8]) -> Result<(), MapError> {
@@ -266,40 +182,15 @@ fn check_avcc(data: &[u8]) -> Result<(), MapError> {
     Ok(())
 }
 
-/// Whether any slice in this AVCC frame is a B slice (`slice_type` 1 or 6, spec table 7-6).
-///
-/// Where [`SpsSummary::reordering`](crate::sps::SpsSummary::reordering) says `Undetermined`, a B
-/// slice is the evidence that the stream reorders; a long run of frames without one is the
-/// evidence that it does not. Only the first two syntax elements of each slice are read.
+/// Whether any slice in this AVCC frame is a B slice (`slice_type` 1 or 6, spec table 7-6): the
+/// evidence that a stream reorders frames where the SPS says `Undetermined`. The scan lives in
+/// core (the recorder runs it on every frame); this maps its error to [`MapError`].
 ///
 /// # Errors
 /// [`MapError::MalformedFrame`] when the data is not AVCC, a slice header is cut off or a
 /// `slice_type` is above 9.
 pub fn contains_b_slice(avcc: &[u8]) -> Result<bool, MapError> {
-    for nal in nal_units(avcc) {
-        let nal = nal.map_err(|_| MapError::MalformedFrame)?;
-        let Some((&header, payload)) = nal.split_first() else {
-            return Err(MapError::MalformedFrame);
-        };
-        // Slice NAL unit types: 1 (non-IDR) and 5 (IDR). Partitioned slices (2 to 4) are
-        // Extended profile only and also start with the same two elements, but have no B-slice
-        // relevance for the cameras this serves, so they are not scanned.
-        if !matches!(header & 0x1f, 1 | 5) {
-            continue;
-        }
-        // The first bytes can hold an emulation prevention byte; 16 bytes cover two ue(v) values.
-        let head = sps::unescape(payload.get(..payload.len().min(16)).unwrap_or_default());
-        let mut r = Bits::new(&head);
-        r.ue().map_err(|_| MapError::MalformedFrame)?; // first_mb_in_slice
-        let slice_type = r.ue().map_err(|_| MapError::MalformedFrame)?;
-        if slice_type > 9 {
-            return Err(MapError::MalformedFrame); // table 7-6 allows 0 to 9
-        }
-        if matches!(slice_type, 1 | 6) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    video::contains_b_slice(avcc).map_err(|_| MapError::MalformedFrame)
 }
 
 #[cfg(test)]

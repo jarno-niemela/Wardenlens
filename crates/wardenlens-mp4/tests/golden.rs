@@ -346,12 +346,13 @@ fn rejects_more_samples_than_the_bound() {
         duration: 1,
         is_sync: false,
     };
-    let many = vec![one; 100_001];
+    let max = wardenlens_mp4::MAX_SAMPLES_PER_FRAGMENT;
+    let many = vec![one; max + 1];
     assert!(matches!(
         Fragment::write(1, 0, &many, &mut std::io::sink()),
         Err(Mp4Error::TooManySamples { .. })
     ));
-    assert!(Fragment::write(1, 0, &many[..100_000], &mut std::io::sink()).is_ok());
+    assert!(Fragment::write(1, 0, &many[..max], &mut std::io::sink()).is_ok());
 }
 
 #[test]
@@ -399,4 +400,23 @@ fn params_reject_bad_parameter_sets() {
         H264Params::new(&PPS, &PPS),
         Err(Mp4Error::NotAnSps)
     ));
+}
+
+/// Writer and parser agree on the sample bound: a fragment with the most samples the writer
+/// accepts is readable by the core box walk, whose `moof` payload cap is 1 MiB (P4).
+#[test]
+fn a_fragment_at_the_sample_bound_is_readable_by_the_core_parser() {
+    let data = avcc(0x41, 1);
+    let one = Sample {
+        data: &data,
+        duration: 1,
+        is_sync: false,
+    };
+    let max = wardenlens_mp4::MAX_SAMPLES_PER_FRAGMENT;
+    let mut buf = init_segment(&params()).unwrap().bytes().to_vec();
+    Fragment::write(1, 0, &vec![one; max], &mut buf).unwrap();
+    let sum = summarize(&mut SliceSource(&buf)).unwrap();
+    assert_eq!(sum.frame_count, u64::try_from(max).unwrap());
+    // One more sample would not fit the parser's cap: the writer already refuses it.
+    assert!(Fragment::write(2, 0, &vec![one; max + 1], &mut buf).is_err());
 }

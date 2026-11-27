@@ -612,21 +612,18 @@ mod tests {
     }
 
     fn frame(key: bool) -> Frame {
-        Frame {
-            data: vec![0, 0, 0, 1, 0x65],
-            is_keyframe: key,
-            rtp_ts_90k: 0,
-            arrival: Timestamp::from_unix_millis(1_700_000_000_000),
-            params: None,
-            discontinuity: false,
-        }
+        Frame::new(
+            vec![0, 0, 0, 1, 0x65],
+            key,
+            0,
+            Timestamp::from_unix_millis(1_700_000_000_000),
+            None,
+            false,
+        )
     }
 
     fn params(tag: u8) -> H264Params {
-        H264Params {
-            sps: vec![0x67, tag],
-            pps: vec![0x68, tag],
-        }
+        H264Params::new(vec![0x67, tag], vec![0x68, tag])
     }
 
     enum Step {
