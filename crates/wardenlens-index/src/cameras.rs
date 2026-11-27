@@ -250,6 +250,32 @@ impl Index {
         catalogue: &[CatalogueEntry],
         now: UnixMs,
     ) -> Result<(), IndexError> {
+        self.write_camera(record, catalogue, now, false)
+    }
+
+    /// Registers `record` only if its id is free: the check and the write are one write
+    /// transaction, so of two callers with one id exactly one succeeds and the other changes
+    /// nothing. Same vetting as [`Index::upsert_camera`].
+    ///
+    /// # Errors
+    /// [`IndexError::CameraExists`] when the id is registered, plus the errors of
+    /// [`Index::upsert_camera`].
+    pub fn insert_camera(
+        &mut self,
+        record: &CameraRecord,
+        catalogue: &[CatalogueEntry],
+        now: UnixMs,
+    ) -> Result<(), IndexError> {
+        self.write_camera(record, catalogue, now, true)
+    }
+
+    fn write_camera(
+        &mut self,
+        record: &CameraRecord,
+        catalogue: &[CatalogueEntry],
+        now: UnixMs,
+        insert_only: bool,
+    ) -> Result<(), IndexError> {
         let model = model_text(&record.model)?;
         let main = vet_path(
             "main_path",
@@ -264,15 +290,24 @@ impl Index {
             .map(|p| vet_path("sub_path", &record.model, catalogue, p.as_str()))
             .transpose()?;
         let id = record.id.as_str();
-        sql::write_tx(&mut self.conn, "upsert camera", |w| {
-            if count(w.read_conn(), sql::CAMERA_EXISTS, Some(id))? == 0
+        let (op, statement) = if insert_only {
+            ("insert camera", sql::INSERT_CAMERA)
+        } else {
+            ("upsert camera", sql::UPSERT_CAMERA)
+        };
+        sql::write_tx(&mut self.conn, op, |w| {
+            let exists = count(w.read_conn(), sql::CAMERA_EXISTS, Some(id))? != 0;
+            if exists && insert_only {
+                return Err(IndexError::CameraExists);
+            }
+            if !exists
                 && usize::try_from(count(w.read_conn(), sql::CAMERA_COUNT, None)?)
                     .map_or(true, |n| n >= MAX_CAMERAS)
             {
                 return Err(IndexError::TooManyCameras { max: MAX_CAMERAS });
             }
             w.write(
-                sql::UPSERT_CAMERA,
+                statement,
                 params![
                     id,
                     model,
@@ -283,10 +318,8 @@ impl Index {
                 ],
             )
             .map_err(|e| match e.sqlite_error_code() {
-                Some(rusqlite::ErrorCode::ConstraintViolation) => IndexError::Constraint {
-                    op: "upsert camera",
-                },
-                _ => IndexError::sqlite("upsert camera")(e),
+                Some(rusqlite::ErrorCode::ConstraintViolation) => IndexError::Constraint { op },
+                _ => IndexError::sqlite(op)(e),
             })?;
             Ok(())
         })

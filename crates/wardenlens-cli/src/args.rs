@@ -3,7 +3,10 @@
 //! No value is ever an argument: `set` and `key import` read from stdin or a no-echo prompt
 //! (ADR 0006 section 10).
 
+use std::net::Ipv4Addr;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use wardenlens_core::entry::EntryKind;
@@ -61,6 +64,9 @@ pub(crate) enum Command {
     /// (an unspecified address is probed on loopback), 3 s timeout. Exits 0 when the service answers
     /// 200, 1 otherwise. For the container healthcheck; needs no token and prints nothing on success.
     Health,
+    /// Find, add, list and remove cameras.
+    #[command(subcommand)]
+    Camera(CameraCommand),
 }
 
 /// `wardenlens token ...`
@@ -281,4 +287,118 @@ impl From<KindArg> for EntryKind {
 pub(crate) enum FieldArg {
     Username,
     Password,
+}
+
+/// `wardenlens camera ...`
+#[derive(Debug, Subcommand)]
+pub(crate) enum CameraCommand {
+    /// Probe the LAN with WS-Discovery (multicast) and list the ONVIF devices that answer.
+    ///
+    /// Everything shown is an unauthenticated suggestion from the network: every address of a
+    /// device is listed, a device whose addresses name different hosts is flagged, nothing is
+    /// ever picked for you, and nothing is fetched. Addresses already registered, this machine's
+    /// own addresses and text from the network are marked or escaped.
+    Discover(DiscoverArgs),
+    /// Register a camera: ask it over ONVIF for its main and sub stream paths (falling back to
+    /// the catalogue paths when ONVIF is unreachable) and store it with sealed credentials.
+    ///
+    /// The password is read from stdin (one line) or a no-echo prompt, never from an argument.
+    /// Refuses this machine's own addresses and 169.254.169.254 before any request is made.
+    Add(AddArgs),
+    /// List the registered cameras: id, model and host. Never a login.
+    List,
+    /// Remove a camera from the registry and its entries from the vault. Recordings are kept.
+    Remove {
+        /// The camera id.
+        id: String,
+    },
+}
+
+/// Arguments of `camera discover`.
+#[derive(Debug, Args)]
+pub(crate) struct DiscoverArgs {
+    /// How long to listen for answers (`3s`, `1500ms`, or plain seconds); at most 10 s are used.
+    #[arg(long, default_value = "3s", value_parser = parse_timeout, value_name = "DURATION")]
+    pub(crate) timeout: Duration,
+    /// The IPv4 address of the interface to probe from; the default lets the OS choose.
+    #[arg(long, default_value = "0.0.0.0", value_name = "IPV4")]
+    pub(crate) interface: Ipv4Addr,
+}
+
+/// Arguments of `camera add`.
+#[derive(Debug, Args)]
+pub(crate) struct AddArgs {
+    /// The camera id: a lowercase slug, at most 32 bytes (`front-door`).
+    #[arg(long)]
+    pub(crate) id: String,
+    /// The camera's IP address or DNS name. Never taken from a discovery result for you.
+    #[arg(long)]
+    pub(crate) host: String,
+    /// The catalogue entry, `<vendor>/<model>` as slugs (see `cameras/README.md`).
+    #[arg(long, value_name = "VENDOR/MODEL")]
+    pub(crate) model: String,
+    /// The camera login's user name. The password is read from stdin or a prompt.
+    #[arg(long)]
+    pub(crate) username: String,
+    /// The ONVIF HTTP port; defaults to the catalogue's, else 80.
+    #[arg(long, value_name = "PORT")]
+    pub(crate) onvif_port: Option<NonZeroU16>,
+    /// A display name; defaults to the id.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+}
+
+/// Parses `3s`, `1500ms` or `3` (seconds): a positive duration.
+fn parse_timeout(text: &str) -> Result<Duration, String> {
+    let (digits, unit_ms) = match text.strip_suffix("ms") {
+        Some(d) => (d, 1_u64),
+        None => (text.strip_suffix('s').unwrap_or(text), 1000),
+    };
+    if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("not a duration".to_owned());
+    }
+    let n: u64 = digits.parse().map_err(|_| "not a duration".to_owned())?;
+    if n == 0 {
+        return Err("must be above zero".to_owned());
+    }
+    Ok(Duration::from_millis(n.saturating_mul(unit_ms)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_parse_by_the_table() {
+        let ok = [
+            ("3s", 3000),
+            ("3", 3000),
+            ("1500ms", 1500),
+            ("1ms", 1),
+            ("10s", 10_000),
+        ];
+        for (text, ms) in ok {
+            assert_eq!(parse_timeout(text), Ok(Duration::from_millis(ms)), "{text}");
+        }
+        for bad in [
+            "",
+            "s",
+            "ms",
+            "0",
+            "0s",
+            "0ms",
+            "-1s",
+            "+1s",
+            "1.5s",
+            " 1s",
+            "1 s",
+            "1m",
+            "1S",
+            "1e3",
+            "9999999999s",
+            "\u{0663}s",
+        ] {
+            assert!(parse_timeout(bad).is_err(), "{bad:?}");
+        }
+    }
 }

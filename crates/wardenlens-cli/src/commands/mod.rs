@@ -6,6 +6,7 @@
 //! [`report_error`], which honours `--log-format`. The older `vault_cmd` module predates this
 //! layout and keeps its own error type and terminal handling.
 
+pub(crate) mod camera;
 pub(crate) mod config;
 pub(crate) mod health;
 pub(crate) mod import;

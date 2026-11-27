@@ -34,6 +34,7 @@ wardenlens-ingest = { path = "../wardenlens-ingest" }
 wardenlens-recorder = { path = "../wardenlens-recorder" }
 wardenlens-storage = { path = "../wardenlens-storage" }
 wardenlens-index = { path = "../wardenlens-index" }
+wardenlens-onvif = { path = "../wardenlens-onvif" }
 wardenlens-secrets = { path = "../wardenlens-secrets" }
 wardenlens-vault = { path = "../wardenlens-vault" }
 zeroize = "1"
