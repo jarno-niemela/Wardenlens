@@ -84,7 +84,7 @@ pub(crate) struct CameraInput<S> {
 }
 
 /// Knobs with production defaults; tests shrink them.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Tuning {
     pub(crate) storage_interval: Duration,
     pub(crate) shutdown_deadline: Duration,
@@ -93,6 +93,9 @@ pub(crate) struct Tuning {
     pub(crate) recorder: RecorderConfig,
     /// Connections served now and at most; read at shutdown.
     pub(crate) stats: ConnectionStats,
+    /// Test hook run before each recorder is built (to hold a camera in start-up).
+    #[cfg(test)]
+    pub(crate) before_recorder: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Two directories of one filesystem as hot and archive (storage's test switch).
     #[cfg(test)]
     pub(crate) allow_same_filesystem: bool,
@@ -107,6 +110,8 @@ impl Default for Tuning {
             supervisor: SupervisorConfig::default(),
             recorder: RecorderConfig::default(),
             stats: ConnectionStats::default(),
+            #[cfg(test)]
+            before_recorder: None,
             #[cfg(test)]
             allow_same_filesystem: false,
         }
@@ -168,6 +173,9 @@ impl wardenlens_core::time::Clock for SystemClock {
 struct Running {
     supervisor: JoinHandle<()>,
     recorder: JoinHandle<RecorderHealth>,
+    /// Wakes the storage loop on `ENOSPC`; ends with the recorder's health channel. Kept here so
+    /// that the wiring cannot be dropped without the compiler noticing (see `stop_all`).
+    wake_watcher: JoinHandle<()>,
 }
 
 /// How a service that did not fail ended.
@@ -181,16 +189,18 @@ pub(crate) enum Stopped {
     Abandoned,
 }
 
-/// Releases the runtime after [`run`]. A clean stop drops it normally (nothing is left to wait
-/// for). After an overrun or an abandoned start-up it is shut down without waiting: dropping a
-/// multi-thread runtime waits without limit for `spawn_blocking` tasks, which would make the
-/// 10 s deadline meaningless. The abandoned work is crash-safe (see the module docs).
+/// How long a clean release waits for blocking tasks that are still running (a DNS lookup that
+/// ingest started for a camera host, an API index read).
+const CLEAN_GRACE: Duration = Duration::from_secs(1);
+
+/// Releases the runtime after [`run`]; always with `shutdown_timeout`, never a plain drop,
+/// because dropping a multi-thread runtime waits without limit for `spawn_blocking` tasks (even
+/// after every part stopped in time, a hung `getaddrinfo` would hold the process). A clean stop
+/// waits at most [`CLEAN_GRACE`] for leftovers; after an overrun or an abandoned start-up it does
+/// not wait at all, so the 10 s deadline holds. What is abandoned is crash-safe (see the module
+/// docs).
 pub(crate) fn release_runtime(runtime: tokio::runtime::Runtime, clean: bool) {
-    if clean {
-        drop(runtime);
-    } else {
-        runtime.shutdown_timeout(Duration::ZERO);
-    }
+    runtime.shutdown_timeout(if clean { CLEAN_GRACE } else { Duration::ZERO });
 }
 
 /// Aborts a task when dropped.
@@ -308,8 +318,11 @@ where
             config: recorder_config,
             supervisor: tuning.supervisor,
             cancel: cancel.clone(),
+            stop: stop.clone(),
             links: links.clone(),
             reconciled: &reconciled,
+            #[cfg(test)]
+            before_recorder: tuning.before_recorder.clone(),
         },
         &storage,
     )
@@ -402,6 +415,10 @@ async fn start_cameras<S: StreamSource>(
     let mut directory = Vec::new();
     let mut running = Vec::new();
     for (position, input) in cameras.into_iter().enumerate() {
+        if shared.stop.is_cancelled() {
+            tracing::info!("stopped while starting cameras; the rest are not started");
+            break;
+        }
         let id = input.camera.id().clone();
         let setup = Setup {
             shared,
@@ -411,7 +428,7 @@ async fn start_cameras<S: StreamSource>(
         if let Ok(r) = setup.start(&id, input.source).await {
             running.push(r);
             directory.push(input.camera);
-        } else {
+        } else if !shared.stop.is_cancelled() {
             tracing::error!(camera = %id, "camera skipped: its recorder could not be set up");
         }
     }
@@ -438,6 +455,8 @@ async fn stop_all(
         } else {
             on_time = false;
         }
+        // It ends by itself with the recorder's health channel; make sure either way.
+        r.wake_watcher.abort();
     }
     let storage_stopped = tokio::task::spawn_blocking(move || storage.stop());
     on_time &= within(deadline, storage_stopped).await.is_some();
@@ -480,6 +499,11 @@ struct Shared<'a> {
     supervisor: SupervisorConfig,
     cancel: CancelToken,
     links: Links,
+    /// The stop signal: a camera that is still being set up when it arrives is not started.
+    stop: CancelToken,
+    /// Test hook run on the blocking pool before a recorder is built.
+    #[cfg(test)]
+    before_recorder: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The start-up reconciliation: the newest key it saw per camera is the recorder's seed.
     reconciled: &'a Reconciled,
 }
@@ -500,14 +524,31 @@ impl Setup<'_> {
         let built = {
             let (id, hot, index) = (id.clone(), Arc::clone(&shared.hot), shared.index.clone());
             let (config, newest) = (shared.config, shared.reconciled.newest.get(&id));
-            tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let hook = shared.before_recorder.clone();
+            let blocking = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(h) = hook {
+                    h();
+                }
                 let root = hot.try_clone().map_err(|e| {
                     tracing::error!(camera = %id, error = %e, "cannot open the hot root for the camera");
                 })?;
-                Recorder::new(id.clone(), config, HotStore::new(root, id.clone()), index, newest)
-                    .map_err(|e| tracing::error!(camera = %id, error = %e, "cannot build the recorder"))
-            })
-            .await
+                Recorder::new(
+                    id.clone(),
+                    config,
+                    HotStore::new(root, id.clone()),
+                    index,
+                    newest,
+                )
+                .map_err(|e| tracing::error!(camera = %id, error = %e, "cannot build the recorder"))
+            });
+            // A set-up that hangs (a busy index) must not hold the stop: abandon it.
+            tokio::select! {
+                biased;
+                () = shared.stop.cancelled() => return Err(()),
+                built = blocking => built,
+            }
         };
         let Ok(Ok((recorder, health))) = built else {
             return Err(());
@@ -527,12 +568,13 @@ impl Setup<'_> {
             shared.links.clone(),
             wall_now,
         ));
-        wire_storage_wake(health, self.wake);
+        let wake_watcher = wire_storage_wake(health, self.wake);
         let recorder =
             tokio::task::spawn_blocking(move || recorder.run(ChannelSource::new(frames)));
         Ok(Running {
             supervisor,
             recorder,
+            wake_watcher,
         })
     }
 }

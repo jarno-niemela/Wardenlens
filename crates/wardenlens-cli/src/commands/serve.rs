@@ -144,8 +144,16 @@ fn start(ctx: &Context<'_>) -> Result<(), CommandError> {
         .await
         .map_err(CommandError::from)
     });
-    // A clean stop drops the runtime; anything else (an overrun, a signal during start-up, a
-    // refusal) abandons blocking tasks so that the exit is not held by them.
+    finish(runtime, result)
+}
+
+/// The tail of [`start`]: releases the runtime, then reports the result. A clean stop gives
+/// blocking leftovers a short grace; anything else (an overrun, a signal during start-up, a
+/// refusal) abandons them, so the exit is never held by blocking tasks (see `release_runtime`).
+fn finish(
+    runtime: tokio::runtime::Runtime,
+    result: Result<Stopped, CommandError>,
+) -> Result<(), CommandError> {
     release_runtime(runtime, matches!(result, Ok(Stopped::Clean)));
     result.map(|_| ())
 }
@@ -412,6 +420,52 @@ mod tests {
             .unwrap();
         assert!(matches!(err, CommandError::Vault(_)));
         assert_eq!(err.exit_code(), 2);
+    }
+
+    fn runtime_with_a_stuck_blocking_task() -> tokio::runtime::Runtime {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        runtime
+    }
+
+    /// The real tail of `start`: an overrun is exit 1 and returns at once (not after the stuck
+    /// task); a refusal and an abandoned start-up do not wait either; a clean stop waits at most
+    /// the short grace. Passing `clean = true` for the overrun would take the grace and fail the
+    /// 500 ms bound.
+    #[test]
+    fn the_tail_of_start_never_waits_for_blocking_tasks() {
+        let bounds = [
+            (
+                Err(CommandError::Serve(ServeError::ShutdownTimeout(
+                    Duration::from_secs(10),
+                ))),
+                Some(1),
+                500,
+            ),
+            (Err(CommandError::AlreadyRunning), Some(2), 500),
+            (Ok(Stopped::Abandoned), None, 500),
+            (Ok(Stopped::Clean), None, 3000),
+        ];
+        for (result, code, bound_ms) in bounds {
+            let at = std::time::Instant::now();
+            let out = finish(runtime_with_a_stuck_blocking_task(), result);
+            assert!(
+                at.elapsed() < Duration::from_millis(bound_ms) + Duration::from_millis(100),
+                "{:?}",
+                at.elapsed()
+            );
+            match (out, code) {
+                (Ok(()), None) => {}
+                (Err(e), Some(c)) => assert_eq!(e.exit_code(), c),
+                (other, _) => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     #[test]

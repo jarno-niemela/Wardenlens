@@ -278,11 +278,9 @@ impl Storage {
         Self::open_on_with(hot, cfg, index, usage, |fs| fs)
     }
 
-    /// As [`open_on`](Self::open_on), with `wrap` applied to the real file system.
-    ///
-    /// # Errors
-    /// [`StorageError::NoActions`].
-    pub fn open_on_with<I, U, F>(
+    /// As [`open_on`](Self::open_on), with `wrap` applied to the real file system (private: only
+    /// `open_with` needs it).
+    fn open_on_with<I, U, F>(
         hot: RootDir,
         cfg: StorageConfig,
         index: I,

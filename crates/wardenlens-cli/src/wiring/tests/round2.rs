@@ -27,14 +27,11 @@ fn releasing_the_runtime_after_an_overrun_does_not_wait_for_blocking_tasks() {
     let at = std::time::Instant::now();
     release_runtime(runtime, false);
     assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
-    // The error that makes `serve` release this way is exit 1.
-    let overrun = ServeError::ShutdownTimeout(Duration::from_secs(10));
-    assert!(matches!(overrun, ServeError::ShutdownTimeout(_)));
 }
 
-/// A clean release does wait (nothing is running, so it is quick).
+/// A clean release of an idle runtime is quick.
 #[test]
-fn a_clean_release_drops_the_runtime() {
+fn a_clean_release_of_an_idle_runtime_is_quick() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -78,33 +75,57 @@ fn idle_health(site: &Site) -> RecorderHealth {
 }
 
 /// The ENOSPC wake where it is wired: a recorder health that moves to `Held(StorageFull)` makes
-/// the storage loop tick long before its (hour-long) interval; other holds do not.
+/// the storage loop tick long before its (hour-long) interval; another hold (`WriteFailed`) does
+/// not. Ticks are counted by the loop's clock, and every wait is on that observable count with a
+/// timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_recorder_wakes_the_storage_loop_before_the_interval() {
     let site = Site::new();
     let health = idle_health(&site);
     let (tx, rx) = watch::channel(health);
-    let (snap_tx, mut snap_rx) = watch::channel(StorageSnapshot::initial());
+    let (snap_tx, _snap_rx) = watch::channel(StorageSnapshot::initial());
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&count);
     let task = storage_task::spawn(
         storage::looper(&site),
         Duration::from_secs(3600),
         snap_tx,
-        wall_now,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            wall_now()
+        },
     )
     .unwrap();
     wire_storage_wake(rx, task.waker());
-    let first = storage::ticks(&mut snap_rx, None).await;
+    let ticks_after = |n: usize| {
+        let count = Arc::clone(&count);
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while count.load(Ordering::SeqCst) <= n {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(ticks_after(0).await, "the loop ticks at start");
+    let at_start = count.load(Ordering::SeqCst);
 
-    // Another hold is not a wake.
+    // Another hold is not a wake: no tick follows within a generous wait.
     let mut other = health;
     other.state = RecorderState::Held(HoldReason::WriteFailed);
     tx.send_replace(other);
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    let early = tokio::time::timeout(Duration::from_millis(300), ticks_after(at_start)).await;
+    assert!(early.is_err(), "a WriteFailed hold ticked the storage loop");
+
     let mut full = health;
     full.state = RecorderState::Held(HoldReason::StorageFull);
     tx.send_replace(full);
-    let second = storage::ticks(&mut snap_rx, Some(first)).await;
-    assert!(second > first);
+    assert!(
+        ticks_after(at_start).await,
+        "StorageFull did not wake the loop"
+    );
     tokio::task::spawn_blocking(move || task.stop())
         .await
         .unwrap();
@@ -255,4 +276,45 @@ async fn accept_errors_do_not_end_the_loop() {
     );
     assert!(seen.load(Ordering::SeqCst) >= 4);
     svc.shutdown().await.1.unwrap();
+}
+
+/// A stop signal while a camera is still being set up (its recorder build is held by the test
+/// hook) is not held up by it: the service stops cleanly, within the deadline, with that camera
+/// not started.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_signal_during_camera_start_up_does_not_wait_for_the_camera() {
+    let site = Site::new();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered = Mutex::new(Some(entered_tx));
+    let release = Mutex::new(release_rx);
+    let mut tuning = quick();
+    tuning.before_recorder = Some(Arc::new(move || {
+        if let Some(tx) = entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        let _ = release.lock().unwrap().recv();
+    }));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let svc = site
+        .start(
+            vec![CameraInput {
+                camera: camera("cam-ok", "192.0.2.10"),
+                source: Fake::Live(Some(rx)),
+            }],
+            tuning,
+        )
+        .await;
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+    let (took, result) = svc.shutdown().await;
+    assert_eq!(result.unwrap(), Stopped::Clean);
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // The camera was never started: frames sent now are not recorded.
+    for f in frames(0, 3, now_ms() - 3_600_000) {
+        let _ = tx.send(f);
+    }
+    assert_eq!(site.files(".part") + site.files(".mp4"), 0);
+    let _ = release_tx.send(());
 }
