@@ -1,5 +1,7 @@
 //! A hand-rolled ONVIF device client over plain HTTP (ADR 0004 section 7).
 //!
+//! [`discovery`] finds devices on the LAN with WS-Discovery; the client below talks to one.
+//!
 //! Three read-only calls: [`OnvifClient::get_device_information`], [`OnvifClient::get_profiles`]
 //! and [`OnvifClient::get_stream_uri`]. Everything a camera sends is untrusted network input
 //! (SEC-2): the reply is read through a 1 MiB limit on the socket read itself, parsed with
@@ -29,8 +31,10 @@
 //! # Credentials
 //!
 //! The password goes into exactly one place, the digest input buffer, which is wiped on return.
-//! It is never formatted: not in `Debug`, not in errors, not in any log. This crate emits no
-//! log or tracing events at all.
+//! It is never formatted: not in `Debug`, not in errors, not in any log. The only events this
+//! crate logs are [`discovery`]'s, at `debug` level, each a fixed text plus the probe id and
+//! never reply text: a reason for every dropped entry or ignored datagram, a datagram over 64
+//! KiB, and a receive error (as its `ErrorKind`).
 //!
 //! # The camera does not choose where the recorder connects
 //!
@@ -43,6 +47,7 @@
 //! `NotAuthorized`; reading its clock with `GetSystemDateAndTime` is not part of this crate yet.
 
 mod client;
+pub mod discovery;
 mod error;
 mod model;
 mod parse;

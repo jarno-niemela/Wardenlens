@@ -19,11 +19,12 @@ pub const DEFAULT_SERVICE_PATH: &str = "/onvif/device_service";
 
 /// A validated service path (`/onvif/device_service`): `/` then `pchar` bytes without `?`, `#`,
 /// `%` or `@`, no `//` at the start, at most [`MAX_SERVICE_PATH_LEN`] bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServicePath(String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ServicePath(String);
 
 impl ServicePath {
-    fn new(text: &str) -> Result<Self, OnvifError> {
+    /// The one rule for a service path, shared with WS-Discovery's `XAddr` check.
+    pub(crate) fn new(text: &str) -> Result<Self, OnvifError> {
         let ok = text.starts_with('/')
             && !text.starts_with("//")
             && text.len() <= MAX_SERVICE_PATH_LEN
@@ -55,6 +56,10 @@ impl ServicePath {
         } else {
             Err(OnvifError::InvalidServicePath)
         }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
