@@ -8,9 +8,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/lib.sh"
 secs="${1:-20}"
 printf 'stream\tpackets\tfps\tkbps\tgop_frames\tgop_seconds\n'
-mapfile -t ids < <(selected_cams)
-(( ${#ids[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; exit 1; }
-for name in "${ids[@]}"; do
+load_cams || exit 1
+for name in "${CAMS[@]}"; do
   for kind in main sub; do
     url="$(rtsp_url "$name" "$(rtsp_path "$name" "$kind")")" || exit 1
     timeout $((secs + 30)) ffprobe -v error -rtsp_transport tcp -select_streams v:0 \

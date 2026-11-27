@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only Dahua CGI probe (digest auth). Credentials go to curl via a config on a pipe, never argv.
-# Usage: dahua.sh <camera-name> get <cgi-path-and-query>        one GET, body to stdout
-#        dahua.sh <camera-name> attach <seconds> [codes]          long-poll eventManager attach
+# Usage: dahua.sh <camera-id> get <cgi-path-and-query>        one GET, body to stdout
+#        dahua.sh <camera-id> attach <seconds> [codes]          long-poll eventManager attach
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh

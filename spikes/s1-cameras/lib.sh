@@ -22,17 +22,42 @@ cam_id() {
 }
 
 # cam_ids -> the inventory ids that have a host entry in the vault (cam:<id>:host), one per line. `vault list` prints
-# ids and kinds, never values.
+# ids and kinds, never values. A :host entry whose id is not a usable inventory id is reported on stderr, not dropped.
 cam_ids() {
   local out
   out="$(wl vault list)" || return 1
-  awk -F'\t' '$1 ~ /^cam:[a-z0-9][a-z0-9-]*:host$/ { split($1, p, ":"); print p[2] }' <<<"$out"
+  awk -F'\t' '
+    $1 ~ /^cam:[a-z0-9][a-z0-9-]*:host$/ { split($1, p, ":"); print p[2]; next }
+    $1 ~ /^cam:.*:host$/ { printf "cam_ids: skipping a vault host entry whose id is not a usable inventory id: %s\n", $1 > "/dev/stderr" }
+  ' <<<"$out"
 }
 
-# selected_cams -> the inventory ids in $CAMERAS (space separated) if set, else cam_ids; one per line, each checked.
+# selected_cams -> the inventory ids in $CAMERAS (whitespace separated, never glob-expanded) if set, else cam_ids; one
+# per line. Non-zero, printing nothing, if any id is invalid.
 selected_cams() {
-  local c
-  if [[ -n ${CAMERAS:-} ]]; then for c in $CAMERAS; do cam_id "$c" || return 1; done; else cam_ids; fi
+  local c list=() all=""
+  if [[ -n ${CAMERAS:-} ]]; then
+    IFS=$' \t\n' read -r -d '' -a list <<<"$CAMERAS" || true
+    for c in "${list[@]}"; do all+="$(cam_id "$c")"$'\n' || return 1; done
+    printf '%s' "$all"
+  else
+    cam_ids
+  fi
+}
+
+# load_cams -> fills the global array CAMS with the selected inventory ids. The one choke point for the scripts that
+# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, a vault failure or an empty selection.
+load_cams() {
+  local out id
+  declare -A seen=()
+  CAMS=()
+  out="$(selected_cams)" || { echo "no usable camera selection" >&2; return 1; }
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    if [[ -n ${seen[$id]:-} ]]; then CAMS=(); echo "duplicate camera id: $id" >&2; return 1; fi
+    seen[$id]=1; CAMS+=("$id")
+  done <<<"$out"
+  (( ${#CAMS[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; return 1; }
 }
 
 # cam_host <name> -> bare host from the vault (entry cam:<id>:host).
@@ -119,8 +144,8 @@ redact() {
   ) || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
-# Vendor RTSP paths (main|sub) by camera; takes an inventory id.
-rtsp_path() { # <name> <main|sub>
+# Vendor RTSP paths (main|sub) by camera; takes an inventory id. An id with no known vendor path is an error.
+rtsp_path() { # <id> <main|sub>
   local id
   id="$(cam_id "$1")" || return 1
   case "$id" in
@@ -128,5 +153,6 @@ rtsp_path() { # <name> <main|sub>
     xr) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
     tapo) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
     hdipc) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
+    *) echo "no vendor RTSP path for camera: $id" >&2; return 1 ;;
   esac
 }

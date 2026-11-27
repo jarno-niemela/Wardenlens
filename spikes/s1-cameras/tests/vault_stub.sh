@@ -38,20 +38,18 @@ S
 chmod +x "$fx/bin/wardenlens"
 export PATH="$fx/bin:$PATH"
 
-# stub_id <inventory id> -> the inventory id (cam_id in lib.sh checks, it does not map).
-stub_id() { echo "$1"; }
 # redact_add <value>: the stub's redact replaces this value.
 redact_add() { jq --arg v "$1" '. + [$v]' "$VAULT_STUB/.redact" >"$VAULT_STUB/.r" && mv "$VAULT_STUB/.r" "$VAULT_STUB/.redact"; }
 # vault_put <entry-id> <value>
 vault_put() { printf '%s' "$2" >"$VAULT_STUB/${1//:/_}"; }
 # cred <camera> <user> <password>: the credential entry (both fields); the password is also redacted.
 cred() {
-  local id; id="$(stub_id "$1")"
+  local id; id="$1"
   printf '%s' "$2" >"$VAULT_STUB/cam_${id}_credential.username"
   printf '%s' "$3" >"$VAULT_STUB/cam_${id}_credential.password"
   [[ -z $3 ]] || redact_add "$3"
 }
 # host <camera> <host>
-host() { vault_put "cam:$(stub_id "$1"):host" "$2"; }
+host() { vault_put "cam:$1:host" "$2"; }
 # no_entries: an empty vault
 no_entries() { find "$VAULT_STUB" -maxdepth 1 -type f ! -name '.*' -delete; }

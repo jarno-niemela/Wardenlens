@@ -5,9 +5,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$here/lib.sh"
-mapfile -t ids < <(selected_cams)
-(( ${#ids[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; exit 1; }
-for name in "${ids[@]}"; do
+load_cams || exit 1
+for name in "${CAMS[@]}"; do
   for kind in main sub; do
     path="$(rtsp_path "$name" "$kind")"
     url="$(rtsp_url "$name" "$path")" || exit 1

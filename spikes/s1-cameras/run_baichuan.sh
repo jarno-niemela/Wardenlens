@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the Baichuan probe against a Reolink camera by name (read-only unless an action is given).
-# Usage: run_baichuan.sh <camera-name> <listen-seconds> [abilities|https-on|https-off]
+# Usage: run_baichuan.sh <camera-id> <listen-seconds> [abilities|https-on|https-off]
 # Actions: abilities is read-only; https-on / https-off WRITE the camera's HTTPS port setting and need
 # the camera owner's explicit approval first.
 # Credentials are passed via environment only to the probe process.

@@ -18,7 +18,7 @@ deadline=$(( $(date +%s) + duration ))
 
 run_stream() { # <cam> <kind>
   local cam="$1" kind="$2" tag restarts=0 url left rc
-  tag="$(printf '%s_%s' "${cam// /_}" "$kind" | tr -d '()')"
+  tag="${cam}_${kind}"
   url="$(rtsp_url "$cam" "$(rtsp_path "$cam" "$kind")")" || return 1
   : >"$out/$tag.log"; : >"$out/$tag.progress"
   while :; do
@@ -40,11 +40,9 @@ run_stream() { # <cam> <kind>
   echo "$restarts" >"$out/$tag.restarts"
 }
 
-# Cameras: the inventory ids in CAMERAS (space separated), else every camera with a host in the vault.
-mapfile -t ids < <(selected_cams)
-(( ${#ids[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; exit 1; }
+load_cams || exit 1
 streams=()
-for id in "${ids[@]}"; do streams+=("$id:main" "$id:sub"); done
+for id in "${CAMS[@]}"; do streams+=("$id:main" "$id:sub"); done
 # Fail before starting anything if a URL cannot be built (unknown camera, missing host).
 for s in "${streams[@]}"; do rtsp_url "${s%%:*}" "$(rtsp_path "${s%%:*}" "${s##*:}")" >/dev/null || exit 1; done
 for s in "${streams[@]}"; do run_stream "${s%%:*}" "${s##*:}" & done
@@ -53,7 +51,7 @@ wait
 printf 'stream\trestarts\tlast_frame_count_per_run\twarnings\n' >"$out/summary.tsv"
 for s in "${streams[@]}"; do
   cam="${s%%:*}"; kind="${s##*:}"
-  tag="$(printf '%s_%s' "${cam// /_}" "$kind" | tr -d '()')"
+  tag="${cam}_${kind}"
   restarts="$(cat "$out/$tag.restarts" 2>/dev/null || echo -)"
   frames="$(grep -E '^frame=' "$out/$tag.progress" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
   warns="$(grep -cviE 'RESTART|^$' "$out/$tag.log" 2>/dev/null || true)"
