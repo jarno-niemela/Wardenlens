@@ -4,6 +4,8 @@
 //! together and exactly one cell applies. Every step that can fail leaves the key as it was found
 //! and counts it `unverified`; no step deletes an invalid file.
 
+use std::io::{Read, Seek, SeekFrom};
+
 use rustix::io::Errno;
 use wardenlens_core::mp4box::Mp4Summary;
 use wardenlens_core::recording::SegmentRecord;
@@ -19,6 +21,9 @@ use crate::index::Rel;
 /// not say whether it was transient, so every failure gets the same bounded retries (section 3:
 /// never an unbounded loop).
 pub(crate) const ADOPT_INSERT_ATTEMPTS: u32 = 3;
+
+/// Bytes read at a time when two copies are compared.
+const COMPARE_CHUNK: usize = 64 * 1024;
 
 /// A file that was looked at and is a regular file the key can rely on.
 struct Valid {
@@ -201,6 +206,48 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
         }
     }
 
+    /// Whether the two copies hold the same bytes. `None` when either could not be read to the
+    /// end: no conclusion, so nothing is deleted on it. Both files are read in bounded chunks and
+    /// each is at most `MAX_SEGMENT_BYTES` (the caller has checked the sizes are equal).
+    fn same_bytes(first: &mut Opened, second: &mut Opened) -> Option<bool> {
+        if first.len != second.len {
+            return Some(false);
+        }
+        first.file.seek(SeekFrom::Start(0)).ok()?;
+        second.file.seek(SeekFrom::Start(0)).ok()?;
+        let mut left_buf = vec![0u8; COMPARE_CHUNK];
+        let mut right_buf = vec![0u8; COMPARE_CHUNK];
+        let mut left = first.len;
+        while left > 0 {
+            let n = usize::try_from(left).map_or(COMPARE_CHUNK, |l| l.min(COMPARE_CHUNK));
+            let (xs, ys) = (left_buf.get_mut(..n)?, right_buf.get_mut(..n)?);
+            first.file.read_exact(xs).ok()?;
+            second.file.read_exact(ys).ok()?;
+            if xs != ys {
+                return Some(false);
+            }
+            left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+        Some(true)
+    }
+
+    /// The hot copy `H` of a key whose archive copy `A` is valid. Both have the size the row (or
+    /// the adoption) gives, but a name is not an identity: a file at the same key may be a
+    /// different recording (the recorder bumped its key onto a name another row held, #195). So
+    /// `H` is deleted only when it is a byte-identical copy of `A`; a file that is not is
+    /// quarantined (never deleted) and counted `foreign_twins`, a health error. When the bytes
+    /// could not be compared nothing is deleted and the key is `unverified`.
+    fn settle_hot_twin(&mut self, rel: &Rel, h: &mut Opened, a: &mut Opened) {
+        match Self::same_bytes(h, a) {
+            Some(true) => self.delete_twin(Tier::Hot, rel),
+            Some(false) => {
+                bump(&mut self.report.foreign_twins);
+                self.quarantine(Tier::Hot, rel);
+            }
+            None => bump(&mut self.report.unverified),
+        }
+    }
+
     /// Adopt a valid file of `tier` that has no row: fsync it and its directory, then insert the
     /// row. Any insert failure (after the bounded attempts) quarantines the file. `false` when
     /// no row was added.
@@ -256,13 +303,24 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
             }
             (Kind::Valid, Kind::Valid) => {
                 // Adopt A; H goes only when the two sizes are equal, otherwise it is quarantined.
-                if let (Some(h), Some(a)) = (h.valid(), a.valid()) {
-                    let same = h.file.len == a.file.len;
+                if let (Some(mut h), Some(mut a)) = (h.valid(), a.valid()) {
+                    // Equal sizes are only a hint: the bytes decide (see `settle_hot_twin`).
+                    let sizes = h.file.len == a.file.len;
+                    let same = if sizes {
+                        Self::same_bytes(&mut h.file, &mut a.file)
+                    } else {
+                        Some(false)
+                    };
                     if self.adopt(Tier::Archive, rel, a) {
-                        if same {
-                            self.delete_twin(Tier::Hot, rel);
-                        } else {
-                            self.quarantine(Tier::Hot, rel);
+                        match same {
+                            Some(true) => self.delete_twin(Tier::Hot, rel),
+                            Some(false) => {
+                                if sizes {
+                                    bump(&mut self.report.foreign_twins);
+                                }
+                                self.quarantine(Tier::Hot, rel);
+                            }
+                            None => bump(&mut self.report.unverified),
                         }
                     }
                 }
@@ -307,7 +365,7 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
         rel: &Rel,
         row: &IndexedSegment,
         kinds: (Kind, Kind),
-        (_, a): (Seen, Seen),
+        (h, a): (Seen, Seen),
     ) {
         match kinds {
             (Kind::Absent, Kind::Absent) => {
@@ -330,11 +388,20 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
             (Kind::Valid, Kind::Absent) => {}
             (Kind::Valid, Kind::Valid) => {
                 // Roll forward (a crash after M6, M7 or before M8): the row first, H last.
-                if let Some(a) = a.valid()
-                    && self.point_row(row, Tier::Archive, rel, a)
-                {
-                    bump(&mut self.report.rolled_forward);
-                    self.delete_twin(Tier::Hot, rel);
+                if let (Some(mut h), Some(mut a)) = (h.valid(), a.valid()) {
+                    // Compared before the row moves: `a` is consumed by `point_row`.
+                    let same = Self::same_bytes(&mut h.file, &mut a.file);
+                    if self.point_row(row, Tier::Archive, rel, a) {
+                        bump(&mut self.report.rolled_forward);
+                        match same {
+                            Some(true) => self.delete_twin(Tier::Hot, rel),
+                            Some(false) => {
+                                bump(&mut self.report.foreign_twins);
+                                self.quarantine(Tier::Hot, rel);
+                            }
+                            None => bump(&mut self.report.unverified),
+                        }
+                    }
                 }
             }
             (Kind::Valid, Kind::Invalid) => {
@@ -394,10 +461,10 @@ impl<F: Fs, I: SegmentIndex> Reconciler<'_, F, I> {
             }
             (Kind::Valid, Kind::Valid) => {
                 // A crash after M8, before M9: H goes, after A is durable.
-                if let Some(mut a) = a.valid()
+                if let (Some(mut h), Some(mut a)) = (h.valid(), a.valid())
                     && self.durable(Tier::Archive, rel, &mut a.file)
                 {
-                    self.delete_twin(Tier::Hot, rel);
+                    self.settle_hot_twin(rel, &mut h.file, &mut a.file);
                 }
             }
             (Kind::Valid, Kind::Invalid) => {

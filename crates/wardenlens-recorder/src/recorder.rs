@@ -213,6 +213,7 @@ where
             arrival,
             u64::try_from(frame.data.len()).unwrap_or(u64::MAX),
         );
+        self.cut_if_full(frame.data.len());
         let pushed = self.segmenter.push(meta);
         self.apply(frame, arrival, pushed);
     }

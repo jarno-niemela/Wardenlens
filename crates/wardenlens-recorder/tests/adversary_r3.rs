@@ -1,18 +1,12 @@
 //! Adversary round 3 (ticket #57): every path from an insert error to quarantine, and the
 //! tri-state read-back (`Match`, `NoRow`, `Differs`, `Unknown`).
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "test code on small synthetic values; a panic is a failure"
-)]
-
 mod common;
 
 use common::rig::*;
 use common::*;
 use rusqlite::ErrorCode;
-use wardenlens_core::recording::{RelPath, SegmentRecord};
-use wardenlens_core::storage::{SegmentIndex, Tier};
+use wardenlens_core::recording::RelPath;
 use wardenlens_index::IndexError;
 
 fn quarantined(root: &std::path::Path) -> Vec<String> {
@@ -129,43 +123,39 @@ fn several_transient_errors_then_a_permanent_one_with_an_unreadable_index_keeps_
     }
 }
 
-/// Builds a rig with an archive-tier row at `T0 + 101`, starts a segment at `T0 + 100` and
-/// plants a foreign file at `T0 + 100`'s final name, so the rename is bumped onto `T0 + 101`.
-fn bumped_rig() -> (Rig, std::path::PathBuf) {
-    let mut r = Rig::build(fast(), None, |_, index| {
-        let rec = SegmentRecord::new(cam(), ms(T0 + 101), 1_000, 4_096, 10);
-        index.insert(&rec, Tier::Archive).unwrap();
-    });
-    r.start();
-    r.feed(Slice::P);
-    let planted = r.root.join(RelPath::new(&cam(), ms(T0 + 100)).to_string());
-    std::fs::write(&planted, b"foreign").unwrap();
-    (r, planted)
-}
-
-/// Bumped onto a held key, and the read-back cannot be answered: the file stays, unindexed.
+/// The rename bump probes the index (#195): a key a row holds is skipped, and so is a key the
+/// index cannot answer for. The file lands one key further, is indexed there, and the held
+/// key's row and the planted file are untouched. (Before #195 the file was finished under the
+/// held key and left unindexed.)
 #[test]
-fn a_bumped_key_with_an_unreadable_index_keeps_the_file_unindexed() {
+fn a_bumped_key_with_an_unreadable_index_is_skipped_as_if_held() {
     let (r, planted) = bumped_rig();
     r.index.lock().unwrap().list_errors = 1;
     let d = r.finish();
     assert_eq!(std::fs::read(&planted).unwrap(), b"foreign");
     assert_eq!(quarantined(&d.root).len(), 0, "{:?}", tree(&d.root));
     assert_eq!(
-        (d.end.segments_unindexed, d.end.segments_quarantined),
-        (1, 0)
+        (
+            d.end.segments_indexed,
+            d.end.segments_unindexed,
+            d.end.segments_quarantined
+        ),
+        (1, 0, 0)
     );
-    let bumped = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
-    assert!(bumped.exists(), "{:?}", tree(&d.root));
+    let held = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
+    assert!(!held.exists(), "{:?}", tree(&d.root));
+    let next = d.root.join(RelPath::new(&cam(), ms(T0 + 102)).to_string());
+    assert!(next.exists(), "{:?}", tree(&d.root));
     // The archive row is untouched.
-    assert_eq!(d.rows.len(), 1);
+    assert_eq!(d.rows.len(), 2);
     assert_eq!(d.rows[0].record.bytes, 4_096);
+    assert_eq!(d.rows[1].record.started_at_ms, ms(T0 + 102));
 }
 
-/// Bumped onto a held key that differs, after transient failures: still left for
-/// reconciliation, never quarantined (the bump rule applies after a retry as well).
+/// Bumped past a held key, after transient insert failures: the segment is indexed under the
+/// free key, nothing is quarantined, and no `.mp4` sits at the held key.
 #[test]
-fn a_bumped_key_held_by_another_row_after_transient_errors_is_not_quarantined() {
+fn a_bumped_key_held_by_another_row_is_skipped_also_after_transient_errors() {
     let (r, _planted) = bumped_rig();
     r.index.lock().unwrap().insert_errors = vec![
         IndexError::Busy { op: "insert" },
@@ -174,7 +164,8 @@ fn a_bumped_key_held_by_another_row_after_transient_errors_is_not_quarantined() 
     .into();
     let d = r.finish();
     assert_eq!(quarantined(&d.root).len(), 0, "{:?}", tree(&d.root));
-    assert_eq!(d.end.segments_unindexed, 1, "{:?}", d.end);
+    assert_eq!((d.end.segments_indexed, d.end.segments_unindexed), (1, 0));
+    assert_eq!(d.rows[1].record.started_at_ms, ms(T0 + 102));
 }
 
 /// Bumped key, the row really committed then a transient error: the read-back matches, the

@@ -10,6 +10,10 @@ use crate::health::{HoldReason, RecorderState};
 /// volume (about a minute with 2 s GOPs).
 const MAX_SKIP_KEYFRAMES: u32 = 32;
 
+/// Keyframes skipped between two probe segments while the index is not writable (about a minute
+/// with 2 s GOPs; the same bound as the full-volume back-off).
+pub(crate) const READ_ONLY_SKIP_KEYFRAMES: u32 = MAX_SKIP_KEYFRAMES;
+
 /// A full volume (`ENOSPC` or `EDQUOT`): when to try again.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FullHold {
@@ -62,6 +66,9 @@ pub(crate) struct Conditions {
     pub(crate) write: bool,
     /// The index could not answer, or no free key was found.
     pub(crate) index: bool,
+    /// The index cannot be written (read-only volume): the keyframes still to skip before the
+    /// next probe segment. `None` when the index takes writes.
+    pub(crate) index_read_only: Option<u32>,
     pub(crate) full: Option<FullHold>,
 }
 
@@ -76,6 +83,8 @@ impl Conditions {
             Some(HoldReason::BadParameters)
         } else if self.full.is_some() {
             Some(HoldReason::StorageFull)
+        } else if self.index_read_only.is_some() {
+            Some(HoldReason::IndexReadOnly)
         } else if self.write {
             Some(HoldReason::WriteFailed)
         } else if self.index {
@@ -107,6 +116,11 @@ mod tests {
         );
         c.write = true;
         assert_eq!(c.state(false), RecorderState::Held(HoldReason::WriteFailed));
+        c.index_read_only = Some(0);
+        assert_eq!(
+            c.state(false),
+            RecorderState::Held(HoldReason::IndexReadOnly)
+        );
         c.full = Some(FullHold::new(1, 0, 0));
         assert_eq!(c.state(false), RecorderState::Held(HoldReason::StorageFull));
         c.params = true;

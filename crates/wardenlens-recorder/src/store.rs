@@ -102,14 +102,23 @@ pub trait SegmentStore {
     /// file, renames `.part` to `.mp4` with `RENAME_NOREPLACE` (at the next free key when another
     /// file appeared at the name), and fsyncs the directory.
     ///
+    /// `row_holds` says whether an index row holds a key. It is asked for every key after the one
+    /// given at `create` (a bump), and a key it holds is skipped: a finished file is never put
+    /// under another segment's key. An answer that cannot be given must be `true` (the key is
+    /// then skipped, the safe side).
+    ///
     /// A failed directory fsync is not an error: the finished file is kept (it is complete and
     /// is adopted by reconciliation, ADR 0005 section 9) and [`Sealed::durable`] is false.
     ///
     /// # Errors
     /// A step before the rename failing, or no free name. The `.part` is removed then (best
     /// effort); no `.mp4` was created.
-    fn commit(&mut self, writer: Self::Writer, patch: &DurationPatch)
-    -> Result<Sealed, StoreError>;
+    fn commit(
+        &mut self,
+        writer: Self::Writer,
+        patch: &DurationPatch,
+        row_holds: &mut dyn FnMut(UnixMs) -> bool,
+    ) -> Result<Sealed, StoreError>;
 
     /// Throws the segment away: removes the `.part`. Best effort.
     fn abort(&mut self, writer: Self::Writer);

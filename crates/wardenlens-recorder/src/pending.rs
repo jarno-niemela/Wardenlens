@@ -16,6 +16,22 @@ struct PendingSample {
 #[derive(Debug, Default)]
 pub(crate) struct Pending {
     samples: Vec<PendingSample>,
+    /// Sum of the sample sizes.
+    payload: u64,
+}
+
+/// Bytes a fragment adds besides its samples: `moof` with `mfhd`, `traf`, `tfhd`, `tfdt` and the
+/// `trun` header (80 bytes, with slack to 128, the bound the adoption parser also uses) and the
+/// `mdat` header.
+const FRAGMENT_OVERHEAD: u64 = 128 + 8;
+/// Bytes a sample adds to the `trun` table (duration, size, flags).
+const SAMPLE_OVERHEAD: u64 = 12;
+
+/// An upper bound of the bytes of a fragment of `samples` samples holding `payload` bytes.
+pub(crate) fn fragment_bound(samples: u64, payload: u64) -> u64 {
+    payload
+        .saturating_add(samples.saturating_mul(SAMPLE_OVERHEAD))
+        .saturating_add(FRAGMENT_OVERHEAD)
 }
 
 fn clamp_duration(ticks: u64) -> u32 {
@@ -27,12 +43,26 @@ impl Pending {
         self.samples.is_empty()
     }
 
+    /// An upper bound of the bytes this fragment will take on disk when it is written.
+    pub(crate) fn bound(&self) -> u64 {
+        if self.samples.is_empty() {
+            return 0;
+        }
+        fragment_bound(
+            u64::try_from(self.samples.len()).unwrap_or(u64::MAX),
+            self.payload,
+        )
+    }
+
     /// Whether one more sample would pass the `trun` table bound.
     pub(crate) fn is_full(&self) -> bool {
         self.samples.len() >= MAX_SAMPLES_PER_FRAGMENT
     }
 
     pub(crate) fn push(&mut self, data: Vec<u8>, dts: u64, is_sync: bool) {
+        self.payload = self
+            .payload
+            .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
         self.samples.push(PendingSample { data, dts, is_sync });
     }
 
@@ -73,6 +103,7 @@ impl Pending {
         out.clear();
         Fragment::write(sequence, base, &samples, out)?;
         self.samples.clear();
+        self.payload = 0;
         Ok(durations.iter().map(|d| u64::from(*d)).sum())
     }
 }
@@ -119,6 +150,22 @@ mod tests {
         p.encode(1, 0, None, 1, &mut out).unwrap();
         assert!(p.is_empty());
         assert!(p.encode(2, 2, None, 1, &mut out).is_err());
+    }
+
+    /// The bound is never below the real size of the fragment (the adoption limit rests on it).
+    #[test]
+    fn the_fragment_bound_covers_the_encoded_size() {
+        for n in [1_usize, 2, 3, 50, 1000] {
+            let mut p = Pending::default();
+            for i in 0..n {
+                p.push(AU.to_vec(), u64::try_from(i).unwrap(), i == 0);
+            }
+            let bound = p.bound();
+            let mut out = Vec::new();
+            p.encode(1, 0, None, 1, &mut out).unwrap();
+            assert!(u64::try_from(out.len()).unwrap() <= bound, "{n} samples");
+            assert_eq!(p.bound(), 0, "emptied");
+        }
     }
 
     #[test]

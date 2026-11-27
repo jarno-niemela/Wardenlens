@@ -615,3 +615,117 @@ fn none_valid_valid_one_byte_apart_is_not_a_duplicate() {
     assert_eq!(out.report.duplicates_deleted, 0);
     assert_eq!(Env::quarantined(&env.hot), vec![h]);
 }
+
+// ---- a foreign file at a key (#195, ADR 0005 section 9, "twins") ----------------------------------
+
+/// A well-formed segment of the same length as [`good`] with other payload bytes: another
+/// recording that landed on the same name (the recorder bumped its key onto it).
+fn same_size_other_content() -> Vec<u8> {
+    let mut v = good();
+    let n = v.len();
+    v[n - 1] ^= 0xFF; // last byte of the mdat payload
+    v
+}
+
+/// The twin rule, one case per cell that used to delete H on the strength of its size: the hot
+/// copy is deleted only when it is byte-identical to the archive copy. Otherwise it is
+/// quarantined (never deleted), the row and A stay, and the report carries `foreign_twins`.
+#[test]
+fn a_hot_file_that_is_not_a_copy_of_the_archive_file_is_quarantined_never_deleted() {
+    // (row tier, expected row tier afterwards, expected report)
+    let cases: [(Option<Tier>, Tier, ReconcileReport); 3] = [
+        (
+            Some(Tier::Archive),
+            Tier::Archive,
+            rep(|r| {
+                r.foreign_twins = 1;
+                r.quarantined = 1;
+            }),
+        ),
+        (
+            Some(Tier::Hot),
+            Tier::Archive,
+            rep(|r| {
+                r.foreign_twins = 1;
+                r.quarantined = 1;
+                r.rolled_forward = 1;
+            }),
+        ),
+        (
+            None,
+            Tier::Archive,
+            rep(|r| {
+                r.foreign_twins = 1;
+                r.quarantined = 1;
+                r.adopted = 1;
+            }),
+        ),
+    ];
+    for (row, after, want) in cases {
+        let env = Env::new();
+        let rel = Env::rel("cam-1", 0);
+        let id = row.map(|t| env.row("cam-1", 0, good().len(), t));
+        let foreign = same_size_other_content();
+        assert_eq!(foreign.len(), good().len());
+        put(&env.hot, &rel, &foreign);
+        put(&env.arch, &rel, &good());
+        let (mut lp, _) = build(&env, None);
+        let out = lp.reconcile_startup().unwrap();
+        assert_eq!(out.report, want, "{row:?}");
+        assert!(out.report.health_error(), "{row:?}: an alert");
+        assert!(!env.hot.join(&rel).exists(), "{row:?}");
+        assert_eq!(Env::quarantined(&env.hot), vec![foreign], "{row:?}: kept");
+        assert_eq!(std::fs::read(env.arch.join(&rel)).unwrap(), good());
+        let r = env.find("cam-1", 0).expect("the row is kept");
+        assert_eq!(r.tier, after);
+        if let Some(id) = id {
+            assert_eq!(r.id, id);
+        }
+    }
+}
+
+/// A true copy is still deleted, in all three cells.
+#[test]
+fn an_identical_hot_copy_is_still_deleted() {
+    for row in [Some(Tier::Archive), Some(Tier::Hot), None] {
+        let env = Env::new();
+        let rel = Env::rel("cam-1", 0);
+        if let Some(t) = row {
+            env.row("cam-1", 0, good().len(), t);
+        }
+        put(&env.hot, &rel, &good());
+        put(&env.arch, &rel, &good());
+        let (mut lp, _) = build(&env, None);
+        let out = lp.reconcile_startup().unwrap();
+        assert_eq!(out.report.duplicates_deleted, 1, "{row:?}");
+        assert_eq!(out.report.foreign_twins, 0);
+        assert!(!out.report.health_error());
+        assert!(!env.hot.join(&rel).exists());
+        assert_eq!(Env::quarantined(&env.hot).len(), 0);
+    }
+}
+
+/// Where the two copies differ matters not: first byte, middle, last.
+#[test]
+fn a_difference_anywhere_in_the_file_is_found() {
+    let len = good().len();
+    for at in [0, len / 2, len - 1] {
+        let env = Env::new();
+        let rel = Env::rel("cam-1", 0);
+        env.row("cam-1", 0, len, Tier::Archive);
+        let mut h = good();
+        h[at] ^= 1;
+        // A flipped header byte may make H invalid (then the old invalid rule applies); only the
+        // payload flip keeps it valid by size, which is the case under test.
+        put(&env.hot, &rel, &h);
+        put(&env.arch, &rel, &good());
+        let (mut lp, _) = build(&env, None);
+        let out = lp.reconcile_startup().unwrap();
+        assert_eq!(out.report.duplicates_deleted, 0, "at {at}");
+        assert_eq!(
+            Env::quarantined(&env.hot),
+            vec![h],
+            "at {at}: never deleted"
+        );
+    }
+}

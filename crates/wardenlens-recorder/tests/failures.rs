@@ -63,10 +63,8 @@ fn permanent() -> Vec<fn() -> IndexError> {
         || IndexError::Constraint { op: "insert" },
         || IndexError::InvalidRecord { field: "bytes" },
         || IndexError::Damaged,
-        || IndexError::Sqlite {
-            op: "insert",
-            code: Some(ErrorCode::ReadOnly),
-        },
+        // `SQLITE_READONLY` is not here since #195: it holds the recorder and keeps the file
+        // (tests/readonly_index.rs).
         || IndexError::Sqlite {
             op: "insert",
             code: None,
@@ -505,24 +503,66 @@ fn an_unreadable_index_never_quarantines_a_file_after_a_duplicate() {
     assert!(!tree(&d.root)[0].contains("_quarantine"));
 }
 
+/// The rename bump never lands on a key an index row holds (#195): the segment is finished under
+/// the next free key and indexed there; the held key's row and the planted file are untouched.
 #[test]
-fn a_segment_bumped_onto_a_key_another_row_holds_stays_in_place_unindexed() {
-    let mut r = Rig::build(fast(), None, |_, index| {
-        let rec = SegmentRecord::new(cam(), ms(T0 + 101), 1_000, 4_096, 10);
-        index.insert(&rec, Tier::Archive).unwrap();
-    });
-    r.start();
-    r.feed(Slice::P);
-    let planted = r.root.join(RelPath::new(&cam(), ms(T0 + 100)).to_string());
-    std::fs::write(&planted, b"foreign").unwrap();
+fn a_segment_bumped_past_a_key_another_row_holds_is_indexed_under_a_free_key() {
+    let (r, planted) = bumped_rig();
     let d = r.finish();
     assert_eq!(std::fs::read(&planted).unwrap(), b"foreign");
     assert_eq!(
-        (d.end.segments_unindexed, d.end.segments_quarantined),
-        (1, 0)
+        (
+            d.end.segments_indexed,
+            d.end.segments_unindexed,
+            d.end.segments_quarantined
+        ),
+        (1, 0, 0)
     );
-    let kept = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
-    assert!(kept.is_file(), "{:?}", tree(&d.root));
-    assert_eq!(d.rows.len(), 1);
+    let held = d.root.join(RelPath::new(&cam(), ms(T0 + 101)).to_string());
+    assert!(!held.exists(), "{:?}", tree(&d.root));
+    assert_eq!(d.rows.len(), 2);
+    assert_eq!(d.rows[0].record.started_at_ms, ms(T0 + 101));
     assert_eq!(d.rows[0].record.bytes, 4_096);
+    assert_eq!(d.rows[1].record.started_at_ms, ms(T0 + 102));
+    let own = d.root.join(RelPath::new(&cam(), ms(T0 + 102)).to_string());
+    assert_eq!(
+        std::fs::metadata(own).unwrap().len(),
+        d.rows[1].record.bytes
+    );
+}
+
+/// Every key the bump passes is checked, however many rows hold consecutive keys, up to the
+/// rename bound; past it the segment is thrown away and no file is left under a held key.
+#[test]
+fn a_run_of_held_keys_is_skipped_and_too_long_a_run_aborts_without_a_file_at_any_of_them() {
+    for (held, indexed, aborted) in [(3_i64, 1_u64, 0_u64), (6, 1, 0), (7, 0, 1)] {
+        let mut r = Rig::build(fast(), None, |_, index| {
+            for n in 1..=held {
+                let rec = SegmentRecord::new(cam(), ms(T0 + 100 + n), 1_000, 4_096, 10);
+                index.insert(&rec, Tier::Archive).unwrap();
+            }
+        });
+        r.start();
+        r.feed(Slice::P);
+        let planted = r.root.join(RelPath::new(&cam(), ms(T0 + 100)).to_string());
+        std::fs::write(&planted, b"foreign").unwrap();
+        let d = r.finish();
+        assert_eq!(
+            (d.end.segments_indexed, d.end.segments_aborted),
+            (indexed, aborted),
+            "{held} held keys: {:?}",
+            d.end
+        );
+        for n in 1..=held {
+            let k = d
+                .root
+                .join(RelPath::new(&cam(), ms(T0 + 100 + n)).to_string());
+            assert!(!k.exists(), "{held}: {:?}", tree(&d.root));
+        }
+        assert_eq!(part_files(&d.root).len(), 0);
+        assert_eq!(
+            d.rows.len(),
+            usize::try_from(held + i64::try_from(indexed).unwrap()).unwrap()
+        );
+    }
 }

@@ -249,6 +249,8 @@ pub fn stream(feeder: &mut Feeder, secs: u32, fps: u32, gop: u32) -> Vec<Frame> 
 pub struct IndexScript {
     /// Errors returned by the next inserts, in order, before the real insert runs.
     pub insert_errors: VecDeque<IndexError>,
+    /// Every insert fails with this (after the scripted ones), until it is cleared.
+    pub insert_forever: Option<fn() -> IndexError>,
     /// Insert attempts seen, failed or not.
     pub attempts: u32,
     /// `latest_started_at` fails with this once.
@@ -293,6 +295,9 @@ impl SegmentIndex for TestIndex {
             s.attempts += 1;
             if let Some(e) = s.insert_errors.pop_front() {
                 return Err(e);
+            }
+            if let Some(make) = s.insert_forever {
+                return Err(make());
             }
             if let Some(e) = s.other_row_then_error.pop_front() {
                 drop(s);
@@ -486,14 +491,19 @@ impl SegmentStore for TestStore {
         self.inner.append(writer, bytes)
     }
 
-    fn commit(&mut self, writer: HotWriter, patch: &DurationPatch) -> Result<Sealed, StoreError> {
+    fn commit(
+        &mut self,
+        writer: HotWriter,
+        patch: &DurationPatch,
+        row_holds: &mut dyn FnMut(UnixMs) -> bool,
+    ) -> Result<Sealed, StoreError> {
         let err = self.script.lock().unwrap().commit_error.take();
         self.script.lock().unwrap().open_now -= 1;
         if let Some(e) = err {
             self.inner.abort(writer);
             return Err(e);
         }
-        let mut sealed = self.inner.commit(writer, patch)?;
+        let mut sealed = self.inner.commit(writer, patch, row_holds)?;
         if self.script.lock().unwrap().not_durable {
             sealed.durable = false;
         }

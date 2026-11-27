@@ -5,6 +5,7 @@ use wardenlens_core::storage::{SegmentIndex, Tier, TransientFault};
 
 use crate::probe::find_row;
 use crate::recorder::Recorder;
+use crate::state::READ_ONLY_SKIP_KEYFRAMES;
 use crate::store::SegmentStore;
 
 /// The index's answer for one key.
@@ -46,7 +47,10 @@ where
         };
         let bytes = open.bytes_written;
         let open_key = open.key;
-        match self.store.commit(open.writer, &patch) {
+        // A bumped key is never a row's key. An index that cannot answer counts as "held".
+        let (camera, index) = (&self.camera, &self.index);
+        let mut row_holds = |k| find_row(index, camera, k).map_or(true, |r| r.is_some());
+        match self.store.commit(open.writer, &patch, &mut row_holds) {
             Ok(sealed) => {
                 self.keys.note(sealed.key);
                 self.full_failures = 0;
@@ -118,6 +122,12 @@ where
     /// file stays where it is (reconciliation adopts a `.mp4` without a row, ADR 0005 section
     /// 9); it counts as indexed only when the read-back finds its row.
     ///
+    /// An error that says the index cannot be written at all (`SQLITE_READONLY`,
+    /// `SQLITE_CANTOPEN`; [`TransientFault::is_unwritable`]) is permanent for the run but not a
+    /// verdict on this file: it is kept, counted unindexed, and the recorder holds
+    /// ([`crate::HoldReason::IndexReadOnly`]) rather than quarantining every segment that
+    /// follows (#195, ADR 0005 section 3).
+    ///
     /// On any other (permanent) error the index is asked what it holds at the key
     /// ([`ReadBack`]), because a failure can follow the commit:
     /// - `Match`: indexed;
@@ -129,7 +139,18 @@ where
         let mut attempt = 0u32;
         loop {
             match self.index.insert(row, Tier::Hot) {
-                Ok(_) => return self.count_indexed(),
+                Ok(_) => {
+                    // The index took a write: a read-only hold is over.
+                    self.cond.index_read_only = None;
+                    return self.count_indexed();
+                }
+                Err(e) if e.is_unwritable() => {
+                    // The index cannot be written at all, so nothing is known about this record
+                    // and nothing is gained by judging the file: it stays (reconciliation adopts
+                    // it) and the recorder holds until a probe segment is accepted.
+                    self.cond.index_read_only = Some(READ_ONLY_SKIP_KEYFRAMES);
+                    return self.count_unindexed();
+                }
                 Err(e) if e.is_transient() => {
                     if attempt >= self.config.insert_retries {
                         if self.read_back(row) == ReadBack::Match {
