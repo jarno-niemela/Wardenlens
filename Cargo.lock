@@ -2246,8 +2246,11 @@ dependencies = [
  "quick-xml",
  "secrecy",
  "sha1",
+ "socket2 0.6.5",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wardenlens-core",
 ]
 

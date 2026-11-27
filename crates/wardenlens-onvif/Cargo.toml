@@ -24,10 +24,16 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net",
 sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
+# WS-Discovery sets the outgoing multicast interface, which tokio's UdpSocket cannot (already in the
+# tree through tokio and hyper-util).
+socket2 = "0.6"
+# Discovery logs the reason for each dropped entry (ADR 0004 section 5; already used by the api crate).
+tracing = "0.1.44"
 
 [dev-dependencies]
 proptest.workspace = true
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "time", "net", "io-util", "test-util"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [lints]
 workspace = true
