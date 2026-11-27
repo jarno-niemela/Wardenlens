@@ -2227,3 +2227,82 @@ fn only_a_failed_delete_is_a_cap_failure_an_index_error_is_not() {
     assert!(r.index_errors >= 1 && r.rows_evicted_over_cap == 0, "{r:?}");
     assert!(!r.cap_delete_failed, "{r:?}");
 }
+
+fn reserve_loop(
+    env: &Env,
+    reserve: u64,
+) -> crate::StorageLoop<super::support::TestIndex, crate::RealFs, super::support::FakeUsage> {
+    let mut cfg = env.cfg();
+    cfg.policy.emergency_reserve_bytes = reserve;
+    Storage::open(cfg, env.index.clone(), env.usage.clone())
+        .unwrap()
+        .0
+}
+
+fn set_foreign(env: &Env, bytes: usize) {
+    std::fs::write(env.hot.join("foreign"), vec![0_u8; bytes]).unwrap();
+}
+
+#[test]
+fn rolling_budget_and_ceiling_travel_together_and_the_budget_recovers_after_foreign_data_leaves() {
+    // Hot 1 MB, floor 250 kB; the archive is away. 900 kB of foreign data keeps the floor
+    // unreachable; the reserve is 30 kB; 5 segments of 10 kB are held (free 50 kB).
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    std::fs::remove_file(env.arch.join(ARCHIVE_MARKER)).unwrap();
+    set_foreign(&env, 900_000);
+    for n in 0..5 {
+        env.add("cam-1", n, 10_000, Tier::Hot);
+    }
+    let mut lp = reserve_loop(&env, 30_000);
+    lp.tick(now()).unwrap();
+    assert_eq!(
+        (lp.rolling_budget(), lp.rolling_ceiling()),
+        (Some(50_000), Some(50_000)),
+        "entered with the video held as the seed"
+    );
+    // A burst of foreign data leaves free at 0: the reserve forces 3 deletes and a ratchet.
+    set_foreign(&env, 950_000);
+    lp.tick(now()).unwrap();
+    assert_eq!(
+        lp.rolling_budget(),
+        Some(20_000),
+        "ratcheted to the video left"
+    );
+    assert_eq!(
+        lp.rolling_ceiling(),
+        Some(50_000),
+        "the ceiling is the entry seed"
+    );
+    // The burst is gone: free 80 kB and 20 kB held, so 70 kB fit next to the reserve; the budget
+    // returns to the ceiling.
+    set_foreign(&env, 900_000);
+    lp.tick(now()).unwrap();
+    assert_eq!(
+        lp.rolling_budget(),
+        Some(50_000),
+        "recovered to the ceiling"
+    );
+    assert_eq!(lp.rolling_ceiling(), Some(50_000));
+    // The floor is reachable again: both are cleared together.
+    std::fs::remove_file(env.hot.join("foreign")).unwrap();
+    lp.tick(now()).unwrap();
+    assert_eq!((lp.rolling_budget(), lp.rolling_ceiling()), (None, None));
+}
+
+#[test]
+fn an_index_that_outgrows_the_used_space_does_not_lower_the_seed_or_start_deleting() {
+    // The index claims 5 MB of new hot video between ticks although the volume holds far less
+    // (a corrupt index): nothing is deleted and no budget appears. The cap on the ingest figure
+    // (`plausible_ingest`) cannot change the plan here, since a figure above the used space
+    // makes the floor reachable; it is covered by its unit test.
+    let env = Env::new();
+    env.set_cap("hot", 1_000_000);
+    env.add("cam-1", 0, 10_000, Tier::Hot);
+    let mut lp = reserve_loop(&env, 30_000);
+    lp.tick(now()).unwrap();
+    env.row("cam-1", 1, 5_000_000, Tier::Hot);
+    let r = lp.tick(now()).unwrap();
+    assert_eq!(r.deleted, 0, "{r:?}");
+    assert_eq!((lp.rolling_budget(), lp.rolling_ceiling()), (None, None));
+}

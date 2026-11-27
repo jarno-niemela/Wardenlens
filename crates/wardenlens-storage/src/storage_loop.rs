@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wardenlens_core::storage::{
     Action, ArchiveState, ArchiveStatus, HotState, MAX_OLDEST, MinFreePercent, PlanInput, Policy,
     SegmentId, SegmentIndex, StorageSnapshot, StoredSegment, TickErrorKind, Tier, VolumeSpace,
-    plan,
+    effective_reserve_bytes, plan,
 };
 use wardenlens_core::time::Timestamp;
 use wardenlens_fsutil::RootDir;
@@ -633,6 +633,12 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         self.hot_after_last_tick
     }
 
+    /// Test hook: the rolling ceiling carried to the next tick.
+    #[cfg(test)]
+    pub(crate) const fn rolling_ceiling(&self) -> Option<u64> {
+        self.rolling_ceiling
+    }
+
     /// Test hook: the rolling budget carried to the next tick.
     #[cfg(test)]
     pub(crate) const fn rolling_budget(&self) -> Option<u64> {
@@ -715,9 +721,10 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
         };
         let mut policy = self.cfg.policy;
         if held {
-            // While the archive cannot relieve the hot tier, the emergency reserve is a floor
-            // too: the recorder keeps writing, and a reserve that only a rolling buffer keeps
-            // would let the volume run down to the plain floor and below between ticks.
+            // The planner already raises the hot floor to the reserve; this rounds it up to a
+            // whole percent instead, so a held tick keeps a little more than the exact reserve
+            // (the recorder keeps writing while the move waits). Both use
+            // `effective_reserve_bytes`, so the cap at the largest floor cannot drift.
             // Unreachable goals fall to the planner's own rules (nothing is deleted for them).
             if let Some(p) = reserve_percent(hot_space.capacity_bytes, policy) {
                 policy.hot_min_free = policy.hot_min_free.max(p);
@@ -928,7 +935,11 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
                     capped_budget(planned.rolling_budget, planned.rolling_ceiling);
             }
             report.hot = Some(planned.hot);
-            report.hot_alert = needs_hot_alert(planned.hot, planned.archive);
+            report.hot_alert = needs_hot_alert(
+                planned.hot,
+                planned.archive,
+                planned.reserve_floor_unreachable,
+            );
             report.archive_full = planned.archive == ArchiveStatus::Full;
             let mut hot_left = hot_total;
             let mut replan = false;
@@ -1415,17 +1426,27 @@ fn tier_space(p: &ProbeResult, tier: Tier) -> Option<VolumeSpace> {
 }
 
 /// Whether the plan's hot state calls for an operator alert: `RollingBuffer`, and `Unsatisfiable`
-/// while the archive is not `Available` (the buffer is rolling but this tick deleted nothing).
-const fn needs_hot_alert(hot: HotState, archive: ArchiveStatus) -> bool {
+/// while the archive is not `Available` (the buffer is rolling but this tick deleted nothing),
+/// and `Unsatisfiable` whenever the floor raised by the emergency reserve is unreachable,
+/// whatever the archive state.
+const fn needs_hot_alert(
+    hot: HotState,
+    archive: ArchiveStatus,
+    reserve_floor_unreachable: bool,
+) -> bool {
     match hot {
         HotState::RollingBuffer => true,
-        HotState::Unsatisfiable => !matches!(archive, ArchiveStatus::Available),
+        HotState::Unsatisfiable => {
+            reserve_floor_unreachable || !matches!(archive, ArchiveStatus::Available)
+        }
         _ => false,
     }
 }
 
-/// The budget and ceiling to feed back: both or neither, and the budget never above the ceiling
-/// (the seed it started from), whatever the planner returned.
+/// The budget and ceiling to feed back: both or neither, and the budget never above the ceiling,
+/// whatever the planner returned. The ceiling is the seed captured when the buffer was entered
+/// (the hot video held before that tick's ingest); the budget may ratchet below it and recover
+/// up to it.
 fn capped_budget(budget: Option<u64>, ceiling: Option<u64>) -> (Option<u64>, Option<u64>) {
     match (budget, ceiling) {
         (Some(b), Some(c)) => (Some(b.min(c)), Some(c)),
@@ -1447,7 +1468,7 @@ fn reserve_percent(
     capacity: u64,
     policy: Policy,
 ) -> Option<wardenlens_core::storage::MinFreePercent> {
-    let reserve = policy.emergency_reserve_bytes;
+    let reserve = effective_reserve_bytes(capacity, policy.emergency_reserve_bytes);
     if reserve == 0 || capacity == 0 {
         return None;
     }
@@ -1477,12 +1498,18 @@ mod reserve_tests {
                 A::Full,
                 A::BelowFloor,
             ] {
-                let want = match hot {
-                    HotState::RollingBuffer => true,
-                    HotState::Unsatisfiable => archive != A::Available,
-                    _ => false,
-                };
-                assert_eq!(needs_hot_alert(hot, archive), want, "{hot:?} {archive:?}");
+                for raised in [false, true] {
+                    let want = match hot {
+                        HotState::RollingBuffer => true,
+                        HotState::Unsatisfiable => raised || archive != A::Available,
+                        _ => false,
+                    };
+                    assert_eq!(
+                        needs_hot_alert(hot, archive, raised),
+                        want,
+                        "{hot:?} {archive:?} {raised}"
+                    );
+                }
             }
         }
     }

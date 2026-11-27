@@ -9,7 +9,7 @@ use crate::time::{DurationMs, Timestamp};
 use super::tests::simulate;
 use super::{
     Action, ArchiveState, ArchiveStatus, HotState, MinFreePercent, PlanInput, Policy, SegmentId,
-    StoredSegment, Tier, VolumeSpace, plan,
+    StoredSegment, Tier, VolumeSpace, effective_reserve_bytes, plan,
 };
 
 fn volume() -> impl Strategy<Value = VolumeSpace> {
@@ -184,7 +184,7 @@ proptest! {
         hot in volume(),
         segs in segments(),
         hot_pct in 0_u8..=90,
-        reserve in prop_oneof![Just(0_u64), 0_u64..1_200_000, Just(u64::MAX)],
+        raw_reserve in prop_oneof![Just(0_u64), 0_u64..1_200_000, Just(u64::MAX)],
         ingested in 0_u64..100_000,
         fed in prop::option::of(0_u64..200_000),
         ceiling in prop::option::of(0_u64..200_000),
@@ -195,8 +195,9 @@ proptest! {
             hot_min_free: MinFreePercent::new(hot_pct).unwrap(),
             archive_min_free: MinFreePercent::default(),
             hot_max_age: DurationMs::from_millis(u64::MAX / 2),
-            emergency_reserve_bytes: reserve,
+            emergency_reserve_bytes: raw_reserve,
         };
+        let reserve = effective_reserve_bytes(hot.capacity_bytes, raw_reserve);
         let state = if with_archive { ArchiveState::Available(archive) } else { ArchiveState::Unavailable };
         let input = PlanInput {
             hot, archive: state, segments: &segs,
@@ -221,6 +222,10 @@ proptest! {
                 prop_assert!(b <= level, "budget rose without a ceiling");
             }
             let reachable = hot.free_bytes + hot_total;
+            // Independent of the recovery formula: the budget is never more than the level fed
+            // in, or the video that fits next to the reserve.
+            prop_assert!(b <= level.max(reachable.saturating_sub(reserve)),
+                "budget {} above max(level {}, reachable {} - reserve {})", b, level, reachable, reserve);
             let start = level.min(c).max(c.min(reachable.saturating_sub(reserve)));
             if b < start {
                 // A ratchet: the budget is what is left, and the last hot delete was needed

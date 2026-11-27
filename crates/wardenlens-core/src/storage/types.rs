@@ -158,3 +158,15 @@ pub struct StoredSegment {
     /// When the segment ended.
     pub ended_at: Timestamp,
 }
+
+/// The emergency reserve the hot volume can be asked to keep: the policy's reserve capped at
+/// [`MinFreePercent::MAX`] percent of the capacity (rounded down). A reserve larger than the
+/// volume could never be met; uncapped it would make the floor unreachable on every tick. The
+/// planner and the storage adapter share this so they cannot drift.
+#[must_use]
+pub fn effective_reserve_bytes(capacity_bytes: u64, reserve_bytes: u64) -> u64 {
+    let cap = u128::from(capacity_bytes)
+        .checked_mul(u128::from(MinFreePercent::MAX))
+        .map_or(u128::MAX, |scaled| scaled / 100);
+    reserve_bytes.min(u64::try_from(cap).unwrap_or(u64::MAX))
+}

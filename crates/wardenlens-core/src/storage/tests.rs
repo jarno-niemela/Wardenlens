@@ -966,3 +966,56 @@ fn a_ratchet_then_recovery_returns_the_buffer_after_a_foreign_burst() {
     );
     assert_eq!(ceiling, Some(CEILING));
 }
+
+#[test]
+fn the_reserve_is_capped_at_ninety_percent_of_the_capacity() {
+    use super::effective_reserve_bytes as eff;
+    assert_eq!(eff(1000, 0), 0);
+    assert_eq!(eff(1000, 899), 899);
+    assert_eq!(eff(1000, 900), 900);
+    assert_eq!(eff(1000, 901), 900);
+    assert_eq!(eff(1000, u64::MAX), 900);
+    assert_eq!(eff(1, 5), 0);
+    assert_eq!(eff(0, 5), 0);
+    assert_eq!(
+        eff(u64::MAX, u64::MAX),
+        u64::MAX / 100 * 90 + u64::MAX % 100 * 90 / 100
+    );
+}
+
+#[test]
+fn a_reserve_floor_above_the_percentage_floor_that_is_unreachable_is_flagged() {
+    let segs = [seg(0, Tier::Hot, 10, 0)];
+    // Percentage floor 250; reserve 500 raises it. free 100 + video 10 < 500: unreachable.
+    let p = plan(&reserve_input(
+        100,
+        ArchiveState::Unavailable,
+        &segs,
+        500,
+        None,
+    ))
+    .unwrap();
+    assert!(p.reserve_floor_unreachable, "{p:?}");
+    // Reserve below the percentage floor: the floor is the percentage and the flag stays off
+    // even though it is unreachable.
+    let p = plan(&reserve_input(
+        100,
+        ArchiveState::Unavailable,
+        &segs,
+        100,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(p.hot, HotState::Unsatisfiable);
+    assert!(!p.reserve_floor_unreachable, "{p:?}");
+    // Reachable: off.
+    let p = plan(&reserve_input(
+        600,
+        ArchiveState::Unavailable,
+        &segs,
+        500,
+        None,
+    ))
+    .unwrap();
+    assert!(!p.reserve_floor_unreachable, "{p:?}");
+}

@@ -5,7 +5,9 @@ use std::fmt;
 
 use crate::time::Timestamp;
 
-use super::types::{ArchiveState, Policy, SegmentId, StoredSegment, Tier, VolumeSpace};
+use super::types::{
+    ArchiveState, Policy, SegmentId, StoredSegment, Tier, VolumeSpace, effective_reserve_bytes,
+};
 
 /// One step of a plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,10 @@ pub struct Plan {
     /// it holds is evicted. Kept separate because `ArchiveStatus::Full` takes precedence
     /// over `BelowFloor` in `archive`.
     pub archive_below_floor: bool,
+    /// The hot floor was raised by the emergency reserve (it is above the percentage floor)
+    /// and is unreachable even by removing all hot video. The adapter must alert on it
+    /// whatever the archive state.
+    pub reserve_floor_unreachable: bool,
 }
 
 /// Why no plan could be made.
@@ -199,6 +205,14 @@ fn floor_and_target(capacity: u64, floor_percent: u8) -> Result<(u64, u64), Plan
     ))
 }
 
+/// The reserve in force on this hot volume (see [`effective_reserve_bytes`]).
+fn effective_reserve(input: &PlanInput<'_>) -> u64 {
+    effective_reserve_bytes(
+        input.hot.capacity_bytes,
+        input.policy.emergency_reserve_bytes,
+    )
+}
+
 /// The hot floor and target in bytes of free space. The emergency reserve is a minimum for
 /// both: a floor below it (a 0 % floor, or a small volume) is raised to the reserve, keeping the
 /// 1 pp headroom above it, so the reserve engages whenever free space falls under it and the
@@ -206,7 +220,7 @@ fn floor_and_target(capacity: u64, floor_percent: u8) -> Result<(u64, u64), Plan
 fn hot_floor_and_target(input: &PlanInput<'_>) -> Result<(u64, u64), PlanError> {
     let (floor, target) =
         floor_and_target(input.hot.capacity_bytes, input.policy.hot_min_free.get())?;
-    let reserve = input.policy.emergency_reserve_bytes;
+    let reserve = effective_reserve(input);
     if reserve <= floor {
         return Ok((floor, target));
     }
@@ -241,7 +255,7 @@ fn rolling_levels(input: &PlanInput<'_>, hot_total: u64, reachable: u64) -> (u64
         .unwrap_or_else(|| hot_total.saturating_sub(input.ingested_bytes));
     let ceiling = input.rolling_ceiling.unwrap_or(level);
     let level = level.min(ceiling);
-    let room = reachable.saturating_sub(input.policy.emergency_reserve_bytes);
+    let room = reachable.saturating_sub(effective_reserve(input));
     (level.max(ceiling.min(room)), ceiling)
 }
 
@@ -329,7 +343,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         unsatisfiable,
         hot_total,
         free,
-        reserve: input.policy.emergency_reserve_bytes,
+        reserve: effective_reserve(input),
         budget,
         ceiling,
     };
@@ -360,6 +374,12 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         actions,
         archive: archive_status,
         archive_below_floor: below_floor,
+        reserve_floor_unreachable: unsatisfiable
+            && hot_floor
+                > percent_of(
+                    input.hot.capacity_bytes,
+                    u64::from(input.policy.hot_min_free.get()),
+                )?,
         hot: match (need.unsatisfiable, rolling.deleted) {
             (false, _) => HotState::Ok,
             (true, false) => HotState::Unsatisfiable,

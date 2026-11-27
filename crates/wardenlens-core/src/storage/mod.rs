@@ -41,5 +41,5 @@ pub use status::{
 };
 pub use types::{
     ArchiveState, DEFAULT_EMERGENCY_RESERVE_BYTES, MinFreePercent, MinFreePercentError, Policy,
-    SegmentId, StoredSegment, Tier, VolumeSpace,
+    SegmentId, StoredSegment, Tier, VolumeSpace, effective_reserve_bytes,
 };
