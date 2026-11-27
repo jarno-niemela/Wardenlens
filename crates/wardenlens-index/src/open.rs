@@ -742,7 +742,7 @@ pub(crate) fn open(
     check_parent(crate::parent_of(path))?;
     // Declared first so it drops last: the registry entry outlives every use of the descriptor.
     let held = open_registered(path)?;
-    let file = &held.file;
+    let file = held.file()?;
     // Two names of one index file would each get their own `-wal` and `-shm`, so two processes
     // would not see each other's SQLite locks and would overwrite each other's commits. Refused
     // before anything is written (#145). `discard_if_created` cannot apply: a file we just made
