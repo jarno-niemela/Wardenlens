@@ -3,7 +3,7 @@
 //! # Steps, in this order
 //! 1. Validate the arguments (id, host, catalogue model, name) and look the model up in the
 //!    catalogue. Nothing is read or written yet.
-//! 2. Vet the host ([`guard::vet_host`]): this machine's own addresses and the cloud metadata
+//! 2. Vet the host ([`super::guard::vet_host`]): this machine's own addresses and the cloud metadata
 //!    address are refused **before any request**, and the probe connects to the vetted address.
 //! 3. Read the password (stdin or a no-echo prompt, never argv) and check the login.
 //! 4. Refuse an id that is registered already (`remove` it first: `add` never overwrites).

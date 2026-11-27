@@ -13,7 +13,7 @@
 //! a test adds a camera here and reads it with `serve`'s own loader.
 //!
 //! The password never comes from argv: see [`password`]. Where `add` may connect is decided by
-//! [`guard`]. The catalogue is the one compiled in ([`catalogue`]).
+//! [`guard`]. The catalogue is the one compiled in (the `catalogue` module).
 //!
 //! Exit codes: 0 done; 1 the request was refused (bad value, refused address, wrong login,
 //! unknown or duplicate id); 2 the system could not do it (config, key file, vault, registry, I/O)
