@@ -319,3 +319,285 @@ fn debug_output_shows_counts_not_needles() {
     let d = format!("{r:?}");
     assert!(!d.contains(PASS) && !d.contains(OTHER), "{d}");
 }
+
+// ---------------------------------------------------------------- addresses (round 2)
+
+#[test]
+fn an_address_token_split_at_every_position_is_found_in_every_spelling() {
+    let host = redactor(&[("cam:x:host", EntryKind::Host, None, "192.0.2.7")]);
+    for text in [
+        "192.0.2.7",
+        "192.000.002.007",
+        "ip-192-0-2-7",
+        "::ffff:c000:207",
+        "::ffff:192.0.2.7",
+    ] {
+        let input = format!("a {text} b");
+        let want = if text.starts_with("ip-") {
+            "a ip-# b"
+        } else {
+            "a # b"
+        };
+        all_cuts(&host, input.as_bytes(), &marked(want));
+    }
+    let v6 = redactor(&[("cam:x:host", EntryKind::Host, None, "2001:db8:0:0:1:0:0:1")]);
+    for text in [
+        "2001:db8:0:0:1::1",
+        "2001:0db8:0000:0000:0001:0000:0000:0001",
+    ] {
+        let input = format!("a {text} b");
+        all_cuts(&v6, input.as_bytes(), &marked("a # b"));
+    }
+    let mac = redactor(&[("cam:x:mac", EntryKind::Mac, None, "AA:BB:CC:00:11:22")]);
+    for text in [
+        "aa:bb:cc:0:11:22",
+        "AABB-CC00-1122",
+        "aa.bb.cc.00.11.22",
+        "aabbcc001122",
+    ] {
+        let input = format!("a {text} b");
+        all_cuts(&mac, input.as_bytes(), &marked("a # b"));
+    }
+}
+
+#[test]
+fn a_token_with_a_longer_run_around_it_is_not_a_match_whatever_the_cut() {
+    // The scan reads `1192.0.2.7` as fields 1192 (too long), 0, 2, 7: not the address. A cut right
+    // after the first digit must not turn the tail into one.
+    let host = redactor(&[("cam:x:host", EntryKind::Host, None, "192.0.2.7")]);
+    all_cuts(&host, b"a 1192.0.2.7 b", b"a 1192.0.2.7 b");
+    let v6 = redactor(&[("cam:x:host", EntryKind::Host, None, "2001:db8::7")]);
+    let long = "a".repeat(200);
+    let input = format!("{long}2001:db8::7 b");
+    all_cuts(&v6, input.as_bytes(), input.as_bytes());
+}
+
+#[test]
+fn a_window_smaller_than_the_longest_token_misses_a_split_address() {
+    // Guards the constant: with `keep` below an IPv6 token's length the matrix above fails.
+    let v6 = redactor(&[(
+        "cam:x:host",
+        EntryKind::Host,
+        None,
+        "2001:db8:85a3:8:8a2e:370:7334:1",
+    )]);
+    assert!(v6.keep >= 45);
+    let input = "x 2001:0db8:85a3:0008:8a2e:0370:7334:0001 y";
+    all_cuts(&v6, input.as_bytes(), &marked("x # y"));
+}
+
+#[test]
+fn an_automaton_that_cannot_run_overlapping_is_a_typed_error() {
+    // Only a hand-built automaton can fail: `build` always picks standard matching.
+    let ac = aho_corasick::AhoCorasick::builder()
+        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+        .build(["abcdefg"])
+        .unwrap();
+    let r = Redactor {
+        ac: Some(ac),
+        addresses: crate::scan::Addresses::default(),
+        keep: 6,
+        needles: 1,
+        unredactable: Vec::new(),
+    };
+    let e = r.filter(&b"abcdefg"[..], Vec::new()).unwrap_err();
+    assert!(matches!(e, RedactError::Automaton), "{e:?}");
+}
+
+/// TEST-9: every entry kind against every rendering, each row "replaced" or "documented not
+/// replaced" (the ADR 0006 as-built note and `docs/DEV_VAULT.md` list the second group).
+use EntryKind::{Credential, DisplayName, Host, Mac, Other, Secret, Serial};
+
+const R: bool = true; // replaced
+const N: bool = false; // documented: not replaced
+
+/// `(what, kind, stored value, text in the input, replaced?)`
+const ROWS: &[(&str, EntryKind, &str, &str, bool)] = &[
+    (
+        "secret raw",
+        Secret,
+        "synthetic-secret-1",
+        "synthetic-secret-1",
+        R,
+    ),
+    (
+        "secret ascii case",
+        Secret,
+        "synthetic-secret-1",
+        "SYNTHETIC-SECRET-1",
+        R,
+    ),
+    (
+        "secret percent",
+        Secret,
+        "synthetic secret/1",
+        "synthetic%20secret%2F1",
+        R,
+    ),
+    (
+        "secret percent lower",
+        Secret,
+        "synthetic secret/1",
+        "synthetic%20secret%2f1",
+        R,
+    ),
+    (
+        "secret form plus",
+        Secret,
+        "synthetic secret/1",
+        "synthetic+secret%2F1",
+        R,
+    ),
+    (
+        "secret hex",
+        Secret,
+        "synthetic-secret-1",
+        "73796e7468657469632d7365637265742d31",
+        R,
+    ),
+    (
+        "secret xml",
+        Secret,
+        "a<b&c'dd-synth",
+        "a&lt;b&amp;c&apos;dd-synth",
+        R,
+    ),
+    (
+        "secret zero-width inside",
+        Secret,
+        "synthetic-secret-1",
+        "synthetic\u{200B}-secret-1",
+        N,
+    ),
+    (
+        "secret fullwidth",
+        Secret,
+        "synthetic-secret-1",
+        "ｓｙｎｔｈｅｔｉｃ-secret-1",
+        N,
+    ),
+    (
+        "secret json-escaped slash",
+        Secret,
+        "synthetic/secret-1",
+        "synthetic\\u002fsecret-1",
+        N,
+    ),
+    (
+        "credential password",
+        Credential,
+        "synthetic-pass-1",
+        "synthetic-pass-1",
+        R,
+    ),
+    (
+        "serial raw",
+        Serial,
+        "SN-0042-ZQ-synth",
+        "SN-0042-ZQ-synth",
+        R,
+    ),
+    (
+        "serial ascii case",
+        Serial,
+        "SN-0042-ZQ-synth",
+        "sn-0042-zq-synth",
+        R,
+    ),
+    (
+        "serial compact",
+        Serial,
+        "SN-0042-ZQ-synth",
+        "SN0042ZQsynth",
+        R,
+    ),
+    (
+        "name raw",
+        DisplayName,
+        "Front Gate North",
+        "Front Gate North",
+        R,
+    ),
+    (
+        "name dashed",
+        DisplayName,
+        "Front Gate North",
+        "front-gate-north",
+        R,
+    ),
+    (
+        "name whitespace run",
+        DisplayName,
+        "Front Gate North",
+        "Front   Gate  North",
+        N,
+    ),
+    (
+        "name non-ascii case",
+        DisplayName,
+        "café nord gate",
+        "CAFÉ NORD GATE",
+        N,
+    ),
+    (
+        "other raw",
+        Other,
+        "synthetic-note-1",
+        "synthetic-note-1",
+        R,
+    ),
+    (
+        "dns host",
+        Host,
+        "cam-yard.example.test",
+        "CAM-YARD.example.test",
+        R,
+    ),
+    ("ipv4 raw", Host, "192.0.2.7", "192.0.2.7", R),
+    ("ipv4 padded", Host, "192.0.2.7", "192.000.002.007", R),
+    ("ipv4 dashed", Host, "192.0.2.7", "192-0-2-7", R),
+    ("ipv4 mapped hex", Host, "192.0.2.7", "::ffff:c000:207", R),
+    (
+        "ipv6 compressed",
+        Host,
+        "2001:db8:0:0:1:0:0:1",
+        "2001:db8:0:0:1::1",
+        R,
+    ),
+    ("ipv6 padded", Host, "2001:db8::7", "2001:0db8::0007", R),
+    (
+        "mac colon",
+        Mac,
+        "AA:BB:CC:00:11:22",
+        "aa:bb:cc:00:11:22",
+        R,
+    ),
+    (
+        "mac unpadded",
+        Mac,
+        "AA:BB:CC:00:11:22",
+        "aa:bb:cc:0:11:22",
+        R,
+    ),
+    (
+        "mac three groups",
+        Mac,
+        "AA:BB:CC:00:11:22",
+        "AABB-CC00-1122",
+        R,
+    ),
+    ("mac flat", Mac, "AA:BB:CC:00:11:22", "aabbcc001122", R),
+];
+
+#[test]
+fn kind_by_rendering_table() {
+    for (what, kind, value, text, replaced) in ROWS {
+        let r = redactor(&[("e:one", *kind, None, value)]);
+        let out = run(&r, text.as_bytes(), 7, 5);
+        if *replaced {
+            assert_eq!(out, MARKER, "{what}: should be replaced");
+        } else {
+            assert_eq!(out, text.as_bytes(), "{what}: documented as not replaced");
+        }
+    }
+}

@@ -52,7 +52,21 @@ u=$(rtsp_url IPC-BO /x)
 dec=$(python3 -I -c 'import sys,urllib.parse as p; print(p.unquote(p.urlsplit(sys.argv[1]).password))' "$u")
 check "rtsp_url percent-encodes and round-trips password with @:/%\$\`'\"" '[[ "$dec" == "$PW1" ]]'
 check "redact removes the password from rtsp_url output (raw and encoded)" \
-  'r=$(echo "$u" | redact); [[ $r != *"$(uri_enc "$PW1")"* && $r != *"$PW1"* && $r == *"[REDACTED]"* ]]'
+  'r=$(echo "$u" | redact); [[ $r != *"$(uri_enc "$PW1")"* && $r != *"$PW1"* ]]'
+
+# --- redact edge cases -------------------------------------------------------
+r=$(echo 'RTSP://admin:secret@10.0.0.1:554/x' | redact)
+check "redact strips userinfo case-insensitively (RTSP://)" '[[ $r != *secret* ]]'
+r=$(echo 'rtsp://admin:se/cret@cam.lan:554/x' | redact)
+check "redact strips decoded userinfo containing '/'" '[[ $r != *cret* ]]'
+r=$(echo 'rtsps://admin:secret@cam.lan/x https://u:secret@h/' | redact)
+check "redact strips userinfo for rtsps/https" '[[ $r != *secret* ]]'
+
+r=$(echo 'x aa:bb:cc:dd:ee:ff y fe80::1ff:fe23:4567:890a z <tds:SerialNumber>ABC123</tds:SerialNumber> "serialNumber":"XYZ789" at 12:30:01' | redact)
+check "redact masks MAC, IPv6 and serial values but keeps clock times" \
+  '[[ $r != *aa:bb* && $r != *fe80* && $r != *ABC123* && $r != *XYZ789* && $r == *12:30:01* ]]'
+r=$(echo 'rtsps://admin:secret@cam.lan/x' | redact)
+check "redact keeps the rtsps scheme" '[[ $r == rtsps://***@* ]]'
 
 # --- redact: wiring, fail closed ---------------------------------------------
 r=$(printf 'hello %s world\n' "$PW1" | redact)

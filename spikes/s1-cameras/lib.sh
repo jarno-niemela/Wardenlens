@@ -89,12 +89,28 @@ rtsp_url() {
   printf 'rtsp://%s:%s@%s:554%s' "$(uri_enc "$CAM_USER")" "$(uri_enc "$CAM_PASS")" "$host" "$2"
 }
 
-# redact: stdin filter, `wardenlens vault redact`: every value in the vault (in the percent, base64, hex and URL
-# userinfo renderings the leak scan knows) becomes [REDACTED]. Fails closed: if the binary or the vault is missing
-# or unusable nothing is written and the exit status is non-zero, so unredacted output never reaches a log.
-# Only vault values are masked; add what must not appear (a serial number, a MAC) to the vault.
+# redact: stdin filter. Two layers, in this order:
+#  1. `wardenlens vault redact`: every value in the vault (the percent, base64, hex and URL userinfo renderings and
+#     every spelling of a stored address) becomes [REDACTED]. The enforcement; it is an exact match, not a guess.
+#  2. Defence in depth behind it, the old shape masks: URL userinfo (up to the last "@" of the token, scheme kept),
+#     IPv4/IPv6 addresses, MAC addresses and serial/hardware-id values. They catch what is not in the vault; they
+#     are never the enforcement (a shape cannot know a value).
+# Fails closed: pipefail, and layer 2 sees nothing if layer 1 fails, so if the binary or the vault is missing or
+# unusable nothing is written and the status is non-zero. Unredacted output never reaches a log.
 redact() {
-  wl vault redact || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
+  local h='[0-9A-Fa-f]{1,4}'
+  (
+    set -o pipefail
+    wl vault redact | sed -uE \
+      -e 's#(rtsps?|https?)://[^ ]*@#\1://***@#Ig' \
+      -e 's#[0-9]{1,3}(\.[0-9]{1,3}){3}#<host>#g' \
+      -e 's#([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}#<mac>#g' \
+      -e "s#(^|[^0-9A-Za-z_:])($h:){7}$h#\1<ip6>#g" \
+      -e "s#(^|[^0-9A-Za-z_:])($h:){1,7}:($h(:$h){0,6})?#\1<ip6>#g" \
+      -e "s#(^|[^0-9A-Za-z_:])::$h(:$h){0,6}#\1<ip6>#g" \
+      -e 's#(<[A-Za-z0-9_:]*(serial[ _]?number|hardware[ _]?id)[^<>]*>)[^<]+#\1<redacted>#Ig' \
+      -e "s#((serial[ _]?number|hardware[ _]?id)[\"']? *[:=] *[\"']?)[^\"', }&<]+#\1<redacted>#Ig"
+  ) || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
 # Vendor RTSP paths (main|sub) by camera; accepts a display name or an inventory id.

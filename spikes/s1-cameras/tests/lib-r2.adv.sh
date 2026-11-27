@@ -29,17 +29,25 @@ secret() {
   for c in IPC-BO "IPC-BO (2)" XR C110 HDIPC; do hosts_for "$c"; done
 }
 hosts_for() { case "$1" in IPC-BO) host "$1" 10.0.0.1 ;; "IPC-BO (2)") host "$1" 10.0.0.2 ;; XR) host "$1" "127.0.0.1:${PORT:-1}" ;; C110) host "$1" 10.0.0.4 ;; HDIPC) host "$1" "${HDIPC_HOST:-10.0.0.5}" ;; esac; }
-secret '[{"name":"XR","login":"admin","password":"x"},{"name":"C110","login":"admin","password":"x"},
- {"name":"HDIPC","login":"admin","password":"x"}]'
+secret '[{"name":"XR","login":"admin","password":"pw-top-synth-1"},{"name":"C110","login":"admin","password":"pw-top-synth-2"},
+ {"name":"HDIPC","login":"admin","password":"pw-top-synth-3"}]'
 # shellcheck source=../lib.sh
 source "$here/lib.sh"
 
 # ============================== redact ==============================
 R() { printf '%s\n' "$1" | redact; }
-secret '[{"name":"XR","login":"admin","password":"s3cr3t-pw"}]'
-redact_add "admin:s3cr3t-pw@"; redact_add "aa:bb:cc:dd:ee:ff"; redact_add "fd00::5"
-r=$(R 'RTSPS://admin:s3cr3t-pw@cam.lan/x'); check "redact: userinfo removed" '[[ $r != *s3cr3t* ]]'
-r=$(R 'a aa:bb:cc:dd:ee:ff b fd00::5 c'); check "redact: vault MAC and IPv6 removed" '[[ $r == "a [REDACTED] b [REDACTED] c" ]]'
+r=$(R 'RTSPS://admin:s3cr3t@cam.lan/x'); check "redact: upper-case RTSPS masked, scheme kept" '[[ $r != *s3cr3t* && $r == RTSPS://***@* ]]'
+r=$(R 'HtTpS://u:s3cr3t@h/'); check "redact: mixed-case HtTpS masked" '[[ $r != *s3cr3t* ]]'
+r=$(R 'rtsp://admin:a/b@c@cam.lan:554/x tail'); check "redact: raw '/' and '@' in password masked up to last @" '[[ $r != *a/b* && $r != *c@* && $r == *cam.lan:554/x\ tail ]]'
+r=$(R '"url":"rtsp://admin:s3cr3t@cam.lan/x"'); check "redact: quoted URL masked" '[[ $r != *s3cr3t* ]]'
+r=$(R 'a AA-BB-CC-DD-EE-FF b 0a:1b:2c:3d:4e:5f c'); check "redact: MAC upper/dash and lower/colon" '[[ $r != *AA-BB* && $r != *0a:1b* && $r == "a <mac> b <mac> c" ]]'
+for v6 in '2001:db8::1' '::1' 'FD00::ABCD:5' '2001:0db8:0000:0000:0000:ff00:0042:8329' '[2001:db8:85a3::8a2e:370:7334]:80' '::ffff:10.0.0.1'; do
+  r=$(R "x $v6 y"); check "redact: IPv6 $v6 masked" '[[ $r != *db8* && $r != *abcd* && $r != *ABCD* && $r != *8329* && $r != *7334* && $r != *ffff* && $r != *::1* ]]'
+done
+r=$(R '<tt:HardwareId>HW-77</tt:HardwareId> <SerialNumber xmlns="urn:x">SN-11</SerialNumber> serialNumber: "SN-22" SERIALNUMBER=SN-33')
+check "redact: HardwareId/SerialNumber (ns attr, Debug, upper-case) masked" '[[ $r != *HW-77* && $r != *SN-11* && $r != *SN-22* && $r != *SN-33* ]]'
+r=$(R 'serial_number: "SN-44"'); check "redact: snake_case serial_number masked (Rust Debug output)" '[[ $r != *SN-44* ]]'
+# No over-redaction of ordinary log text.
 for txt in 'frame=  250 fps= 25 q=-1.0 size=N/A time=00:00:10.00 bitrate=N/A speed=1.0x' \
   '[rtsp @ 0x55d4c3a0b2c0] method DESCRIBE failed: 401 Unauthorized' \
   'see http://cam.lan/onvif/device_service and mail ops@example.org' \
@@ -47,6 +55,15 @@ for txt in 'frame=  250 fps= 25 q=-1.0 size=N/A time=00:00:10.00 bitrate=N/A spe
   'ffmpeg version 6.1.1 codec h264 profile Main' 'neolink_core::bc_protocol::errors'; do
   r=$(R "$txt"); check "redact: leaves ordinary text intact: $txt" '[[ $r == "$txt" ]]'
 done
+
+# Layer 1 (the vault filter) is a stub here; the shape masks above are layer 2. A vault value is replaced:
+secret '[{"name":"XR","login":"admin","password":"s3cr3t-pw"}]'
+r=$(R 'login admin s3cr3t-pw ok'); check "redact: a vault value is replaced by layer 1" '[[ $r == "login admin [REDACTED] ok" ]]'
+touch "$VAULT_STUB/.broken"
+r=$(R 'rtsp://u:p@h/ 10.0.0.1 aa:bb:cc:dd:ee:ff' 2>/dev/null); rc=$?
+check "redact: with the vault filter failing, layer 2 prints nothing either (fail closed)" '[[ -z $r ]]'
+R 'x' >/dev/null 2>&1; check "redact: status is non-zero when layer 1 fails" '[[ $? != 0 ]]'
+rm -f "$VAULT_STUB/.broken"
 
 # ============================== cam_creds / rtsp_url ==============================
 secret '[{"name":"XR","login":"","password":"p"},{"name":"C110","login":"","password":""}]'

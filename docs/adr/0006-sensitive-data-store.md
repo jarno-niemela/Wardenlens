@@ -725,14 +725,22 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   replaces **the whole raw line** (or lines) the hit touches, never a guessed sub-range.
   **As built (#76), which narrows the paragraph above.** The filter must stream in bounded memory (a spike pipes a
   30-minute `ffmpeg` log through it), and a line is unbounded, so the view-and-offset-map design with a whole-line
-  fallback was not built. `redact` matches the **literal renderings** of each value (the raw value, the percent forms,
-  base64 at three alignments, hex, the XML escape, the squeezed forms, the text forms of a host, IP or MAC, and for a
-  credential the `user:password@` URL prefix), ignoring ASCII case, in a streaming Aho-Corasick pass that keeps
-  `longest needle - 1` bytes across reads. It does not apply the decoded, JSON-unescaped or joined views, so a value
-  that only appears JSON-escaped (`\u2013`) or split over a line break is not replaced; `vault scan` still finds those.
-  Every match, overlapping or touching ones merged, becomes the fixed `[REDACTED]`: no entry id and no length. Exit 0
-  done, 1 an input or output error (what was written is redacted), 2 the vault or key unusable (nothing is read or
-  written). Entries that are too short to match (`unscannable`) are listed by id on stderr and not replaced.
+  fallback was not built. `redact` matches in two ways, both in a streaming pass that keeps
+  `max(longest needle - 1, 64)` bytes across reads (64 covers the longest address token the scan recognises):
+  (1) the **literal renderings** of each value (the raw value, the percent forms, base64 at three alignments, hex, the XML
+  escape, and for a credential the `user:password@` URL prefix) by Aho-Corasick; (2) **address tokens**: an IPv4, IPv6
+  or MAC value is not spelled out but found by the scan's own tokenisers (`scan/net.rs`, shared, so scan and redact
+  agree), which canonicalise zero-padded, dashed, compressed, IPv4-mapped and unpadded spellings. Matching ignores
+  **ASCII case only**. The input is **not squeezed** (zero-width characters, fullwidth letters, white-space runs) and the
+  decoded, JSON-unescaped, joined and line-split views are **not** applied, so a value that appears only in one of those
+  forms is not replaced; `vault scan` still finds all of them. (The squeezed forms of a needle are compiled, but that
+  matches the input only where the input already holds them.) Every match, overlapping or touching ones merged, becomes
+  the fixed `[REDACTED]`: no entry id and no length. Exit 0 done, 1 an input or output error (what was written is
+  redacted), 2 the vault or key unusable (nothing is read or written). An entry whose value is too short to match safely
+  is listed by id on stderr and its value is not replaced; the `user:password@` prefix of a credential with a short
+  password is still replaced when it is long enough. The store's `unscannable` flag is not consulted (such an entry is
+  matched like any other: masking more is allowed). `redact`, like `scan`, is an oracle for guesses (see the oracle note
+  in the threat list).
 - **RTSP URLs on argv (accepted spike-only exception).** The `ffmpeg`/`ffprobe` spikes pass an RTSP URL with credentials
   on argv (ADR 0002). That stays an accepted exception **for the spikes only**; the product uses `retina` with
   in-process credentials (below) and never puts a credential in a URL or on argv.

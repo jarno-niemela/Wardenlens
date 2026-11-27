@@ -20,6 +20,7 @@ wardenlens-core = { workspace = true }
 wardenlens-fsutil = { path = "../wardenlens-fsutil" }
 wardenlens-secrets = { path = "../wardenlens-secrets" }
 rustix = { workspace = true }
+zeroize = "1"
 
 [dev-dependencies]
 proptest = "1"

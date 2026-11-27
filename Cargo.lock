@@ -2257,6 +2257,7 @@ dependencies = [
  "wardenlens-core",
  "wardenlens-fsutil",
  "wardenlens-secrets",
+ "zeroize",
 ]
 
 [[package]]

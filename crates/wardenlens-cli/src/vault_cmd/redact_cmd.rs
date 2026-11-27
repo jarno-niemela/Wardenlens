@@ -23,7 +23,7 @@ pub(super) fn run<T: Terminal>(env: &Env, term: &mut T) -> Result<(), CliError> 
         warn(
             term,
             &format!(
-                "warning: entry {} ({}) is unredactable (too short, or already public) and is not replaced",
+                "warning: entry {} ({}) is unredactable (too short to match safely) and its value is not replaced",
                 u.id, u.kind
             ),
         )?;

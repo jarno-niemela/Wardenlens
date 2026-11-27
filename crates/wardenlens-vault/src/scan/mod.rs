@@ -26,7 +26,9 @@ use wardenlens_core::entry::{EntryId, EntryKind};
 
 use crate::error::VaultError;
 
-pub(crate) use literals::{literals as redaction_literals, userinfo_literals};
+pub(crate) use literals::{
+    Addresses, MAX_TOKEN, literals as redaction_literals, userinfo_literals,
+};
 pub use matcher::Matcher;
 pub use squeeze::is_invisible;
 

@@ -1,13 +1,20 @@
 //! The streaming redaction filter (ADR 0006 amendment, #76).
 //!
-//! A [`Redactor`] replaces every occurrence of every vault value, in the renderings the leak
-//! scan knows, with the fixed [`MARKER`]. It does not guess what looks like a secret. The
-//! marker is the same for every value and run, so the output reveals neither which entry matched
-//! nor how long it was; overlapping and touching matches become one marker.
+//! A [`Redactor`] replaces every occurrence of every vault value, in the literal renderings the
+//! leak scan knows (raw, percent, base64, hex, XML escape, the `user:password@` prefix), and every
+//! token that is a stored IPv4, IPv6 or MAC address in any spelling the scan's own recognisers
+//! accept (`scan/net.rs`), with the fixed [`MARKER`]. It does not guess what looks like a secret.
+//! The marker is the same for every value and run, so the output reveals neither which entry
+//! matched nor how long it was; overlapping and touching matches become one marker.
 //!
-//! [`Redactor::filter`] reads in bounded chunks and keeps at most `longest needle - 1` bytes
-//! (plus one chunk) in memory, so a match split across two reads is still found. The output is
-//! the same whatever the chunk sizes of the input. Nothing here prints or returns a value.
+//! Matching ignores ASCII case only. The input is not squeezed (zero-width characters, fullwidth
+//! letters and runs of white space are not normalised), and the decoded, JSON-unescaped and
+//! line-split views are not applied: `vault scan` finds those, the filter does not replace them.
+//!
+//! [`Redactor::filter`] reads in bounded chunks and keeps at most `max(longest needle - 1,
+//! MAX_TOKEN)` bytes (plus one chunk and a short left context) in memory, so a match or an
+//! address token split across two reads is still found. The output is the same whatever the chunk
+//! sizes of the input. Nothing here prints or returns a value.
 
 use std::io::{self, Read, Write};
 
@@ -15,7 +22,11 @@ use aho_corasick::{AhoCorasick, MatchKind};
 use secrecy::ExposeSecret;
 use wardenlens_core::entry::{EntryId, EntryKind};
 
-use crate::scan::{MAX_NEEDLE_BYTES, ScanError, redaction_literals, userinfo_literals};
+use zeroize::Zeroizing;
+
+use crate::scan::{
+    Addresses, MAX_NEEDLE_BYTES, MAX_TOKEN, ScanError, redaction_literals, userinfo_literals,
+};
 use crate::store::{MAX_ENTRIES, Value, Vault};
 
 /// What replaces a value. Fixed text: it carries no length and no entry name.
@@ -23,6 +34,10 @@ pub const MARKER: &[u8] = b"[REDACTED]";
 
 /// Bytes read from the input at a time.
 const CHUNK: usize = 64 * 1024;
+
+/// Bytes of already written input kept in front of the window, so that a token that starts in the
+/// window is recognised as the scan would see it (the byte before it is known).
+const CONTEXT: usize = 16;
 
 /// Why filtering stopped. Carries no input bytes and no value.
 #[derive(Debug, thiserror::Error)]
@@ -39,8 +54,11 @@ pub enum RedactError {
     Automaton,
 }
 
-/// An entry the filter cannot use (too short, or already public): it is listed so the gap is
-/// visible, and never partly replaced.
+/// An entry whose own value the filter cannot use (too short to match safely, or unusable): it is
+/// listed so the gap is visible and its value is never replaced. The store's `unscannable` flag is
+/// not consulted: such an entry is decrypted and matched like any other, which masks more, never
+/// less. For a credential with a short password the `user:password@` prefix is still replaced
+/// when it is long enough.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Unredactable {
@@ -53,7 +71,9 @@ pub struct Unredactable {
 /// The compiled needles of a vault. `Debug` shows counts only.
 pub struct Redactor {
     ac: Option<AhoCorasick>,
-    longest: usize,
+    addresses: Addresses,
+    /// Bytes a match may need after its start: the window kept between reads.
+    keep: usize,
     needles: usize,
     unredactable: Vec<Unredactable>,
 }
@@ -71,8 +91,8 @@ impl std::fmt::Debug for Redactor {
 struct Item {
     id: EntryId,
     kind: EntryKind,
-    user: Option<String>,
-    secret: String,
+    user: Option<Zeroizing<String>>,
+    secret: Zeroizing<String>,
 }
 
 impl Redactor {
@@ -89,10 +109,10 @@ impl Redactor {
             };
             let (user, secret) = match entry.value {
                 Value::Credential(c) => (
-                    Some(c.username.clone()),
-                    c.password.expose_secret().to_owned(),
+                    Some(Zeroizing::new(c.username.clone())),
+                    Zeroizing::new(c.password.expose_secret().to_owned()),
                 ),
-                Value::Text(t) => (None, t.expose_secret().to_owned()),
+                Value::Text(t) => (None, Zeroizing::new(t.expose_secret().to_owned())),
             };
             items.push(Item {
                 id: info.id,
@@ -115,8 +135,8 @@ impl Redactor {
             .map(|(id, kind, user, secret)| Item {
                 id: id.clone(),
                 kind: *kind,
-                user: user.map(str::to_owned),
-                secret: (*secret).to_owned(),
+                user: user.map(|u| Zeroizing::new(u.to_owned())),
+                secret: Zeroizing::new((*secret).to_owned()),
             })
             .collect();
         Self::build(&items)
@@ -126,11 +146,12 @@ impl Redactor {
         if items.len() > MAX_ENTRIES {
             return Err(ScanError::TooManyEntries);
         }
-        let mut texts: Vec<String> = Vec::new();
+        let mut texts: Vec<Zeroizing<String>> = Vec::new();
+        let mut addresses = Addresses::default();
         let mut unredactable = Vec::new();
         for item in items {
-            match redaction_literals(item.kind, &item.secret) {
-                Some(l) => texts.extend(l),
+            match redaction_literals(item.kind, &item.secret, &mut addresses) {
+                Some(l) => texts.extend(l.into_iter().map(Zeroizing::new)),
                 None => unredactable.push(Unredactable {
                     id: item.id.clone(),
                     kind: item.kind,
@@ -138,17 +159,26 @@ impl Redactor {
             }
             if let Some(user) = &item.user {
                 // A short username (`admin`) is public text; only a long one is a needle.
-                texts.extend(redaction_literals(EntryKind::Secret, user).unwrap_or_default());
-                texts.extend(userinfo_literals(user, &item.secret));
+                texts.extend(
+                    redaction_literals(EntryKind::Secret, user, &mut Addresses::default())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Zeroizing::new),
+                );
+                texts.extend(
+                    userinfo_literals(user, &item.secret)
+                        .into_iter()
+                        .map(Zeroizing::new),
+                );
             }
         }
-        texts.sort();
-        texts.dedup();
+        texts.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        texts.dedup_by(|a, b| a.as_str() == b.as_str());
         let total = texts.iter().fold(0usize, |a, t| a.saturating_add(t.len()));
         if total > MAX_NEEDLE_BYTES {
             return Err(ScanError::NeedlesTooLarge);
         }
-        let longest = texts.iter().map(String::len).max().unwrap_or(0);
+        let longest = texts.iter().map(|t| t.len()).max().unwrap_or(0);
         let needles = texts.len();
         let ac = if texts.is_empty() {
             None
@@ -158,13 +188,15 @@ impl Redactor {
                 AhoCorasick::builder()
                     .match_kind(MatchKind::Standard)
                     .ascii_case_insensitive(true)
-                    .build(&texts)
+                    .build(texts.iter().map(|t| t.as_bytes()))
                     .map_err(|_| ScanError::Automaton)?,
             )
         };
+        let token = if addresses.is_empty() { 0 } else { MAX_TOKEN };
         Ok(Self {
             ac,
-            longest,
+            addresses,
+            keep: longest.saturating_sub(1).max(token),
             needles,
             unredactable,
         })
@@ -176,9 +208,9 @@ impl Redactor {
         &self.unredactable
     }
 
-    /// How many distinct needles are compiled (zero for an empty vault).
-    #[must_use]
-    pub fn needle_count(&self) -> usize {
+    /// How many distinct literal needles are compiled (zero for an empty vault).
+    #[cfg(test)]
+    pub(crate) fn needle_count(&self) -> usize {
         self.needles
     }
 
@@ -197,9 +229,10 @@ impl Redactor {
         mut out: W,
         chunk: usize,
     ) -> Result<(), RedactError> {
-        let keep = self.longest.saturating_sub(1);
+        let keep = self.keep;
         let mut read_buf = vec![0u8; chunk.max(1)];
         let mut buf: Vec<u8> = Vec::new();
+        let mut context: Vec<u8> = Vec::new();
         let mut state = Carry::default();
         loop {
             let n = match input.read(&mut read_buf) {
@@ -216,7 +249,10 @@ impl Redactor {
             } else {
                 buf.len().saturating_sub(keep)
             };
-            state = self.round(&buf, safe, state, &mut out)?;
+            state = self.round(&context, &buf, safe, state, &mut out)?;
+            context.extend_from_slice(buf.get(..safe).unwrap_or_default());
+            let excess = context.len().saturating_sub(CONTEXT);
+            context.drain(..excess);
             buf.drain(..safe);
             if eof {
                 return out.flush().map_err(RedactError::Write);
@@ -225,26 +261,45 @@ impl Redactor {
         }
     }
 
-    /// Writes the first `safe` bytes of `buf`, redacted, and returns what carries over.
+    /// Writes the first `safe` bytes of `buf`, redacted, and returns what carries over. `context`
+    /// is the input that precedes `buf` (already written), for the address tokeniser.
     fn round<W: Write>(
         &self,
+        context: &[u8],
         buf: &[u8],
         safe: usize,
         carry: Carry,
         out: &mut W,
     ) -> Result<Carry, RedactError> {
         let w = |out: &mut W, b: &[u8]| out.write_all(b).map_err(RedactError::Write);
-        let Some(ac) = &self.ac else {
-            w(out, buf.get(..safe).unwrap_or_default())?;
-            return Ok(Carry::default());
-        };
         // reach[i]: the furthest end of a match that starts at i.
         let mut reach = vec![0usize; safe];
-        for m in ac.find_overlapping_iter(buf) {
-            if let Some(slot) = reach.get_mut(m.start())
-                && m.end() > *slot
+        let mut note = |start: usize, end: usize| {
+            if let Some(slot) = reach.get_mut(start)
+                && end > *slot
             {
-                *slot = m.end();
+                *slot = end.min(buf.len());
+            }
+        };
+        if let Some(ac) = &self.ac {
+            for m in ac
+                .try_find_overlapping_iter(buf)
+                .map_err(|_| RedactError::Automaton)?
+            {
+                note(m.start(), m.end());
+            }
+        }
+        if !self.addresses.is_empty() {
+            let mut hay = Vec::with_capacity(context.len().saturating_add(buf.len()));
+            hay.extend_from_slice(context);
+            hay.extend_from_slice(buf);
+            let mut found = Vec::new();
+            self.addresses.ranges(&hay, &mut found);
+            for (s, e) in found {
+                // A token that starts in the context was decided in an earlier round.
+                if let Some(start) = s.checked_sub(context.len()) {
+                    note(start, e.saturating_sub(context.len()));
+                }
             }
         }
         let mut run_end = carry.covered;
