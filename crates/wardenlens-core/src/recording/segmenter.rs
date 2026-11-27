@@ -1,6 +1,6 @@
 //! `Segmenter`: decides where segments start and end (ADR 0005 section 2).
 
-use super::clock::{MediaClock, TICKS_PER_SECOND};
+use super::clock::{MAX_STEP_TICKS, MediaClock, TICKS_PER_SECOND};
 use super::path::RecordingError;
 use crate::camera::CameraId;
 use crate::time::{DurationMs, Timestamp, UnixMs};
@@ -75,7 +75,9 @@ pub struct Pushed {
     /// (0 for `StartNew`); `None` when dropped.
     pub dts: Option<u64>,
     /// The segment this frame closed, if any. Present on `StartNew` (the
-    /// previous segment) and on a `Drop` that hit the hard maximum or byte cap.
+    /// previous segment) and on a `Drop` that closed the open segment: the hard
+    /// maximum, the byte cap, the arrival-span bound, or a stream error
+    /// ([`PushError`]).
     pub closed: Option<SegmentRecord>,
     /// Flush the open fragment before this frame: set at each keyframe (a
     /// fragment is one GOP) and when appending the frame would take the open
@@ -157,7 +159,45 @@ pub(crate) fn ticks_to_ms_ceil(ticks: u64) -> u64 {
 pub struct SegmentConfig {
     target_ticks: u64,
     max_ticks: u64,
+    /// Arrival-span bound, ms: twice the hard maximum (ADR 0005 section 2, rule 3a).
+    max_arrival_ms: u64,
     max_segment_bytes: u64,
+}
+
+/// Largest forward progress one frame adds to the arrival span, ms: the media clock's per-step
+/// limit (one RTP step is at most 10 s), so a stepped wall clock counts like one long frame gap.
+const MAX_ARRIVAL_STEP_MS: u64 = MAX_STEP_TICKS.saturating_mul(1000) / TICKS_PER_SECOND;
+
+/// Arrival-span progress of a frame at `arrival_ms` given the segment's high-water mark.
+///
+/// Returns the new high-water mark and the progress to add to the span:
+/// - only progress beyond the high-water mark counts, so an arrival clock that oscillates around
+///   true time (two time daemons) adds the real forward time, not the sum of its forward steps;
+/// - one frame adds at most [`MAX_ARRIVAL_STEP_MS`], so a forward step of the host clock cannot
+///   cost more than one long frame gap;
+/// - a backward step of more than [`MAX_ARRIVAL_STEP_MS`] re-anchors the mark at the new arrival,
+///   so a clock stepped far back cannot hide the time that passes afterwards. A smaller backward
+///   step (jitter, oscillation) keeps the mark and delays the span by at most that step in total.
+fn arrival_progress(high_water_ms: i64, arrival_ms: i64) -> (i64, u64) {
+    let cap = i64::try_from(MAX_ARRIVAL_STEP_MS).unwrap_or(i64::MAX);
+    let mark = if high_water_ms.saturating_sub(arrival_ms) > cap {
+        arrival_ms
+    } else {
+        high_water_ms
+    };
+    let progress = u64::try_from(arrival_ms.saturating_sub(mark))
+        .unwrap_or(0)
+        .min(MAX_ARRIVAL_STEP_MS);
+    (mark.max(arrival_ms), progress)
+}
+
+/// The arrival-span bound for a hard maximum of `max_ticks`: twice the hard maximum, in ms.
+fn arrival_bound_ms(max_ticks: u64) -> u64 {
+    max_ticks
+        .saturating_mul(2)
+        .saturating_mul(1000)
+        .checked_div(TICKS_PER_SECOND)
+        .unwrap_or(u64::MAX)
 }
 
 impl SegmentConfig {
@@ -182,6 +222,7 @@ impl SegmentConfig {
         Ok(Self {
             target_ticks,
             max_ticks: target_ticks.saturating_mul(2),
+            max_arrival_ms: arrival_bound_ms(target_ticks.saturating_mul(2)),
             max_segment_bytes,
         })
     }
@@ -193,6 +234,7 @@ impl Default for SegmentConfig {
         Self {
             target_ticks: 60 * TICKS_PER_SECOND,
             max_ticks: 120 * TICKS_PER_SECOND,
+            max_arrival_ms: arrival_bound_ms(120 * TICKS_PER_SECOND),
             max_segment_bytes: 1 << 30,
         }
     }
@@ -207,6 +249,10 @@ struct Open {
     last_dts: u64,
     /// Step before the latest frame; the last sample reuses it (at least 1).
     last_step: u64,
+    /// Latest arrival seen in this segment (high-water mark), ms. See [`arrival_progress`].
+    high_water_ms: i64,
+    /// Arrival span so far, ms: the sum of the capped forward progress of the arrival clock.
+    arrival_span_ms: u64,
     bytes: u64,
     /// Bytes in the open fragment.
     fragment_bytes: u64,
@@ -216,8 +262,10 @@ struct Open {
 /// Cuts a frame stream into segments and keeps media time monotonic.
 ///
 /// Rules: frames before the first keyframe are dropped; a segment is cut at
-/// the first keyframe at or after the target; at the hard maximum (2x target)
-/// or the byte cap the segment closes at that frame unless it is a keyframe,
+/// the first keyframe at or after the target; at the hard maximum (2x target),
+/// the byte cap or the arrival-span bound (the capped forward progress of the
+/// arrival clock reaching 2x the hard maximum, for a frozen or drifting RTP
+/// clock; ADR 0005 rule 3a) the segment closes at that frame unless it is a keyframe,
 /// and frames are dropped until the next keyframe. A frame of 0 bytes or more
 /// than 8 MiB is a stream error: the open segment closes and frames are dropped
 /// until the next keyframe.
@@ -261,6 +309,8 @@ impl Segmenter {
             start_dts: dts,
             last_dts: dts,
             last_step: 1,
+            high_water_ms: f.arrival.as_i64(),
+            arrival_span_ms: 0,
             bytes: f.bytes,
             fragment_bytes: f.bytes,
             frames: 1,
@@ -298,7 +348,13 @@ impl Segmenter {
         };
         let elapsed = dts.saturating_sub(o.start_dts);
         let over_bytes = o.bytes.saturating_add(f.bytes) > self.config.max_segment_bytes;
-        let forced = elapsed >= self.config.max_ticks || over_bytes;
+        // Arrival span including this frame (capped forward progress, ADR 0005 rule 3a).
+        let (high_water_ms, progress) = arrival_progress(o.high_water_ms, f.arrival.as_i64());
+        let arrival_span = o.arrival_span_ms.saturating_add(progress);
+        // One test for all three bounds, so a frame that trips several cuts only once.
+        let forced = elapsed >= self.config.max_ticks
+            || over_bytes
+            || arrival_span >= self.config.max_arrival_ms;
         if f.is_keyframe && (elapsed >= self.config.target_ticks || forced) {
             let closed = self.record(&o);
             let mut next = self.start(&f, dts);
@@ -311,6 +367,8 @@ impl Segmenter {
         }
         o.last_step = dts.saturating_sub(o.last_dts).max(1);
         o.last_dts = dts;
+        o.high_water_ms = high_water_ms;
+        o.arrival_span_ms = arrival_span;
         o.bytes = o.bytes.saturating_add(f.bytes);
         o.frames = o.frames.saturating_add(1);
         let flush_fragment =
@@ -689,6 +747,384 @@ mod tests {
         assert_eq!(ticks_to_ms_ceil(91), 2);
         assert_eq!(ticks_to_ms_ceil(90_000), 1000);
         assert_eq!(ticks_to_ms_ceil(u64::MAX), u64::MAX / 90_000);
+    }
+
+    // ---- arrival-span bound (ADR 0005 section 2, rule 3a) ----
+
+    /// 25 fps, keyframe every 25 frames, 1000 bytes; `rtp(i)` and `at(i)` (ms after T0) are given.
+    fn run25(
+        s: &mut Segmenter,
+        frames: u32,
+        rtp: impl Fn(u32) -> u32,
+        at: impl Fn(u32) -> i64,
+    ) -> Vec<Pushed> {
+        (0..frames)
+            .map(|i| s.push(frame(i % 25 == 0, rtp(i), T0 + at(i), 1000)))
+            .collect()
+    }
+
+    /// Asserts each closed record spans at most the 40 s bound plus one GOP of arrival time.
+    fn assert_bounded_in_wall_time(out: &[Pushed], tail: Option<&SegmentRecord>) {
+        let mut recs: Vec<&SegmentRecord> = records(out);
+        recs.extend(tail);
+        assert_ne!(recs.len(), 0);
+        for r in recs {
+            assert!(r.frame_count * 40 <= 40_000 + 1000, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn frozen_rtp_is_cut_at_the_arrival_bound() {
+        let mut s = seg(10); // hard max 20 s, arrival bound 40 s
+        let out = run25(&mut s, 25 * 130, |_| 12_345, |i| i64::from(i) * 40);
+        let starts: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.decision == Decision::StartNew)
+            .map(|(i, _)| i)
+            .collect();
+        // keyframes are one per second; the bound is hit exactly at frame 1000 (40.000 s).
+        assert_eq!(starts, [0, 1000, 2000, 3000]);
+        for r in records(&out) {
+            assert_eq!(r.frame_count, 1000);
+            // media time barely moved: the duration is the media span, not the arrival span
+            assert_eq!(r.duration_ms, 1000_u64.div_ceil(90));
+        }
+        assert_bounded_in_wall_time(&out, s.finish().as_ref());
+    }
+
+    #[test]
+    fn frozen_rtp_without_keyframes_closes_on_the_frame_and_drops_until_one() {
+        let mut s = seg(10);
+        let out: Vec<Pushed> = (0..1100u32)
+            .map(|i| s.push(frame(i == 0, 7, T0 + i64::from(i) * 40, 10)))
+            .collect();
+        assert_eq!(out[999].decision, Decision::Append); // 39.96 s
+        assert_eq!(out[1000].decision, Decision::Drop); // 40.000 s
+        assert_eq!(out[1000].closed.as_ref().unwrap().frame_count, 1000);
+        assert!(out[1001..].iter().all(|p| p.closed.is_none()));
+        let k = s.push(frame(true, 7, T0 + 60_000, 10));
+        assert_eq!((k.decision, k.closed), (Decision::StartNew, None));
+    }
+
+    #[test]
+    fn slow_backward_drift_is_bounded_in_wall_time() {
+        // Every frame is 1 ms of RTP (90 ticks) earlier than the one before: clamped to +1 tick.
+        let mut s = seg(10);
+        let out = run25(
+            &mut s,
+            25 * 300,
+            |i| 1_000_000u32.wrapping_sub(i * 90),
+            |i| i64::from(i) * 40,
+        );
+        assert_bounded_in_wall_time(&out, s.finish().as_ref());
+    }
+
+    #[test]
+    fn forward_jumps_close_on_media_time_before_the_arrival_bound() {
+        // A 9 s RTP jump per 40 ms frame: media time passes the 20 s maximum after 3 frames.
+        let mut s = seg(10);
+        let out = run25(&mut s, 200, |i| i * 810_000, |i| i64::from(i) * 40);
+        for r in records(&out) {
+            assert!(r.frame_count <= 3, "{r:?}");
+        }
+        assert_ne!(records(&out).len(), 0);
+    }
+
+    #[test]
+    fn healthy_stream_never_hits_the_arrival_bound() {
+        let mut s = seg(10);
+        // 25 fps, GOP 50 (2 s), real pacing, 5 minutes.
+        let out: Vec<Pushed> = (0..25 * 300u32)
+            .map(|i| s.push(frame(i % 50 == 0, i * 3600, T0 + i64::from(i) * 40, 1000)))
+            .collect();
+        assert!(out.iter().all(|p| p.decision != Decision::Drop));
+        for r in records(&out) {
+            assert_eq!((r.frame_count, r.duration_ms), (250, 10_000));
+        }
+        assert_eq!(records(&out).len(), 29);
+    }
+
+    #[test]
+    fn healthy_stream_with_late_arrivals_is_unaffected() {
+        // Constant 300 ms queueing delay plus 100 ms jitter does not change any cut point.
+        let mut s = seg(10);
+        let out = run25(
+            &mut s,
+            25 * 60,
+            |i| i * 3600,
+            |i| i64::from(i) * 40 + 300 + i64::from(i % 3) * 50,
+        );
+        for r in records(&out) {
+            assert_eq!(r.frame_count, 250);
+        }
+    }
+
+    #[test]
+    fn arrival_clock_stalled_does_not_trigger_the_bound() {
+        // All frames carry the same arrival time: the span is 0, media time bounds the segment.
+        let mut s = seg(10);
+        let out = run25(&mut s, 25 * 60, |i| i * 3600, |_| 0);
+        for r in records(&out) {
+            assert_eq!(r.frame_count, 250);
+        }
+        assert_ne!(records(&out).len(), 0);
+    }
+
+    #[test]
+    fn backward_wall_clock_step_neither_cuts_nor_hides_the_span() {
+        let mut s = seg(10);
+        let at = |i: u32| {
+            let t = i64::from(i) * 40;
+            // The wall clock steps back one hour at frame 500 (20 s) and runs normally after.
+            if i < 500 { t } else { t - 3_600_000 }
+        };
+        // Frozen RTP so only the arrival bound can end the segment.
+        let out = run25(&mut s, 25 * 130, |_| 5, at);
+        // The step contributes 0, so the 40 s bound is reached 40 ms (one frame) later: the
+        // segment ends at frame 1001's keyframe slot, which is frame 1025.
+        let starts: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.decision == Decision::StartNew)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts[..2], [0, 1025]);
+    }
+
+    #[test]
+    fn forward_wall_clock_step_adds_at_most_one_step_and_cuts_nothing_early() {
+        // A one-hour host clock step on a healthy stream counts as 10 s: the stream is not cut.
+        let mut s = seg(10);
+        let at = |i: u32| {
+            let t = i64::from(i) * 40;
+            if i < 100 { t } else { t + 3_600_000 }
+        };
+        let out = run25(&mut s, 200, |i| i * 3600, at);
+        assert!(out.iter().all(|p| p.decision != Decision::Drop));
+        assert_eq!(out[100].decision, Decision::Append);
+    }
+
+    #[test]
+    fn repeated_forward_steps_reach_the_bound_ten_seconds_at_a_time() {
+        // Frozen RTP, one frame per host-clock hour: each frame adds 10 s; the 40 s bound of
+        // target 10 is reached by the fifth frame (index 4).
+        let mut s = seg(10);
+        let hour = 3_600_000;
+        let out: Vec<Pushed> = (0..6)
+            .map(|i| s.push(frame(i == 0, 7, T0 + i64::from(i) * hour, 10)))
+            .collect();
+        assert_eq!(out[3].decision, Decision::Append); // 30 s
+        assert_eq!(out[4].decision, Decision::Drop); // 40 s
+        assert_eq!(out[4].closed.as_ref().unwrap().frame_count, 4);
+        assert_eq!(out[5].closed, None);
+    }
+
+    #[test]
+    fn repeated_forward_steps_on_keyframes_start_a_new_segment() {
+        let mut s = seg(10);
+        let hour = 3_600_000;
+        let out: Vec<Pushed> = (0..5)
+            .map(|i| s.push(frame(true, 7, T0 + i64::from(i) * hour, 10)))
+            .collect();
+        assert_eq!(out[4].decision, Decision::StartNew);
+        assert_eq!(out[4].closed.as_ref().unwrap().frame_count, 4);
+    }
+
+    /// Frozen RTP; `steps` frames 10 s apart after the first (a keyframe), then one frame
+    /// `last_gap` ms later. Returns that last frame's decision.
+    fn after_ten_second_steps(target: u32, steps: i64, last_gap: i64) -> Decision {
+        let mut s = seg(target);
+        for i in 0..=steps {
+            let p = s.push(frame(i == 0, 1, T0 + i * 10_000, 10));
+            assert_ne!(p.decision, Decision::Drop, "step {i}");
+        }
+        s.push(frame(false, 1, T0 + steps * 10_000 + last_gap, 10))
+            .decision
+    }
+
+    #[test]
+    fn arrival_bound_threshold_is_exact() {
+        // target 10: bound 40 s. 30 s after three 10 s steps, then 9_999 / 10_000 ms.
+        assert_eq!(after_ten_second_steps(10, 3, 9_999), Decision::Append);
+        assert_eq!(after_ten_second_steps(10, 3, 10_000), Decision::Drop);
+    }
+
+    #[test]
+    fn arrival_bound_scales_with_the_configured_target() {
+        // target 290: bound 1160 s = 116 steps of 10 s.
+        assert_eq!(after_ten_second_steps(290, 115, 9_999), Decision::Append);
+        assert_eq!(after_ten_second_steps(290, 115, 10_000), Decision::Drop);
+    }
+
+    #[test]
+    fn simultaneous_bounds_close_the_segment_once() {
+        // Frame 4 trips the byte cap (500 > 450), the media maximum (20 s of RTP) and the arrival
+        // bound (40 s) at once: exactly one record, then nothing more to close.
+        let cfg = SegmentConfig::new(10, 450).unwrap();
+        let mut s = Segmenter::new("cam".parse().unwrap(), cfg);
+        for i in 0..4u32 {
+            let p = s.push(frame(i == 0, i * 450_000, T0 + i64::from(i) * 10_000, 100));
+            assert_ne!(p.decision, Decision::Drop);
+        }
+        let p = s.push(frame(false, 4 * 450_000, T0 + 40_000, 100));
+        assert_eq!(p.decision, Decision::Drop);
+        assert_eq!(p.closed.as_ref().unwrap().frame_count, 4);
+        for i in 0..5 {
+            let q = s.push(frame(false, 100_000_000 + i, T0 + 60_000, 1));
+            assert_eq!((q.decision, q.closed), (Decision::Drop, None));
+        }
+        assert_eq!(s.finish(), None);
+    }
+
+    #[test]
+    fn byte_cap_wins_when_it_comes_first_under_frozen_rtp() {
+        let cfg = SegmentConfig::new(10, 5000).unwrap();
+        let mut s = Segmenter::new("cam".parse().unwrap(), cfg);
+        let out = run25(&mut s, 200, |_| 9, |i| i64::from(i) * 40);
+        let r = out.iter().find_map(|p| p.closed.as_ref()).unwrap();
+        assert_eq!((r.frame_count, r.bytes), (5, 5000));
+    }
+
+    /// Runs the span model (written out here: per frame, progress beyond the high-water mark,
+    /// at most 10 s, the mark re-anchored by a backward step of more than 10 s and at each
+    /// segment start) against the segmenter. Frames are `(keyframe, rtp mode, arrival delta ms)`.
+    /// Every appended frame keeps the span under the 40 s bound, and a close (on a `Drop` or on a
+    /// keyframe `StartNew`) happens only when a bound is really reached (minimality).
+    fn check_span_model(
+        frames: &[(bool, u32, i64)],
+        reanchor_at_start: bool,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let mut s = seg(10);
+        let mut model = MediaClock::default();
+        let mut rtp = 1000u32;
+        let mut at = T0;
+        let mut hw = T0;
+        let mut span = 0i64;
+        let mut start_dts = 0u64;
+        for &(key, rtp_mode, delta) in frames {
+            // rtp: frozen / 1 tick back / 1 s forward / normal 25 fps
+            rtp = match rtp_mode {
+                0 => rtp,
+                1 => rtp.wrapping_sub(1),
+                2 => rtp.wrapping_add(90_000),
+                _ => rtp.wrapping_add(3600),
+            };
+            at += delta;
+            let dts = model.push(rtp);
+            let p = s.push(frame(key, rtp, at, 100));
+            let mark = if hw - at > 10_000 { at } else { hw };
+            let would = span + (at - mark).clamp(0, 10_000);
+            hw = mark.max(at);
+            let media = dts - start_dts;
+            match p.decision {
+                Decision::StartNew => {
+                    if p.closed.is_some() {
+                        proptest::prop_assert!(
+                            would >= 40_000 || media >= 10 * 90_000,
+                            "keyframe cut without a bound: span {would}, media {media}"
+                        );
+                    }
+                    span = 0;
+                    start_dts = dts;
+                    if reanchor_at_start {
+                        hw = at; // a new segment anchors its mark at its first arrival
+                    }
+                }
+                Decision::Append => {
+                    span = would;
+                    proptest::prop_assert!(span < 40_000, "span {span}");
+                }
+                Decision::Drop if p.closed.is_some() => {
+                    proptest::prop_assert!(
+                        would >= 40_000 || media >= 20 * 90_000,
+                        "cut without a bound: span {would}, media {media}"
+                    );
+                }
+                Decision::Drop => {}
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        /// Hostile RTP and arrival steps (frozen, backward, forward, wall-clock steps).
+        #[test]
+        fn arrival_span_is_bounded_and_cuts_are_minimal(
+            frames in proptest::collection::vec(
+                (proptest::bool::weighted(0.04), 0u32..4, -20_000i64..60_000),
+                1..600,
+            ),
+        ) {
+            // mostly 40 ms; steps back (down to -20 s) and forward (up to 60 s)
+            let frames: Vec<(bool, u32, i64)> = frames
+                .into_iter()
+                .map(|(k, r, d)| (k, r, if (101..30_000).contains(&d) { 40 } else { d }))
+                .collect();
+            check_span_model(&frames, true)?;
+        }
+
+        /// Phases of a frozen-RTP stream: a keyframe after a short backward step, a long run of
+        /// 40 ms frames, then large forward steps that close the segment. The next phase's keyframe
+        /// starts a segment below the old high-water mark, which a model that keeps the old mark
+        /// gets wrong.
+        #[test]
+        fn short_backward_step_then_long_runs_match_the_model(
+            phases in proptest::collection::vec((0i64..10_000, 1usize..1500, 0usize..6), 1..6),
+        ) {
+            let mut frames = Vec::new();
+            for (back, run, jumps) in phases {
+                frames.push((true, 0, -back));
+                frames.extend(std::iter::repeat_n((false, 0, 40), run));
+                frames.extend(std::iter::repeat_n((false, 0, 30_000), jumps));
+            }
+            check_span_model(&frames, true)?;
+        }
+    }
+
+    /// The regime above fails against a model that keeps the high-water mark across segment
+    /// starts (the round-2 defect); this pins that the check can fail.
+    #[test]
+    fn the_stale_mark_model_is_caught_by_the_phase_regime() {
+        let mut frames = vec![(true, 0, 0)];
+        frames.extend(std::iter::repeat_n((false, 0, 30_000), 5));
+        frames.push((true, 0, -5000));
+        frames.extend(std::iter::repeat_n((false, 0, 40), 1200));
+        assert!(check_span_model(&frames, true).is_ok());
+        assert!(check_span_model(&frames, false).is_err());
+    }
+
+    #[test]
+    fn segment_after_a_backward_step_anchors_at_its_own_first_arrival() {
+        // Frozen RTP. 1: keyframe; 2: four 30 s steps (10 s each, the 4th closes at 40 s);
+        // 3: a keyframe 5 s before the last appended arrival; 4: 200 frames of 40 ms;
+        // 5: three 30 s steps; 6: 40 ms frames until the 40 s bound is reached.
+        let mut s = seg(10);
+        let mut at = T0;
+        assert_eq!(s.push(frame(true, 7, at, 10)).decision, Decision::StartNew);
+        for i in 0..4 {
+            at += 30_000;
+            let p = s.push(frame(false, 7, at, 10));
+            assert_eq!(p.decision == Decision::Drop, i == 3, "step {i}");
+        }
+        let kf = T0 + 90_000 - 5000; // 5 s below the last appended arrival (the old mark)
+        let k = s.push(frame(true, 7, kf, 10));
+        assert_eq!((k.decision, k.closed), (Decision::StartNew, None));
+        at = kf;
+        for _ in 0..200 {
+            at += 40;
+            assert_eq!(s.push(frame(false, 7, at, 10)).decision, Decision::Append);
+        }
+        for _ in 0..3 {
+            at += 30_000;
+            assert_eq!(s.push(frame(false, 7, at, 10)).decision, Decision::Append);
+        }
+        // span is 8 s + 3 x 10 s = 38 s; 40 ms frames add the last 2 s: the 50th closes.
+        for i in 1..=50 {
+            at += 40;
+            let p = s.push(frame(false, 7, at, 10));
+            assert_eq!(p.decision == Decision::Drop, i == 50, "frame {i}");
+        }
     }
 
     proptest::proptest! {

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 939f26bd1b4db76fe9da003ced77ac81b87614bedc5a1b5724f34da310322746 # shrinks to frames = [(true, 0, 0), (false, 0, 20001), (false, 0, 20001)]
+cc c2b575a52cadb074f8cf0708c19e43bfbccac211c5c4855430630a61dc257bdc # shrinks to frames = [(true, 0, 0), (false, 0, -3114), (false, 0, -2476), (false, 0, -1022), (false, 0, -3162), (false, 0, -2537), (false, 0, -4872), (false, 0, 40), (false, 0, 101), (false, 0, 40), (false, 0, 22497), (false, 0, 40), (false, 0, 101), (false, 0, 40), (false, 0, 40)]

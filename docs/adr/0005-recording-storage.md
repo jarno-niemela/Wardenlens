@@ -111,6 +111,36 @@ salvage such a file (section 9) but the format allows it later.
    segment is closed at that frame (a closed fMP4 does not need to end on a GOP boundary), and frames are dropped until
    the next keyframe starts a new segment. The loss is counted as a gap. Also forced: the byte cap `max_segment_bytes`
    (default 1 GiB; 120 s of the highest-bitrate camera is about 130 MB, so this is a sanity bound).
+   **3a. Arrival-span bound (amendment, ticket #103).** The media-time bounds of rules 2 and 3 rely on the camera's RTP
+   clock. A camera whose timestamp freezes or keeps drifting backward is clamped to +1 tick per frame (the `MediaClock`
+   below), so media time hardly advances and neither the target nor the hard maximum is reached. A segment is therefore
+   also bounded by **arrival time**: when the arrival span of a segment, from its first frame to the current frame,
+   reaches **2 x the hard maximum** (240 s with the defaults, 4 x the configured target), the segment is closed by the
+   same mechanism as the hard maximum: a keyframe starts the next segment and closes this one, any other frame closes
+   the segment and is dropped, with frames dropped until the next keyframe (a segment always starts at a keyframe, so
+   there is no "resume mid-GOP"; the loss counts as a gap). The factor 2 leaves a healthy stream untouched: its arrival
+   span tracks its media span, which is cut at 60 s (120 s at the latest) long before. A crash loses at most 120 s of
+   a stream with a sound clock; with a frozen or drifting RTP clock it loses at most 240 s of capped arrival time (the span below), plus a gap of
+   up to one GOP at each forced cut. That holds for frame gaps of at most 10 s and a host clock that does not lag and
+   catch up by steps (see #183).
+   - *Clock.* `arrival` is the wall-clock `UnixMs` of the `Clock` trait (#46), which can step. The segmenter does not
+     subtract first from last arrival. For each frame it adds the **forward progress** of the arrival clock to the
+     span, under three rules: (1) only progress beyond the **high-water mark** (the latest arrival seen in this
+     segment) counts, so a clock oscillating around true time (two time daemons, +500 ms / -500 ms) adds the real
+     forward time and not the sum of its forward steps; (2) one frame adds **at most 10 s**, the same per-step limit
+     as the media clock (`MAX_STEP_TICKS`), so a step of the host clock (NTP at first sync, a manual change) counts
+     as one long frame gap, not as the size of the step: a healthy stream is not cut by it, although repeated large
+     steps do advance the span 10 s at a time and can still cut a healthy stream, which is accepted; (3) a step
+     **backward of more than 10 s** re-anchors the high-water mark at the new arrival, so a clock stepped far back
+     cannot hide the time that passes afterwards (a smaller backward step keeps the mark and delays the span by at
+     most that step each time). A stalled clock (equal arrivals) adds 0, so the media-time bounds still apply.
+   - *Interaction.* The byte cap, the media-time maximum and the arrival bound are one test (`forced`) per frame:
+     whichever is reached first closes the segment, and a frame closes at most one segment (it is `StartNew` with the
+     old record, or `Drop` with the record, never both). A frozen RTP clock together with a host whose clock also
+     stalls, or lags and catches up by steps, is bounded only by the byte cap; that case is out of scope here (see #183).
+   - *`duration_ms`.* It stays the **media** duration (unchanged definition, so the 600 s `CHECK` and the sums of
+     section 2 still hold) and may be far below the arrival span when the bound fires. Consumers needing wall
+     coverage of such a segment have the next segment's `started_at_ms`; no wall duration is stored.
 4. **Fragment** = one GOP. A fragment is also flushed early when it reaches 16 MiB, so no `mdat` approaches the u32
    size limit. A single frame larger than 8 MiB is treated as a stream error (a discontinuity, #57).
 5. A discontinuity (reconnect), an SPS/PPS change (resolution, profile) or a write error closes the segment cleanly

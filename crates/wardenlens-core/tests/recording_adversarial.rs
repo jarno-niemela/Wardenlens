@@ -145,7 +145,6 @@ fn reset_then_wrap_is_independent_of_previous_stream() {
 // ---------- Segmenter ----------
 
 #[test]
-#[ignore = "wall-clock segment bound needs an ADR 0005 amendment; see follow-up"]
 fn frozen_rtp_segment_is_bounded_in_frames() {
     // Camera sends the same RTP timestamp forever at 25 fps. Media time advances 1 tick
     // per frame, so the 10 s target needs 900,000 frames (10 h of wall time).
@@ -164,7 +163,7 @@ fn frozen_rtp_segment_is_bounded_in_frames() {
     // 10 minutes of wall-clock frames with a 10 s target and 20 s hard max.
     assert!(
         closes >= 1,
-        "no segment closed in 600 s of wall time (starts={starts}); hard max is media time only"
+        "no segment closed in 600 s of wall time (starts={starts}); the arrival bound did not fire"
     );
 }
 
