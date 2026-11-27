@@ -15,18 +15,50 @@ vault_value() { # <id> [username|password]
   if [[ -n "${2:-}" ]]; then wl vault get "$1" --field "$2"; else wl vault get "$1"; fi
 }
 
-# cam_id <name-or-id> -> inventory id. The old AgentDVR display names are still accepted; anything that already
-# looks like an inventory id (lower case, digits, hyphen) is used as it is.
+# cam_id <inventory-id> -> the inventory id, checked (lower case, digits, hyphen). Display names are not accepted and
+# no name->id mapping lives in the tree: site-specific names stay in the vault (docs/DEV_VAULT.md).
 cam_id() {
-  case "$1" in
-    IPC-BO) echo reolink-1 ;;
-    "IPC-BO (2)") echo reolink-2 ;;
-    XR) echo xr ;;
-    C110) echo tapo ;;
-    HDIPC) echo hdipc ;;
-    *)
-      if [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]; then echo "$1"; else echo "unknown camera" >&2; return 1; fi ;;
-  esac
+  if [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]; then echo "$1"; else echo "unknown camera" >&2; return 1; fi
+}
+
+# cam_ids -> the inventory ids that have a host entry in the vault (cam:<id>:host), one per line. `vault list` prints
+# ids and kinds, never values. A :host entry whose id is not a usable inventory id is reported on stderr, not dropped.
+cam_ids() {
+  local out
+  out="$(wl vault list)" || return 1
+  awk -F'\t' '
+    $1 ~ /^cam:[a-z0-9][a-z0-9-]*:host$/ { split($1, p, ":"); print p[2]; next }
+    $1 ~ /^cam:.*:host$/ { printf "cam_ids: skipping a vault host entry whose id is not a usable inventory id: %s\n", $1 > "/dev/stderr" }
+  ' <<<"$out"
+}
+
+# selected_cams -> the inventory ids in $CAMERAS (whitespace separated, never glob-expanded) if set, else cam_ids; one
+# per line. Non-zero, printing nothing, if any id is invalid.
+selected_cams() {
+  local c list=() all=""
+  if [[ -n ${CAMERAS:-} ]]; then
+    IFS=$' \t\n' read -r -d '' -a list <<<"$CAMERAS" || true
+    for c in "${list[@]}"; do all+="$(cam_id "$c")"$'\n' || return 1; done
+    printf '%s' "$all"
+  else
+    cam_ids
+  fi
+}
+
+# load_cams -> fills the global array CAMS with the selected inventory ids. The one choke point for the scripts that
+# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, an id with no vendor RTSP path, a vault failure or an empty selection.
+load_cams() {
+  local out id
+  declare -A seen=()
+  CAMS=()
+  out="$(selected_cams)" || { echo "no usable camera selection" >&2; return 1; }
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    if [[ -n ${seen[$id]:-} ]]; then CAMS=(); echo "duplicate camera id: $id" >&2; return 1; fi
+    rtsp_path "$id" main >/dev/null || { CAMS=(); return 1; }
+    seen[$id]=1; CAMS+=("$id")
+  done <<<"$out"
+  (( ${#CAMS[@]} > 0 )) || { echo "no cameras: set CAMERAS or add cam:<id>:host vault entries" >&2; return 1; }
 }
 
 # cam_host <name> -> bare host from the vault (entry cam:<id>:host).
@@ -84,6 +116,7 @@ uri_enc() { printf '%s' "$1" | jq -rRs '@uri'; }
 # spike-only exception of ADR 0002 (those tools take the credentials nowhere else).
 rtsp_url() {
   local host
+  [[ ${2:-} == /* ]] || { echo "no RTSP path for camera: $1" >&2; return 1; }
   cam_creds "$1" || return 1
   host="$(cam_host "$1")" && [[ -n "$host" ]] || { echo "no host for camera: $1" >&2; return 1; }
   printf 'rtsp://%s:%s@%s:554%s' "$(uri_enc "$CAM_USER")" "$(uri_enc "$CAM_PASS")" "$host" "$2"
@@ -113,8 +146,8 @@ redact() {
   ) || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
-# Vendor RTSP paths (main|sub) by camera; accepts a display name or an inventory id.
-rtsp_path() { # <name> <main|sub>
+# Vendor RTSP paths (main|sub) by camera; takes an inventory id. An id with no known vendor path is an error.
+rtsp_path() { # <id> <main|sub>
   local id
   id="$(cam_id "$1")" || return 1
   case "$id" in
@@ -122,5 +155,6 @@ rtsp_path() { # <name> <main|sub>
     xr) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
     tapo) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
     hdipc) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
+    *) echo "no vendor RTSP path for camera: $id" >&2; return 1 ;;
   esac
 }
