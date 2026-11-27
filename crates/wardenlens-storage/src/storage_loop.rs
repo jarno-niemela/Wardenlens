@@ -701,11 +701,14 @@ impl<I: SegmentIndex, F: Fs, U: VolumeUsage> StorageLoop<I, F, U> {
             archive_only,
         } = mode;
         let hot_space = current.hot.map_err(TickError::HotVolume)?;
-        let ingested = plausible_ingest(
-            self.hot_after_last_tick
-                .map_or(0, |after| hot_total.saturating_sub(after)),
-            hot_space,
-        );
+        // No cap on `ingested`: it only seeds the rolling budget (`hot_total - ingested`), which
+        // matters only when the floor is unreachable, i.e. `free + hot_total < floor <= capacity`.
+        // An ingest above the used space (`capacity - free`) would give `hot_total >= ingested >
+        // capacity - free`, so `free + hot_total > capacity`: the floor is reachable and the
+        // seed is never used. A cap could therefore never change a plan.
+        let ingested = self
+            .hot_after_last_tick
+            .map_or(0, |after| hot_total.saturating_sub(after));
         // `archive_only` plans with the hot video out of sight: the planner then plans no move and
         // no eviction on behalf of one, only what the archive's own floor needs.
         let visible: Vec<StoredSegment>;
@@ -1454,14 +1457,6 @@ fn capped_budget(budget: Option<u64>, ceiling: Option<u64>) -> (Option<u64>, Opt
     }
 }
 
-/// Bytes recorded since the last tick, capped at the space in use on the hot volume: the video
-/// recorded in one tick is on the disk, so a larger figure comes from a corrupt index and would
-/// only shrink the seed of the rolling budget and delete good video.
-const fn plausible_ingest(ingested: u64, hot: VolumeSpace) -> u64 {
-    let used = hot.capacity_bytes.saturating_sub(hot.free_bytes);
-    if ingested < used { ingested } else { used }
-}
-
 /// The reserve as a whole percent of the hot capacity, rounded up (capped at the largest
 /// accepted floor), or `None` for no reserve.
 fn reserve_percent(
@@ -1522,27 +1517,6 @@ mod reserve_tests {
         assert_eq!(capped_budget(None, None), (None, None));
         assert_eq!(capped_budget(Some(5), None), (None, None));
         assert_eq!(capped_budget(None, Some(5)), (None, None));
-    }
-
-    #[test]
-    fn ingest_is_capped_at_the_space_in_use() {
-        let hot = |free| VolumeSpace {
-            capacity_bytes: 1000,
-            free_bytes: free,
-        };
-        assert_eq!(plausible_ingest(10, hot(900)), 10);
-        assert_eq!(
-            plausible_ingest(500, hot(900)),
-            100,
-            "only 100 B are in use"
-        );
-        assert_eq!(plausible_ingest(u64::MAX, hot(0)), 1000);
-        assert_eq!(plausible_ingest(5, hot(1000)), 0, "nothing in use");
-        assert_eq!(
-            plausible_ingest(5, hot(2000)),
-            0,
-            "free above capacity saturates"
-        );
     }
 
     fn pol(reserve: u64) -> Policy {

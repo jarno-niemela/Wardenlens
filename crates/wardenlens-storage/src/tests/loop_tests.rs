@@ -2293,9 +2293,9 @@ fn rolling_budget_and_ceiling_travel_together_and_the_budget_recovers_after_fore
 #[test]
 fn an_index_that_outgrows_the_used_space_does_not_lower_the_seed_or_start_deleting() {
     // The index claims 5 MB of new hot video between ticks although the volume holds far less
-    // (a corrupt index): nothing is deleted and no budget appears. The cap on the ingest figure
-    // (`plausible_ingest`) cannot change the plan here, since a figure above the used space
-    // makes the floor reachable; it is covered by its unit test.
+    // (a corrupt index): nothing is deleted and no budget appears, because the ingest figure
+    // above the used space makes the floor reachable (see `make_plan`). Regression test of that
+    // invariant.
     let env = Env::new();
     env.set_cap("hot", 1_000_000);
     env.add("cam-1", 0, 10_000, Tier::Hot);

@@ -577,7 +577,8 @@ of the rules above; the planner is `wardenlens_core::storage::plan`.
   emptied on every tick. A volume that foreign data keeps under that floor is the rolling-buffer case below.
 - *Rolling buffer.* When the floor is unreachable even by removing all hot video (case 4) and the archive cannot
   take the load, the oldest hot video is deleted until what remains is at most the rolling budget and the
-  reserve is free, or no hot video is left. Where the archive can absorb the video, or the plan deletes nothing for
+  reserve is free, or no hot video is left. This is the ticket #44 override of case 4 and it stays: the cap above, not
+  its removal, is what stops a reserve larger than the volume from emptying it. Where the archive can absorb the video, or the plan deletes nothing for
   the floor, hot video is never deleted for a floor that deleting cannot reach.
 - *Budget, ratchet, ceiling and recovery.* The budget is the hot-video level the buffer holds. On entry it is the
   video held before that tick's ingest (the seed), which is also its ceiling. It ratchets down to the video left only

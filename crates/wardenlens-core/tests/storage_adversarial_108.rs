@@ -9,7 +9,7 @@
 use proptest::prelude::*;
 use wardenlens_core::storage::{
     Action, ArchiveState, HotState, MinFreePercent, Plan, PlanInput, Policy, SegmentId,
-    StoredSegment, Tier, VolumeSpace, plan,
+    StoredSegment, Tier, VolumeSpace, effective_reserve_bytes, plan,
 };
 use wardenlens_core::time::{DurationMs, Timestamp};
 
@@ -218,7 +218,8 @@ fn hot_state_is_measured_against_the_larger_of_floor_and_reserve() {
             },
         );
         let floor = u64::try_from(u128::from(cap) * u128::from(pct) / 100).unwrap();
-        let unsat = free + video < floor.max(reserve);
+        // The oracle uses the reserve capped at 90 % of capacity (ticket #108 ruling).
+        let unsat = free + video < floor.max(effective_reserve_bytes(cap, reserve));
         assert_eq!(
             p.hot != HotState::Ok,
             unsat,
