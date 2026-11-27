@@ -49,7 +49,7 @@ use crate::wiring::{
 
 /// Why `serve` failed.
 #[derive(Debug, thiserror::Error)]
-enum CommandError {
+pub(super) enum CommandError {
     /// The config could not be used.
     #[error(transparent)]
     Config(#[from] ConfigFileError),
@@ -71,6 +71,9 @@ enum CommandError {
     /// The index cannot be opened.
     #[error("the index cannot be opened")]
     Index(#[source] IndexError),
+    /// The built-in camera catalogue is invalid (cannot happen; a test pins it).
+    #[error("the built-in camera catalogue is invalid")]
+    Catalogue(#[source] wardenlens_core::catalogue::CatalogueError),
     /// The registry has cameras and the vault cannot be opened with the key.
     #[error("the vault cannot be used")]
     Vault(#[source] VaultError),
@@ -204,12 +207,17 @@ fn load_key(path: &Path) -> Result<KeyFile, CommandError> {
 
 /// One stream source per registered camera that the vault can complete. The vault is opened only
 /// when there is a camera to read it for, and is dropped (with the key) before the service runs.
-fn camera_inputs(
+pub(super) fn camera_inputs(
     config: &Config,
     index: &Index,
     key: KeyFile,
 ) -> Result<Vec<CameraInput<RetinaSource<SystemClock>>>, CommandError> {
-    let stored = index.list_cameras(&[]).map_err(CommandError::Index)?;
+    // The catalogue lists the query strings that a stored path may carry (`camera add` stores
+    // such paths); with none loaded one row of such a camera would fail the whole listing.
+    let catalogue = super::camera::catalogue().map_err(CommandError::Catalogue)?;
+    let stored = index
+        .list_cameras(&catalogue)
+        .map_err(CommandError::Index)?;
     if stored.is_empty() {
         tracing::warn!("no cameras are registered; the service records nothing");
         return Ok(Vec::new());

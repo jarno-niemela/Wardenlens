@@ -169,7 +169,8 @@ fn parse(args: &[&str]) -> VaultCommand {
             | Command::Import(_)
             | Command::Secrets(_)
             | Command::Token(_)
-            | Command::Serve,
+            | Command::Serve
+            | Command::Camera(_),
         ) => {
             panic!("no vault command")
         }

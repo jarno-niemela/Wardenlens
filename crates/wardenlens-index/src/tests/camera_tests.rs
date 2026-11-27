@@ -242,6 +242,62 @@ fn the_registry_is_bounded() {
     assert_eq!(idx.list_cameras(&cat).unwrap().len(), MAX_CAMERAS);
 }
 
+/// `insert_camera` never replaces: the second of two inserts of one id is refused, with the first
+/// row, its `created_at` and the generation untouched; the vetting and the bound are the
+/// upsert's.
+#[test]
+fn insert_camera_refuses_an_existing_id_and_changes_nothing() {
+    let (_f, mut idx) = open_new();
+    let cat = catalogue();
+    idx.insert_camera(&simple("one"), &cat, at(T0)).unwrap();
+    let before = generation(&idx);
+    let other = record("one", ("acme", "c2"), 8554, "/plain", None);
+    let e = idx.insert_camera(&other, &cat, at(T0 + 5)).unwrap_err();
+    assert!(matches!(e, IndexError::CameraExists), "{e:?}");
+    assert_eq!(generation(&idx), before);
+    let got = idx.get_camera(&cam("one"), &cat).unwrap().unwrap();
+    assert_eq!(got.record(), &simple("one"));
+    assert_eq!(got.updated_at(), at(T0));
+    // An unlisted query is refused as for upsert, and nothing is written.
+    let bad = record("two", ("acme", "c2"), 554, "/s?x=1", None);
+    let e = idx.insert_camera(&bad, &cat, at(T0)).unwrap_err();
+    assert!(
+        matches!(e, IndexError::CameraQueryNotAllowed { .. }),
+        "{e:?}"
+    );
+    assert!(idx.get_camera(&cam("two"), &cat).unwrap().is_none());
+    // Upsert still replaces.
+    idx.upsert_camera(&other, &cat, at(T0 + 9)).unwrap();
+    assert_eq!(
+        idx.get_camera(&cam("one"), &cat).unwrap().unwrap().record(),
+        &other
+    );
+}
+
+#[test]
+fn insert_camera_respects_the_bound() {
+    let (f, mut idx) = open_new();
+    let cat = catalogue();
+    {
+        let c = raw(&f.path);
+        c.execute_batch("BEGIN").unwrap();
+        for n in 0..MAX_CAMERAS {
+            c.execute(
+                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/m', NULL, ?2, ?2)",
+                rusqlite::params![format!("c{n:04}"), T0],
+            )
+            .unwrap();
+        }
+        c.execute_batch("COMMIT").unwrap();
+    }
+    let e = idx.insert_camera(&simple("zzz"), &cat, at(T0)).unwrap_err();
+    assert!(matches!(e, IndexError::TooManyCameras { .. }), "{e:?}");
+    let e = idx
+        .insert_camera(&simple("c0007"), &cat, at(T0))
+        .unwrap_err();
+    assert!(matches!(e, IndexError::CameraExists), "{e:?}");
+}
+
 // ---- generation bump (P2) --------------------------------------------------------------
 
 #[test]
@@ -524,6 +580,7 @@ fn every_new_error_variant_has_a_message_that_names_the_rule_only() {
         IndexError::CameraQueryNotAllowed { field: "main_path" },
         IndexError::CorruptCameraRow { field: "id" },
         IndexError::TooManyCameras { max: 1 },
+        IndexError::CameraExists,
     ] {
         assert!(!e.is_transient());
     }

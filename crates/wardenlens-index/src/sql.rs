@@ -87,6 +87,11 @@ pub(crate) const UPSERT_CAMERA: &str = "INSERT INTO cameras \
     main_path = excluded.main_path, sub_path = excluded.sub_path, \
     updated_at_ms = excluded.updated_at_ms";
 
+/// Insert only: a row with the id makes this a constraint error (the caller checks first).
+pub(crate) const INSERT_CAMERA: &str = "INSERT INTO cameras \
+    (id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)";
+
 pub(crate) const GET_CAMERA: ReadSql = ReadSql(
     "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms \
     FROM cameras WHERE id = ?1",
