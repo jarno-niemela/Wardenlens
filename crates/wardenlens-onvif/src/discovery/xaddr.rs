@@ -20,14 +20,17 @@ use std::str::FromStr;
 
 use crate::client::ServicePath;
 
+/// The port of a URL that names none.
+const DEFAULT_PORT: NonZeroU16 = NonZeroU16::MIN.saturating_add(79);
+
 /// A validated device service address found by discovery.
 ///
 /// `Debug` shows no address (it is LAN data from a hostile source); `Display` writes the
 /// canonical `http://host[:port]/path` for an operator to confirm.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct XAddr {
     host: IpAddr,
-    port: Option<NonZeroU16>,
+    port: NonZeroU16,
     path: ServicePath,
 }
 
@@ -38,10 +41,10 @@ impl XAddr {
         self.host
     }
 
-    /// The port, 80 when the URL named none.
+    /// The port: 80 when the URL named none or named 80 (one canonical value).
     #[must_use]
     pub fn port(&self) -> u16 {
-        self.port.map_or(80, NonZeroU16::get)
+        self.port.get()
     }
 
     /// The service path: starts with `/`, valid for [`crate::OnvifClient::with_device_path`].
@@ -63,8 +66,8 @@ impl fmt::Display for XAddr {
             IpAddr::V4(a) => write!(f, "http://{a}")?,
             IpAddr::V6(a) => write!(f, "http://[{a}]")?,
         }
-        if let Some(p) = self.port {
-            write!(f, ":{p}")?;
+        if self.port != DEFAULT_PORT {
+            write!(f, ":{}", self.port)?;
         }
         f.write_str(self.path.as_str())
     }
@@ -114,7 +117,7 @@ impl fmt::Display for XAddrDrop {
             Self::NotIpLiteral => "xaddr host is not a plain IP address",
             Self::BadPort => "xaddr port is invalid",
             Self::OutsideLan => "xaddr address is not private or link-local",
-            Self::BadPath => "xaddr path has a character outside the allowed set",
+            Self::BadPath => "xaddr path is not a valid service path",
         })
     }
 }
@@ -157,8 +160,8 @@ pub(crate) fn validate(raw: &str) -> Result<XAddr, XAddrDrop> {
     let (host, port) = split_authority(authority)?;
     let host = parse_host(host)?;
     let port = match port {
-        None => None,
-        Some(p) => Some(parse_port(p)?),
+        None => DEFAULT_PORT,
+        Some(p) => parse_port(p)?,
     };
     if !(path.is_empty() || path.starts_with('/')) {
         return Err(XAddrDrop::BadPath);

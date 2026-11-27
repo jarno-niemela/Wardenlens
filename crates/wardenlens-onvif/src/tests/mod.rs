@@ -7,6 +7,7 @@
 mod client;
 mod discovery;
 mod discovery_adv;
+mod discovery_adv_r2;
 mod discovery_adversary;
 mod fixtures;
 mod leaks;

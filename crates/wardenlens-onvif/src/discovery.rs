@@ -269,6 +269,11 @@ pub(crate) async fn run(
     let mut counted = 0_usize;
     let mut read = 0_usize;
     while counted < max_replies && read < MAX_DATAGRAMS {
+        // `timeout_at` polls the socket first, so under a continuous flood it would never see
+        // the deadline: check it here, before receiving and before parsing.
+        if Instant::now() >= deadline {
+            break;
+        }
         let received = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await;
         let n = match received {
             Err(_elapsed) => break,

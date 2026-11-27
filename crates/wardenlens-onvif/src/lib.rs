@@ -32,8 +32,9 @@
 //!
 //! The password goes into exactly one place, the digest input buffer, which is wiped on return.
 //! It is never formatted: not in `Debug`, not in errors, not in any log. The only events this
-//! crate logs are [`discovery`]'s drop reasons, which are fixed texts and never carry reply
-//! text.
+//! crate logs are [`discovery`]'s, at `debug` level, each a fixed text plus the probe id and
+//! never reply text: a reason for every dropped entry or ignored datagram, a datagram over 64
+//! KiB, and a receive error (as its `ErrorKind`).
 //!
 //! # The camera does not choose where the recorder connects
 //!

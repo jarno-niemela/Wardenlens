@@ -896,7 +896,8 @@ fn label(e: DiscoveryError) -> &'static str {
 #[test]
 fn every_discovery_error_variant_is_driven_or_listed() {
     // `Random` (the OS RNG failing) cannot be provoked from a test. A receive error is not an
-    // error of the run: see `a_receive_error_keeps_what_was_found`.
+    // error of the run: it ends collection and keeps the devices (untestable: an unconnected
+    // UDP socket gets no receive error on loopback).
     let undrivable: BTreeSet<&str> = ["Random"].into();
     let driven: BTreeSet<&str> = [label(DiscoveryError::Socket(
         io::ErrorKind::AddrNotAvailable,

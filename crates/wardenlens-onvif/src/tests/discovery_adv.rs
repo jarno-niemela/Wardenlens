@@ -27,8 +27,9 @@ async fn closed_port() -> SocketAddr {
 }
 
 #[tokio::test]
-async fn an_icmp_port_unreachable_for_the_probe_does_not_abort_the_run() {
-    // On loopback the kernel answers the probe with ICMP port unreachable at once.
+async fn no_responder_gives_an_empty_result() {
+    // Nobody listens on the target port. (Linux does not deliver the ICMP port unreachable to an
+    // unconnected UDP socket, so this does not exercise a receive error.)
     let to = closed_port().await;
     let got = run(to, LOOP, Duration::from_millis(200), MAX_REPLIES, ID).await;
     assert_eq!(got, Ok(Vec::new()));

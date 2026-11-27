@@ -19,7 +19,7 @@ pub const DEFAULT_SERVICE_PATH: &str = "/onvif/device_service";
 
 /// A validated service path (`/onvif/device_service`): `/` then `pchar` bytes without `?`, `#`,
 /// `%` or `@`, no `//` at the start, at most [`MAX_SERVICE_PATH_LEN`] bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ServicePath(String);
 
 impl ServicePath {
