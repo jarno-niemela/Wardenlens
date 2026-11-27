@@ -1116,9 +1116,10 @@ fn the_password_is_not_read_for_a_duplicate_id_or_a_missing_key() {
 }
 
 /// `import` reads the registry with the catalogue: re-importing over an id that `camera add`
-/// stored with a catalogue-listed query works (with no catalogue the row cannot be read).
+/// stored with a catalogue-listed query works when it is the same source (the same model), and
+/// never overwrites it with another model (#207). With no catalogue the row cannot be read.
 #[test]
-fn import_updates_a_camera_that_camera_add_stored_with_a_listed_query() {
+fn import_updates_only_a_camera_row_of_its_own_model() {
     let site = Site::new();
     add_closed(&site, "agentdvr-1", "dahua/ipc-hfw4431r-z");
     let xml = "<objects><cameras><camera id=\"1\" name=\"A\"><settings>\
@@ -1127,14 +1128,35 @@ fn import_updates_a_camera_that_camera_add_stored_with_a_listed_query() {
                </camera></cameras></objects>";
     let parsed = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
     assert_eq!(parsed.cameras[0].id.as_str(), "agentdvr-1");
-    let model = ModelRef::new("agentdvr", "imported").unwrap();
-    let rows =
-        crate::commands::import::write_all(&site.config, site.key(), &parsed.cameras, &model)
-            .unwrap();
+    let catalogue = crate::commands::camera::catalogue().unwrap();
+    let ready = |model: &str| {
+        vec![crate::commands::import::Ready {
+            draft: parsed.cameras[0].clone(),
+            model: ModelRef::new("agentdvr", model).unwrap(),
+        }]
+    };
+    // Another model: the `camera add` row is kept and reported.
+    let rows = crate::commands::import::write_all(
+        &site.config,
+        site.key(),
+        &ready("imported"),
+        &catalogue,
+    )
+    .unwrap();
     assert_eq!(rows.len(), 1);
     let cams = site.cameras();
     assert_eq!(cams.len(), 1);
-    assert_eq!(cams[0].record().model().to_string(), "agentdvr/imported");
+    assert_eq!(cams[0].record().model().to_string(), "dahua/ipc-hfw4431r-z");
+    // The same model: an update.
+    let same = vec![crate::commands::import::Ready {
+        draft: parsed.cameras[0].clone(),
+        model: ModelRef::new("dahua", "ipc-hfw4431r-z").unwrap(),
+    }];
+    crate::commands::import::write_all(&site.config, site.key(), &same, &catalogue).unwrap();
+    let cams = site.cameras();
+    assert_eq!(cams.len(), 1);
+    assert_eq!(cams[0].record().model().to_string(), "dahua/ipc-hfw4431r-z");
+    assert_eq!(cams[0].record().streams().main.as_str(), "/live");
 }
 
 mod adversary;

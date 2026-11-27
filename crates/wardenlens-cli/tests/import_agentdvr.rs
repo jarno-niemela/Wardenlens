@@ -326,7 +326,8 @@ fn input_over_8_mib_is_refused_before_reading() {
     // Sparse: nothing is written, so only a size check can refuse it quickly.
     f.set_len(8 * 1024 * 1024 + 1).unwrap();
     let out = site.import(&file, &[]);
-    assert_eq!(out.status.code(), Some(1));
+    // Like a config file over its limit: a file that cannot be used is 2 (#163).
+    assert_eq!(out.status.code(), Some(2));
     assert!(text(&out.stderr).contains("8 MiB"), "{}", text(&out.stderr));
     assert!(!site.p("state/vault.db").exists());
 }

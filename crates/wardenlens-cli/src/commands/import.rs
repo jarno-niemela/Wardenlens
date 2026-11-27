@@ -1,4 +1,5 @@
-//! `wardenlens import agentdvr <objects.xml> [--dry-run]` (#66).
+//! `wardenlens import agentdvr <objects.xml> [--dry-run] [--model M] [--camera-model ID=M]` (#66,
+//! #163).
 //!
 //! Wires the parser ([`wardenlens_agentdvr`]), the key file ([`wardenlens_secrets`]), the vault and
 //! the camera registry. Where each part of a camera goes (ADR 0006):
@@ -14,7 +15,9 @@
 //!
 //! # Behaviour
 //! * The input is opened with `O_NOFOLLOW` as a regular file, refused when its size (`fstat`) is
-//!   over 8 MiB, and read through `take(limit + 1)` so a file that grows is bounded too. A file
+//!   over 8 MiB, and read through `take(limit + 1)` so a file that grows is bounded too (two
+//!   guards, each tested alone). Exit codes follow `ConfigFileError`: a document refused for its
+//!   content or a bad option is 1; a file that cannot be used, or any other failure, is 2. A file
 //!   readable by others draws a warning on stderr; the file is never changed. The buffer is
 //!   zeroised on drop.
 //! * `--dry-run` parses and prints, and touches no file: not the index, not the vault, not the key
@@ -27,9 +30,32 @@
 //!   cannot share a transaction, so a run that fails midway is repaired by running it again
 //!   (every write is an upsert). The registry row is last so a listed camera always has its
 //!   vault entries.
-//! * The registry stores model `agentdvr/imported`, which is in no catalogue, so a path with a query
-//!   string is skipped (`path has a query string`): the registry accepts a query only for a model
-//!   whose catalogue entry lists it (SEC-10). The check runs in a dry run too, so both agree.
+//! * **A run that fails midway leaves orphans.** If the registry write fails after the vault
+//!   writes of that camera (the registry refuses the row, the disk is full), the vault holds
+//!   `cam:<id>:host` and `:name` (and the login) for an id that no registry row lists. Nothing
+//!   reads them, `camera list` does not show them, and running the import again completes the
+//!   camera. The cameras before the failing one are complete.
+//! * **Cameras removed from the file are not pruned.** The import only adds and updates; a camera
+//!   that is no longer in `objects.xml` keeps its registry row and vault entries until
+//!   `wardenlens camera remove <id>` removes them. (A prune would delete a camera the owner may
+//!   have added by hand under the same id scheme.)
+//! * **The model of a camera** (catalogue data only; no vendor or model is named in this code).
+//!   In this order: its `--camera-model <id>=<vendor>/<model>`, then `--model <vendor>/<model>`
+//!   for the whole file, then, only for a source path **with a query string**, the one catalogue
+//!   model that lists exactly that path (path and query) among its RTSP paths. More than one such
+//!   model is an ambiguity: the camera is skipped, naming the model ids, never guessed. A path
+//!   with no query string and no option keeps `agentdvr/imported`. An option model must be in the
+//!   catalogue, and a `--camera-model` id must be in the file, or nothing is written (exit 1).
+//!   The `AgentDVR` file has no vendor field that the importer reads, so the vendor is not a
+//!   matching input; the path shape is.
+//! * **SEC-10 holds whatever picked the model:** the registry accepts a query only for a model
+//!   whose catalogue entry lists exactly that query, so an unlisted query is skipped (`path has a
+//!   query string`) even under a chosen model, and no other model is substituted. The check runs
+//!   in a dry run too, so both agree.
+//! * An existing registry row is updated (re-import) only if its model is of vendor `agentdvr`
+//!   (an earlier import) or equals the model chosen now. A row of another model was made by
+//!   `camera add` (or by an import with another model): it is skipped and its vault entries are
+//!   not touched (#207).
 //! * A path that contains any user or password the parser read (any camera's, since sites share
 //!   passwords, and the logins of skipped entries too; ASCII-case-insensitive) is skipped and its path is not
 //!   shown, so a login hidden in a path never reaches the registry or the output. A very short
@@ -38,7 +64,7 @@
 //!   refused whole (`the objects file was refused`), so the screen's cost is bounded.
 //! * Only the path is screened. The host is not: it is a site identifier the table prints by design,
 //!   and a host that equals a login is not a leak path into the registry (which stores no host).
-//! * Output (stdout) is a table of id, host, path and status. The host identifies the site: the
+//! * Output (stdout) is a table of id, host, path, model (`-` for the default) and status. The host identifies the site: the
 //!   owner runs this locally and never pastes the output. No login, password or source URL is
 //!   ever printed, and no error carries input text.
 
@@ -50,8 +76,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aho_corasick::AhoCorasick;
 use secrecy::SecretString;
 use wardenlens_agentdvr::{CameraDraft, Logins, MAX_INPUT_BYTES, SkipReason, Skipped};
-use wardenlens_core::camera::{CameraError, MAX_PATH_LEN, ModelRef, RtspPath, StreamSet};
-use wardenlens_core::catalogue::query_allowed;
+use wardenlens_core::camera::{CameraError, CameraId, MAX_PATH_LEN, ModelRef, RtspPath, StreamSet};
+use wardenlens_core::catalogue::{CatalogueEntry, ProtocolKind, query_allowed};
 use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
 use wardenlens_core::time::UnixMs;
@@ -68,8 +94,13 @@ use crate::config_file::{ConfigFileError, load, resolve_path};
 /// The vault file next to the index.
 const VAULT_FILE_NAME: &str = "vault.db";
 
-/// The registry model of an imported camera: in no catalogue (see the module docs).
+/// The registry model of an imported camera that no catalogue model was chosen for or matched:
+/// in no catalogue, so a path with a query string is not imported under it (see the module docs).
 const MODEL: (&str, &str) = ("agentdvr", "imported");
+
+/// The vendor slug of the models this command itself assigns. A registry row of any other vendor
+/// was made by `camera add` or by an earlier import with a catalogue model.
+const OWN_VENDOR: &str = "agentdvr";
 
 /// Why the import failed.
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +155,19 @@ pub(crate) enum ImportError {
     /// The built-in camera catalogue is invalid (cannot happen; a test pins it).
     #[error("the built-in camera catalogue is invalid")]
     Catalogue(#[source] wardenlens_core::catalogue::CatalogueError),
+    /// A `--model` or `--camera-model` value is not `<vendor>/<model>` (or `<id>=<vendor>/<model>`).
+    #[error(
+        "a model option is malformed; use `--model <vendor>/<model>` and `--camera-model <id>=<vendor>/<model>`"
+    )]
+    ModelArg,
+    /// A model given on the command line is in no catalogue entry.
+    #[error(
+        "a model option names no catalogue entry; use `<vendor>/<model>` as in cameras/README.md"
+    )]
+    UnknownModel,
+    /// `--camera-model` names a camera that is not in the file.
+    #[error("`--camera-model` names a camera id that is not in the file")]
+    UnknownCamera,
     /// The vault file would be the index file.
     #[error("the vault file and the index file are the same path; rename `database.path`")]
     SameFile,
@@ -142,7 +186,9 @@ impl ImportError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Config(e) => e.exit_code(),
-            Self::Parse(_) | Self::TooLarge { .. } => 1,
+            // Like `ConfigFileError`: a document that is refused for its content is 1; a file
+            // that cannot be used (missing, too large, not regular, unreadable) is 2.
+            Self::Parse(_) | Self::ModelArg | Self::UnknownModel | Self::UnknownCamera => 1,
             _ => 2,
         }
     }
@@ -167,7 +213,52 @@ pub(super) enum Status {
     WouldImport,
     Imported,
     Updated,
-    Skipped(String),
+    Skipped(SkipWhy),
+}
+
+/// Why a camera was not imported. The text holds ids and model ids only, never a host, a name or
+/// a login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SkipWhy {
+    /// The parser skipped the entry.
+    Parser { reason: SkipReason, position: usize },
+    /// The path holds a login of the file.
+    LoginInPath,
+    /// The path has a query string that the model (the matched or chosen one, if any) does not
+    /// list.
+    QueryNotListed(Option<ModelRef>),
+    /// The path is listed by several catalogue models; none is guessed.
+    Ambiguous(Vec<ModelRef>),
+    /// The registry holds this id under a model of another source (for example `camera add`).
+    ExistingModel(ModelRef),
+}
+
+impl SkipWhy {
+    fn text(&self) -> String {
+        match self {
+            Self::Parser { reason, position } => format!("{reason} (entry {position})"),
+            Self::LoginInPath => "path contains the login (path not shown)".to_owned(),
+            Self::QueryNotListed(None) => {
+                "path has a query string (no catalogue model lists it; choose one with \
+                 --model or --camera-model)"
+                    .to_owned()
+            }
+            Self::QueryNotListed(Some(m)) => {
+                format!("path has a query string that model {m} does not list")
+            }
+            Self::Ambiguous(models) => {
+                let list: Vec<String> = models.iter().map(ToString::to_string).collect();
+                format!(
+                    "ambiguous: the path is listed by models {}; choose one with --camera-model",
+                    list.join(", ")
+                )
+            }
+            Self::ExistingModel(m) => format!(
+                "the registry holds this id under model {m}, not an import model; not overwritten \
+                 (give the same model to update it)"
+            ),
+        }
+    }
 }
 
 impl Status {
@@ -176,7 +267,7 @@ impl Status {
             Self::WouldImport => "would import".to_owned(),
             Self::Imported => "imported".to_owned(),
             Self::Updated => "updated".to_owned(),
-            Self::Skipped(reason) => format!("skipped: {reason}"),
+            Self::Skipped(why) => format!("skipped: {}", why.text()),
         }
     }
 }
@@ -187,12 +278,19 @@ pub(super) struct Row {
     id: String,
     host: String,
     path: String,
+    /// The catalogue model the camera is registered under; none for the default or a skipped one.
+    model: Option<ModelRef>,
     status: Status,
 }
 
 pub(crate) fn execute(cmd: &ImportCommand, ctx: &Context<'_>) -> ExitCode {
     let result = match cmd {
-        ImportCommand::Agentdvr { file, dry_run } => agentdvr(ctx, file, *dry_run),
+        ImportCommand::Agentdvr {
+            file,
+            model,
+            camera_model,
+            dry_run,
+        } => agentdvr(ctx, file, model.as_deref(), camera_model, *dry_run),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -203,37 +301,204 @@ pub(crate) fn execute(cmd: &ImportCommand, ctx: &Context<'_>) -> ExitCode {
     }
 }
 
-fn agentdvr(ctx: &Context<'_>, file: &Path, dry_run: bool) -> Result<(), ImportError> {
+/// The models the user chose on the command line, checked against the catalogue.
+#[derive(Debug, Default)]
+struct Choice {
+    /// `--model`: every camera without an entry of its own.
+    all: Option<ModelRef>,
+    /// `--camera-model`: one camera each.
+    each: Vec<(CameraId, ModelRef)>,
+}
+
+impl Choice {
+    /// Parses the options. Refuses a malformed value, a model that is in no catalogue entry and a
+    /// camera named twice (which of the two would be a guess).
+    ///
+    /// No error echoes the option text.
+    fn parse(
+        all: Option<&str>,
+        each: &[String],
+        catalogue: &[CatalogueEntry],
+    ) -> Result<Self, ImportError> {
+        let known = |text: &str| -> Result<ModelRef, ImportError> {
+            let m = super::camera::parse_model(text).map_err(|_| ImportError::ModelArg)?;
+            if catalogue
+                .iter()
+                .any(|e| ModelRef::from_entry(e).is_ok_and(|x| x == m))
+            {
+                Ok(m)
+            } else {
+                Err(ImportError::UnknownModel)
+            }
+        };
+        let all = all.map(known).transpose()?;
+        let mut pairs: Vec<(CameraId, ModelRef)> = Vec::with_capacity(each.len());
+        for text in each {
+            let (id, model) = text.split_once('=').ok_or(ImportError::ModelArg)?;
+            let id = CameraId::new(id).map_err(|_| ImportError::ModelArg)?;
+            if pairs.iter().any(|(seen, _)| *seen == id) {
+                return Err(ImportError::ModelArg);
+            }
+            pairs.push((id, known(model)?));
+        }
+        Ok(Self { all, each: pairs })
+    }
+
+    fn for_camera(&self, id: &CameraId) -> Option<&ModelRef> {
+        self.each
+            .iter()
+            .find(|(c, _)| c == id)
+            .map(|(_, m)| m)
+            .or(self.all.as_ref())
+    }
+}
+
+fn agentdvr(
+    ctx: &Context<'_>,
+    file: &Path,
+    model: Option<&str>,
+    camera_model: &[String],
+    dry_run: bool,
+) -> Result<(), ImportError> {
     let config = load(&resolve_path(ctx.config_flag, ctx.env)?)?;
     if vault_path(&config) == config.database_path() {
         return Err(ImportError::SameFile);
     }
+    let catalogue = super::camera::catalogue().map_err(ImportError::Catalogue)?;
+    let choice = Choice::parse(model, camera_model, &catalogue)?;
     let bytes = read_input(file)?;
     let parsed = wardenlens_agentdvr::parse(&bytes).map_err(ImportError::Parse)?;
     drop(bytes);
-    let model = ModelRef::new(MODEL.0, MODEL.1).map_err(ImportError::Camera)?;
-    let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &model)?;
+    if choice
+        .each
+        .iter()
+        .any(|(id, _)| !parsed.cameras.iter().any(|d| d.id == *id))
+    {
+        return Err(ImportError::UnknownCamera);
+    }
+    let (ready, mut rows) = screen(parsed.cameras, &parsed.logins, &catalogue, &choice)?;
     rows.extend(parsed.skipped.iter().map(skipped_row));
     if dry_run {
-        rows.extend(ready.iter().map(|d| row(d, Status::WouldImport)));
+        rows.extend(ready.iter().map(|r| row(r, Status::WouldImport)));
     } else {
         let key = load_key(config.key_file())?;
-        let written = write_all(&config, key, &ready, &model)?;
+        let written = write_all(&config, key, &ready, &catalogue)?;
         rows.extend(written);
     }
     print_table(&rows, &mut io::stdout().lock()).map_err(ImportError::Output)
 }
 
+/// A camera that passed the screen, with the model it is registered under.
+#[derive(Debug, Clone)]
+pub(super) struct Ready {
+    pub(super) draft: CameraDraft,
+    pub(super) model: ModelRef,
+}
+
+/// The default model: in no catalogue.
+fn default_model() -> Result<ModelRef, ImportError> {
+    ModelRef::new(MODEL.0, MODEL.1).map_err(ImportError::Camera)
+}
+
+/// The catalogue models that list exactly this path (head and query) among their RTSP paths, each
+/// once. Only catalogue data is read.
+fn models_listing(catalogue: &[CatalogueEntry], path: &RtspPath) -> Vec<ModelRef> {
+    let mut found: Vec<ModelRef> = Vec::new();
+    for entry in catalogue {
+        let lists = entry
+            .protocols
+            .iter()
+            .filter(|p| p.kind == ProtocolKind::Rtsp)
+            .flat_map(|p| &p.paths)
+            .any(|listed| listed == path.as_str());
+        if let (true, Ok(m)) = (lists, ModelRef::from_entry(entry))
+            && !found.contains(&m)
+        {
+            found.push(m);
+        }
+    }
+    found
+}
+
+/// The model one camera is registered under, or why it is not imported.
+///
+/// In this order: its `--camera-model`, `--model`, then, only for a path with a query string (the
+/// one case where a model is needed to import it), the one catalogue model that lists the path
+/// exactly. Several such models are never guessed. A path with no query and no choice keeps the
+/// default model. Whatever the source, a query string must be listed for the resulting model
+/// (SEC-10): a chosen model does not make an unlisted query acceptable.
+fn resolve(
+    d: &CameraDraft,
+    catalogue: &[CatalogueEntry],
+    choice: &Choice,
+    default: &ModelRef,
+) -> Result<ModelRef, SkipWhy> {
+    if let Some(m) = choice.for_camera(&d.id) {
+        return if query_allowed(catalogue, m, &d.path) {
+            Ok(m.clone())
+        } else {
+            Err(SkipWhy::QueryNotListed(Some(m.clone())))
+        };
+    }
+    if d.path.query().is_none() {
+        return Ok(default.clone());
+    }
+    let mut found = models_listing(catalogue, &d.path);
+    match found.len() {
+        0 => Err(SkipWhy::QueryNotListed(None)),
+        1 => found.pop().ok_or(SkipWhy::QueryNotListed(None)),
+        _ => Err(SkipWhy::Ambiguous(found)),
+    }
+}
+
+/// The size limit as a `u64`.
+fn size_limit(path: &Path) -> Result<u64, ImportError> {
+    u64::try_from(MAX_INPUT_BYTES).map_err(|_| too_large(path))
+}
+
+fn too_large(path: &Path) -> ImportError {
+    ImportError::TooLarge {
+        path: path.to_path_buf(),
+    }
+}
+
+/// Guard 1: the size from `fstat` of the opened file is over the limit.
+fn check_declared_size(size: u64, path: &Path) -> Result<(), ImportError> {
+    if size > size_limit(path)? {
+        return Err(too_large(path));
+    }
+    Ok(())
+}
+
+/// Guard 2: reads at most the limit plus one byte of `src` and refuses when more than the limit
+/// came, whatever size `declared` (from `fstat`) said: a file that grew after it was opened is
+/// bounded too.
+fn read_bounded(
+    src: impl Read,
+    declared: u64,
+    path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, ImportError> {
+    let limit = size_limit(path)?;
+    // Capacity for the whole bounded read, so the buffer never reallocates and leaves copies.
+    let capacity =
+        usize::try_from(declared.min(limit).saturating_add(1)).map_err(|_| too_large(path))?;
+    let mut buf = Zeroizing::new(Vec::with_capacity(capacity));
+    src.take(limit.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|source| ImportError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(buf.len()).map_or(true, |n| n > limit) {
+        return Err(too_large(path));
+    }
+    Ok(buf)
+}
+
 /// Opens, bounds and reads the input; see the module docs.
 fn read_input(path: &Path) -> Result<Zeroizing<Vec<u8>>, ImportError> {
     let (file, stat) = open_regular_nofollow(path).map_err(|e| ImportError::open(path, e))?;
-    let too_large = || ImportError::TooLarge {
-        path: path.to_path_buf(),
-    };
-    let limit = u64::try_from(MAX_INPUT_BYTES).map_err(|_| too_large())?;
-    if stat.size > limit {
-        return Err(too_large());
-    }
+    check_declared_size(stat.size, path)?;
     if stat.mode & 0o004 != 0 {
         // Not `tracing`: a `RUST_LOG` filter must not be able to hide it.
         // Escaped, so a control character in a path cannot forge a line.
@@ -244,37 +509,27 @@ fn read_input(path: &Path) -> Result<Zeroizing<Vec<u8>>, ImportError> {
              it was not changed"
         );
     }
-    // Capacity for the whole bounded read, so the buffer never reallocates and leaves copies.
-    let capacity = usize::try_from(stat.size.saturating_add(1)).map_err(|_| too_large())?;
-    let mut buf = Zeroizing::new(Vec::with_capacity(capacity));
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|source| ImportError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if u64::try_from(buf.len()).map_or(true, |n| n > limit) {
-        return Err(too_large());
-    }
-    Ok(buf)
+    read_bounded(file, stat.size, path)
 }
 
-/// Splits the drafts into those that can be written and the rows of those that cannot.
+/// Splits the drafts into those that can be written (with their model) and the rows of those that
+/// cannot.
 ///
 /// A draft is refused when its path contains any login of the file (any user or password the
 /// parser read, skipped entries included, compared ASCII-case-insensitively with the path as
 /// written and, defensively, percent-decoded): the registry would hold it in plaintext. Such a row
 /// shows `-` for the path, and a query path that is skipped shows only the
-/// part before `?`, so no refused path ever reaches the output.
+/// part before `?`, so no refused path ever reaches the output. Then [`resolve`] picks the model.
 ///
 /// # Errors
 /// [`ImportError::Screen`] when the search cannot be built: never "no match".
 fn screen(
     drafts: Vec<CameraDraft>,
     logins: &Logins,
-    model: &ModelRef,
-) -> Result<(Vec<CameraDraft>, Vec<Row>), ImportError> {
-    let (ready, rows, _) = screen_with(drafts, logins, model, build_matcher)?;
+    catalogue: &[CatalogueEntry],
+    choice: &Choice,
+) -> Result<(Vec<Ready>, Vec<Row>), ImportError> {
+    let (ready, rows, _) = screen_with(drafts, logins, catalogue, choice, build_matcher)?;
     Ok((ready, rows))
 }
 
@@ -292,12 +547,14 @@ fn build_matcher(patterns: &[Zeroizing<Vec<u8>>]) -> Result<AhoCorasick, ImportE
 fn screen_with(
     drafts: Vec<CameraDraft>,
     logins: &Logins,
-    model: &ModelRef,
+    catalogue: &[CatalogueEntry],
+    choice: &Choice,
     build: impl FnOnce(&[Zeroizing<Vec<u8>>]) -> Result<AhoCorasick, ImportError>,
-) -> Result<(Vec<CameraDraft>, Vec<Row>, u64), ImportError> {
+) -> Result<(Vec<Ready>, Vec<Row>, u64), ImportError> {
     let mut work = 0_u64;
     let mut ready = Vec::new();
     let mut rows = Vec::new();
+    let default = default_model()?;
     let logins = lowered_logins(logins);
     // One automaton over every login, built once (cost linear in the login bytes, at most
     // `MAX_LOGIN_BYTES`); no login at all needs none.
@@ -308,23 +565,20 @@ fn screen_with(
     };
     for d in drafts {
         if path_holds_login(&d.path, matcher.as_ref(), &mut work) {
-            let mut r = row(
-                &d,
-                Status::Skipped("path contains the login (path not shown)".to_owned()),
-            );
+            let mut r = row_of(&d, None, Status::Skipped(SkipWhy::LoginInPath));
             "-".clone_into(&mut r.path);
             rows.push(r);
-        } else if query_allowed(&[], model, &d.path) {
-            ready.push(d);
-        } else {
-            // The registry vets the same thing on write; checking here keeps a dry run honest.
-            let mut r = row(
-                &d,
-                Status::Skipped("path has a query string (no catalogue model lists it)".to_owned()),
-            );
-            let head = before_query(&r.path).to_owned();
-            r.path = head;
-            rows.push(r);
+            continue;
+        }
+        match resolve(&d, catalogue, choice, &default) {
+            Ok(model) => ready.push(Ready { draft: d, model }),
+            Err(why) => {
+                // The registry vets the same thing on write; checking here keeps a dry run honest.
+                let mut r = row_of(&d, None, Status::Skipped(why));
+                let head = before_query(&r.path).to_owned();
+                r.path = head;
+                rows.push(r);
+            }
         }
     }
     Ok((ready, rows, work))
@@ -390,22 +644,32 @@ fn path_holds_login(path: &RtspPath, matcher: Option<&AhoCorasick>, work: &mut u
     scan(written) || (decoded.as_slice() != written && scan(&decoded))
 }
 
-fn row(d: &CameraDraft, status: Status) -> Row {
+/// A row for a camera that passed the screen. The default model is not shown.
+fn row(r: &Ready, status: Status) -> Row {
+    let shown = (r.model.vendor() != OWN_VENDOR).then(|| r.model.clone());
+    row_of(&r.draft, shown, status)
+}
+
+fn row_of(d: &CameraDraft, model: Option<ModelRef>, status: Status) -> Row {
     Row {
         id: d.id.to_string(),
         host: d.host.expose(),
         path: d.path.as_str().to_owned(),
+        model,
         status,
     }
 }
 
 fn skipped_row(s: &Skipped) -> Row {
-    let reason: SkipReason = s.reason;
     Row {
         id: "-".to_owned(),
         host: "-".to_owned(),
         path: "-".to_owned(),
-        status: Status::Skipped(format!("{reason} (entry {})", s.position)),
+        model: None,
+        status: Status::Skipped(SkipWhy::Parser {
+            reason: s.reason,
+            position: s.position,
+        }),
     }
 }
 
@@ -445,36 +709,56 @@ fn now() -> Result<UnixMs, ImportError> {
     UnixMs::new(ms).map_err(|_| ImportError::Clock)
 }
 
+/// Writes the cameras: the vault entries, then the registry row.
+///
+/// A row that the registry already holds under a model of another vendor than `agentdvr` and that
+/// differs from the one chosen now was made by `camera add` (or by an import with another model):
+/// it is not overwritten and its vault entries are not touched, the camera is reported skipped.
+/// Re-running with the same model updates it (the same source).
+///
+/// # Errors
+/// Vault, index and clock errors. A failure midway leaves the vault entries of the camera it
+/// stopped at without a registry row (nothing lists them; running again repairs them).
 pub(super) fn write_all(
     config: &Config,
     key: KeyFile,
-    drafts: &[CameraDraft],
-    model: &ModelRef,
+    ready: &[Ready],
+    catalogue: &[CatalogueEntry],
 ) -> Result<Vec<Row>, ImportError> {
     let mut vault = open_vault(&vault_path(config), key).map_err(ImportError::Vault)?;
     let mut index = Index::open(config.database_path()).map_err(ImportError::Index)?;
     // The registry may hold cameras whose paths carry a query that the catalogue lists
     // (`camera add`); reading or writing a row with no catalogue would refuse them.
-    let catalogue = super::camera::catalogue().map_err(ImportError::Catalogue)?;
-    let mut rows = Vec::with_capacity(drafts.len());
-    for d in drafts {
-        let existed = index
-            .get_camera(&d.id, &catalogue)
-            .map_err(ImportError::Index)?
-            .is_some();
+    let mut rows = Vec::with_capacity(ready.len());
+    for r in ready {
+        let d = &r.draft;
+        let existing = index
+            .get_camera(&d.id, catalogue)
+            .map_err(ImportError::Index)?;
+        if let Some(e) = &existing {
+            let have = e.record().model();
+            if have.vendor() != OWN_VENDOR && *have != r.model {
+                rows.push(row_of(
+                    d,
+                    None,
+                    Status::Skipped(SkipWhy::ExistingModel(have.clone())),
+                ));
+                continue;
+            }
+        }
         write_vault(&mut vault, d)?;
         let record = CameraRecord::new(
             d.id.clone(),
-            model.clone(),
+            r.model.clone(),
             d.port,
             StreamSet::new(d.path.clone(), None),
         );
         index
-            .upsert_camera(&record, &catalogue, now()?)
+            .upsert_camera(&record, catalogue, now()?)
             .map_err(ImportError::Index)?;
         rows.push(row(
-            d,
-            if existed {
+            r,
+            if existing.is_some() {
                 Status::Updated
             } else {
                 Status::Imported
@@ -521,6 +805,14 @@ fn write_vault(vault: &mut Vault, d: &CameraDraft) -> Result<(), ImportError> {
 
 fn print_table(rows: &[Row], out: &mut impl Write) -> io::Result<()> {
     let status: Vec<String> = rows.iter().map(|r| r.status.text()).collect();
+    let model: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.model
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string)
+        })
+        .collect();
     let width = |head: &str, f: fn(&Row) -> &str| {
         rows.iter()
             .map(|r| f(r).chars().count())
@@ -533,9 +825,23 @@ fn print_table(rows: &[Row], out: &mut impl Write) -> io::Result<()> {
         width("host", |r| &r.host),
         width("path", |r| &r.path),
     );
-    writeln!(out, "{:wi$}  {:wh$}  {:wp$}  status", "id", "host", "path")?;
-    for (r, s) in rows.iter().zip(&status) {
-        writeln!(out, "{:wi$}  {:wh$}  {:wp$}  {s}", r.id, r.host, r.path)?;
+    let wm = model
+        .iter()
+        .map(|m| m.chars().count())
+        .chain(["model".len()])
+        .max()
+        .unwrap_or(0);
+    writeln!(
+        out,
+        "{:wi$}  {:wh$}  {:wp$}  {:wm$}  status",
+        "id", "host", "path", "model"
+    )?;
+    for ((r, s), m) in rows.iter().zip(&status).zip(&model) {
+        writeln!(
+            out,
+            "{:wi$}  {:wh$}  {:wp$}  {m:wm$}  {s}",
+            r.id, r.host, r.path
+        )?;
     }
     out.flush()
 }
@@ -551,13 +857,15 @@ mod tests {
                 id: "agentdvr-1".into(),
                 host: "192.0.2.10".into(),
                 path: "/s".into(),
+                model: None,
                 status: Status::Imported,
             },
             Row {
                 id: "-".into(),
                 host: "-".into(),
                 path: "-".into(),
-                status: Status::Skipped("x".into()),
+                model: None,
+                status: Status::Skipped(SkipWhy::LoginInPath),
             },
         ];
         let mut out = Vec::new();
@@ -565,7 +873,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert!(text.contains("agentdvr-1  192.0.2.10"));
-        assert!(text.contains("skipped: x"));
+        assert!(text.contains("skipped: path contains the login"));
     }
 
     #[test]
@@ -600,8 +908,8 @@ mod tests {
         wardenlens_agentdvr::parse(xml.as_bytes()).unwrap()
     }
 
-    fn screen_all(i: wardenlens_agentdvr::Import, m: &ModelRef) -> (Vec<CameraDraft>, Vec<Row>) {
-        screen(i.cameras, &i.logins, m).unwrap()
+    fn screen_all(i: wardenlens_agentdvr::Import) -> (Vec<Ready>, Vec<Row>) {
+        screen(i.cameras, &i.logins, &[], &Choice::default()).unwrap()
     }
 
     /// The ends-match shape: 255 paths of 512 bytes, and 4096 distinct 255-byte logins that are
@@ -641,11 +949,16 @@ mod tests {
 
     #[test]
     fn the_screen_work_is_the_path_bytes_scanned_in_the_ends_match_worst_case() {
-        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
         let parsed = ends_match_import();
         assert_eq!(parsed.logins.len(), 4096);
-        let (ready, _, work) =
-            screen_with(parsed.cameras, &parsed.logins, &model, build_matcher).unwrap();
+        let (ready, _, work) = screen_with(
+            parsed.cameras,
+            &parsed.logins,
+            &[],
+            &Choice::default(),
+            build_matcher,
+        )
+        .unwrap();
         assert_eq!(ready.len(), 255);
         // One pass over each 512-byte path (the decoded text equals the written one, so it is
         // not scanned again); independent of the 4096 logins.
@@ -655,27 +968,29 @@ mod tests {
 
     #[test]
     fn a_matcher_that_cannot_be_built_fails_the_screen_closed() {
-        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
         let i = drafts("/live/Fake-pw-1/main", "u-fake", "Fake-pw-1");
-        let r = screen_with(i.cameras, &i.logins, &model, |_| Err(ImportError::Screen));
+        let r = screen_with(i.cameras, &i.logins, &[], &Choice::default(), |_| {
+            Err(ImportError::Screen)
+        });
         assert!(matches!(r, Err(ImportError::Screen)));
         // With no login there is nothing to build, so a failing builder is never asked.
         let i = drafts("/live/main", "", "");
-        let (ready, _, _) =
-            screen_with(i.cameras, &i.logins, &model, |_| Err(ImportError::Screen)).unwrap();
+        let (ready, _, _) = screen_with(i.cameras, &i.logins, &[], &Choice::default(), |_| {
+            Err(ImportError::Screen)
+        })
+        .unwrap();
         assert_eq!(ready.len(), 1);
     }
 
     #[test]
     fn a_path_holding_the_login_is_refused_and_never_shown() {
-        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
         // (path, user, password): every one holds the password or the user.
         for (path, user, pw) in [
             ("/live/Fake-pw-1/main", "u-fake", "Fake-pw-1"),
             ("/a/u-fake/b", "u-fake", "Fake-pw-1"),
             ("/x_zzq=Fake-pw-1", "u-fake", "Fake-pw-1"),
         ] {
-            let (ready, rows) = screen_all(drafts(path, user, pw), &model);
+            let (ready, rows) = screen_all(drafts(path, user, pw));
             assert!(ready.is_empty(), "{path}");
             assert_eq!(rows.len(), 1);
             let shown = format!("{:?}", rows[0]);
@@ -683,15 +998,14 @@ mod tests {
             assert_eq!(rows[0].path, "-");
         }
         // An empty password matches nothing; a path without the login passes.
-        let (ready, _) = screen_all(drafts("/live/main", "u-fake", ""), &model);
+        let (ready, _) = screen_all(drafts("/live/main", "u-fake", ""));
         assert_eq!(ready.len(), 1);
-        let (ready, _) = screen_all(drafts("/live/main", "u-fake", "Fake-pw-1"), &model);
+        let (ready, _) = screen_all(drafts("/live/main", "u-fake", "Fake-pw-1"));
         assert_eq!(ready.len(), 1);
     }
 
     #[test]
     fn another_cameras_login_and_other_case_are_refused() {
-        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
         let xml = "<objects><cameras>\
             <camera id=\"1\" name=\"A\"><settings><videosourcestring>rtsp://192.0.2.5/s\
             </videosourcestring><login>u-fake</login><password>Fake-pw-1</password></settings></camera>\
@@ -699,8 +1013,8 @@ mod tests {
             </videosourcestring></settings></camera>\
             <camera id=\"3\" name=\"C\"><settings><videosourcestring>rtsp://192.0.2.7/ok\
             </videosourcestring></settings></camera></cameras></objects>";
-        let (ready, rows) = screen_all(wardenlens_agentdvr::parse(xml.as_bytes()).unwrap(), &model);
-        let ids: Vec<_> = ready.iter().map(|d| d.id.to_string()).collect();
+        let (ready, rows) = screen_all(wardenlens_agentdvr::parse(xml.as_bytes()).unwrap());
+        let ids: Vec<_> = ready.iter().map(|r| r.draft.id.to_string()).collect();
         assert_eq!(ids, ["agentdvr-1", "agentdvr-3"]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "-");
@@ -720,8 +1034,7 @@ mod tests {
 
     #[test]
     fn a_skipped_query_path_shows_only_the_part_before_the_query() {
-        let model = ModelRef::new(MODEL.0, MODEL.1).unwrap();
-        let (ready, rows) = screen_all(drafts("/s?pin=7731", "u-fake", "Fake-pw-1"), &model);
+        let (ready, rows) = screen_all(drafts("/s?pin=7731", "u-fake", "Fake-pw-1"));
         assert!(ready.is_empty());
         assert_eq!(rows[0].path, "/s");
         assert_eq!(before_query("/a"), "/a");
@@ -760,5 +1073,415 @@ key_file = "/srv/wl/keys/secrets.key"
 "#;
         let c = Config::from_toml_str(toml).unwrap();
         assert_eq!(vault_path(&c), Path::new("/srv/wl/state/vault.db"));
+    }
+
+    // ---- #163: catalogue models ---------------------------------------------------------------
+
+    /// A synthetic catalogue entry with one RTSP protocol listing `paths`.
+    fn entry(vendor: &str, model: &str, paths: &[&str]) -> CatalogueEntry {
+        let list: Vec<String> = paths.iter().map(|p| format!("\"{p}\"")).collect();
+        CatalogueEntry::from_toml_str(&format!(
+            "vendor = \"{vendor}\"\nmodel = \"{model}\"\nsupport = \"community\"\n\
+             [[protocols]]\nkind = \"rtsp\"\npaths = [{}]\n\
+             [[evidence]]\nreference = \"docs/adr/0002-camera-integration.md\"\n",
+            list.join(", ")
+        ))
+        .unwrap()
+    }
+
+    fn model(v: &str, m: &str) -> ModelRef {
+        ModelRef::new(v, m).unwrap()
+    }
+
+    /// Two models with a distinct listed query path, and two that list the same one.
+    fn catalogue() -> Vec<CatalogueEntry> {
+        vec![
+            entry("acme", "c1", &["/cam?channel=1&subtype=0", "/plain1"]),
+            entry("acme", "c2", &["/other?x=1"]),
+            entry("acme", "d1", &["/dual?z=1"]),
+            entry("beta", "d2", &["/dual?z=1"]),
+        ]
+    }
+
+    fn one_draft(path: &str) -> CameraDraft {
+        drafts(path, "", "").cameras.remove(0)
+    }
+
+    #[test]
+    fn the_model_of_a_camera_is_decided_by_this_table() {
+        let cat = catalogue();
+        let default = default_model().unwrap();
+        let c1 = model("acme", "c1");
+        let c2 = model("acme", "c2");
+        let none = Choice::default();
+        let all_c1 = Choice {
+            all: Some(c1.clone()),
+            each: Vec::new(),
+        };
+        let each_c2 = Choice {
+            all: Some(c1.clone()),
+            each: vec![(CameraId::new("agentdvr-1").unwrap(), c2.clone())],
+        };
+        let other_id = Choice {
+            all: None,
+            each: vec![(CameraId::new("agentdvr-9").unwrap(), c2.clone())],
+        };
+        let amp = "?channel=1&amp;subtype=0";
+        let cam = format!("/cam{amp}");
+        // (choice, path, expected)
+        let cases: Vec<(&Choice, &str, Result<ModelRef, SkipWhy>)> = vec![
+            // matched from the catalogue by the path shape
+            (&none, &cam, Ok(c1.clone())),
+            (&none, "/other?x=1", Ok(c2.clone())),
+            // no query and no choice: the default model
+            (&none, "/stream1", Ok(default.clone())),
+            // even a path that a model lists, without a query: still the default
+            (&none, "/plain1", Ok(default.clone())),
+            // the query is listed by no model, or only for another path head
+            (
+                &none,
+                "/cam?channel=2&amp;subtype=0",
+                Err(SkipWhy::QueryNotListed(None)),
+            ),
+            (&none, "/elsewhere?x=1", Err(SkipWhy::QueryNotListed(None))),
+            (
+                &none,
+                "/cam?channel=1&amp;subtype=0&amp;extra=1",
+                Err(SkipWhy::QueryNotListed(None)),
+            ),
+            // two models list it: never a guess
+            (
+                &none,
+                "/dual?z=1",
+                Err(SkipWhy::Ambiguous(vec![
+                    model("acme", "d1"),
+                    model("beta", "d2"),
+                ])),
+            ),
+            // a chosen model
+            (&all_c1, "/stream1", Ok(c1.clone())),
+            (&all_c1, &cam, Ok(c1.clone())),
+            (&each_c2, "/other?x=1", Ok(c2.clone())),
+            (&each_c2, "/stream1", Ok(c2.clone())),
+            (&other_id, "/stream1", Ok(default.clone())),
+            // SEC-10: a chosen model does not make an unlisted query acceptable, and another
+            // model that lists it is not substituted
+            (
+                &all_c1,
+                "/other?x=1",
+                Err(SkipWhy::QueryNotListed(Some(c1.clone()))),
+            ),
+            (
+                &all_c1,
+                "/dual?z=1",
+                Err(SkipWhy::QueryNotListed(Some(c1.clone()))),
+            ),
+            (
+                &each_c2,
+                &cam,
+                Err(SkipWhy::QueryNotListed(Some(c2.clone()))),
+            ),
+        ];
+        for (choice, path, want) in cases {
+            let d = one_draft(path);
+            assert_eq!(
+                resolve(&d, &cat, choice, &default),
+                want,
+                "{path} with {choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_query_path_is_ready_and_an_unlisted_one_is_skipped_by_the_screen() {
+        let cat = catalogue();
+        let xml = "<objects><cameras>\
+            <camera id=\"1\" name=\"A\"><settings><videosourcestring>\
+            rtsp://192.0.2.5/cam?channel=1&amp;subtype=0</videosourcestring></settings></camera>\
+            <camera id=\"2\" name=\"B\"><settings><videosourcestring>\
+            rtsp://192.0.2.6/cam?channel=7&amp;subtype=0</videosourcestring></settings></camera>\
+            <camera id=\"3\" name=\"C\"><settings><videosourcestring>\
+            rtsp://192.0.2.7/dual?z=1</videosourcestring></settings></camera>\
+            </cameras></objects>";
+        let i = wardenlens_agentdvr::parse(xml.as_bytes()).unwrap();
+        let (ready, rows) = screen(i.cameras, &i.logins, &cat, &Choice::default()).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].model, model("acme", "c1"));
+        assert_eq!(ready[0].draft.path.as_str(), "/cam?channel=1&subtype=0");
+        assert_eq!(rows.len(), 2);
+        // Neither refused row shows the query.
+        assert!(rows.iter().all(|r| !r.path.contains('?')), "{rows:?}");
+        let text: Vec<String> = rows.iter().map(|r| r.status.text()).collect();
+        assert!(text[0].contains("query"), "{text:?}");
+        // The ambiguity names model ids only: no host, no name, no path.
+        assert_eq!(
+            text[1],
+            "skipped: ambiguous: the path is listed by models acme/d1, beta/d2; \
+             choose one with --camera-model"
+        );
+        for t in &text {
+            assert!(!t.contains("192.0.2") && !t.contains("dual"), "{t}");
+        }
+    }
+
+    #[test]
+    fn the_model_options_are_checked_against_the_catalogue() {
+        let cat = catalogue();
+        let ok = |all: Option<&str>, each: &[&str]| {
+            let each: Vec<String> = each.iter().map(|s| (*s).to_owned()).collect();
+            Choice::parse(all, &each, &cat)
+        };
+        let c = ok(Some("acme/c1"), &["agentdvr-2=acme/c2"]).unwrap();
+        assert_eq!(c.all, Some(model("acme", "c1")));
+        assert_eq!(c.each.len(), 1);
+        assert!(ok(None, &[]).unwrap().all.is_none());
+        for bad in ["", "acme", "acme/", "/c1", "Acme/C1", "a/b/c"] {
+            assert!(
+                matches!(ok(Some(bad), &[]), Err(ImportError::ModelArg)),
+                "{bad:?}"
+            );
+        }
+        // Well formed but in no catalogue entry (the default model is in none either).
+        for unknown in ["acme/zz", "other/c1", "agentdvr/imported"] {
+            assert!(
+                matches!(ok(Some(unknown), &[]), Err(ImportError::UnknownModel)),
+                "{unknown}"
+            );
+        }
+        for bad in [
+            "agentdvr-2",
+            "=acme/c1",
+            "agentdvr-2=",
+            "Bad Id=acme/c1",
+            "agentdvr-2=acme/zz",
+        ] {
+            assert!(ok(None, &[bad]).is_err(), "{bad:?}");
+        }
+        // A camera named twice is refused, even for the same model.
+        assert!(matches!(
+            ok(None, &["agentdvr-2=acme/c1", "agentdvr-2=acme/c1"]),
+            Err(ImportError::ModelArg)
+        ));
+        // No error echoes the option.
+        let e = ok(Some("secretword/x"), &[]).unwrap_err().to_string();
+        assert!(!e.contains("secretword"), "{e}");
+    }
+
+    #[test]
+    fn exit_codes_line_up_with_the_config_file_errors() {
+        let p = || PathBuf::from("/srv/x");
+        let parse = wardenlens_agentdvr::parse(b"<nope").unwrap_err();
+        // A document refused for its content: 1 (as `ConfigFileError::Invalid`).
+        assert_eq!(ImportError::Parse(parse).exit_code(), 1);
+        // A file that cannot be used: 2 (as `NotFound`, `TooLarge`, `NotRegular`, `Symlink`).
+        assert_eq!(ImportError::TooLarge { path: p() }.exit_code(), 2);
+        assert_eq!(ImportError::NotFound { path: p() }.exit_code(), 2);
+        assert_eq!(ImportError::NotRegular { path: p() }.exit_code(), 2);
+        assert_eq!(ImportError::Symlink { path: p() }.exit_code(), 2);
+        for usage in [
+            ImportError::ModelArg,
+            ImportError::UnknownModel,
+            ImportError::UnknownCamera,
+        ] {
+            assert_eq!(usage.exit_code(), 1);
+        }
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_regular_file_is_its_own_error() {
+        let e = ImportError::open(Path::new("/srv/x"), FsError::NotRegular);
+        assert!(matches!(e, ImportError::NotRegular { .. }), "{e:?}");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_input(dir.path()),
+            Err(ImportError::NotRegular { .. })
+        ));
+    }
+
+    /// Guard 1 alone: the size from `fstat`.
+    #[test]
+    fn the_declared_size_guard_refuses_on_its_own() {
+        let p = Path::new("/srv/x");
+        let limit = u64::try_from(MAX_INPUT_BYTES).unwrap();
+        assert!(check_declared_size(limit, p).is_ok());
+        assert!(matches!(
+            check_declared_size(limit + 1, p),
+            Err(ImportError::TooLarge { .. })
+        ));
+    }
+
+    /// Guard 2 alone: the file said it was small and then grew; the declared size is not asked.
+    #[test]
+    fn the_read_bound_refuses_a_file_that_grew_after_it_was_opened() {
+        let p = Path::new("/srv/x");
+        let limit = MAX_INPUT_BYTES;
+        let at = vec![b' '; limit];
+        assert_eq!(read_bounded(&at[..], 0, p).unwrap().len(), limit);
+        let over = vec![b' '; limit + 1];
+        assert!(matches!(
+            read_bounded(&over[..], 0, p),
+            Err(ImportError::TooLarge { .. })
+        ));
+        // An endless source is bounded too, not read to the end.
+        assert!(matches!(
+            read_bounded(io::repeat(b' '), 10, p),
+            Err(ImportError::TooLarge { .. })
+        ));
+    }
+
+    /// The private directories the vault and the key file need.
+    fn make_dirs(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for d in ["state", "keys"] {
+            let p = dir.join(d);
+            std::fs::create_dir(&p).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// A synthetic config in `dir`.
+    fn site_config(dir: &Path) -> Config {
+        let t = dir.display();
+        Config::from_toml_str(&format!(
+            "[api]\nlisten = \"127.0.0.1:8080\"\n[storage]\nhot_root = \"{t}/hot\"\n\
+             archive_root = \"{t}/archive\"\n[database]\npath = \"{t}/state/index.db\"\n\
+             [secrets]\nkey_file = \"{t}/keys/secrets.key\"\n"
+        ))
+        .unwrap()
+    }
+
+    /// A run that fails at the registry after the vault writes leaves vault entries with no
+    /// registry row (documented in the module docs); running again completes it.
+    #[test]
+    fn a_failed_index_write_after_the_vault_writes_is_repaired_by_a_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path());
+        let config = site_config(dir.path());
+        let key = KeyFile::generate(config.key_file()).unwrap();
+        let cat = catalogue();
+        let d = one_draft("/cam?channel=1&amp;subtype=0");
+        let host_id = d.id.entry_id(EntryKind::Host).unwrap();
+        // The query is listed by `acme/c1` and not by the default model: the registry refuses the
+        // row after the vault entries were written.
+        let bad = [Ready {
+            draft: d.clone(),
+            model: default_model().unwrap(),
+        }];
+        let err = write_all(&config, key, &bad, &cat).unwrap_err();
+        assert!(matches!(err, ImportError::Index(_)), "{err:?}");
+        let key = KeyFile::load(config.key_file()).unwrap();
+        let vault = Vault::open(&vault_path(&config), key).unwrap();
+        assert!(
+            vault.get(&host_id).is_ok(),
+            "the vault entries were written"
+        );
+        drop(vault);
+        let index = Index::open(config.database_path()).unwrap();
+        assert!(index.get_camera(&d.id, &cat).unwrap().is_none(), "no row");
+        drop(index);
+        // The run again, with the model that lists the path.
+        let good = [Ready {
+            draft: d.clone(),
+            model: model("acme", "c1"),
+        }];
+        let key = KeyFile::load(config.key_file()).unwrap();
+        let rows = write_all(&config, key, &good, &cat).unwrap();
+        assert_eq!(rows[0].status, Status::Imported);
+        let index = Index::open(config.database_path()).unwrap();
+        let got = index.get_camera(&d.id, &cat).unwrap().unwrap();
+        assert_eq!(got.record().model(), &model("acme", "c1"));
+        assert_eq!(
+            got.record().streams().main.as_str(),
+            "/cam?channel=1&subtype=0"
+        );
+    }
+
+    /// #207: a row of another source is not overwritten, and its vault entries are not touched.
+    #[test]
+    fn a_row_with_another_vendors_model_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path());
+        let config = site_config(dir.path());
+        let cat = catalogue();
+        let d = one_draft("/stream1");
+        let mk = |m: ModelRef| {
+            [Ready {
+                draft: d.clone(),
+                model: m,
+            }]
+        };
+        // Registered by something else (here: an earlier import under `acme/c1`).
+        let key = KeyFile::generate(config.key_file()).unwrap();
+        write_all(&config, key, &mk(model("acme", "c1")), &cat).unwrap();
+        let key = KeyFile::load(config.key_file()).unwrap();
+        // The default model and another catalogue model are both refused.
+        for m in [default_model().unwrap(), model("acme", "c2")] {
+            let rows = write_all(
+                &config,
+                KeyFile::load(config.key_file()).unwrap(),
+                &mk(m),
+                &cat,
+            )
+            .unwrap();
+            assert_eq!(
+                rows[0].status,
+                Status::Skipped(SkipWhy::ExistingModel(model("acme", "c1")))
+            );
+        }
+        drop(key);
+        let index = Index::open(config.database_path()).unwrap();
+        let got = index.get_camera(&d.id, &cat).unwrap().unwrap();
+        assert_eq!(got.record().model(), &model("acme", "c1"));
+        drop(index);
+        // The same model updates; an `agentdvr/*` row is updated by any model.
+        let key = KeyFile::load(config.key_file()).unwrap();
+        let rows = write_all(&config, key, &mk(model("acme", "c1")), &cat).unwrap();
+        assert_eq!(rows[0].status, Status::Updated);
+    }
+
+    #[test]
+    fn an_import_model_row_is_updated_by_a_catalogue_model() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path());
+        let config = site_config(dir.path());
+        let cat = catalogue();
+        let d = one_draft("/stream1");
+        let mk = |m: ModelRef| {
+            [Ready {
+                draft: d.clone(),
+                model: m,
+            }]
+        };
+        let key = KeyFile::generate(config.key_file()).unwrap();
+        write_all(&config, key, &mk(default_model().unwrap()), &cat).unwrap();
+        let key = KeyFile::load(config.key_file()).unwrap();
+        let rows = write_all(&config, key, &mk(model("acme", "c1")), &cat).unwrap();
+        assert_eq!(rows[0].status, Status::Updated);
+        let index = Index::open(config.database_path()).unwrap();
+        let got = index.get_camera(&d.id, &cat).unwrap().unwrap();
+        assert_eq!(got.record().model(), &model("acme", "c1"));
+    }
+
+    #[test]
+    fn every_skip_reason_has_its_own_text_without_site_data() {
+        let m = model("acme", "c1");
+        let texts = [
+            SkipWhy::Parser {
+                reason: SkipReason::Deleted,
+                position: 3,
+            }
+            .text(),
+            SkipWhy::LoginInPath.text(),
+            SkipWhy::QueryNotListed(None).text(),
+            SkipWhy::QueryNotListed(Some(m.clone())).text(),
+            SkipWhy::Ambiguous(vec![m.clone(), model("beta", "d2")]).text(),
+            SkipWhy::ExistingModel(m).text(),
+        ];
+        let mut sorted = texts.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), texts.len(), "{texts:?}");
+        assert!(texts[0].contains("entry 3"));
+        assert!(texts[3].contains("acme/c1") && texts[5].contains("acme/c1"));
     }
 }

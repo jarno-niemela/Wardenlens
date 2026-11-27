@@ -200,6 +200,14 @@ pub(crate) fn catalogue() -> Result<Vec<wardenlens_core::catalogue::CatalogueEnt
     catalogue::load()
 }
 
+/// `vendor/model` as a `ModelRef` (for `import agentdvr --model`).
+///
+/// # Errors
+/// [`CameraError::ModelSlug`] when `text` has no `/` or a part is not a slug.
+pub(crate) fn parse_model(text: &str) -> Result<wardenlens_core::camera::ModelRef, CameraError> {
+    catalogue::parse_model(text)
+}
+
 /// The key file, or a message that points at `secrets init` when it is missing.
 fn load_key(path: &Path) -> Result<KeyFile, CameraCmdError> {
     if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
