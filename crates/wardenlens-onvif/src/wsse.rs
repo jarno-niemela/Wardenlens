@@ -1,7 +1,8 @@
 //! WS-Security `UsernameToken` with a password digest, and the SOAP envelopes this crate sends.
 //!
 //! The digest is `Base64(SHA1(nonce + created + password))` (WS-Security `UsernameToken` Profile
-//! 1.0 section 3.1, adopted by ONVIF Core section 5.12.2). The three parts are the **raw** nonce
+//! 1.0 section 3.1, adopted by ONVIF Core section 5.12.2; the test vector below is from the ONVIF
+//! guide material, not from the OASIS profile text). The three parts are the **raw** nonce
 //! bytes, the `Created` text exactly as sent, and the password bytes. SHA-1 is required by the
 //! profile the cameras implement; it only answers that challenge and never protects anything
 //! locally (SEC-7: the audited `RustCrypto` `sha1`, nothing hand-rolled).
@@ -159,9 +160,9 @@ mod tests {
     use super::*;
     use secrecy::SecretString;
 
-    // The worked example of WS-Security UsernameToken Profile 1.0 section 3.1, reproduced in the
-    // ONVIF Core Specification section 5.12.2 (WS-UsernameToken): nonce, `Created` and password
-    // below give exactly this `Password` digest. Independently checked with `hashlib`.
+    // A worked example from the ONVIF guide material (WS-UsernameToken), not from OASIS
+    // UsernameToken Profile section 3.1: nonce, `Created` and password below give exactly this
+    // `Password` digest. Independently checked with `hashlib`.
     const SPEC_NONCE_B64: &str = "LKqI6G/AikKCQrN0zqZFlg==";
     const SPEC_CREATED: &str = "2010-09-16T07:50:45Z";
     const SPEC_PASSWORD: &str = "userpassword";

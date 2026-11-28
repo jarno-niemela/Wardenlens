@@ -294,7 +294,6 @@ async fn non_http_garbage_is_a_typed_error() {
 }
 
 #[tokio::test]
-#[ignore = "follow-up #151"]
 async fn content_length_over_the_cap_is_refused_without_waiting_for_the_body() {
     // The camera announces 2 MiB and then stays silent. The cap must not wait for the timeout:
     // with request_timeout at 30 s the test would take 30 s and report Timeout.
@@ -356,7 +355,6 @@ async fn many_informational_heads_then_a_reply() {
 // ---- the parser ----
 
 #[test]
-#[ignore = "follow-up #151"]
 fn an_audio_only_profile_with_an_unusual_token_does_not_hide_the_video_profiles() {
     // The audio-only profile is documented as "left out"; its token is never sent back, so its
     // spelling must not decide whether the video profiles can be read.
@@ -369,7 +367,6 @@ fn an_audio_only_profile_with_an_unusual_token_does_not_hide_the_video_profiles(
 }
 
 #[test]
-#[ignore = "follow-up #151"]
 fn an_audio_only_profile_without_a_token_does_not_hide_the_video_profiles() {
     let audio = r"<trt:Profiles><tt:Name>A</tt:Name></trt:Profiles>";
     let r =
@@ -378,7 +375,6 @@ fn an_audio_only_profile_without_a_token_does_not_hide_the_video_profiles() {
 }
 
 #[test]
-#[ignore = "follow-up #151"]
 fn a_token_is_never_altered_before_it_is_sent_back() {
     // " main" (leading space via a character reference) is a different token from "main";
     // trimming it would make GetStreamUri ask for a profile the camera does not have.

@@ -23,10 +23,14 @@
 //! Up to [`MAX_ATTEMPTS`] (6) attempts per call. An attempt fails *retryably* when it gets no HTTP
 //! response head: the connect is refused or times out
 //! ([`ClientConfig::connect_timeout`], default 3 s), the camera closes the connection before
-//! answering, or it stays silent for [`ClientConfig::request_timeout`]. Between attempts the wait
+//! answering, it sends a head that hyper refuses (malformed, over 64 KiB, conflicting lengths; this
+//! too ends as `Unreachable`, not as a transport error), or it stays silent for
+//! [`ClientConfig::request_timeout`]. Every attempt builds its own request, with a fresh
+//! WS-Security nonce and `Created`. Between attempts the wait
 //! comes from core's `Backoff` ([`ClientConfig::backoff`]). After the last failure the result is
 //! [`OnvifError::Unreachable`]. Once a head has arrived nothing is retried: the body is read once
-//! and a failure there is final. The calls are read-only queries, so repeating them is safe.
+//! and a failure there is final (a `Content-Length` over the cap is refused at once, the body as
+//! a whole has [`ClientConfig::body_timeout`]). The calls are read-only queries, so repeating them is safe.
 //!
 //! # Credentials
 //!

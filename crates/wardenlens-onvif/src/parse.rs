@@ -13,13 +13,27 @@ use crate::soap::Doc;
 use crate::stream_uri::{StreamEndpoint, reduce_stream_uri};
 use crate::{MAX_PROFILES, OnvifError};
 
-/// The trimmed text of `idx`, checked as a display field (bounded, no control characters).
+/// Unicode format characters (general category Cf): invisible, yet able to reorder or hide text
+/// (bidi controls, zero-width characters, tags). The standard library has no test for them.
+fn is_format_char(c: char) -> bool {
+    matches!(u32::from(c),
+        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
+        | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// The trimmed text of `idx`, checked as a display field (bounded, no control or format
+/// characters).
 fn field(doc: &Doc, idx: usize, name: &'static str) -> Result<String, OnvifError> {
     let e = doc
         .elem(idx)
         .ok_or(OnvifError::InvalidField { field: name })?;
     let text = e.text.trim();
-    if e.text_too_long || text.len() > MAX_FIELD_LEN || text.chars().any(char::is_control) {
+    if e.text_too_long
+        || text.len() > MAX_FIELD_LEN
+        || text.chars().any(|c| c.is_control() || is_format_char(c))
+    {
         return Err(OnvifError::InvalidField { field: name });
     }
     Ok(text.to_owned())
@@ -80,8 +94,11 @@ fn encoding(doc: &Doc, config: usize) -> Result<VideoEncoding, OnvifError> {
 }
 
 /// Parses a `GetProfilesResponse`. A profile without a `VideoEncoderConfiguration` (audio-only,
-/// metadata-only) is left out. Two profiles with one token are refused, since a token must name
-/// one profile.
+/// metadata-only) is left out *before* its token is looked at, so an odd token on such a profile
+/// never matters. A video profile whose token is missing or outside the pass-list (checked
+/// untrimmed: the token is sent back exactly as received) is refused, not skipped: a camera
+/// whose main stream silently vanished is worse than a loud error. Two profiles with one token
+/// are refused, since a token must name one profile.
 ///
 /// # Errors
 /// An [`OnvifError`] for an empty, oversized, malformed or fault reply, more than
@@ -101,13 +118,14 @@ pub fn parse_profiles(reply: &[u8]) -> Result<Vec<Profile>, OnvifError> {
         let e = doc
             .elem(idx)
             .ok_or(OnvifError::InvalidField { field: "token" })?;
-        let token = match (&e.token, e.token_too_long) {
-            (Some(t), false) => ProfileToken::new(t.trim())
-                .map_err(|_| OnvifError::InvalidField { field: "token" })?,
-            _ => return Err(OnvifError::InvalidField { field: "token" }),
-        };
         let Some(config) = doc.child(idx, "VideoEncoderConfiguration") else {
             continue;
+        };
+        let token = match (&e.token, e.token_too_long) {
+            (Some(t), false) => {
+                ProfileToken::new(t).map_err(|_| OnvifError::InvalidField { field: "token" })?
+            }
+            _ => return Err(OnvifError::InvalidField { field: "token" }),
         };
         let name = match doc.child(idx, "Name") {
             Some(n) => Some(field(&doc, n, "Name")?),

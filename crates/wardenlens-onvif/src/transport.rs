@@ -6,7 +6,15 @@
 //! silent for the request timeout. Between attempts the delay comes from core's [`Backoff`]. After
 //! the last failure the result is [`OnvifError::Unreachable`]. Once a head has arrived nothing is
 //! retried: the body is read once, capped at [`MAX_BODY_BYTES`] by a limit on the read itself
-//! (the read stops at the cap, nothing is buffered past it), and a failure there is final.
+//! (the read stops at the cap, nothing is buffered past it), and a failure there is final. A
+//! `Content-Length` above the cap is refused as soon as the head is read.
+//!
+//! A head that hyper itself refuses (malformed, over 64 KiB, conflicting lengths) counts as "no
+//! head": it is retried like a silent camera and, after the last attempt, reported as
+//! [`OnvifError::Unreachable`] rather than as a transport error.
+//!
+//! Each attempt builds its own request body (see [`Request1::body`]), so a WS-Security nonce is
+//! never sent twice.
 //!
 //! The retry is for read-only queries only; a request that changed state must not use it.
 
@@ -14,7 +22,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::header::{CONNECTION, CONTENT_TYPE, HOST};
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
@@ -36,9 +44,10 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 pub struct ClientConfig {
     /// How long one TCP connect may take. Default 3 s.
     pub connect_timeout: Duration,
-    /// How long, per attempt, the camera may take to send its response head, and after that how
-    /// long the body may take. Default 10 s.
+    /// How long, per attempt, the camera may take to send its response head. Default 10 s.
     pub request_timeout: Duration,
+    /// How long the whole body may take once the head has arrived. Default 10 s.
+    pub body_timeout: Duration,
     /// The delay between attempts. Default [`Backoff::DEFAULT`] (2 s growing to 5 s).
     pub backoff: Backoff,
 }
@@ -48,6 +57,7 @@ impl Default for ClientConfig {
         Self {
             connect_timeout: Duration::from_secs(3),
             request_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(10),
             backoff: Backoff::DEFAULT,
         }
     }
@@ -99,7 +109,9 @@ pub(crate) struct Request1<'a> {
     pub port: u16,
     pub path: &'a str,
     pub action: &'a str,
-    pub body: Bytes,
+    /// Builds the body for one attempt. Called once per attempt, so the WS-Security nonce and
+    /// `Created` are fresh each time. An error ends the call.
+    pub body: &'a (dyn Fn() -> Result<Bytes, OnvifError> + Sync),
 }
 
 /// One attempt up to the response head. `None` is a retryable failure; `Some(Err(_))` is final.
@@ -117,8 +129,14 @@ async fn attempt(req: &Request1<'_>, cfg: &ClientConfig) -> Option<Result<Live, 
         .await
         .ok()?;
     let driver = Driver(tokio::spawn(async move {
+        // The connection's own outcome is irrelevant here: the request future reports every
+        // failure that matters, and a dropped `Driver` aborts this task anyway.
         let _ = conn.await;
     }));
+    let body = match (req.body)() {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
     let request = Request::builder()
         .method(Method::POST)
         .uri(req.path)
@@ -131,7 +149,7 @@ async fn attempt(req: &Request1<'_>, cfg: &ClientConfig) -> Option<Result<Live, 
             ),
         )
         .header(CONNECTION, "close")
-        .body(Full::new(req.body.clone()));
+        .body(Full::new(body));
     let Ok(request) = request else {
         return Some(Err(OnvifError::InvalidServicePath));
     };
@@ -175,8 +193,18 @@ pub(crate) async fn post(
     if status == 401 {
         return Err(OnvifError::Unauthorized);
     }
-    let limited = Limited::new(live.response.into_body(), MAX_BODY_BYTES);
-    let collected = timeout(cfg.request_timeout, limited.collect())
+    let body = live.response.into_body();
+    // A declared length over the cap is final at once; waiting for the body would only burn the
+    // timeout. (`upper` is the exact `Content-Length` for a sized body.)
+    if body
+        .size_hint()
+        .upper()
+        .is_some_and(|n| n > u64::try_from(MAX_BODY_BYTES).unwrap_or(u64::MAX))
+    {
+        return Err(OnvifError::BodyTooLarge);
+    }
+    let limited = Limited::new(body, MAX_BODY_BYTES);
+    let collected = timeout(cfg.body_timeout, limited.collect())
         .await
         .map_err(|_| OnvifError::Timeout)?;
     match collected {

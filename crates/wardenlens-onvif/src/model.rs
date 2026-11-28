@@ -115,20 +115,25 @@ pub struct StreamChoice<'a> {
     pub sub: Option<&'a Profile>,
 }
 
-/// Picks the main and sub profile by resolution (pixel count). Ties go to the profile listed
-/// first. `None` when `profiles` is empty. Codec and name play no part: a camera with one
-/// resolution has a main stream and no sub stream.
+/// Picks the main and sub profile by resolution (pixel count) among the H.264 and H.265
+/// profiles. Only when the camera lists none of those does the choice fall back to all
+/// profiles, so a tiny MJPEG profile never becomes the sub stream of an H.264 camera. Ties go to
+/// the profile listed first. `None` when `profiles` is empty. Name plays no part: a camera with
+/// one resolution has a main stream and no sub stream.
 #[must_use]
 pub fn pick_streams(profiles: &[Profile]) -> Option<StreamChoice<'_>> {
+    let modern = |p: &&Profile| matches!(p.encoding, VideoEncoding::H264 | VideoEncoding::H265);
+    let any_modern = profiles.iter().any(|p| modern(&p));
+    let candidates = || profiles.iter().filter(move |p| !any_modern || modern(p));
     let mut main: Option<&Profile> = None;
-    for p in profiles {
+    for p in candidates() {
         if main.is_none_or(|m| p.pixels() > m.pixels()) {
             main = Some(p);
         }
     }
     let main = main?;
     let mut sub: Option<&Profile> = None;
-    for p in profiles {
+    for p in candidates() {
         if p.pixels() < main.pixels() && sub.is_none_or(|s| p.pixels() < s.pixels()) {
             sub = Some(p);
         }

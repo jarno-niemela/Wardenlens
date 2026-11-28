@@ -210,7 +210,7 @@ async fn every_error_variant_is_provoked_and_leaks_nothing() {
     check(&mut seen, Some(&fake), &e, "unreachable");
     let fake = spawn(0, Reply::StalledBody).await;
     let cfg = ClientConfig {
-        request_timeout: Duration::from_millis(40),
+        body_timeout: Duration::from_millis(40),
         ..fast()
     };
     let e = client(&fake, Some(cred()), cfg)
