@@ -86,7 +86,7 @@ fn seed(v: &mut Vault, camera: &str) {
 fn moves_every_entry_with_its_value_and_kind() {
     let (_t, mut v) = fresh();
     seed(&mut v, "import-json-1");
-    put(&mut v, "cam:other:host", EntryKind::Host, "192.0.2.77");
+    put(&mut v, "cam:cam-1:host", EntryKind::Host, "192.0.2.77");
     let moved = v
         .rename_camera(&cam("import-json-1"), &cam("cam-2"))
         .unwrap();
@@ -94,7 +94,7 @@ fn moves_every_entry_with_its_value_and_kind() {
     assert_eq!(
         ids(&v),
         [
-            "cam:other:host",
+            "cam:cam-1:host",
             "cam:cam-2:credential",
             "cam:cam-2:host",
             "cam:cam-2:mac",
@@ -107,7 +107,7 @@ fn moves_every_entry_with_its_value_and_kind() {
         panic!("shape")
     };
     assert_eq!(c.password.expose_secret(), "pw-synthetic-9");
-    assert_eq!(text(&v, "cam:other:host"), "192.0.2.77");
+    assert_eq!(text(&v, "cam:cam-1:host"), "192.0.2.77");
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn survives_a_reopen_and_authenticates_under_the_new_id() {
 #[test]
 fn a_missing_source_is_refused() {
     let (_t, mut v) = fresh();
-    put(&mut v, "cam:other:host", EntryKind::Host, "192.0.2.77");
+    put(&mut v, "cam:cam-1:host", EntryKind::Host, "192.0.2.77");
     let err = v.rename_camera(&cam("a"), &cam("b")).unwrap_err();
     assert!(matches!(err, VaultError::NothingToRename), "{err:?}");
 }
