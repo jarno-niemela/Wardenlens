@@ -315,12 +315,16 @@ fn print<T: Terminal>(
         // location.
         let kind = format!("{} ", f.kind);
         let at = render_in(matcher, &loc(&f.at, &found.paths), (&kind, ""));
-        say(term, &format!("{} {} {at}", f.id, f.kind))?;
+        if let Some(l) = at.print(&format!("{} {} ", f.id, f.kind), "") {
+            say(term, &l)?;
+        }
     }
     for (at, why) in &found.problems {
         let post = format!(" {why}");
         let at = render_in(matcher, &loc(at, &found.paths), ("error: ", &post));
-        warn(term, &format!("error: {at}{post}"))?;
+        if let Some(l) = at.print("error: ", &post) {
+            warn(term, &l)?;
+        }
     }
     Ok(GitTally {
         objects: found.objects,

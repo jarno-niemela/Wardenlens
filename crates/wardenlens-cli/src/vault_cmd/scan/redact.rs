@@ -4,22 +4,50 @@
 //! would print the value. Every location of every source (a path, the index, a blob, a commit,
 //! a tag, a ref) is rendered here, and the report prints only a [`Safe`], which cannot be built
 //! anywhere else. The text of a [`Safe`] has been run through the matcher: if it still holds a
-//! value (also when the text could not be scanned), a less specific form is used.
+//! value (also when the text could not be scanned), a less specific form is used, and if even
+//! the last marker would spell one the location is dropped: the line is printed without it
+//! (or, if the fixed text around it spells a value too, not at all). Nothing is ever printed
+//! that has not been scanned.
 
-use std::ffi::OsStr;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use wardenlens_vault::{Matcher, is_invisible, scan};
 
 /// Text that has passed the matcher and may be printed. Built only by [`render_in`] and
-/// [`Safe::path`].
-pub(super) struct Safe(String);
+/// [`Safe::path`]. It is `None` when no form of the location was clean: it then prints as
+/// nothing, and [`Safe::print`] gives the line without it.
+pub(super) struct Safe {
+    loc: Option<String>,
+    /// The fixed text around the location, without it, holds no vault value.
+    bare_ok: bool,
+}
 
 impl fmt::Display for Safe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.loc.as_deref().unwrap_or_default())
+    }
+}
+
+/// The checked text of a line whose location is dropped: the fixed text before and after it.
+fn bare(pre: &str, post: &str) -> String {
+    format!("{} {}", pre.trim_end(), post.trim_start())
+        .trim()
+        .to_owned()
+}
+
+impl Safe {
+    /// The printed line `{pre}{location}{post}`, where `pre` and `post` are what the caller
+    /// prints around the location (the entry id included, which is not checked). Without a
+    /// clean location the line is `pre` and `post` alone, and `None` if even those (as checked
+    /// when this was built) held a value: such a line is not printed.
+    pub(super) fn print(&self, pre: &str, post: &str) -> Option<String> {
+        match &self.loc {
+            Some(l) => Some(format!("{pre}{l}{post}")),
+            None if self.bare_ok => Some(bare(pre, post)),
+            None => None,
+        }
     }
 }
 
@@ -78,9 +106,6 @@ pub(super) enum Loc<'a> {
     Ref(usize),
 }
 
-/// The last resort when even the fixed marker text would spell a value.
-const LAST_RESORT: &str = "<redacted-location>";
-
 fn clean(matcher: &Matcher, text: &[u8]) -> bool {
     scan(matcher, text).is_ok_and(|r| r.hits.is_empty())
 }
@@ -111,9 +136,14 @@ pub(super) fn render_in(matcher: &Matcher, loc: &Loc<'_>, (pre, post): (&str, &s
             };
             if clean(matcher, path) {
                 candidates.push(with_line(escaped_bytes(path), line));
+                if line.is_some() {
+                    candidates.push(escaped_bytes(path));
+                }
             }
             candidates.push(blob("<redacted-path>", line));
-            candidates.push(blob("<redacted-path>", None));
+            if line.is_some() {
+                candidates.push(blob("<redacted-path>", None));
+            }
         }
         Loc::Blob { paths, sha, line } => {
             let blob = |name: &str, line| with_line(format!("{name} blob {sha}"), line);
@@ -123,9 +153,14 @@ pub(super) fn render_in(matcher: &Matcher, loc: &Loc<'_>, (pre, post): (&str, &s
                 .filter(|_| paths.iter().all(|p| clean(matcher, p)))
             {
                 candidates.push(blob(&escaped_bytes(first), line));
+                if line.is_some() {
+                    candidates.push(blob(&escaped_bytes(first), None));
+                }
             }
             candidates.push(blob("<redacted-path>", line));
-            candidates.push(blob("<redacted-path>", None));
+            if line.is_some() {
+                candidates.push(blob("<redacted-path>", None));
+            }
         }
         Loc::Tree { path, sha } => {
             if path.is_empty() {
@@ -148,16 +183,16 @@ pub(super) fn render_in(matcher: &Matcher, loc: &Loc<'_>, (pre, post): (&str, &s
         }
         Loc::Ref(index) => candidates.push(format!("ref:{index}")),
     }
-    Safe(
-        candidates
+    Safe {
+        loc: candidates
             .into_iter()
-            .find(|c| clean(matcher, format!("{pre}{c}{post}").as_bytes()))
-            .unwrap_or_else(|| LAST_RESORT.to_owned()),
-    )
+            .find(|c| clean(matcher, format!("{pre}{c}{post}").as_bytes())),
+        bare_ok: clean(matcher, bare(pre, post).as_bytes()),
+    }
 }
 
 fn escaped_bytes(path: &[u8]) -> String {
-    escaped(Path::new(OsStr::from_bytes(path)))
+    escaped_raw(path)
 }
 
 impl Safe {
@@ -170,7 +205,10 @@ impl Safe {
         line: Option<usize>,
         around: (&str, &str),
     ) -> Self {
-        Self(location(matcher, path, ordinal, line, around))
+        Self {
+            loc: location(matcher, path, ordinal, line, around),
+            bare_ok: clean(matcher, bare(around.0, around.1).as_bytes()),
+        }
     }
 }
 
@@ -201,65 +239,71 @@ fn is_printable(c: char) -> bool {
 }
 
 /// A path as it may be printed: characters that are not printable are written as `\u{..}`
-/// escapes, so a file name can neither forge a report line nor send terminal escapes.
-fn escaped(path: &Path) -> String {
+/// escapes, a backslash as `\\` and a byte that is not UTF-8 as `\x{..}`, so a file name can
+/// neither forge a report line nor send terminal escapes, and two different names never print
+/// alike (a name holding the text `\u{202e}` and one holding U+202E, or an invalid byte and a
+/// real U+FFFD).
+fn escaped_raw(path: &[u8]) -> String {
     let mut out = String::new();
-    for c in path.to_string_lossy().chars() {
-        if is_printable(c) {
-            out.push(c);
-        } else {
-            out.extend(c.escape_unicode());
+    for chunk in path.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c == '\\' {
+                out.push_str("\\\\");
+            } else if is_printable(c) {
+                out.push(c);
+            } else {
+                out.extend(c.escape_unicode());
+            }
+        }
+        for b in chunk.invalid() {
+            // Writing to a String cannot fail.
+            let _ = write!(out, "\\x{{{b:02x}}}");
         }
     }
     out
 }
 
+fn escaped(path: &Path) -> String {
+    escaped_raw(path.as_os_str().as_bytes())
+}
+
 /// The text one printed line shows about a path: `{pre}{name}[:{line}]{post}`, where `pre` and
-/// `post` are the fixed message text around it (never the entry id or kind, which are printed
-/// by the caller and are not secret). Redaction (ADR 0006 section 8) considers exactly this
-/// text and the raw path bytes. When either holds a vault value the name becomes
-/// `<redacted-path:N>` (`N` is the position of the file in this scan). A clean path whose
-/// `:line` spells a value (a number equal to the line) is printed without the line. If the
-/// numbered marker still spells a value the line is dropped, then the position. A text that cannot be scanned counts as holding a value (fail closed).
+/// `post` are the fixed message text around it: for a hit line the kind token (`{kind} `), for
+/// a notice its message, never the entry id (printed by the caller, not secret, ADR 0006
+/// section 8). Redaction considers exactly this text and the raw path bytes. The forms run from
+/// the most to the least specific and the first clean one wins: the name with its line, the
+/// name without the line (the line number can itself spell a value), `<redacted-path:N>:line`
+/// (`N` is the position of the file in this scan), `<redacted-path:N>`, `<redacted-path>`. If
+/// none is clean the result is `None`: the location is dropped. A text that cannot be scanned
+/// counts as holding a value (fail closed).
 fn location(
     matcher: &Matcher,
     path: &Path,
     ordinal: usize,
     line: Option<usize>,
     (pre, post): (&str, &str),
-) -> String {
+) -> Option<String> {
     let raw_clean = scan(matcher, path.as_os_str().as_bytes()).is_ok_and(|r| r.hits.is_empty());
     let show = |name: &str, line: Option<usize>| match line {
         Some(n) => format!("{name}:{n}"),
         None => name.to_owned(),
     };
-    let clean = |shown: &str| {
-        scan(matcher, format!("{pre}{shown}{post}").as_bytes()).is_ok_and(|r| r.hits.is_empty())
-    };
-    let plain = show(&escaped(path), line);
-    if raw_clean && clean(&plain) {
-        return plain;
-    }
     let numbered = format!("<redacted-path:{ordinal}>");
-    // The most specific form that is clean wins: the name without the line (the line number
-    // can itself spell a value), then the position, then nothing. A candidate equal to the one
-    // before it (no line to drop) is not tried twice.
     let mut candidates = Vec::new();
-    if raw_clean && line.is_some() {
-        candidates.push(show(&escaped(path), None));
+    if raw_clean {
+        candidates.push(show(&escaped(path), line));
+        if line.is_some() {
+            candidates.push(show(&escaped(path), None));
+        }
     }
     candidates.push(show(&numbered, line));
     if line.is_some() {
         candidates.push(show(&numbered, None));
     }
     candidates.push(show("<redacted-path>", None));
-    for candidate in candidates {
-        if clean(&candidate) {
-            return candidate;
-        }
-    }
-    // Nothing but the fixed marker is left to print.
-    "<redacted-path>".to_owned()
+    candidates
+        .into_iter()
+        .find(|c| clean(matcher, format!("{pre}{c}{post}").as_bytes()))
 }
 
 #[cfg(test)]
@@ -285,21 +329,21 @@ mod tests {
         let m = matcher_of(Other, "1234567");
         let p = Path::new("/w/a-1234567-b.txt");
         assert_eq!(
-            location(&m, p, 3, Some(1_234_567), ("", "")),
-            "<redacted-path:3>"
+            location(&m, p, 3, Some(1_234_567), ("", "")).as_deref(),
+            Some("<redacted-path:3>")
         );
         // The value is the position: the position goes too.
         let m = matcher_of(Other, "1234567");
         let p = Path::new("/w/a-1234567-b.txt");
         assert_eq!(
-            location(&m, p, 1_234_567, Some(2), ("", "")),
-            "<redacted-path>"
+            location(&m, p, 1_234_567, Some(2), ("", "")).as_deref(),
+            Some("<redacted-path>")
         );
         // A clean path with an id-like or unrelated value is printed as it is.
         let m = matcher_of(Other, "zq-synthetic-mark");
         assert_eq!(
-            location(&m, Path::new("/w/a.txt"), 0, Some(4), ("", "")),
-            "/w/a.txt:4"
+            location(&m, Path::new("/w/a.txt"), 0, Some(4), ("", "")).as_deref(),
+            Some("/w/a.txt:4")
         );
     }
 
@@ -314,7 +358,7 @@ mod tests {
             Option<usize>,
             &'static str,
             &'static str,
-            &'static str,
+            Option<&'static str>,
         );
         let rows: &[Row] = &[
             // The line spells the value: a clean path keeps its name, loses the line.
@@ -325,7 +369,7 @@ mod tests {
                 Some(1_234_567),
                 "",
                 "",
-                "/w/a.txt",
+                Some("/w/a.txt"),
             ),
             // The path holds the value and the line equals the value too.
             (
@@ -335,10 +379,10 @@ mod tests {
                 Some(1_234_567),
                 "",
                 "",
-                "<redacted-path:3>",
+                Some("<redacted-path:3>"),
             ),
             // No line: nothing to drop, the plain form is clean.
-            ("1234567", "/w/a.txt", 3, None, "", "", "/w/a.txt"),
+            ("1234567", "/w/a.txt", 3, None, "", "", Some("/w/a.txt")),
             // The position spells the value as well as the line.
             (
                 "1234567",
@@ -347,7 +391,7 @@ mod tests {
                 Some(1_234_567),
                 "",
                 "",
-                "<redacted-path>",
+                Some("<redacted-path>"),
             ),
             // No line, position spells the value, path holds it too.
             (
@@ -357,7 +401,7 @@ mod tests {
                 None,
                 "",
                 "",
-                "<redacted-path>",
+                Some("<redacted-path>"),
             ),
             // The fixed text before the path completes a value (the kind token).
             (
@@ -367,17 +411,61 @@ mod tests {
                 Some(1),
                 "other-",
                 "",
-                "<redacted-path:0>:1",
+                Some("<redacted-path:0>:1"),
             ),
+            // Every marker spells the value: the location is dropped.
+            (
+                "redacted-path",
+                "/w/redacted-path.txt",
+                0,
+                Some(1),
+                "",
+                "",
+                None,
+            ),
+            ("redacted-path", "/w/redacted-path", 0, None, "", "", None),
         ];
         for &(value, path, ordinal, line, pre, post, want) in rows {
             let m = matcher_of(Other, value);
             assert_eq!(
-                location(&m, Path::new(path), ordinal, line, (pre, post)),
+                location(&m, Path::new(path), ordinal, line, (pre, post)).as_deref(),
                 want,
                 "{value} {path} {ordinal} {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn print_drops_the_location_then_the_line() {
+        use wardenlens_core::entry::EntryKind::Other;
+        let m = matcher_of(Other, "redacted-path");
+        let s = Safe::path(&m, Path::new("/w/redacted-path"), 0, Some(1), ("kind ", ""));
+        assert!(s.loc.is_none());
+        assert_eq!(s.print("id kind ", "").as_deref(), Some("id kind"));
+        // The fixed text spells the value too: nothing is printed.
+        let s = Safe::path(
+            &m,
+            Path::new("/w/x.txt"),
+            0,
+            Some(1),
+            ("redacted-path ", ""),
+        );
+        assert_eq!(s.print("id redacted-path ", ""), None);
+        // A clean location is printed with what the caller adds.
+        let s = Safe::path(&m, Path::new("/w/ok"), 0, None, ("kind ", ""));
+        assert_eq!(s.print("id kind ", "").as_deref(), Some("id kind /w/ok"));
+    }
+
+    #[test]
+    fn backslashes_and_invalid_bytes_do_not_print_like_their_escapes() {
+        assert_eq!(escaped_raw(b"a\\u{202e}b"), "a\\\\u{202e}b");
+        assert_ne!(
+            escaped_raw("a\u{202e}b".as_bytes()),
+            escaped_raw(b"a\\u{202e}b")
+        );
+        assert_eq!(escaped_raw(b"a\xffb"), "a\\x{ff}b");
+        assert_ne!(escaped_raw(b"a\xffb"), escaped_raw("a\u{fffd}b".as_bytes()));
+        assert_ne!(escaped_raw(b"a\\x{ff}b"), escaped_raw(b"a\xffb"));
     }
 
     #[test]

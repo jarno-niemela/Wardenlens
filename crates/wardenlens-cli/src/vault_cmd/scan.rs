@@ -90,10 +90,11 @@ fn scan_input<T: Terminal>(
     tally: &mut Tally,
     term: &mut T,
 ) -> Result<(), CliError> {
-    // One printed line: `pre`, the location (redacted as a whole by `location`), `post`.
+    // One printed line: `pre`, the location (redacted as a whole by `Safe`), `post`. A line
+    // whose location cannot be shown is printed without it, or not at all.
+    let path = input.path();
     let at = |line: Option<usize>, pre: &str, post: &str| {
-        let loc = Safe::path(matcher, &input.path, ordinal, line, (pre, post));
-        format!("{pre}{loc}{post}")
+        Safe::path(matcher, &path, ordinal, line, (pre, post)).print(pre, post)
     };
     let binary_notice = || at(None, "notice: skipped binary file ", "");
     let outcome = match input.problem {
@@ -107,7 +108,7 @@ fn scan_input<T: Terminal>(
         }
         Err(why) => {
             tally.unread = tally.unread.saturating_add(1);
-            return warn(term, &at(None, "error: ", &format!(" {why}")));
+            return notice(term, at(None, "error: ", &format!(" {why}")));
         }
     };
     let text = match classify(&bytes) {
@@ -118,13 +119,13 @@ fn scan_input<T: Terminal>(
         // A kind of content added later is not silently passed over.
         _ => {
             tally.unread = tally.unread.saturating_add(1);
-            return warn(term, &at(None, "error: ", " has an unknown content type"));
+            return notice(term, at(None, "error: ", " has an unknown content type"));
         }
     };
     tally.files = tally.files.saturating_add(1);
     let Ok(report) = scan(matcher, &text) else {
         tally.unread = tally.unread.saturating_add(1);
-        return warn(term, &at(None, "error: ", " could not be scanned"));
+        return notice(term, at(None, "error: ", " could not be scanned"));
     };
     if report.truncated {
         tally.truncated = tally.truncated.saturating_add(1);
@@ -135,20 +136,30 @@ fn scan_input<T: Terminal>(
         // part of the text the location is checked with, so a value cannot be spelled across
         // the kind and the path.
         let kind = format!("{} ", h.kind);
-        let loc = Safe::path(matcher, &input.path, ordinal, Some(h.line), (&kind, ""));
-        say(term, &format!("{} {} {loc}", h.id, h.kind))?;
+        let loc = Safe::path(matcher, &path, ordinal, Some(h.line), (&kind, ""));
+        if let Some(l) = loc.print(&format!("{} {} ", h.id, h.kind), "") {
+            say(term, &l)?;
+        }
     }
     Ok(())
 }
 
+/// Prints a notice line; a line that cannot be shown safely is not printed.
+fn notice<T: Terminal>(term: &mut T, line: Option<String>) -> Result<(), CliError> {
+    match line {
+        Some(l) => warn(term, &l),
+        None => Ok(()),
+    }
+}
+
 fn binary<T: Terminal>(
-    notice: impl FnOnce() -> String,
+    notice_line: impl FnOnce() -> Option<String>,
     tally: &mut Tally,
     term: &mut T,
 ) -> Result<(), CliError> {
     tally.binary = tally.binary.saturating_add(1);
     if tally.binary <= MAX_BINARY_NOTICES {
-        warn(term, &notice())?;
+        notice(term, notice_line())?;
     }
     Ok(())
 }

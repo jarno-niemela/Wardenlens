@@ -4,13 +4,17 @@
 //! entries are typed with `fstatat(AT_SYMLINK_NOFOLLOW)` and subdirectories are opened with
 //! `openat` on the parent descriptor, so a directory swapped for a symlink while the walk runs
 //! is refused, not followed. A file found by the walk is opened again when it is scanned, the
-//! same way, one `openat` per component below the directory given on the command line (a
-//! descriptor per file would exhaust the process limit). A path given on the command line is
-//! the owner's own choice and is followed if it is a symlink.
+//! same way: one `openat` per component, starting from the descriptor of the directory given on
+//! the command line (a descriptor per file would exhaust the process limit). A path given on the
+//! command line is the owner's own choice and is followed if it is a symlink.
+//!
+//! Memory is bounded: an entry is one node (its name and a link to its parent directory's
+//! node), shared by everything below it; the display path is built only when it is printed, and
+//! the names of one walk may hold at most [`MAX_NAME_BYTES`] bytes in all.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,6 +26,12 @@ use crate::error::CliError;
 
 /// Deepest directory nesting that is walked.
 pub(super) const MAX_DEPTH: usize = 64;
+/// Most bytes of names (each counted with a fixed per-entry overhead) one walk keeps. About
+/// 16 MiB: a tree of 100,000 files with names of 100 bytes fits; a hostile tree of long names
+/// is refused (exit 2) long before it exhausts memory.
+pub(super) const MAX_NAME_BYTES: usize = 16 * 1024 * 1024;
+/// What one entry costs besides its name, for the budget above.
+const ENTRY_OVERHEAD: usize = 64;
 
 const TOO_MANY: &str = "too many files to scan in one command; scan a smaller directory";
 
@@ -40,29 +50,67 @@ pub(super) enum Unread {
     Malformed,
 }
 
-/// Where a file found while walking is: the directory given on the command line and the names
-/// below it.
-struct Below {
-    root: Rc<PathBuf>,
-    names: Vec<OsString>,
+/// A directory given on the command line, held open for the whole scan.
+struct Root {
+    shown: PathBuf,
+    fd: OwnedFd,
+}
+
+/// One entry below a root: its name and the node of the directory that holds it (`None` for the
+/// root directory itself, whose name is empty).
+struct Node {
+    parent: Option<Rc<Node>>,
+    name: OsString,
+}
+
+impl Node {
+    /// The names from just below the root down to this entry.
+    fn chain(&self) -> Vec<&OsStr> {
+        let mut names = Vec::new();
+        let mut at = Some(self);
+        while let Some(n) = at {
+            if n.parent.is_some() {
+                names.push(n.name.as_os_str());
+            }
+            at = n.parent.as_deref();
+        }
+        names.reverse();
+        names
+    }
+}
+
+enum Place {
+    /// A path given on the command line, followed if it is a symlink.
+    Explicit(PathBuf),
+    /// An entry found while walking.
+    Below { root: Rc<Root>, node: Rc<Node> },
 }
 
 /// Something found while walking: a file to scan or one that could not be read.
 pub(super) struct Input {
-    /// What is printed (never opened for a file found while walking).
-    pub(super) path: PathBuf,
-    /// `None`: a path given on the command line, followed if it is a symlink.
-    below: Option<Below>,
+    place: Place,
     pub(super) problem: Option<Unread>,
 }
 
 impl Input {
+    /// What is printed. Built on demand, never stored.
+    pub(super) fn path(&self) -> PathBuf {
+        match &self.place {
+            Place::Explicit(p) => p.clone(),
+            Place::Below { root, node } => {
+                let mut p = root.shown.clone();
+                p.extend(node.chain());
+                p
+            }
+        }
+    }
+
     /// Opens the file without ever blocking on it (a FIFO would hang a plain open). A file found
     /// while walking is reached through descriptors and never through a symlink.
     pub(super) fn open(&self) -> Result<File, Unread> {
-        let fd = match &self.below {
-            None => open_flags(&self.path, base_flags()),
-            Some(b) => open_below(b),
+        let fd = match &self.place {
+            Place::Explicit(p) => open_flags(p, base_flags()),
+            Place::Below { root, node } => open_below(root, node),
         }?;
         let file = File::from(fd);
         let meta = file.metadata().map_err(|e| Unread::Io(e.kind()))?;
@@ -95,19 +143,24 @@ fn open_flags(path: &Path, flags: OFlags) -> Result<OwnedFd, Unread> {
     rustix::fs::open(path, flags, Mode::empty()).map_err(unread)
 }
 
-fn open_at(dir: &OwnedFd, name: &OsStr, flags: OFlags) -> Result<OwnedFd, Unread> {
+fn open_at(dir: BorrowedFd<'_>, name: &OsStr, flags: OFlags) -> Result<OwnedFd, Unread> {
     rustix::fs::openat(dir, name, flags | OFlags::NOFOLLOW, Mode::empty()).map_err(unread)
 }
 
-fn open_below(b: &Below) -> Result<OwnedFd, Unread> {
-    let Some((last, parents)) = b.names.split_last() else {
+fn open_below(root: &Root, node: &Node) -> Result<OwnedFd, Unread> {
+    let chain = node.chain();
+    let Some((last, parents)) = chain.split_last() else {
         return Err(Unread::NotRegular);
     };
-    let mut dir = open_flags(&b.root, dir_flags())?;
+    // Each directory is held only until the next one is open.
+    let mut held: Option<OwnedFd> = None;
     for name in parents {
-        dir = open_at(&dir, name, dir_flags())?;
+        let from = held.as_ref().map_or(root.fd.as_fd(), AsFd::as_fd);
+        let next = open_at(from, name, dir_flags())?;
+        held = Some(next);
     }
-    open_at(&dir, last, base_flags())
+    let from = held.as_ref().map_or(root.fd.as_fd(), AsFd::as_fd);
+    open_at(from, last, base_flags())
 }
 
 pub(super) struct Walk {
@@ -117,63 +170,66 @@ pub(super) struct Walk {
     seen: usize,
     /// Most inputs this walk accepts.
     limit: usize,
+    /// Bytes of names kept so far, and the most this walk keeps.
+    name_bytes: usize,
+    name_limit: usize,
 }
 
 impl Walk {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, name_limit: usize) -> Self {
         Self {
             inputs: Vec::new(),
             symlinks: 0,
             special: 0,
             seen: 0,
             limit,
+            name_bytes: 0,
+            name_limit,
         }
     }
 
-    fn push(
-        &mut self,
-        path: PathBuf,
-        below: Option<Below>,
-        problem: Option<Unread>,
-    ) -> Result<(), CliError> {
+    fn push(&mut self, place: Place, problem: Option<Unread>) -> Result<(), CliError> {
         self.seen = self.seen.saturating_add(1);
         if self.seen > self.limit {
             return Err(CliError::Refused(TOO_MANY));
         }
-        self.inputs.push(Input {
-            path,
-            below,
-            problem,
-        });
+        self.inputs.push(Input { place, problem });
         Ok(())
     }
 
-    fn below(root: &Rc<PathBuf>, names: &[OsString]) -> Below {
-        Below {
+    /// Charges the name of an entry that is about to be kept.
+    fn charge(&mut self, name: &OsStr) -> Result<(), CliError> {
+        self.name_bytes = self
+            .name_bytes
+            .saturating_add(name.len())
+            .saturating_add(ENTRY_OVERHEAD);
+        if self.name_bytes > self.name_limit {
+            return Err(CliError::Refused(TOO_MANY));
+        }
+        Ok(())
+    }
+
+    fn below(root: &Rc<Root>, node: &Rc<Node>) -> Place {
+        Place::Below {
             root: Rc::clone(root),
-            names: names.to_vec(),
+            node: Rc::clone(node),
         }
     }
 
-    /// Lists the open directory `fd`, shown as `shown` and reached by `names` from `root`.
+    /// Lists the open directory `fd`, which is `node` below `root`.
     fn dir(
         &mut self,
-        root: &Rc<PathBuf>,
+        root: &Rc<Root>,
         fd: &OwnedFd,
-        names: &mut Vec<OsString>,
-        shown: &Path,
+        node: &Rc<Node>,
         depth: usize,
     ) -> Result<(), CliError> {
         if depth > MAX_DEPTH {
-            return self.push(
-                shown.to_owned(),
-                Some(Self::below(root, names)),
-                Some(Unread::TooDeep),
-            );
+            return self.push(Self::below(root, node), Some(Unread::TooDeep));
         }
         let mut entries = match Dir::read_from(fd) {
             Ok(d) => d,
-            Err(e) => return self.listing_failed(root, names, shown, e),
+            Err(e) => return self.push(Self::below(root, node), Some(unread(e))),
         };
         let mut found: Vec<OsString> = Vec::new();
         while let Some(entry) = entries.read() {
@@ -181,10 +237,12 @@ impl Walk {
                 Ok(e) => {
                     let name = e.file_name().to_bytes();
                     if name != b"." && name != b".." {
-                        found.push(OsStr::from_bytes(name).to_owned());
+                        let name = OsStr::from_bytes(name);
+                        self.charge(name)?;
+                        found.push(name.to_owned());
                     }
                 }
-                Err(e) => self.listing_failed(root, names, shown, e)?,
+                Err(e) => self.push(Self::below(root, node), Some(unread(e)))?,
             }
             if found.len().saturating_add(self.seen) > self.limit {
                 return Err(CliError::Refused(TOO_MANY));
@@ -192,61 +250,35 @@ impl Walk {
         }
         found.sort();
         for name in found {
-            self.entry(root, fd, names, shown, &name, depth)?;
+            self.entry(root, fd, node, name, depth)?;
         }
         Ok(())
     }
 
-    fn listing_failed(
-        &mut self,
-        root: &Rc<PathBuf>,
-        names: &[OsString],
-        shown: &Path,
-        e: Errno,
-    ) -> Result<(), CliError> {
-        self.push(
-            shown.to_owned(),
-            Some(Self::below(root, names)),
-            Some(unread(e)),
-        )
-    }
-
     fn entry(
         &mut self,
-        root: &Rc<PathBuf>,
+        root: &Rc<Root>,
         fd: &OwnedFd,
-        names: &mut Vec<OsString>,
-        shown: &Path,
-        name: &OsStr,
+        parent: &Rc<Node>,
+        name: OsString,
         depth: usize,
     ) -> Result<(), CliError> {
-        let path = shown.join(name);
-        names.push(name.to_owned());
-        let r = self.typed(root, fd, names, path, name, depth);
-        names.pop();
-        r
-    }
-
-    fn typed(
-        &mut self,
-        root: &Rc<PathBuf>,
-        fd: &OwnedFd,
-        names: &mut Vec<OsString>,
-        path: PathBuf,
-        name: &OsStr,
-        depth: usize,
-    ) -> Result<(), CliError> {
-        let st = match rustix::fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        let st = rustix::fs::statat(fd, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW);
+        let node = Rc::new(Node {
+            parent: Some(Rc::clone(parent)),
+            name,
+        });
+        let st = match st {
             Ok(st) => st,
-            Err(e) => return self.push(path, Some(Self::below(root, names)), Some(unread(e))),
+            Err(e) => return self.push(Self::below(root, &node), Some(unread(e))),
         };
         match FileType::from_raw_mode(st.st_mode) {
             FileType::Symlink => self.symlinks = self.symlinks.saturating_add(1),
-            FileType::Directory => match open_at(fd, name, dir_flags()) {
-                Ok(sub) => self.dir(root, &sub, names, &path, depth.saturating_add(1))?,
-                Err(p) => self.push(path, Some(Self::below(root, names)), Some(p))?,
+            FileType::Directory => match open_at(fd.as_fd(), &node.name, dir_flags()) {
+                Ok(sub) => self.dir(root, &sub, &node, depth.saturating_add(1))?,
+                Err(p) => self.push(Self::below(root, &node), Some(p))?,
             },
-            FileType::RegularFile => self.push(path, Some(Self::below(root, names)), None)?,
+            FileType::RegularFile => self.push(Self::below(root, &node), None)?,
             _ => self.special = self.special.saturating_add(1),
         }
         Ok(())
@@ -256,16 +288,34 @@ impl Walk {
 /// Finds the inputs of a scan: the files given, and every regular file below the directories
 /// given. More than `limit` of them is refused.
 pub(super) fn walk(paths: &[PathBuf], limit: usize) -> Result<Walk, CliError> {
-    let mut w = Walk::new(limit);
+    walk_with(paths, limit, MAX_NAME_BYTES)
+}
+
+pub(super) fn walk_with(
+    paths: &[PathBuf],
+    limit: usize,
+    name_limit: usize,
+) -> Result<Walk, CliError> {
+    let mut w = Walk::new(limit, name_limit);
     for p in paths {
         match fs::metadata(p) {
             Ok(m) if m.is_dir() => match open_flags(p, dir_flags()) {
-                Ok(fd) => w.dir(&Rc::new(p.clone()), &fd, &mut Vec::new(), p, 0)?,
-                Err(why) => w.push(p.clone(), None, Some(why))?,
+                Ok(fd) => {
+                    let root = Rc::new(Root {
+                        shown: p.clone(),
+                        fd,
+                    });
+                    let top = Rc::new(Node {
+                        parent: None,
+                        name: OsString::new(),
+                    });
+                    w.dir(&root, &root.fd, &top, 0)?;
+                }
+                Err(why) => w.push(Place::Explicit(p.clone()), Some(why))?,
             },
-            Ok(m) if m.is_file() => w.push(p.clone(), None, None)?,
-            Ok(_) => w.push(p.clone(), None, Some(Unread::NotRegular))?,
-            Err(e) => w.push(p.clone(), None, Some(Unread::Io(e.kind())))?,
+            Ok(m) if m.is_file() => w.push(Place::Explicit(p.clone()), None)?,
+            Ok(_) => w.push(Place::Explicit(p.clone()), Some(Unread::NotRegular))?,
+            Err(e) => w.push(Place::Explicit(p.clone()), Some(Unread::Io(e.kind())))?,
         }
     }
     Ok(w)
@@ -297,6 +347,49 @@ mod tests {
         }
     }
 
+    /// The names of a walk are bounded in bytes, not only in count: one more entry over the
+    /// budget is refused (exit 2 through `CouldNotScan`), exactly at the budget is accepted.
+    #[test]
+    fn the_name_budget_is_exact_and_one_byte_over_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            std::fs::write(d.path().join(format!("file{i}")), "x").unwrap();
+        }
+        // Four names of five bytes, each with the fixed overhead.
+        let exact = 4 * (5 + ENTRY_OVERHEAD);
+        for (limit, ok) in [(exact, true), (exact - 1, false)] {
+            let r = walk_with(&[d.path().to_owned()], 100, limit);
+            assert_eq!(r.is_ok(), ok, "limit {limit}");
+            if let Err(e) = r {
+                assert!(matches!(e, CliError::Refused(_)));
+                assert_eq!(CliError::CouldNotScan(Box::new(e)).exit_code(), 2);
+            }
+        }
+    }
+
+    /// Long names at depth are charged once each, never once per file below them: a directory
+    /// of many files under long directory names costs the names once.
+    #[test]
+    fn a_directory_name_is_charged_once_whatever_is_below_it() {
+        let d = tempfile::tempdir().unwrap();
+        let long = "d".repeat(200);
+        let dir = d.path().join(&long).join(&long);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..50 {
+            std::fs::write(dir.join(format!("f{i:02}")), "x").unwrap();
+        }
+        // Two 200 byte directory names and fifty 3 byte file names.
+        let need = 2 * (200 + ENTRY_OVERHEAD) + 50 * (3 + ENTRY_OVERHEAD);
+        let w = walk_with(&[d.path().to_owned()], 1000, need).unwrap();
+        assert_eq!(w.inputs.len(), 50);
+        assert!(walk_with(&[d.path().to_owned()], 1000, need - 1).is_err());
+        // The display path is built on demand and is complete.
+        assert!(w.inputs[0].path().ends_with(format!("{long}/{long}/f00")));
+        for i in &w.inputs {
+            assert!(i.open().is_ok());
+        }
+    }
+
     #[test]
     fn nesting_beyond_the_depth_limit_is_reported_not_walked() {
         let d = tempfile::tempdir().unwrap();
@@ -314,7 +407,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(w.inputs.iter().all(|i| !i.path.ends_with("leaf.txt")));
+        assert!(w.inputs.iter().all(|i| !i.path().ends_with("leaf.txt")));
     }
 
     #[test]
@@ -336,7 +429,7 @@ mod tests {
         let shown: Vec<_> = w
             .inputs
             .iter()
-            .map(|i| i.path.strip_prefix(d.path()).unwrap().to_owned())
+            .map(|i| i.path().strip_prefix(d.path()).unwrap().to_owned())
             .collect();
         assert_eq!(shown, [PathBuf::from("a.txt"), PathBuf::from("sub/b.txt")]);
         assert_eq!((w.symlinks, w.special), (1, 1));
@@ -384,7 +477,7 @@ mod tests {
         let idx = w
             .inputs
             .iter()
-            .position(|i| i.path.ends_with("f.txt"))
+            .position(|i| i.path().ends_with("f.txt"))
             .unwrap();
         std::fs::remove_file(d.path().join("f.txt")).unwrap();
         symlink(d.path().join("other"), d.path().join("f.txt")).unwrap();
