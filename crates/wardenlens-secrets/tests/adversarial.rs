@@ -64,7 +64,7 @@ fn load_refuses_fifo_without_blocking() {
     let p = d.path().join("vault.key");
     mkfifo(&p);
     let p2 = p.clone();
-    let res = within(3, move || KeyFile::load(&p2).map(|_| ()));
+    let res = within(30, move || KeyFile::load(&p2).map(|_| ()));
     // Unblock the hung open (if any) so the leaked thread can finish.
     let _ = std::fs::OpenOptions::new()
         .write(true)

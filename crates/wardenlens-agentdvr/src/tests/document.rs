@@ -361,6 +361,11 @@ fn many_attributes_do_not_take_quadratic_time() {
         let _ = tx.send(parse(s.as_bytes()).is_ok());
     });
     let r = rx.recv_timeout(std::time::Duration::from_secs(60));
+    assert_ne!(
+        r,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the parser thread panicked"
+    );
     assert_eq!(
         r,
         Ok(true),

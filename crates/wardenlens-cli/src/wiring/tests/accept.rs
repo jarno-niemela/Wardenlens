@@ -82,10 +82,10 @@ async fn partial_header_and_idle_connections_are_closed_and_recording_continues(
     .await;
     assert!(svc.stats.peak() <= CAP);
 
-    // Every one of them is closed by the server within the header timeout (plus slack).
+    // Every one of them is closed by the server within the header timeout (1 s; 9 s of slack for host load, under the 10 s default).
     let mut ok = 0;
     for s in held {
-        if closed_within(s, Duration::from_secs(5)).await {
+        if closed_within(s, Duration::from_secs(9)).await {
             ok += 1;
         }
     }

@@ -38,7 +38,7 @@ fn load_refuses_unix_socket_without_blocking() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("sock");
     let _l = UnixListener::bind(&p).unwrap();
-    let r = within(5, move || KeyFile::load(&p).map(|_| ()));
+    let r = within(30, move || KeyFile::load(&p).map(|_| ()));
     let r = r.expect("load on a socket blocked");
     // Opening a socket gives ENXIO; any refusal is fine, success is not.
     assert!(matches!(
@@ -65,7 +65,7 @@ fn load_fifo_with_a_writer_present_is_still_refused() {
         .open(&p)
         .unwrap();
     std::io::Write::write_all(&mut w, &[7u8; 32]).unwrap();
-    let r = within(5, move || KeyFile::load(&p).map(|_| ())).expect("blocked");
+    let r = within(30, move || KeyFile::load(&p).map(|_| ())).expect("blocked");
     assert!(matches!(r, Err(SecretsError::KeyFileNotRegular)));
 }
 

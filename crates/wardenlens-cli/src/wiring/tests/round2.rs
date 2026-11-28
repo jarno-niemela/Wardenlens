@@ -102,7 +102,8 @@ async fn a_full_recorder_wakes_the_storage_loop_before_the_interval() {
     let ticks_after = |n: usize| {
         let count = Arc::clone(&count);
         async move {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            // Hang guard (TEST-5): 30 s, far above host load.
+            tokio::time::timeout(Duration::from_secs(30), async {
                 while count.load(Ordering::SeqCst) <= n {
                     tokio::task::yield_now().await;
                 }
@@ -222,8 +223,9 @@ fn a_stop_signal_during_a_stuck_start_up_exits_promptly() {
     });
     assert_eq!(result.unwrap(), Stopped::Abandoned);
     release_runtime(runtime, false);
-    // The stuck reconciliation never returns by itself; 30 s is a hang backstop (TEST-5).
-    assert!(at.elapsed() < Duration::from_secs(30), "{:?}", at.elapsed());
+    // The exit contract: the stuck reconciliation must not hold the exit past the 10 s
+    // SHUTDOWN_DEADLINE.
+    assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
     assert_eq!(
         site.files(".mp4") + site.files(".part"),
         0,

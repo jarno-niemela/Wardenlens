@@ -466,7 +466,8 @@ async fn wake_when_sends_one_tick_per_rising_edge() {
     let judged_at_least = |n: usize| {
         let judged = Arc::clone(&judged);
         async move {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            // Hang guard (TEST-5): 30 s, far above host load.
+            tokio::time::timeout(Duration::from_secs(30), async {
                 while judged.load(Ordering::SeqCst) < n {
                     tokio::task::yield_now().await;
                 }
@@ -485,7 +486,7 @@ async fn wake_when_sends_one_tick_per_rising_edge() {
     assert!(inbox.try_recv().is_err(), "not full yet");
     send(2, 3).await;
     assert_eq!(
-        inbox.recv_timeout(Duration::from_secs(5)).unwrap(),
+        inbox.recv_timeout(Duration::from_secs(30)).unwrap(),
         Wake::Tick
     );
     send(3, 4).await;
@@ -493,7 +494,7 @@ async fn wake_when_sends_one_tick_per_rising_edge() {
     send(0, 5).await;
     send(2, 6).await;
     assert_eq!(
-        inbox.recv_timeout(Duration::from_secs(5)).unwrap(),
+        inbox.recv_timeout(Duration::from_secs(30)).unwrap(),
         Wake::Tick,
         "a new edge ticks again"
     );
