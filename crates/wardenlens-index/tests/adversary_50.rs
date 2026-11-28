@@ -144,7 +144,7 @@ fn a_version_1_index_migrates_to_2_keeping_segments_which_are_then_orphans() {
     let v: i64 = raw(&f.path)
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 3);
+    assert_eq!(v, 4);
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn a_refused_stored_path_never_appears_in_the_error_debug_or_display() {
             .unwrap();
         for (n, p) in leaks.iter().enumerate() {
             c.execute(
-                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/plain', ?2, 1, 1)",
+                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/plain', ?2, 1, 1, 0)",
                 rusqlite::params![format!("cam{n}"), p],
             )
             .unwrap();

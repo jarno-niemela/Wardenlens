@@ -131,6 +131,12 @@ impl<C> RetinaSource<C> {
         self.options = options;
         self
     }
+
+    /// The per-camera [`OpenOptions`] this source opens its sessions with.
+    #[must_use]
+    pub fn open_options(&self) -> OpenOptions {
+        self.options
+    }
 }
 
 impl<C: Clock + Clone + Send + 'static> StreamSource for RetinaSource<C> {

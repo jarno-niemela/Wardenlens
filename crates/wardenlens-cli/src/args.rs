@@ -346,8 +346,16 @@ pub(crate) enum CameraCommand {
     /// The password is read from stdin (one line) or a no-echo prompt, never from an argument.
     /// Refuses this machine's own addresses and 169.254.169.254 before any request is made.
     Add(AddArgs),
-    /// List the registered cameras: id, model and host. Never a login.
+    /// List the registered cameras: id, model, whether Basic authentication is allowed, and host.
+    /// Never a login.
     List,
+    /// Change a setting of a registered camera.
+    ///
+    /// `--allow-basic-auth true` lets `serve` answer a Basic-only challenge from this camera with
+    /// the password, which then crosses the network in base64, that is in cleartext. Use it only
+    /// for a camera that offers nothing better, on a network you trust. Takes effect when the
+    /// service next starts.
+    Set(CameraSetArgs),
     /// Remove a camera from the registry and its entries from the vault. Recordings are kept.
     Remove {
         /// The camera id.
@@ -364,6 +372,16 @@ pub(crate) struct DiscoverArgs {
     /// The IPv4 address of the interface to probe from; the default lets the OS choose.
     #[arg(long, default_value = "0.0.0.0", value_name = "IPV4")]
     pub(crate) interface: Ipv4Addr,
+}
+
+/// Arguments of `camera set`.
+#[derive(Debug, Args)]
+pub(crate) struct CameraSetArgs {
+    /// The camera id.
+    pub(crate) id: String,
+    /// Allow (`true`) or refuse (`false`) answering a Basic-only authentication challenge.
+    #[arg(long, action = clap::ArgAction::Set, value_name = "true|false")]
+    pub(crate) allow_basic_auth: bool,
 }
 
 /// Arguments of `camera add`.
@@ -387,6 +405,11 @@ pub(crate) struct AddArgs {
     /// A display name; defaults to the id.
     #[arg(long)]
     pub(crate) name: Option<String>,
+    /// Let `serve` answer a Basic-only authentication challenge from this camera with the
+    /// password. Basic sends the login in base64, that is in cleartext, on every connection: use
+    /// it only for a camera that offers nothing better, on a network you trust. Off by default.
+    #[arg(long)]
+    pub(crate) allow_basic_auth: bool,
 }
 
 /// Parses `3s`, `1500ms` or `3` (seconds): a positive duration.

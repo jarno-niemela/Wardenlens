@@ -158,11 +158,11 @@ fn peak_rss_kib() -> u64 {
         .unwrap()
 }
 
-/// ADR 0002 item 12: "the peak is about twice that (up to about 32 MiB), plus the depacketizer's
-/// piece metadata". With 2-byte NALs the metadata is seven times the ring data, so the session
-/// holds about 112 MiB of metadata (Vec capacities 64 MiB + 48 MiB, plus a realloc transient)
-/// before the 16 MiB bound fails it. Expect the peak growth to stay within 64 MiB (the stated
-/// 32 MiB with as much again of slack).
+/// ADR 0002 item 12: "the peak is about twice that (up to about 32 MiB)". A flood of 2-byte NALs
+/// is stopped by the NAL bound (`MAX_NALS_PER_ACCESS_UNIT`, 4096 NALs or 16 x that many pieces),
+/// which keeps the depacketizer's metadata under about 1.5 MiB, long before the 16 MiB byte bound
+/// matters. Expect the peak growth to stay within 64 MiB (the stated 32 MiB with as much again of
+/// slack).
 #[tokio::test]
 async fn adv_tiny_nal_flood_peak_memory_stays_near_the_stated_bound() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -193,6 +193,6 @@ async fn adv_tiny_nal_flood_peak_memory_stays_near_the_stated_bound() {
     let grown_mib = (peak_rss_kib() - before) / 1024;
     assert!(
         grown_mib <= 64,
-        "one session grew peak RSS by {grown_mib} MiB before the 16 MiB buffer bound failed it"
+        "one session grew peak RSS by {grown_mib} MiB before the NAL bound failed the session"
     );
 }

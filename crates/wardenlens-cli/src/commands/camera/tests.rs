@@ -262,6 +262,7 @@ fn args(id: &str, host: &str, model: &str, onvif_port: Option<NonZeroU16>) -> Ad
         username: USER.to_owned(),
         onvif_port,
         name: None,
+        allow_basic_auth: false,
     }
 }
 
@@ -869,6 +870,214 @@ fn remove_cleans_vault_entries_that_have_no_row() {
         remove(&site.config, "yard", &mut Scripted::piped("")),
         Err(CameraCmdError::NotFound)
     ));
+}
+
+// ---- the Basic authentication opt-in (#225) ----
+
+fn registered_flag(site: &Site, id: &str) -> bool {
+    site.cameras()
+        .iter()
+        .find(|c| c.record().id().as_str() == id)
+        .map(|c| c.record().allow_basic_auth())
+        .unwrap()
+}
+
+fn set_args(id: &str, allow: bool) -> crate::args::CameraSetArgs {
+    crate::args::CameraSetArgs {
+        id: id.to_owned(),
+        allow_basic_auth: allow,
+    }
+}
+
+/// The inputs `serve` builds for the site's cameras, as (id, camera flag, source flag).
+fn serve_view(site: &Site) -> Vec<(String, bool, bool)> {
+    let index = Index::open(site.config.database_path()).unwrap();
+    let mut v: Vec<_> = camera_inputs(&site.config, &index, site.key())
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i.camera.id().to_string(),
+                i.camera.allow_basic_auth(),
+                i.source.open_options().allow_basic_auth,
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn add_is_off_by_default_without_a_warning_and_serve_gets_false() {
+    let site = Site::new();
+    let a = args("yard", "127.0.0.1", "reolink/rlc-520a", Some(closed_port()));
+    let o = run_add(&site, &foreign(), &a, &pw());
+    o.result.unwrap();
+    assert!(!o.err.contains("Basic"), "{}", o.err);
+    assert!(!registered_flag(&site, "yard"));
+    assert_eq!(serve_view(&site), [("yard".to_owned(), false, false)]);
+}
+
+#[test]
+fn add_allow_basic_auth_stores_warns_and_reaches_serve_for_that_camera_only() {
+    let site = Site::new();
+    let a = AddArgs {
+        allow_basic_auth: true,
+        ..args("yard", "127.0.0.1", "reolink/rlc-520a", Some(closed_port()))
+    };
+    let o = run_add(&site, &foreign(), &a, &pw());
+    o.result.unwrap();
+    assert!(
+        o.err.contains("Basic") && o.err.contains("base64") && o.err.contains("cleartext"),
+        "{}",
+        o.err
+    );
+    assert!(!o.err.contains(PASSWORD) && !o.out.contains(PASSWORD));
+    add_closed(&site, "lawn", "dahua/ipc-hfw4431r-z");
+    assert!(registered_flag(&site, "yard"));
+    assert!(!registered_flag(&site, "lawn"));
+    assert_eq!(
+        serve_view(&site),
+        [
+            ("lawn".to_owned(), false, false),
+            ("yard".to_owned(), true, true)
+        ]
+    );
+}
+
+#[test]
+fn list_shows_whether_basic_is_allowed() {
+    let site = Site::new();
+    let a = AddArgs {
+        allow_basic_auth: true,
+        ..args("yard", "127.0.0.1", "reolink/rlc-520a", Some(closed_port()))
+    };
+    run_add(&site, &foreign(), &a, &pw()).result.unwrap();
+    add_closed(&site, "lawn", "dahua/ipc-hfw4431r-z");
+    let (out, _) = list_out(&site);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].contains("BASIC"), "{out}");
+    assert!(
+        lines[1].starts_with("lawn") && lines[1].contains("refused"),
+        "{out}"
+    );
+    assert!(
+        lines[2].starts_with("yard") && lines[2].contains("allowed"),
+        "{out}"
+    );
+}
+
+#[test]
+fn set_changes_the_flag_both_ways_and_warns_only_when_allowing() {
+    let site = Site::new();
+    add_closed(&site, "yard", "reolink/rlc-520a");
+    add_closed(&site, "lawn", "dahua/ipc-hfw4431r-z");
+    let mut term = Scripted::piped("");
+    set(&site.config, &set_args("yard", true), &mut term).unwrap();
+    let err = String::from_utf8(term.err).unwrap();
+    assert!(err.contains("cleartext"), "{err}");
+    assert!(registered_flag(&site, "yard"));
+    assert!(!registered_flag(&site, "lawn"));
+    assert_eq!(
+        serve_view(&site),
+        [
+            ("lawn".to_owned(), false, false),
+            ("yard".to_owned(), true, true)
+        ]
+    );
+    let mut term = Scripted::piped("");
+    set(&site.config, &set_args("yard", false), &mut term).unwrap();
+    assert_eq!(String::from_utf8(term.err).unwrap(), "");
+    assert!(!registered_flag(&site, "yard"));
+    // The vault is untouched: the login still reads back.
+    assert!(site.entry("yard", EntryKind::Credential).is_some());
+}
+
+#[test]
+fn set_of_an_unknown_id_or_without_a_registry_is_not_found_and_creates_nothing() {
+    let site = Site::new();
+    let err = set(
+        &site.config,
+        &set_args("nobody", true),
+        &mut Scripted::piped(""),
+    )
+    .unwrap_err();
+    assert!(matches!(err, CameraCmdError::NotFound));
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(site.files().len(), 0);
+    add_closed(&site, "yard", "reolink/rlc-520a");
+    let err = set(
+        &site.config,
+        &set_args("nobody", true),
+        &mut Scripted::piped(""),
+    )
+    .unwrap_err();
+    assert!(matches!(err, CameraCmdError::NotFound));
+    assert!(!registered_flag(&site, "yard"));
+    let err = set(
+        &site.config,
+        &set_args("Bad Id", true),
+        &mut Scripted::piped(""),
+    )
+    .unwrap_err();
+    assert!(matches!(err, CameraCmdError::Camera(_)));
+}
+
+#[test]
+fn the_flags_parse_and_a_bad_value_is_refused() {
+    use clap::Parser as _;
+    let base = [
+        "wardenlens",
+        "camera",
+        "add",
+        "--id",
+        "a",
+        "--host",
+        "h",
+        "--model",
+        "x/y",
+        "--username",
+        "u",
+    ];
+    let off = Cli::try_parse_from(base).unwrap();
+    let mut on_args = base.to_vec();
+    on_args.push("--allow-basic-auth");
+    let on = Cli::try_parse_from(on_args).unwrap();
+    let flag = |c: Cli| match c.command {
+        Some(Command::Camera(CameraCommand::Add(a))) => a.allow_basic_auth,
+        _ => panic!("not add"),
+    };
+    assert!(!flag(off));
+    assert!(flag(on));
+    for (value, want) in [("true", true), ("false", false)] {
+        let c = Cli::try_parse_from([
+            "wardenlens",
+            "camera",
+            "set",
+            "a",
+            "--allow-basic-auth",
+            value,
+        ])
+        .unwrap();
+        match c.command {
+            Some(Command::Camera(CameraCommand::Set(s))) => assert_eq!(s.allow_basic_auth, want),
+            _ => panic!("not set"),
+        }
+    }
+    for bad in [
+        vec![
+            "wardenlens",
+            "camera",
+            "set",
+            "a",
+            "--allow-basic-auth",
+            "maybe",
+        ],
+        vec!["wardenlens", "camera", "set", "a", "--allow-basic-auth"],
+        vec!["wardenlens", "camera", "set", "a"],
+    ] {
+        assert!(Cli::try_parse_from(bad.clone()).is_err(), "{bad:?}");
+    }
 }
 
 // ---- exit codes ----
