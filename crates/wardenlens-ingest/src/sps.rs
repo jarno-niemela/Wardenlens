@@ -594,8 +594,74 @@ mod tests {
         assert_eq!(unescape(&[0, 3, 0, 0, 3, 3]), [0, 3, 0, 0, 3]);
     }
 
+    /// Whether the oracle (h264-reader) reads this profile's SPS the way the parser does.
+    ///
+    /// Profile 144 is the High 4:4:4 profile withdrawn from H.264 in 2007: 7.3.2.1.1 no longer
+    /// lists it, so a strict reader (h264-reader) treats it as having no chroma syntax. ffmpeg
+    /// and the JM decoder still read it as a High profile, and so does `HIGH_FAMILY_PROFILES`,
+    /// because cameras and old files in the wild carry it (#54). The parser is right and the
+    /// oracle is not an authority on 144: it is excluded from the comparison, not from the
+    /// parser (#241).
+    fn oracle_agrees_on(profile: u8) -> bool {
+        profile != 144
+    }
+
     fn oracle(nal: &[u8]) -> Option<SeqParameterSet> {
         SeqParameterSet::from_bits(BitReader::new(ByteReader::skipping_h264_header(nal))).ok()
+    }
+
+    /// #241: the shrunk case. Profile 144 with the High syntax and a reorder bound parses as
+    /// written; the strict oracle misreads the same bytes, which is why it is not compared.
+    #[test]
+    fn profile_144_parses_as_high_family_regression_241() {
+        let mut s = with_reorder(base_spec(144), Some(2));
+        s.chroma.bit_depths = (1, 0);
+        s.gaps = true;
+        s.size_mbs = (0, 30);
+        let got = parse_sps(&s.nal()).unwrap();
+        assert_eq!(got.profile_idc, 144);
+        assert_eq!(got.max_num_reorder_frames, Some(2));
+        assert!(!oracle_agrees_on(144));
+        // The cause, pinned: for some High syntax values the oracle accepts the same bytes and
+        // reads a different pic_order_cnt_type (it takes the chroma fields for the frame_num and POC fields).
+        // If h264-reader ever learns 144 this fails and 144 can rejoin the comparison.
+        let mut disagreements = 0;
+        for idc in 0..=3 {
+            for depths in [(0, 0), (1, 0), (0, 1), (2, 3)] {
+                for gaps in [false, true] {
+                    let mut t = s.clone();
+                    t.chroma.idc = idc;
+                    t.chroma.bit_depths = depths;
+                    t.gaps = gaps;
+                    let ours = parse_sps(&t.nal()).unwrap();
+                    assert_eq!(ours.max_num_reorder_frames, Some(2));
+                    let theirs = oracle(&t.nal()).map(|o| match o.pic_order_cnt {
+                        h264_reader::nal::sps::PicOrderCntType::TypeZero { .. } => 0,
+                        h264_reader::nal::sps::PicOrderCntType::TypeOne { .. } => 1,
+                        h264_reader::nal::sps::PicOrderCntType::TypeTwo => 2,
+                    });
+                    if theirs.is_some_and(|x| x != ours.pic_order_cnt_type) {
+                        disagreements += 1;
+                    }
+                }
+            }
+        }
+        assert!(disagreements > 0, "oracle no longer misreads 144");
+        for p in wardenlens_core::video::HIGH_FAMILY_PROFILES {
+            if p != 144 {
+                assert!(oracle_agrees_on(p), "oracle must still check {p}");
+                let mut t = with_reorder(base_spec(p), Some(2));
+                if let Some(r) = t.vui.as_mut().and_then(|v| v.restriction.as_mut()) {
+                    r.dec_buf = 2; // the oracle bounds it by the level's DPB size
+                }
+                let theirs = oracle(&t.nal())
+                    .unwrap_or_else(|| panic!("oracle rejects {p}"))
+                    .vui_parameters
+                    .and_then(|v| v.bitstream_restrictions)
+                    .map(|b| b.max_num_reorder_frames);
+                assert_eq!(theirs, Some(2), "profile {p}");
+            }
+        }
     }
 
     proptest! {
@@ -609,7 +675,7 @@ mod tests {
             prop_assert_eq!(got.constraint_flags, spec.constraint);
             prop_assert_eq!(got.pic_order_cnt_type, spec.poc_type());
             prop_assert_eq!(got.max_num_reorder_frames, spec.declared_reorder());
-            if let Some(o) = oracle(&nal) {
+            if let Some(o) = oracle(&nal).filter(|_| oracle_agrees_on(spec.profile)) {
                 let theirs = o.vui_parameters.and_then(|v| v.bitstream_restrictions)
                     .map(|b| b.max_num_reorder_frames);
                 prop_assert_eq!(got.max_num_reorder_frames, theirs);
