@@ -152,7 +152,8 @@ redact() {
 cam_model() {
   local id m
   id="$(cam_id "$1")" || return 1
-  # A vault failure (stderr shown, say so) is reported separately from a missing or malformed entry.
+  # The vault's own error (if any) is shown; a failed lookup (missing entry or vault failure, `get` does not tell them
+  # apart) is reported separately from a malformed value.
   if ! m="$(vault_value "cam:$id:model")"; then
     echo "no model entry for camera: $id (the vault lookup of cam:$id:model failed; set it to <vendor>/<model>, e.g. reolink/rlc-520a)" >&2
     return 1

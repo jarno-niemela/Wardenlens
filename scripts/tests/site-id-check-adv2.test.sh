@@ -19,7 +19,7 @@ printf '\xef\xbb\xbfzq-site-7\r\n' >"$tmp/bom"
 run "$tmp/bom"
 [[ $rc != 0 ]] && ok "a BOM-prefixed list still checks (or refuses) its first id" || bad "BOM list: first id silently unchecked, reports ok ($rc: $out)"
 
-# An id carried only in a scanned file NAME (the #233 scope named results/hdipc-onvif.tsv as a site id in a name).
+# An id carried only in a scanned file NAME (a result file named after a camera).
 fresh; printf 'clean\n' >"$t/spikes/s/zq-site-7.tsv"
 run "$tmp/ids"
 [[ $rc == 1 ]] && ok "an id only in a scanned file name is found" || bad "an id in a file name (content clean) is not reported ($rc: $out)"
