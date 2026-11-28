@@ -54,8 +54,9 @@ impl TokenId {
     /// The id as a string slice (always ASCII).
     #[must_use]
     pub fn as_str(&self) -> &str {
-        // Invariant: `parse` only admits ASCII bytes, so this cannot fail; the
-        // fallback keeps the function total without a panic path.
+        // Invariant: every constructor (`parse`, `from_random`) yields ASCII bytes only
+        // (`a-z2-7`), so this cannot fail; the fallback keeps the function total without
+        // a panic path.
         std::str::from_utf8(&self.0).unwrap_or_default()
     }
 }

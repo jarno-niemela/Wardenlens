@@ -18,11 +18,17 @@
 //!    `Proxy-Authorization` sensitive before anything can log them, so it must wrap the
 //!    trace layer.
 //! 2. `TraceLayer` logs requests and responses (headers redacted by 1). The span records
-//!    the method, the path and the headers, never the query string.
+//!    the method and the path, never the query string; a path segment containing `wl_`
+//!    (the token prefix) is redacted and the path is length-capped. The headers are logged
+//!    once, in the request event, capped in count and size (see the `trace` module), so the
+//!    response and failure events carry no header values. A `5xx` logs one fixed-size
+//!    `response failed` line.
 //! 3. JSON error mapping turns bodyless error responses into `{"error": code}`.
-//! 4. `ConcurrencyLimitLayer` caps in-flight requests. It sits **outside** the timeout so
-//!    that waiting for a free slot does not consume the request deadline.
-//! 5. `TimeoutLayer` answers `408` when a handler runs too long.
+//! 4. `ConcurrencyLimitLayer` caps in-flight requests. It takes its permit in `poll_ready`.
+//! 5. `TimeoutLayer` answers `408` when a handler runs too long. Its timer starts at
+//!    `call`, which comes after `poll_ready` has returned, so time spent waiting for a
+//!    slot is not charged to the deadline whichever of 4 and 5 is outer. Only waiting
+//!    that happens after `call` (inside a handler) counts against it.
 //! 6. `RequestBodyLimitLayer` rejects bodies over 64 KiB with `413`.
 //!
 //! Neither limit covers a streamed response body: the recordings download has its own idle
@@ -37,6 +43,7 @@ mod rfc3339;
 mod routes;
 mod storage;
 pub mod token;
+mod trace;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +62,6 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
@@ -159,15 +165,7 @@ fn with_layers(router: Router, limits: Limits) -> Router {
             COOKIE,
             PROXY_AUTHORIZATION,
         ]))
-        .layer(TraceLayer::new_for_http().make_span_with(|req: &Request| {
-            // Path only: a query string may carry a token someone put there by mistake.
-            tracing::info_span!(
-                "request",
-                method = %req.method(),
-                path = %req.uri().path(),
-                headers = ?req.headers(),
-            )
-        }))
+        .layer(trace::layer())
         .layer(middleware::from_fn(json_errors))
         .layer(ConcurrencyLimitLayer::new(limits.max_in_flight))
         .layer(TimeoutLayer::with_status_code(

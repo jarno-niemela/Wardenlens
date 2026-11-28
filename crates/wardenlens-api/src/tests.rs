@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::get;
 use http_body_util::BodyExt as _;
+use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
 use wardenlens_core::camera::{
     Camera, CameraDirectory, CameraId, CameraStatus, Credential, DirectoryError, LinkStatus,
@@ -595,7 +597,7 @@ async fn store_failures_are_sampled_separately_and_log_no_token() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn waiting_for_a_slot_does_not_consume_the_request_deadline() {
+async fn request_queued_for_a_slot_past_the_timeout_still_succeeds() {
     async fn hold() -> &'static str {
         tokio::time::sleep(Duration::from_secs(8)).await;
         "held"
@@ -628,8 +630,51 @@ async fn waiting_for_a_slot_does_not_consume_the_request_deadline() {
     for h in [first, second, queued] {
         assert_eq!(h.await.unwrap().unwrap().status(), StatusCode::OK);
     }
-    // The last request waited 16 s for its slot: longer than the 10 s deadline.
+    // The last request waited 16 s for its slot: longer than the 10 s deadline. The permit
+    // is taken in `poll_ready` and the timer starts at `call`, so this holds for either
+    // order of the two layers; it does not pin that order.
     assert!(start.elapsed() >= Duration::from_secs(16));
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_inside_the_handler_does_consume_the_request_deadline() {
+    // Counterpart of the test above: waiting that starts after `call` (here, on a lock the
+    // handler takes) is charged to the 5 s deadline. Without this, the test above could
+    // not fail for any reason about when the timer starts.
+    async fn gated(State(gate): State<Arc<Semaphore>>) -> &'static str {
+        let _permit = gate.acquire().await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        "done"
+    }
+    let router = Router::new()
+        .route("/gated", get(gated))
+        .with_state(Arc::new(Semaphore::new(1)));
+    let app = with_layers(
+        router,
+        Limits {
+            max_in_flight: 2,
+            timeout: Duration::from_secs(5),
+            ..LIMITS
+        },
+    );
+    let start = tokio::time::Instant::now();
+    let spawn = || {
+        let app = app.clone();
+        tokio::spawn(async move { app.oneshot(get_req("/gated", None)).await })
+    };
+    let first = spawn();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    let second = spawn();
+    for h in [first, second] {
+        assert_eq!(
+            h.await.unwrap().unwrap().status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+    }
+    // Both ended at the 5 s deadline; the second never got the handler's lock in time.
+    assert!(start.elapsed() < Duration::from_secs(8));
 }
 
 #[tokio::test]
@@ -665,6 +710,7 @@ async fn undocumented_path_is_never_served() {
 }
 
 mod adversary;
+mod adversary_r2;
 mod cameras;
 mod recordings;
 mod storage;
