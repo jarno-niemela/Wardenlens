@@ -51,5 +51,7 @@ cred() {
 }
 # host <camera> <host>
 host() { vault_put "cam:$1:host" "$2"; }
+# model <camera> <vendor/model>: the optional model entry that rtsp_path reads.
+model() { vault_put "cam:$1:model" "$2"; }
 # no_entries: an empty vault
 no_entries() { find "$VAULT_STUB" -maxdepth 1 -type f ! -name '.*' -delete; }

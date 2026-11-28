@@ -83,7 +83,7 @@ fn names_to_ids(table: &toml::Table) -> Result<BTreeMap<String, String>, CliErro
 /// must not put anything but a fixed message into an error.
 fn parse_map(text: &str) -> Result<(usize, String), CliError> {
     const BAD: CliError =
-        CliError::Refused("--map needs <json-index>=<id>, for example --map 1=reolink-1");
+        CliError::Refused("--map needs <json-index>=<id>, for example --map 1=cam-1");
     let (index, id) = text.split_once('=').ok_or(BAD)?;
     let index = index.parse::<usize>().map_err(|_| BAD)?;
     if id.is_empty() {

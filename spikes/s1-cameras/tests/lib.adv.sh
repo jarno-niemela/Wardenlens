@@ -20,18 +20,23 @@ PW1='p@ss:w/rd%41$HOME`id`'"'"'"x'
 export HOME="$fx/home"; mkdir -p "$HOME"   # the real ~/.config and ~/.local/share are never read
 # shellcheck source=vault_stub.sh
 source "$here/tests/vault_stub.sh"
-cred reolink-1 admin "$PW1"
-cred reolink-2 admin "$PW1"
-cred xr admin 'q"uo\te'
-cred tapo 'a&b<c' "$PW1"
-vault_put cam:hdipc:credential.username admin
-host reolink-1 10.0.0.1
-host reolink-2 10.0.0.2
-host xr 127.0.0.1:PORT
-host tapo 10.0.0.4
-host hdipc '$(touch PWNED)10.0.0.5;touch PWNED2'
+cred cam-2 admin "$PW1"
+cred cam-3 admin "$PW1"
+cred cam-6 admin 'q"uo\te'
+cred cam-5 'a&b<c' "$PW1"
+vault_put cam:cam-1:credential.username admin
+host cam-2 10.0.0.1
+model cam-2 reolink/rlc-520a
+host cam-3 10.0.0.2
+model cam-3 reolink/rlc-520a
+host cam-6 127.0.0.1:PORT
+model cam-6 dahua/ipc-hfw4431r-z
+host cam-5 10.0.0.4
+model cam-5 tp-link/tapo-c110
+host cam-1 '$(touch PWNED)10.0.0.5;touch PWNED2'
+model cam-1 rtt/rtt-8700
 # A credential with an empty password is a valid entry.
-printf '' >"$VAULT_STUB/cam_hdipc_credential.password"
+printf '' >"$VAULT_STUB/cam_cam-1_credential.password"
 
 # Stub bin: ffprobe/ffmpeg record argv and echo the input URL on stderr (as real ffmpeg does in errors).
 for t in ffprobe ffmpeg; do
@@ -50,7 +55,7 @@ source "$here/lib.sh"
 redact_add "$(uri_enc "$PW1")"
 
 # --- lib.sh: rtsp_url round-trips hostile passwords ----------------------------
-u=$(rtsp_url reolink-1 /x)
+u=$(rtsp_url cam-2 /x)
 dec=$(python3 -I -c 'import sys,urllib.parse as p; print(p.unquote(p.urlsplit(sys.argv[1]).password))' "$u")
 check "rtsp_url percent-encodes and round-trips password with @:/%\$\`'\"" '[[ "$dec" == "$PW1" ]]'
 check "redact removes the password from rtsp_url output (raw and encoded)" \
@@ -87,27 +92,27 @@ r=$(printf 'secret %s\n' "$PW1" | PATH=/usr/bin:/bin WARDENLENS_BIN='' redact 2>
 check "redact fails closed when wardenlens is not on PATH: no output, non-zero" '[[ -z $r && $rc != 0 ]]'
 
 # --- secrets never on argv of the vault binary -----------------------------------
-: >"$VAULT_STUB/.argv"; cam_creds reolink-1; cam_host reolink-1 >/dev/null; echo "$u" | redact >/dev/null
+: >"$VAULT_STUB/.argv"; cam_creds cam-2; cam_host cam-2 >/dev/null; echo "$u" | redact >/dev/null
 check "wardenlens argv holds entry ids only, never a value" \
-  '! grep -qF -e "$PW1" -e admin -e 10.0.0.1 "$VAULT_STUB/.argv" && grep -qx "vault get cam:reolink-1:credential --field password" "$VAULT_STUB/.argv"'
+  '! grep -qF -e "$PW1" -e admin -e 10.0.0.1 "$VAULT_STUB/.argv" && grep -qx "vault get cam:cam-2:credential --field password" "$VAULT_STUB/.argv"'
 check "cam_creds returns the exact password" '[[ $CAM_PASS == "$PW1" && $CAM_USER == admin ]]'
 
 # --- the legacy files and WARDENLENS_CAMERAS are not read by lib.sh ------------------
-printf '[{"name":"xr","login":"legacyuser","password":"legacypass"}]' >"$fx/legacy.json"
-printf '[cameras.xr]\nhost = "203.0.113.9"\n' >"$fx/legacy.toml"
+printf '[{"name":"cam-6","login":"legacyuser","password":"legacypass"}]' >"$fx/legacy.json"
+printf '[cameras.cam-6]\nhost = "203.0.113.9"\n' >"$fx/legacy.toml"
 check "lib.sh ignores WARDENLENS_SECRET_FILE / WARDENLENS_CAMERAS (legacy files)" \
-  '(export WARDENLENS_SECRET_FILE="$fx/legacy.json" WARDENLENS_CAMERAS="$fx/legacy.toml"; cam_creds xr; [[ $CAM_USER == admin && $(cam_host xr) == 127.0.0.1:PORT ]])'
+  '(export WARDENLENS_SECRET_FILE="$fx/legacy.json" WARDENLENS_CAMERAS="$fx/legacy.toml"; cam_creds cam-6; [[ $CAM_USER == admin && $(cam_host cam-6) == 127.0.0.1:PORT ]])'
 check "lib.sh source has no reference to the legacy files" '! grep -nE "secret\.json|cameras\.local|SECRET_FILE|WARDENLENS_CAMERAS" "$here/lib.sh" | grep -v "^[0-9]*:#"'
 
 # --- missing entries -----------------------------------------------------------
 check "cam_creds: missing password entry is an error, not an empty password" \
-  '! (rm "$VAULT_STUB/cam_xr_credential.password"; cam_creds xr) 2>/dev/null'
-cred xr admin 'q"uo\te'
-check "cam_creds: empty password entry is allowed" '(cam_creds hdipc; [[ -z $CAM_PASS && $CAM_USER == admin ]])'
+  '! (rm "$VAULT_STUB/cam_cam-6_credential.password"; cam_creds cam-6) 2>/dev/null'
+cred cam-6 admin 'q"uo\te'
+check "cam_creds: empty password entry is allowed" '(cam_creds cam-1; [[ -z $CAM_PASS && $CAM_USER == admin ]])'
 check "cam_creds: unknown camera is an error" '! cam_creds NOPE 2>/dev/null'
 check "cam_creds: invalid camera name is an error" '! cam_creds "../x:y" 2>/dev/null'
 check "cam_host: no host entry is an error" '! cam_host NOPE 2>/dev/null'
-check "cam_creds: unusable vault is an error, variables empty" '! (touch "$VAULT_STUB/.broken"; cam_creds xr; true) 2>/dev/null; (touch "$VAULT_STUB/.broken"; cam_creds xr 2>/dev/null; rc=$?; rm "$VAULT_STUB/.broken"; [[ $rc != 0 && -z $CAM_USER && -z $CAM_PASS ]])'
+check "cam_creds: unusable vault is an error, variables empty" '! (touch "$VAULT_STUB/.broken"; cam_creds cam-6; true) 2>/dev/null; (touch "$VAULT_STUB/.broken"; cam_creds cam-6 2>/dev/null; rc=$?; rm "$VAULT_STUB/.broken"; [[ $rc != 0 && -z $CAM_USER && -z $CAM_PASS ]])'
 check "cam_creds: a failure inside \$(...) aborts a set -e caller" \
   'o=$(bash -c '"'"'set -euo pipefail; source "$1/lib.sh"; url="$(rtsp_url NOPE /x)"; echo "URL=$url"'"'"' _ "$here" 2>/dev/null); [[ $? != 0 && $o != *URL=* ]]'
 
@@ -128,7 +133,8 @@ check "stream_soak.sh refuses a non-empty output directory" '! "$here/stream_soa
 # A local server records the Basic auth it receives; a curl wrapper swaps --digest for --basic so the
 # exact user:password curl parsed from the -K config becomes observable.
 port=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-host xr "127.0.0.1:$port"
+host cam-6 "127.0.0.1:$port"
+model cam-6 dahua/ipc-hfw4431r-z
 python3 -I -c '
 import socket,base64,sys
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(1); s.settimeout(10)
@@ -141,7 +147,7 @@ real_curl=$(command -v curl)
 printf '#!/usr/bin/env bash\na=(); for x in "$@"; do [[ $x == --digest ]] && x=--basic; a+=("$x"); done\nprintf "%%s\\n" "$*" >>%q\nexec %q "${a[@]}"\n' \
   "$fx/curl.argv" "$real_curl" >"$fx/bin/curl"; chmod +x "$fx/bin/curl"
 sleep 0.3
-dout=$("$here/dahua.sh" xr get / 2>&1); wait "$srv" 2>/dev/null
+dout=$("$here/dahua.sh" cam-6 get / 2>&1); wait "$srv" 2>/dev/null
 got=$(cat "$fx/auth" 2>/dev/null)
 check "dahua.sh sends exact password containing \" and \\ (curl -K quoting)" '[[ $got == "admin:q\"uo\\te" ]]'
 check "dahua.sh: password not on curl argv nor in output" '! grep -qF "uo\\te" "$fx/curl.argv" && [[ $dout != *uo* ]]'
@@ -149,7 +155,7 @@ check "dahua.sh: password not on curl argv nor in output" '! grep -qF "uo\\te" "
 # --- onvif.sh: XML escaping of username -------------------------------------------------------
 printf '#!/usr/bin/env bash\nwhile (($#)); do [[ $1 == --data-binary ]] && { if [[ $2 == @- ]]; then cat >%q; else printf "%%s" "$2" >%q; fi; shift; }; shift; done\necho; echo "HTTP 000 0s"\n' \
   "$fx/env.xml" "$fx/env.xml.argv" >"$fx/bin/curl"
-"$here/onvif.sh" tapo device '<tds:GetDeviceInformation/>' >/dev/null 2>&1
+"$here/onvif.sh" cam-5 device '<tds:GetDeviceInformation/>' >/dev/null 2>&1
 check "onvif.sh: envelope is well-formed XML when username contains & and <" \
   'python3 -I -c "import sys,xml.dom.minidom as m; m.parse(sys.argv[1])" "$fx/env.xml" 2>/dev/null'
 check "onvif.sh: envelope is sent on stdin, not argv" '[[ -s $fx/env.xml ]]'

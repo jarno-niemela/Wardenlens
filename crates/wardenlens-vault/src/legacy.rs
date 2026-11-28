@@ -8,8 +8,8 @@
 //! [`map_legacy_with_ids`]** (#188): every JSON camera is joined to a real inventory id (by name,
 //! or by `--map`) and an unmatched or ambiguous camera is refused, never guessed. Never call the
 //! two mappers and store both results: `Vault::set` is an upsert, so two files that produce the
-//! same entry id (a JSON camera mapped to `tapo` and a `[cameras.tapo]` section both give
-//! `cam:tapo:name`) would silently overwrite each other. [`map_legacy_with_ids`] checks the union
+//! same entry id (a JSON camera mapped to `cam-5` and a `[cameras.cam-5]` section both give
+//! `cam:cam-5:name`) would silently overwrite each other. [`map_legacy_with_ids`] checks the union
 //! and refuses any overlap.
 //!
 //! [`map_legacy`] and [`map_secret_json`] keep the older name-only lookup with the
@@ -592,8 +592,8 @@ mod tests {
 
     fn ids() -> BTreeMap<String, String> {
         BTreeMap::from([
-            ("Front Gate".to_owned(), "reolink-1".to_owned()),
-            ("Garage".to_owned(), "tapo".to_owned()),
+            ("Front Gate".to_owned(), "cam-2".to_owned()),
+            ("Garage".to_owned(), "cam-5".to_owned()),
         ])
     }
 
@@ -618,14 +618,14 @@ mod tests {
         let imp = map_secret_json(&doc, &ids()).unwrap();
         assert_eq!(
             entry_ids(&imp),
-            ["cam:reolink-1:credential", "cam:tapo:credential"]
+            ["cam:cam-2:credential", "cam:cam-5:credential"]
         );
         // The inventory owns the display name of a mapped camera.
         assert_eq!(
             imp.unknown_keys,
-            ["reolink-1.name", "reolink-1.onvif", "tapo.name"]
+            ["cam-2.name", "cam-2.onvif", "cam-5.name"]
         );
-        let cred = find(&imp, "cam:reolink-1:credential");
+        let cred = find(&imp, "cam:cam-2:credential");
         assert_eq!(cred.kind, EntryKind::Credential);
         let Value::Credential(pair) = &cred.value else {
             panic!("shape")
@@ -683,10 +683,7 @@ mod tests {
             r#"[{"name":"Front Gate","login":"u","password":"p","onvif":"http://192.0.2.10/","ptz":true}]"#,
         );
         let i = map_secret_json(&v, &ids()).unwrap();
-        assert_eq!(
-            i.unknown_keys,
-            ["reolink-1.name", "reolink-1.onvif", "reolink-1.ptz"]
-        );
+        assert_eq!(i.unknown_keys, ["cam-2.name", "cam-2.onvif", "cam-2.ptz"]);
         let all = format!("{:?}", i.unknown_keys);
         assert!(!all.contains("192.0.2.10") && !all.contains("Front Gate"));
     }
@@ -719,7 +716,7 @@ mod tests {
     fn json_login_without_password_gets_an_empty_password() {
         let v = json(r#"[{"name":"Garage","login":"u"}]"#);
         let i = map_secret_json(&v, &ids()).unwrap();
-        let Value::Credential(c) = &find(&i, "cam:tapo:credential").value else {
+        let Value::Credential(c) = &find(&i, "cam:cam-5:credential").value else {
             panic!("shape")
         };
         assert_eq!(c.password.expose_secret(), "");
@@ -730,7 +727,7 @@ mod tests {
         let v = json(r#"[{"name":"Garage","password":"orphan"}]"#);
         let i = map_secret_json(&v, &ids()).unwrap();
         assert!(i.entries.is_empty());
-        assert_eq!(i.unknown_keys, ["tapo.name", "tapo.password"]);
+        assert_eq!(i.unknown_keys, ["cam-5.name", "cam-5.password"]);
     }
 
     #[test]
@@ -874,20 +871,20 @@ mod tests {
 
     #[test]
     fn json_and_toml_names_for_one_camera_do_not_collide() {
-        let t = toml_of("[cameras.tapo]\nname = \"Garage Side\"\n");
+        let t = toml_of("[cameras.cam-5]\nname = \"Garage Side\"\n");
         let j = json(r#"[{"name":"Garage","login":"u","password":"p"}]"#);
         let i = map_legacy(Some(&j), &ids(), Some(&t)).unwrap();
-        assert_eq!(entry_ids(&i), ["cam:tapo:credential", "cam:tapo:name"]);
-        assert_eq!(i.unknown_keys, ["tapo.name"]);
+        assert_eq!(entry_ids(&i), ["cam:cam-5:credential", "cam:cam-5:name"]);
+        assert_eq!(i.unknown_keys, ["cam-5.name"]);
     }
 
     #[test]
     fn merge_refuses_a_real_overlap() {
-        let a = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Garage\"\n")).unwrap();
-        let b = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Side\"\n")).unwrap();
+        let a = map_inventory_toml(&toml_of("[cameras.cam-5]\nname = \"Garage\"\n")).unwrap();
+        let b = map_inventory_toml(&toml_of("[cameras.cam-5]\nname = \"Side\"\n")).unwrap();
         assert_eq!(
             a.merge(b).unwrap_err(),
-            LegacyError::DuplicateId("cam:tapo:name".to_owned())
+            LegacyError::DuplicateId("cam:cam-5:name".to_owned())
         );
     }
 
@@ -1008,10 +1005,10 @@ mod tests {
         let i = map_secret_json(&v, &ids()).unwrap();
         assert_eq!(
             i.unknown_keys,
-            ["tapo.name", "tapo.username", "reolink-1.name"]
+            ["cam-5.name", "cam-5.username", "cam-2.name"]
         );
         // `username` alone is taken as the login.
-        assert!(entry_ids(&i).contains(&"cam:reolink-1:credential"));
+        assert!(entry_ids(&i).contains(&"cam:cam-2:credential"));
         // Equal login and username: nothing to report.
         let v = json(r#"[{"login":"a","username":"a"}]"#);
         let quiet = map_secret_json(&v, &ids()).unwrap();
@@ -1077,7 +1074,7 @@ mod tests {
     fn maps_inventory_toml() {
         let t = toml_of(
             r#"
-[cameras.reolink-1]
+[cameras.cam-2]
 host = "192.0.2.10"
 mac = "02:00:5e:00:53:af"
 serial = "SN-0042-ZQ"
@@ -1090,16 +1087,16 @@ onvif_port = 8000
         assert_eq!(
             entry_ids(&i),
             [
-                "cam:reolink-1:host",
-                "cam:reolink-1:mac",
-                "cam:reolink-1:name",
-                "cam:reolink-1:serial"
+                "cam:cam-2:host",
+                "cam:cam-2:mac",
+                "cam:cam-2:name",
+                "cam:cam-2:serial"
             ]
         );
-        assert_eq!(find(&i, "cam:reolink-1:host").kind, EntryKind::Host);
-        assert_eq!(find(&i, "cam:reolink-1:mac").kind, EntryKind::Mac);
-        assert_eq!(find(&i, "cam:reolink-1:serial").kind, EntryKind::Serial);
-        assert_eq!(find(&i, "cam:reolink-1:name").kind, EntryKind::DisplayName);
+        assert_eq!(find(&i, "cam:cam-2:host").kind, EntryKind::Host);
+        assert_eq!(find(&i, "cam:cam-2:mac").kind, EntryKind::Mac);
+        assert_eq!(find(&i, "cam:cam-2:serial").kind, EntryKind::Serial);
+        assert_eq!(find(&i, "cam:cam-2:name").kind, EntryKind::DisplayName);
         assert!(i.unknown_keys.is_empty(), "public keys are not unknown");
     }
 
@@ -1107,15 +1104,15 @@ onvif_port = 8000
     fn toml_unknown_keys_are_listed_by_name_only() {
         let t = toml_of(
             r#"
-[cameras.tapo]
+[cameras.cam-5]
 host = "nvr-1.example.invalid"
 location = "12 Example Lane"
 rtsp_path = "/stream1"
 "#,
         );
         let i = map_inventory_toml(&t).unwrap();
-        assert_eq!(entry_ids(&i), ["cam:tapo:host"]);
-        assert_eq!(i.unknown_keys, ["tapo.location", "tapo.rtsp_path"]);
+        assert_eq!(entry_ids(&i), ["cam:cam-5:host"]);
+        assert_eq!(i.unknown_keys, ["cam-5.location", "cam-5.rtsp_path"]);
         assert!(!format!("{:?}", i.unknown_keys).contains("Example Lane"));
     }
 
@@ -1167,8 +1164,7 @@ a = 1"
         .unwrap();
         let key = wardenlens_secrets::KeyFile::generate(&d.path().join("k")).unwrap();
         let mut v = crate::Vault::create(&d.path().join("v.db"), key).unwrap();
-        let t =
-            toml_of("[cameras.reolink-1]\nhost = \"192.0.2.10\"\nmac = \"02:00:5e:00:53:af\"\n");
+        let t = toml_of("[cameras.cam-2]\nhost = \"192.0.2.10\"\nmac = \"02:00:5e:00:53:af\"\n");
         let j = json(r#"[{"name":"Front Gate","login":"svc-reader","password":"Tr0ub4dor-x9"}]"#);
         for imp in [
             map_inventory_toml(&t).unwrap(),
@@ -1181,11 +1177,7 @@ a = 1"
         let listed: Vec<String> = v.list().unwrap().iter().map(|e| e.id.to_string()).collect();
         assert_eq!(
             listed,
-            [
-                "cam:reolink-1:credential",
-                "cam:reolink-1:host",
-                "cam:reolink-1:mac"
-            ]
+            ["cam:cam-2:credential", "cam:cam-2:host", "cam:cam-2:mac"]
         );
     }
 }

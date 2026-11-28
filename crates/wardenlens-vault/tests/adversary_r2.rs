@@ -161,16 +161,16 @@ fn json_and_toml_results_never_share_an_entry_id() {
 /// succeeds and the JSON name is reported by key.
 #[test]
 fn json_name_of_a_mapped_camera_yields_to_the_inventory_name() {
-    let toml: toml::Table = toml::from_str("[cameras.tapo]\nname = \"Garage Side\"\n").unwrap();
+    let toml: toml::Table = toml::from_str("[cameras.cam-5]\nname = \"Garage Side\"\n").unwrap();
     let json: serde_json::Value =
         serde_json::from_str(r#"[{"name":"Garage","login":"u","password":"p"}]"#).unwrap();
-    let m = BTreeMap::from([("Garage".to_owned(), "tapo".to_owned())]);
+    let m = BTreeMap::from([("Garage".to_owned(), "cam-5".to_owned())]);
     let i = map_legacy(Some(&json), &m, Some(&toml)).unwrap();
-    assert!(i.unknown_keys.iter().any(|k| k == "tapo.name"));
+    assert!(i.unknown_keys.iter().any(|k| k == "cam-5.name"));
     assert_eq!(
         i.entries
             .iter()
-            .filter(|e| e.id.as_str() == "cam:tapo:name")
+            .filter(|e| e.id.as_str() == "cam:cam-5:name")
             .count(),
         1
     );

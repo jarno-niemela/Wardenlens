@@ -20,7 +20,7 @@ use wardenlens_secrets::{
     seal, seal_credentials,
 };
 
-const ID: &str = "cam:reolink-1:credential";
+const ID: &str = "cam:cam-2:credential";
 
 fn key() -> KeyFile {
     KeyFile::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap()

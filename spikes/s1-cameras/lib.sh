@@ -46,7 +46,7 @@ selected_cams() {
 }
 
 # load_cams -> fills the global array CAMS with the selected inventory ids. The one choke point for the scripts that
-# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, an id with no vendor RTSP path, a vault failure or an empty selection.
+# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, an id with no model entry or no path for its model, a vault failure or an empty selection.
 load_cams() {
   local out id
   declare -A seen=()
@@ -146,15 +146,37 @@ redact() {
   ) || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
-# Vendor RTSP paths (main|sub) by camera; takes an inventory id. An id with no known vendor path is an error.
-rtsp_path() { # <id> <main|sub>
-  local id
+# cam_model <id> -> the camera's catalogue slug "<vendor>/<model>" (cameras/<vendor>/<model>.toml), from the optional
+# vault entry cam:<id>:model (`vault set --kind other`). Which camera is which model is a site fact and stays in the
+# vault (ARCH-7); this file knows only model-level facts.
+cam_model() {
+  local id m
   id="$(cam_id "$1")" || return 1
-  case "$id" in
-    reolink-*) [[ $2 == main ]] && echo /h264Preview_01_main || echo /h264Preview_01_sub ;;
-    xr) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
-    tapo) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
-    hdipc) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
-    *) echo "no vendor RTSP path for camera: $id" >&2; return 1 ;;
+  # The vault's own error (if any) is shown; a failed lookup (missing entry or vault failure, `get` does not tell them
+  # apart) is reported separately from a malformed value.
+  if ! m="$(vault_value "cam:$id:model")"; then
+    echo "no model entry for camera: $id (the vault lookup of cam:$id:model failed; set it to <vendor>/<model>, e.g. reolink/rlc-520a)" >&2
+    return 1
+  fi
+  [[ $m =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$ ]] || {
+    echo "malformed model entry for camera: $id (cam:$id:model must be <vendor>/<model>)" >&2
+    return 1
+  }
+  echo "$m"
+}
+
+# Model RTSP paths (main|sub) by catalogue model; takes an inventory id and looks its model up (cam_model). A model
+# with no known path is an error. Paths are the cameras/*.toml ones.
+rtsp_path() { # <id> <main|sub>
+  local id model
+  [[ ${2:-} == main || ${2:-} == sub ]] || { echo "rtsp_path: the stream kind must be main or sub" >&2; return 1; }
+  id="$(cam_id "$1")" || return 1
+  model="$(cam_model "$id")" || return 1
+  case "$model" in
+    reolink/rlc-520a) [[ $2 == main ]] && echo /h264Preview_01_main || echo /h264Preview_01_sub ;;
+    dahua/ipc-hfw4431r-z) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
+    tp-link/tapo-c110) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
+    rtt/rtt-8700) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
+    *) echo "no RTSP path for model: $model (camera $id)" >&2; return 1 ;;
   esac
 }

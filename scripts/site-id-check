@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ARCH-7 check: fail if a camera id from a site list kept OUTSIDE the repo occurs, in a file's CONTENT or in its PATH
+# (any file or directory name), in non-test code, scripts, spike scripts, compose.yaml or docker/. The list is never
+# committed and never read from a fixed location: point WARDENLENS_SITE_IDS_FILE at it (one id per line; a UTF-8 BOM
+# on the first line, leading and trailing blanks, CRs and NBSP (U+00A0), blank lines and # comments are ignored; a
+# last line without a newline counts). A relative path is resolved before the check changes directory.
+# Usage: scripts/site-id-check [root]   (root defaults to the repository top level)
+#
+# Candidate files: the tracked files (`git ls-files -z`) of the root, or, if the root is not a git work tree, every
+# file under it (`find`). A listing failure (git or find, any non-zero status) exits 2. Filtered by anchored patterns:
+#   included: crates/*/src/**, crates/*/build.rs, crates/*/benches/**, crates/*/examples/**, crates/*/Cargo.toml,
+#             scripts/**, spikes/**, compose.yaml, docker/**
+#   excluded: any tests/ directory, any tests.rs, spikes/*/results/** (measured data, generic ids by convention),
+#             scripts/site-id-check itself. Nothing else is excluded: a src/target/ or src/results/ module is code.
+# CONTENT is read from the WORK TREE (the gate runs on a clean, committed tree). A tracked path deleted from the work
+# tree has its name checked and its content skipped; a path present but neither a regular file nor a symlink (FIFO,
+# directory, gitlink/submodule) exits 2. A root with no candidate file prints a notice and exits 0. Symlinks are listed too: the link PATH is checked and
+# the link is never followed; a link whose target is not itself a scanned file is refused (exit 2).
+#
+# Exit status: 0 clean, or skipped with a notice (list unset, no ids in the list, no candidate files);
+#              1 an id was found; 2 a usage or tool error (missing root, unreadable list, no file list, a grep failure
+#              such as an unreadable file or no -P, an unvouchable path). An error never counts as "clean".
+# Matching: each id is a literal (every non-alphanumeric byte is escaped) and matches only as a whole, CASE-SENSITIVE
+# token: not inside a longer run of [A-Za-z0-9_-] (so `cam-1` is not found in `cam-10`), but an id right after a
+# string escape (`\n`, `\t`, `\r`, `\0`, and in practice `\u{2f}`) matches, and so does `<id>_main` / `<id>_sub` (the spike stream-name form).
+# Every path component is matched with the same rule. All files are scanned as text, so a NUL byte hides nothing.
+# LIMITS (the ARCH-7 review checklist covers them): `_` is a token character, so other snake_case forms (`CAM9_MAIN`,
+# `main_<id>`) and hyphen compounds (`<id>-main`, `<id>-onvif.tsv`) are not caught, nor is other case, other escapes (`\x20`, `\e`) and URL-encoded forms (`%2F`) are not caught. Staged or HEAD-only content that differs from the work tree is
+# not checked either.
+# Output: the matching files, never an id: every list id is redacted (as <id>) in a reported path.
+set -euo pipefail
+export LC_ALL=C
+list="${WARDENLENS_SITE_IDS_FILE:-}"
+if [[ -z $list ]]; then
+  echo "site-id-check: WARDENLENS_SITE_IDS_FILE is not set; skipped (ARCH-7 reviewer checklist still applies)"
+  exit 0
+fi
+root="${1:-}"
+[[ -f $list && -r $list ]] || { echo "site-id-check: WARDENLENS_SITE_IDS_FILE is not a readable file" >&2; exit 2; }
+if [[ -z $root ]]; then root="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "site-id-check: not in a git work tree and no root given" >&2; exit 2; }; fi
+list="$(CDPATH='' cd -- "$(dirname -- "$list")" >/dev/null && pwd)/$(basename -- "$list")"
+root="$(CDPATH='' cd -- "$root" >/dev/null 2>&1 && pwd -P)" || { echo "site-id-check: the root is not a directory" >&2; exit 2; }
+cd -- "$root" || exit 2
+
+# --- the ids ---
+nbsp=$'\xc2\xa0'
+ids=() first=1
+while IFS= read -r id || [[ -n $id ]]; do
+  if (( first )); then id="${id#$'\xef\xbb\xbf'}"; first=0; fi
+  prev=
+  while [[ $id != "$prev" ]]; do
+    prev=$id
+    id="${id#[[:space:]]}"; id="${id%[[:space:]]}"; id="${id#"$nbsp"}"; id="${id%"$nbsp"}"
+  done
+  [[ -z $id || $id == \#* ]] && continue
+  ids+=("$id")
+done <"$list"
+if (( ${#ids[@]} == 0 )); then echo "site-id-check: no ids in the list; nothing to check"; exit 0; fi
+
+# --- the candidate files ---
+listing="$(mktemp)" || { echo "site-id-check: no temporary file" >&2; exit 2; }
+trap 'rm -f "$listing"' EXIT
+if top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" && [[ $(cd -- "$top" && pwd -P) == "$root" ]]; then
+  git -C "$root" ls-files -z >"$listing" 2>/dev/null || { echo "site-id-check: git ls-files failed" >&2; exit 2; }
+else
+  find . \( -type f -o -type l \) -print0 >"$listing" 2>/dev/null || { echo "site-id-check: cannot list the files (find failed)" >&2; exit 2; }
+fi
+all=()
+mapfile -d '' all <"$listing"
+for i in "${!all[@]}"; do all[i]="${all[i]#./}"; done
+paths=() files=() links=()
+for p in "${all[@]}"; do
+  [[ $p =~ ^(crates/[^/]+/(src/|benches/|examples/|build\.rs$|Cargo\.toml$)|scripts/|spikes/|docker/)|^compose\.yaml$ ]] || continue
+  [[ $p =~ (^|/)tests/ || $p =~ (^|/)tests\.rs$ || $p =~ ^spikes/[^/]+/results/ || $p == scripts/site-id-check ]] && continue
+  paths+=("$p")
+  if [[ -L $p ]]; then links+=("$p"); elif [[ -f $p ]]; then files+=("$p")
+  elif [[ -e $p ]]; then echo "site-id-check: a scanned path is neither a regular file nor a symlink; the check cannot vouch for it" >&2; exit 2
+  elif ! serr="$(stat -c %F -- "$p" 2>&1)" && [[ $serr != *"No such file"* && $serr != *"Not a directory"* ]]; then
+    echo "site-id-check: a scanned path cannot be examined (permissions?); the check cannot vouch for it" >&2; exit 2
+  fi
+done
+# A symlink is not followed, so a link whose target is not itself a scanned file would hide content: refuse (exit 2).
+for l in "${links[@]}"; do
+  tgt="$(readlink -f -- "$l" 2>/dev/null)" || tgt=
+  rel="${tgt#"$root"/}"
+  ok=0
+  if [[ -n $tgt && $rel != "$tgt" ]]; then for f in "${files[@]}"; do [[ $f == "$rel" ]] && ok=1 && break; done; fi
+  (( ok )) || { echo "site-id-check: a symlink in the scanned set points at an unscanned target; the check cannot vouch for it" >&2; exit 2; }
+done
+if (( ${#paths[@]} == 0 )); then echo "site-id-check: no candidate files under the root; nothing to check"; exit 0; fi
+
+# --- the check ---
+hits=()
+for id in "${ids[@]}"; do
+  esc="$(printf '%s' "$id" | sed 's/[^A-Za-z0-9]/\\&/g')"
+  re="(?:(?<![A-Za-z0-9_-])|(?<=\\\\[ntr0]))${esc}(?:(?![A-Za-z0-9_-])|(?=_(?:main|sub)(?![A-Za-z0-9_-])))"
+  rc=0
+  out="$(printf '%s\0' "${paths[@]}" | grep -zP -e "$re" 2>/dev/null | tr '\0' '\n')" || rc=$?
+  case $rc in 0) mapfile -t -O "${#hits[@]}" hits <<<"$out" ;; 1) ;; *) echo "site-id-check: grep failed (rc $rc) on paths" >&2; exit 2 ;; esac
+  if (( ${#files[@]} )); then
+    rc=0
+    out="$(grep -laP -e "$re" -- "${files[@]}" 2>/dev/null)" || rc=$?
+    case $rc in 0) mapfile -t -O "${#hits[@]}" hits <<<"$out" ;; 1) ;; *) echo "site-id-check: grep failed (rc $rc); the check cannot vouch for the tree" >&2; exit 2 ;; esac
+  fi
+done
+if (( ${#hits[@]} )); then
+  # Redact every list id, longest first, in each reported path.
+  mapfile -t byLen < <(for i in "${ids[@]}"; do printf '%d\t%s\n' "${#i}" "$i"; done | sort -rn | cut -f2-)
+  printf '%s\n' "${hits[@]}" | sort -u | while IFS= read -r f; do
+    for i in "${byLen[@]}"; do f="${f//"$i"/<id>}"; done
+    echo "site-id-check: a site camera id occurs in $f" >&2
+  done
+  echo "site-id-check: FAILED (ARCH-7: no site camera ids outside tests)" >&2
+  exit 1
+fi
+echo "site-id-check: ok"
