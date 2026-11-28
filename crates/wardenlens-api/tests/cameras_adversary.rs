@@ -189,6 +189,8 @@ async fn error_kind_appears_only_while_degraded() {
             LinkStatus {
                 state,
                 since: Timestamp::from_unix_millis(1),
+                last_failure: None,
+                attempts: 0,
             },
         )]));
         let (app, auth) = app(Dir(vec![cam("cam-a", RtspPath::new("/main").unwrap())]), st);
@@ -204,6 +206,8 @@ async fn error_kind_appears_only_while_degraded() {
         LinkStatus {
             state: LinkState::Degraded(FailureKind::Auth),
             since: Timestamp::from_unix_millis(1),
+            last_failure: None,
+            attempts: 0,
         },
     )]));
     let (app, auth) = app(Dir(vec![cam("cam-a", RtspPath::new("/main").unwrap())]), st);
@@ -293,6 +297,8 @@ async fn since_round_trips_extremes() {
             LinkStatus {
                 state: LinkState::Backoff,
                 since: Timestamp::from_unix_millis(ms),
+                last_failure: None,
+                attempts: 0,
             },
         )]));
         let (app, auth) = app(Dir(vec![cam("cam-a", RtspPath::new("/main").unwrap())]), st);

@@ -39,6 +39,8 @@ fn status(state: LinkState, since: i64) -> LinkStatus {
     LinkStatus {
         state,
         since: Timestamp::from_unix_millis(since),
+        last_failure: None,
+        attempts: 0,
     }
 }
 
@@ -155,6 +157,60 @@ async fn every_state_maps_to_its_wire_name() {
             None => assert!(v["connection"].get("error_kind").is_none()),
         }
     }
+}
+
+#[tokio::test]
+async fn connection_carries_attempts_always_and_last_failure_once_one_failed() {
+    use wardenlens_core::camera::LastFailure;
+    let kinds = [
+        (FailureKind::Auth, "auth"),
+        (FailureKind::Timeout, "timeout"),
+        (FailureKind::Refused, "refused"),
+        (FailureKind::Protocol, "protocol"),
+        (FailureKind::Other, "other"),
+    ];
+    for (kind, name) in kinds {
+        let dir = FakeDirectory {
+            cameras: vec![camera("cam-a", "192.0.2.10", None)],
+            ..FakeDirectory::default()
+        };
+        let mut failed = status(LinkState::Backoff, 5);
+        failed.last_failure = Some(LastFailure {
+            kind,
+            at: Timestamp::from_unix_millis(1_700_000_000_123),
+        });
+        failed.attempts = 7;
+        let st = FakeStatus(HashMap::from([("cam-a".to_owned(), failed)]));
+        let (app, auth) = app_of(dir, st);
+        let (_, body) = fetch(&app, "/api/v1/cameras/cam-a", Some(&auth)).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let c = &v["connection"];
+        assert_eq!(c["state"], "backoff");
+        assert_eq!(c["since"], 5);
+        assert_eq!(c["attempts"], 7);
+        assert_eq!(c["last_failure"]["kind"], name);
+        assert_eq!(c["last_failure"]["at"], 1_700_000_000_123_i64);
+        // Exactly kind and time: nothing else of a failure can be served.
+        assert_eq!(c["last_failure"].as_object().unwrap().len(), 2);
+        assert!(
+            c.get("error_kind").is_none(),
+            "error_kind stays degraded-only"
+        );
+    }
+    // No failure yet: attempts is still there, last_failure is absent.
+    let dir = FakeDirectory {
+        cameras: vec![camera("cam-a", "192.0.2.10", None)],
+        ..FakeDirectory::default()
+    };
+    let st = FakeStatus(HashMap::from([(
+        "cam-a".to_owned(),
+        status(LinkState::Streaming, 5),
+    )]));
+    let (app, auth) = app_of(dir, st);
+    let (_, body) = fetch(&app, "/api/v1/cameras/cam-a", Some(&auth)).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["connection"]["attempts"], 0);
+    assert!(v["connection"].get("last_failure").is_none());
 }
 
 #[tokio::test]

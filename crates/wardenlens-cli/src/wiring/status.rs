@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::watch;
 use wardenlens_core::camera::{
-    Camera, CameraDirectory, CameraId, CameraStatus, DirectoryError, LinkStatus,
+    Camera, CameraDirectory, CameraId, CameraStatus, DirectoryError, LastFailure, LinkStatus,
 };
-use wardenlens_core::connection::ConnectionState;
+use wardenlens_core::connection::{ConnectionState, FailureKind};
 use wardenlens_core::storage::{StorageSnapshot, StorageStatus, StorageStatusError};
 use wardenlens_core::time::Timestamp;
 
@@ -45,12 +45,43 @@ impl CameraDirectory for Directory {
 pub(crate) struct Links(Arc<Mutex<HashMap<CameraId, LinkStatus>>>);
 
 impl Links {
-    /// Records `status` for `camera`.
+    /// Records the state and `since` of `status` for `camera`. The failure record belongs to
+    /// [`Links::record_failure`] and [`Links::record_recovery`] and is kept as it is, so the two
+    /// writers (the state mirror and the supervisor's observer) cannot overwrite each other.
     pub(crate) fn set(&self, camera: &CameraId, status: LinkStatus) {
-        self.0
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = map.entry(camera.clone()).or_insert(status);
+        entry.state = status.state;
+        entry.since = status.since;
+    }
+
+    /// Records a failed attempt of `camera`: its kind, when, and the failures so far in the
+    /// outage.
+    pub(crate) fn record_failure(
+        &self,
+        camera: &CameraId,
+        kind: FailureKind,
+        at: Timestamp,
+        attempts: u32,
+    ) {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = map
+            .entry(camera.clone())
+            .or_insert_with(|| LinkStatus::from_state(&ConnectionState::INITIAL, at));
+        entry.last_failure = Some(LastFailure { kind, at });
+        entry.attempts = attempts;
+    }
+
+    /// The outage of `camera` is over: its attempt count starts over (the last failure stays).
+    pub(crate) fn record_recovery(&self, camera: &CameraId) {
+        if let Some(entry) = self
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(camera.clone(), status);
+            .get_mut(camera)
+        {
+            entry.attempts = 0;
+        }
     }
 
     fn get(&self, camera: &CameraId) -> Option<LinkStatus> {
@@ -80,6 +111,12 @@ pub(crate) fn next_status(
         Some(p) if p.state.same_coarse(&fresh.state) => LinkStatus {
             state: fresh.state,
             since: p.since,
+            ..p
+        },
+        Some(p) => LinkStatus {
+            last_failure: p.last_failure,
+            attempts: p.attempts,
+            ..fresh
         },
         _ => fresh,
     }
@@ -141,6 +178,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_state_mirror_and_the_failure_record_do_not_overwrite_each_other() {
+        let links = Links::default();
+        let id = CameraId::new("cam-a").unwrap();
+        // The observer can run before the mirror's first write.
+        links.record_failure(&id, FailureKind::Auth, at(30), 2);
+        links.set(&id, next_status(None, &ConnectionState::INITIAL, at(40)));
+        let s = links.status(&id).await.unwrap();
+        assert_eq!((s.state, s.since), (LinkState::Connecting, at(40)));
+        assert_eq!(s.attempts, 2);
+        assert_eq!(
+            s.last_failure,
+            Some(LastFailure {
+                kind: FailureKind::Auth,
+                at: at(30)
+            })
+        );
+        // A later state write keeps the record.
+        links.set(&id, next_status(Some(s), &ConnectionState::INITIAL, at(50)));
+        assert_eq!(links.status(&id).await.unwrap().attempts, 2);
+        // A recovery restarts the count and keeps the last failure.
+        links.record_recovery(&id);
+        let s = links.status(&id).await.unwrap();
+        assert_eq!(s.attempts, 0);
+        assert!(s.last_failure.is_some());
+        // A recovery of an unknown camera does nothing.
+        links.record_recovery(&CameraId::new("cam-z").unwrap());
+        assert!(
+            links
+                .status(&CameraId::new("cam-z").unwrap())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn the_directory_is_ordered_and_finds_by_id() {
         let dir = Directory::new(Vec::new());
         assert_eq!(dir.list().await.unwrap().len(), 0);
@@ -153,6 +225,8 @@ mod tests {
             LinkStatus {
                 state: LinkState::Degraded(FailureKind::Timeout),
                 since: at(5),
+                last_failure: None,
+                attempts: 0,
             },
         );
         assert_eq!(links.status(&id).await.unwrap().since, at(5));
