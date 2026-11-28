@@ -78,6 +78,7 @@ async fn an_endless_flood_of_garbage_cannot_extend_the_window() {
     let took = started.elapsed();
     flood.abort();
     assert_eq!(got, Ok(Vec::new()));
-    // Generous bound: the point is that the flood does not keep the loop alive.
-    assert!(took < Duration::from_secs(5), "{took:?}");
+    // The flood must not keep the loop alive past its 300 ms window. Without the deadline check
+    // only the datagram cap ends it (tens of seconds), so 6 s leaves 20x for host load (TEST-5).
+    assert!(took < Duration::from_secs(6), "{took:?}");
 }

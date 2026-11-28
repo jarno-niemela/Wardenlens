@@ -243,7 +243,8 @@ async fn oversized_body_on_protected_route_is_413_json_and_no_store_call() {
         .header(header::CONTENT_LENGTH, 64 * 1024 + 1)
         .body(Body::from(vec![0u8; 64 * 1024 + 1]))
         .unwrap();
-    let resp = tokio::time::timeout(Duration::from_secs(5), app.oneshot(r))
+    // Hang guard (TEST-5): 30 s, far above host load.
+    let resp = tokio::time::timeout(Duration::from_secs(30), app.oneshot(r))
         .await
         .unwrap()
         .unwrap();

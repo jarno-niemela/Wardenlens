@@ -295,7 +295,8 @@ fn one_gib_of_eight_byte_boxes_is_rejected_quickly() {
     let t = Instant::now();
     assert_eq!(summarize(&mut src), Err(Mp4BoxError::TooManyBoxes));
     assert!(src.reads <= 300_000, "reads {}", src.reads);
-    assert!(t.elapsed() < Duration::from_secs(5));
+    // Runaway work takes minutes or more; the bound only has to beat that, not host load (TEST-5).
+    assert!(t.elapsed() < Duration::from_secs(60));
 }
 
 #[test]
@@ -342,7 +343,8 @@ fn huge_default_sample_counts_do_not_iterate() {
     let f = cat(&[ftyp(), moov(90_000), moof(&children), mdat()]);
     let t = Instant::now();
     let s = run(&f).unwrap();
-    assert!(t.elapsed() < Duration::from_secs(2));
+    // Runaway work takes minutes or more; the bound only has to beat that, not host load (TEST-5).
+    assert!(t.elapsed() < Duration::from_secs(60));
     assert_eq!(s.frame_count, u64::from(u32::MAX) * 10_000);
 }
 

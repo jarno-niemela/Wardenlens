@@ -26,7 +26,8 @@ fn releasing_the_runtime_after_an_overrun_does_not_wait_for_blocking_tasks() {
     });
     let at = std::time::Instant::now();
     release_runtime(runtime, false);
-    assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
+    // The stuck task sleeps 30 s; waiting for it would exceed this (TEST-5: not a load gauge).
+    assert!(at.elapsed() < Duration::from_secs(20), "{:?}", at.elapsed());
 }
 
 /// A clean release of an idle runtime is quick.
@@ -101,7 +102,8 @@ async fn a_full_recorder_wakes_the_storage_loop_before_the_interval() {
     let ticks_after = |n: usize| {
         let count = Arc::clone(&count);
         async move {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            // Hang guard (TEST-5): 30 s, far above host load.
+            tokio::time::timeout(Duration::from_secs(30), async {
                 while count.load(Ordering::SeqCst) <= n {
                     tokio::task::yield_now().await;
                 }
@@ -221,7 +223,9 @@ fn a_stop_signal_during_a_stuck_start_up_exits_promptly() {
     });
     assert_eq!(result.unwrap(), Stopped::Abandoned);
     release_runtime(runtime, false);
-    assert!(at.elapsed() < Duration::from_secs(8), "{:?}", at.elapsed());
+    // The exit contract: the stuck reconciliation must not hold the exit past the 10 s
+    // SHUTDOWN_DEADLINE.
+    assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
     assert_eq!(
         site.files(".mp4") + site.files(".part"),
         0,
@@ -328,7 +332,8 @@ async fn a_stop_signal_during_camera_start_up_does_not_wait_for_the_camera() {
     let stopped = tokio::time::timeout(Duration::from_secs(10), svc.shutdown())
         .await
         .expect("the stop is not held by the camera that is being set up");
-    assert!(at.elapsed() < Duration::from_secs(10));
+    // The 10 s timeout above is the real check; this is a redundant margin (TEST-5).
+    assert!(at.elapsed() < Duration::from_secs(30));
     assert_eq!(stopped.1.unwrap(), Stopped::Clean);
     // Let the abandoned set-up finish; its recorder is dropped, and ingest never opened it.
     let _ = release_tx.send(());

@@ -25,7 +25,8 @@ async fn read_one_response(s: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
-        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut chunk))
+        let n = // Hang guard (TEST-5): 30 s, far above host load.
+        tokio::time::timeout(Duration::from_secs(30), s.read(&mut chunk))
             .await
             .expect("response arrives")
             .unwrap();
@@ -63,12 +64,13 @@ async fn a_keep_alive_connection_idle_after_a_request_is_closed_within_the_heade
         .unwrap();
     let resp = read_one_response(&mut s).await;
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-    // Now idle: the server must close within the 1 s timeout (5 s slack).
+    // Now idle: the server must close within the 1 s timeout. 9 s of slack for host load stays
+    // under the 10 s production default, so a lost timeout setting still fails (TEST-5).
     let mut b = [0u8; 16];
-    let r = tokio::time::timeout(Duration::from_secs(6), s.read(&mut b)).await;
+    let r = tokio::time::timeout(Duration::from_secs(9), s.read(&mut b)).await;
     assert!(
         matches!(r, Ok(Ok(0) | Err(_))),
-        "an idle keep-alive connection was still open 6 s after its response: {r:?}"
+        "an idle keep-alive connection was still open 9 s after its response: {r:?}"
     );
     svc.shutdown().await.1.unwrap();
 }
@@ -106,7 +108,8 @@ async fn trickled_header_bytes_do_not_extend_the_header_timeout() {
         "a trickling client kept the connection open for 20 s"
     );
     assert!(
-        start.elapsed() < Duration::from_secs(6),
+        // The trickle runs 20 s if the server never closes; stay under the 10 s production default.
+        start.elapsed() < Duration::from_secs(10),
         "closed only after {:?}",
         start.elapsed()
     );

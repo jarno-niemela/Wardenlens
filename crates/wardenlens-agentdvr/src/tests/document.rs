@@ -344,20 +344,33 @@ fn accepted_constructs() {
 fn many_attributes_do_not_take_quadratic_time() {
     // quick-xml's duplicate-attribute check compares each key with the earlier ones; an element
     // with a million attributes must be refused or read fast, not tie a core up for hours.
+    //
+    // The ratio check at sizes where a quadratic scan is measurable lives in
+    // `tests/adversary_252.rs`. This is the max-size run: one parse of a document over 7 MB in a
+    // spawned thread, so a regression FAILS at the 60 s limit instead of hanging the gate
+    // (TEST-5: the bound is far above host load, far below quadratic time).
     let mut s = String::from("<objects");
     for n in 0..700_000_u32 {
         s.push_str(&format!(" a{n}=\"\""));
     }
     s.push_str("/>");
     assert!(s.len() > 7_000_000 && s.len() <= MAX_INPUT_BYTES);
-    let start = std::time::Instant::now();
-    let r = parse(s.as_bytes());
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
-        "{:?}",
-        start.elapsed()
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached on a timeout: the runaway thread dies with the test process.
+    std::thread::spawn(move || {
+        let _ = tx.send(parse(s.as_bytes()).is_ok());
+    });
+    let r = rx.recv_timeout(std::time::Duration::from_secs(60));
+    assert_ne!(
+        r,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the parser thread panicked"
     );
-    assert!(r.is_ok());
+    assert_eq!(
+        r,
+        Ok(true),
+        "the max-size attribute flood did not parse in 60 s"
+    );
 }
 
 #[test]

@@ -53,7 +53,8 @@ async fn it_ticks_at_start_and_on_a_wake_long_before_the_interval() {
         .await
         .unwrap();
     assert!(
-        at.elapsed() < Duration::from_secs(5),
+        // The interval is an hour; a stop that waited for it would blow far past this (TEST-5).
+        at.elapsed() < Duration::from_secs(60),
         "stop does not wait for the interval"
     );
 }

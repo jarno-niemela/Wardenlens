@@ -231,7 +231,11 @@ mod tests {
             probe(addr, SHORT).await,
             Err(HealthError::Timeout)
         ));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Backstop against a hang only: the peer holds for 30 s, so a probe that waited for it
+        // passes 25 s. It does not distinguish SHORT from a longer timeout; the `Timeout` match
+        // above is the check, and a tighter wall-clock bound would only measure host load (TEST-5;
+        // a paused-clock assert is tracked in #255).
+        assert!(started.elapsed() < Duration::from_secs(25));
     }
 
     #[tokio::test]

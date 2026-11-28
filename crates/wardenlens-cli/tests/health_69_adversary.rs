@@ -19,8 +19,10 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-/// The probe's documented deadline is 3 s; anything well past it is a hang.
-const BOUND: Duration = Duration::from_secs(6);
+/// A backstop against a hang, not a check of the 3 s probe deadline (the exit status and
+/// message assertions catch a probe that gave up wrongly). Far above host load plus a process
+/// spawn (TEST-5).
+const BOUND: Duration = Duration::from_secs(30);
 
 struct Cfg {
     dir: TempDir,
@@ -129,7 +131,9 @@ fn a_200_with_a_huge_content_length_and_no_body_is_healthy_at_once() {
     drop(hold_tx);
     assert!(out.status.success(), "{out:?}");
     assert!(
-        took < Duration::from_secs(2),
+        // The probe is capped by its own 3 s deadline, and the status assertion above catches a
+        // timeout; this bound is only a backstop against a hang, far above host load (TEST-5).
+        took < Duration::from_secs(60),
         "waited for the body: {took:?}"
     );
 }

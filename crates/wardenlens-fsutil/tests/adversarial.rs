@@ -13,13 +13,14 @@ use wardenlens_fsutil::{
     quarantine_with_bound,
 };
 
-/// Run `f` on a thread and fail if it does not finish within two seconds (a blocking open).
+/// Run `f` on a thread and fail if it does not finish within 30 seconds (a blocking open).
 fn must_not_block<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(Duration::from_secs(2))
+    // 30 s, not a tight bound: this only catches a blocking open (TEST-5, host load).
+    rx.recv_timeout(Duration::from_secs(30))
         .expect("operation blocked")
 }
 

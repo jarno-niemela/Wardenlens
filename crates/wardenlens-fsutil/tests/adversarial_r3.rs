@@ -20,7 +20,8 @@ fn must_not_block<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(Duration::from_secs(2))
+    // 30 s, not a tight bound: this only catches a blocking open (TEST-5, host load).
+    rx.recv_timeout(Duration::from_secs(30))
         .expect("operation blocked")
 }
 

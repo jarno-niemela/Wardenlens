@@ -381,7 +381,10 @@ fn one_mib_moof_of_empty_trafs_is_fast() {
     ]);
     let t = Instant::now();
     let r = run(&f);
-    assert!(t.elapsed() < Duration::from_secs(5));
+    // Linear work takes about 0.1 s here. A per-trun quadratic scan at the 1 MiB cap
+    // measured 29 s here (59 s with a heavier comparison, 126 s per traf), so 10 s keeps 100x
+    // for host load and still catches it (TEST-5).
+    assert!(t.elapsed() < Duration::from_secs(10));
     assert_eq!(r.map(|s| s.frame_count), Ok(1));
 }
 
@@ -401,7 +404,10 @@ fn one_mib_traf_of_many_truns_is_fast_and_summed() {
     let f = cat(&[ftyp(), moov(1000), moof(&children), mdat()]);
     let t = Instant::now();
     let r = run(&f);
-    assert!(t.elapsed() < Duration::from_secs(5));
+    // Linear work takes about 0.1 s here. A per-trun quadratic scan at the 1 MiB cap
+    // measured 29 s here (59 s with a heavier comparison, 126 s per traf), so 10 s keeps 100x
+    // for host load and still catches it (TEST-5).
+    assert!(t.elapsed() < Duration::from_secs(10));
     assert_eq!(
         r,
         Ok(Mp4Summary {
