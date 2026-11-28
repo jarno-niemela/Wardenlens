@@ -205,7 +205,7 @@ fn scan_all<T: Terminal>(
             ),
         )?;
     }
-    if let Some(source) = git_scan::source_of(args, &git)? {
+    if let Some(source) = git_scan::source(args, &git)? {
         let g = git_scan::run(&matcher, &git, &source, git_scan::Sources::ALL, term)?;
         if g.truncated {
             warn(term, "notice: more hits than are listed")?;

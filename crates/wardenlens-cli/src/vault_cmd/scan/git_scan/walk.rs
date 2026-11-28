@@ -177,7 +177,7 @@ impl Stored {
     fn add(&mut self, n: usize) -> Result<(), GitError> {
         self.bytes = self.bytes.saturating_add(n);
         if self.bytes > self.budget {
-            return Err(GitError::TooMany);
+            return Err(GitError::PathBytes);
         }
         Ok(())
     }
@@ -214,7 +214,7 @@ pub(super) fn walk<'a>(
 ///
 /// # Errors
 /// A path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places, more than
-/// [`MAX_PATH_BYTES`] of stored paths (`TooMany`), or a loader error.
+/// [`MAX_PATH_BYTES`] of stored paths (`PathBytes`), or a loader error.
 pub(super) fn walk_with<'a>(
     matcher: &Matcher,
     found: &mut Collected,

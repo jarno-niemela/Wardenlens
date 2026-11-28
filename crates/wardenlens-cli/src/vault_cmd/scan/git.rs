@@ -44,6 +44,8 @@ pub(super) enum GitError {
     PathTooLong,
     #[error("a partial clone is scanned with a git that cannot stop lazy fetching")]
     PartialClone,
+    #[error("the stored paths are larger than the scan limit")]
+    PathBytes,
 }
 
 /// An object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
@@ -158,6 +160,21 @@ impl Git {
         }
     }
 
+    /// The binary this runs (tests wrap it).
+    #[cfg(test)]
+    pub(super) fn exe_for_test(&self) -> &Path {
+        &self.exe
+    }
+
+    /// A git at `exe` run in `dir` (tests with a wrapper that logs or fakes its version).
+    #[cfg(test)]
+    pub(super) fn with_exe(exe: &Path, dir: &Path) -> Self {
+        Self {
+            exe: exe.to_owned(),
+            dir: Some(dir.to_owned()),
+        }
+    }
+
     /// Spawns `cmd`. In tests the spawn is held under `crate::vault_cmd::spawning`.
     fn spawn(cmd: &mut Command) -> Result<Child, GitError> {
         #[cfg(test)]
@@ -235,11 +252,12 @@ impl Git {
     /// Refuses to go on when git is older than 2.44 (or its version is not understood) and the
     /// repository is a partial clone: only a git that honours `GIT_NO_LAZY_FETCH` is trusted not
     /// to fetch or write during a scan. A full repository is fine with any git.
+    #[cfg(test)]
     pub(super) fn guard_lazy_fetch(&self) -> Result<(), GitError> {
         self.guard_lazy_fetch_from(LAZY_FETCH_MIN)
     }
 
-    fn guard_lazy_fetch_from(&self, min: (u32, u32)) -> Result<(), GitError> {
+    pub(super) fn guard_lazy_fetch_from(&self, min: (u32, u32)) -> Result<(), GitError> {
         let out = self.capture(&args(&["version"]), b"", 1024)?;
         if parse_version(&out).is_some_and(|v| v >= min) {
             return Ok(());
@@ -642,7 +660,10 @@ mod tests {
         assert_eq!(git.guard_lazy_fetch_from((99, 0)), Ok(()));
         run(&["config", "extensions.partialclone", "origin"]);
         assert_eq!(git.guard_lazy_fetch_from((0, 0)), Ok(()));
-        assert_eq!(git.guard_lazy_fetch(), Ok(()), "this git is new enough");
+        let host = Command::new("git").arg("version").output().unwrap();
+        if parse_version(&host.stdout).is_some_and(|v| v >= LAZY_FETCH_MIN) {
+            assert_eq!(git.guard_lazy_fetch(), Ok(()), "this git is new enough");
+        }
         // An old git in a partial clone (either marker) is refused.
         assert_eq!(
             git.guard_lazy_fetch_from((99, 0)),
@@ -755,5 +776,170 @@ mod tests {
         let g = Git::locate();
         assert_eq!(g.resolve("--output=x"), Err(GitError::Malformed));
         assert_eq!(g.resolve(""), Err(GitError::Malformed));
+    }
+}
+
+#[cfg(test)]
+mod adversary_128 {
+    //! Adversarial tests (#128) of the old-git guard with a fake old git: a shell wrapper that
+    //! answers `version` as an old (or unparseable) git and runs the real git otherwise.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    struct Fake {
+        _dir: tempfile::TempDir,
+        repo: PathBuf,
+        exe: PathBuf,
+    }
+
+    fn real_git() -> PathBuf {
+        Git::locate().exe
+    }
+
+    fn fake(version_line: &str) -> Fake {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("old-git");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = version ]; then printf '%s\\n' '{version_line}'; exit 0; fi; done\nexec '{}' \"$@\"\n",
+            real_git().display()
+        );
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let f = Fake {
+            _dir: dir,
+            repo,
+            exe,
+        };
+        f.run(&["init", "-q"]);
+        f
+    }
+
+    impl Fake {
+        fn run(&self, args: &[&str]) {
+            let ok = Command::new(real_git())
+                .arg("-C")
+                .arg(&self.repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+
+        fn git(&self) -> Git {
+            Git {
+                exe: self.exe.clone(),
+                dir: Some(self.repo.clone()),
+            }
+        }
+    }
+
+    #[test]
+    fn control_the_fake_old_git_passes_a_full_repository() {
+        let f = fake("git version 2.43.0");
+        assert_eq!(f.git().guard_lazy_fetch(), Ok(()));
+    }
+
+    #[test]
+    fn an_old_git_refuses_the_camel_case_spelling_of_extensions_partial_clone() {
+        let f = fake("git version 2.43.0");
+        f.run(&["config", "extensions.partialClone", "origin"]);
+        assert_eq!(f.git().guard_lazy_fetch(), Err(GitError::PartialClone));
+    }
+
+    #[test]
+    fn an_old_git_refuses_a_promisor_remote_with_a_mixed_case_name() {
+        let f = fake("git version 2.39.5 (Apple Git-154)");
+        f.run(&["config", "remote.My.Origin.Promisor", "true"]);
+        assert_eq!(f.git().guard_lazy_fetch(), Err(GitError::PartialClone));
+    }
+
+    #[test]
+    fn an_old_git_refuses_a_partial_clone_set_in_the_worktree_config() {
+        let f = fake("git version 2.43.0");
+        f.run(&["config", "extensions.worktreeConfig", "true"]);
+        f.run(&["config", "--worktree", "extensions.partialclone", "origin"]);
+        assert_eq!(f.git().guard_lazy_fetch(), Err(GitError::PartialClone));
+    }
+
+    #[test]
+    fn an_old_git_refuses_a_partial_clone_set_through_an_included_file() {
+        let f = fake("git version 2.43.0");
+        let inc = f.repo.join("extra.cfg");
+        std::fs::write(&inc, "[remote \"origin\"]\n\tpromisor = true\n").unwrap();
+        f.run(&["config", "include.path", inc.to_str().unwrap()]);
+        assert_eq!(f.git().guard_lazy_fetch(), Err(GitError::PartialClone));
+    }
+
+    #[test]
+    fn an_unparseable_version_refuses_a_partial_clone() {
+        for v in [
+            "git version",
+            "git version  2.53.0",
+            "version 2.53.0",
+            "git version v2.53",
+        ] {
+            let f = fake(v);
+            f.run(&["config", "extensions.partialclone", "origin"]);
+            assert_eq!(
+                f.git().guard_lazy_fetch(),
+                Err(GitError::PartialClone),
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_blobless_clone_is_refused_by_an_old_git() {
+        let f = fake("git version 2.43.0");
+        f.run(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        f.run(&["config", "uploadpack.allowFilter", "true"]);
+        let clone = f.repo.parent().unwrap().join("clone");
+        let ok = Command::new(real_git())
+            .args(["clone", "-q", "--no-checkout", "--filter=blob:none"])
+            .arg(format!("file://{}", f.repo.display()))
+            .arg(&clone)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let g = Git {
+            exe: f.exe.clone(),
+            dir: Some(clone),
+        };
+        assert_eq!(g.guard_lazy_fetch(), Err(GitError::PartialClone));
+    }
+
+    #[test]
+    fn version_edge_cases_never_read_an_old_git_as_new() {
+        for (text, want) in [
+            ("git version 2.43.99\n", Some((2, 43))),
+            ("git version 2.4.44\n", Some((2, 4))),
+            ("git version 1.44.0\n", Some((1, 44))),
+            ("git version 2.44.0-rc0\n", Some((2, 44))),
+            ("git version 2.99999999999.0\n", None),
+        ] {
+            assert_eq!(parse_version(text.as_bytes()), want, "{text:?}");
+            if let Some(v) = want {
+                assert_eq!(v >= LAZY_FETCH_MIN, v.0 > 2 || (v.0 == 2 && v.1 >= 44));
+            }
+        }
     }
 }

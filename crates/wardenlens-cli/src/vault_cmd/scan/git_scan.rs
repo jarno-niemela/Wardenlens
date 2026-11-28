@@ -220,6 +220,27 @@ impl Collected {
     }
 }
 
+/// The source of the arguments (see [`source_of`]), after the lazy-fetch guard. The guard runs
+/// FIRST, before any git call that reads objects (`rev-parse` of a range end can lazily fetch a
+/// missing object in a partial clone on a git older than 2.44), and only for a git source.
+///
+/// # Errors
+/// As [`source_of`], or a partial clone with a git that cannot stop lazy fetching.
+pub(super) fn source(args: &ScanArgs, git: &Git) -> Result<Option<Source>, CliError> {
+    source_with_min(args, git, super::git::LAZY_FETCH_MIN)
+}
+
+fn source_with_min(
+    args: &ScanArgs,
+    git: &Git,
+    min: (u32, u32),
+) -> Result<Option<Source>, CliError> {
+    if args.staged || args.range.is_some() {
+        git.guard_lazy_fetch_from(min).map_err(git_error)?;
+    }
+    source_of(args, git)
+}
+
 /// Builds the source from the arguments, or `None` when the arguments name paths.
 ///
 /// # Errors
@@ -280,6 +301,7 @@ fn git_error(e: GitError) -> CliError {
         GitError::Missing => "an object listed by git is missing; fetch it and retry",
         GitError::TooMany => "too many objects for one scan; scan a smaller range",
         GitError::PathTooLong => "a path in the pushed trees is longer than the scan limit",
+        GitError::PathBytes => "the paths of the pushed trees are larger than the scan limit",
         GitError::PartialClone => {
             "this is a partial clone and git is older than 2.44, which cannot stop lazy fetching; upgrade git"
         }
@@ -297,7 +319,6 @@ pub(super) fn run<T: Terminal>(
     sources: Sources,
     term: &mut T,
 ) -> Result<GitTally, CliError> {
-    git.guard_lazy_fetch().map_err(git_error)?;
     let found = match source {
         Source::Staged => collect_staged(matcher, git, sources),
         Source::Range {

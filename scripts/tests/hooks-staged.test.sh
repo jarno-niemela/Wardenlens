@@ -25,11 +25,37 @@ check "the staged pre-push passes every pre-push test" env HOOKS="$staged" "$roo
 for adv in "$root"/scripts/tests/adversarial/pre-push-*.adv.sh; do
   check "the staged pre-push passes $(basename "$adv")" env HOOKS="$staged" "$adv"
 done
-# Nothing is removed except the detail argument of a refusal (#128: it is `ref:$idx`, never a ref name or a workflow path).
-removed=$(diff -u "$root/.githooks/pre-push" "$staged/pre-push" | grep '^-' | grep -v '^---' | grep -vc 'refuse "' || true)
-check "the staged pre-push only adds lines to the installed one (or re-words a refusal's detail)" test "$removed" -eq 0
-# shellcheck disable=SC2016 # the patterns are literal shell text
-check "no refusal of the staged pre-push prints a ref name, a ref pair or a path" bash -c "! grep 'refuse \"' '$staged/pre-push' | grep -E 'refuse \"[^\"]*\" \"[^\"]*(\\\$rref|\\\$lref|\\\$wf)'"
+# Nothing is removed from the installed pre-push except the DETAIL argument of a refusal (#128: it is `ref:$idx`, never a
+# ref name or a workflow path). Strict pairing: every removed line must equal an added line once only that detail is
+# replaced by a placeholder (so the condition, the message and what follows the refusal must be identical), the counts
+# must match, and no other line may be removed. A weakened condition (`true || refuse`, `if false`) is a removed line with
+# no twin and fails.
+norm_detail() { sed -E 's/^(.*refuse "[^"]*") ".*"(.*)$/\1 DETAIL\2/'; }
+pairing_gap() {  # pairing_gap INSTALLED STAGED: the number of removed lines without a twin, or 1000 if the counts differ
+  local d removed added nr gap
+  d=$(diff -u "$1" "$2")
+  removed=$(grep '^-' <<<"$d" | grep -v '^---' | cut -c2- | norm_detail | LC_ALL=C sort)
+  added=$(grep '^+' <<<"$d" | grep -v '^+++' | cut -c2- | norm_detail | LC_ALL=C sort)
+  nr=$(grep -c . <<<"$removed" || true)
+  gap=$(LC_ALL=C comm -23 <(cat <<<"$removed") <(cat <<<"$added") | grep -c . || true)
+  if [[ "$nr" -gt 0 ]] && [[ "$(LC_ALL=C comm -12 <(cat <<<"$removed") <(cat <<<"$added") | grep -c . || true)" -ne "$nr" ]]; then gap=$((gap + 1000)); fi
+  echo "$gap"
+}
+check "the staged pre-push only adds lines to the installed one, or changes a refusal's detail alone" test "$(pairing_gap "$root/.githooks/pre-push" "$staged/pre-push")" -eq 0
+# Self-test: weakened conditions and a dropped refusal are caught by the same check (mutants live in $tmp only).
+# shellcheck disable=SC2329 # called through `check`
+mut() { sed "$1" "$staged/pre-push" >"$tmp/mutant"; ! cmp -s "$tmp/mutant" "$staged/pre-push" || return 1; test "$(pairing_gap "$root/.githooks/pre-push" "$tmp/mutant")" -gt 0; }
+# shellcheck disable=SC2016 # the sed expressions are literal shell text
+{
+check "the pairing check rejects a disabled main condition" mut 's/refs\/heads\/main|refs\/heads\/master) refuse/refs\/heads\/main) refuse/'
+check "the pairing check rejects a disabled tag condition" mut 's/then refuse "existing tags/then true "existing tags/'
+check "the pairing check rejects true || refuse" mut 's/git cat-file -e "\$rsha^{commit}" 2>\/dev\/null || refuse/true || refuse/'
+check "the pairing check rejects a workflow-inspection failure that no longer refuses" mut 's/2>\/dev\/null) || refuse "cannot inspect/2>\/dev\/null) || true refuse "cannot inspect/'
+check "the pairing check rejects a dropped refusal" mut 's/        refuse "non-fast-forward \/ force push" "ref:\$idx"/        true "non-fast-forward \/ force push"/'
+}
+# No refusal detail names a ref, a ref pair or a path, spelt with or without braces.
+# shellcheck disable=SC2016 # the pattern is literal shell text
+check "no refusal of the staged pre-push prints a ref name, a ref pair or a path" bash -c "! grep 'refuse \"' '$staged/pre-push' | grep -E 'refuse \"[^\"]*\" \"[^\"]*[$](rref|lref|wf|[{](rref|lref|wf))'"
 removed=$(diff -u "$root/.githooks/pre-commit" "$staged/pre-commit" | grep '^-' | grep -vc '^---' || true)
 check "the staged pre-commit only adds lines to the installed one" test "$removed" -eq 0
 check "no WARDENLENS_BIN override in either hook" bash -c "! grep -q 'WARDENLENS_BIN' '$staged/pre-push' '$staged/pre-commit' || ! grep -v '^#' '$staged/pre-push' '$staged/pre-commit' | grep -q 'WARDENLENS_BIN'"

@@ -1371,7 +1371,9 @@ fn an_old_subtree_counts_toward_a_small_tree_budget_in_real_git() {
         run(new_root.saturating_add(old).saturating_sub(1)).err(),
         Some(GitError::TooLarge)
     );
-    assert!(new_root < new_root + old - 1);
+    // The new root alone as the budget is refused: the old subtree is what passes it.
+    assert!(run(new_root).is_err());
+    assert!(old > 1);
     // Control: the default budget is the documented 32 MiB.
     assert_eq!(walk::MAX_TREE_BYTES, 32 * 1024 * 1024);
     assert_eq!(Limits::DEFAULT.tree_bytes, walk::MAX_TREE_BYTES);
@@ -1406,8 +1408,8 @@ fn the_stored_paths_have_an_exact_byte_budget() {
         walk::walk(&m, &mut found, &trees, [&root])
     };
     assert_eq!(run(11), Ok(()));
-    assert_eq!(run(10), Err(GitError::TooMany));
-    assert_eq!(run(0), Err(GitError::TooMany));
+    assert_eq!(run(10), Err(GitError::PathBytes));
+    assert_eq!(run(0), Err(GitError::PathBytes));
     assert_eq!(walk::MAX_PATH_BYTES, 64 * 1024 * 1024);
     assert_eq!(Limits::DEFAULT.path_bytes, walk::MAX_PATH_BYTES);
 }
@@ -1415,8 +1417,7 @@ fn the_stored_paths_have_an_exact_byte_budget() {
 #[test]
 fn a_repeating_tree_of_long_paths_hits_the_byte_budget_before_the_place_bound() {
     // 30 levels, two entries per level with 100-byte names: 2^k paths of up to 3000 bytes. A
-    // small byte budget stops it long before MAX_PLACES; the error is the same fail-closed
-    // `TooMany`, and a far larger budget still ends at the place bound.
+    // small byte budget stops it long before MAX_PLACES, with its own fail-closed error.
     let m = matcher(&[("e:path", V_PATH)]);
     let a = "a".repeat(100);
     let b = "b".repeat(100);
@@ -1435,7 +1436,7 @@ fn a_repeating_tree_of_long_paths_hits_the_byte_budget_before_the_place_bound() 
     });
     assert_eq!(
         walk::walk(&m, &mut small, &trees, [&root]),
-        Err(GitError::TooMany)
+        Err(GitError::PathBytes)
     );
     assert!(small.findings.is_empty());
 }
@@ -1463,6 +1464,89 @@ fn the_same_name_in_two_trees_is_reported_in_each() {
     };
     let places: BTreeSet<Sha> = found.findings.iter().map(sha_of).collect();
     assert_eq!(places.len(), 2, "two different places: {places:?}");
+}
+
+#[test]
+fn the_path_byte_bound_has_its_own_refusal_text() {
+    let CliError::Refused(text) = git_error(GitError::PathBytes) else {
+        panic!("not a refusal");
+    };
+    assert!(text.contains("paths"), "{text}");
+    assert_ne!(
+        git_error(GitError::PathBytes).to_string(),
+        git_error(GitError::TooMany).to_string()
+    );
+}
+
+/// A git wrapper that logs every call's arguments, answers `version` as `version_line` and
+/// otherwise runs the real git. Returns the wrapper and the log's path.
+fn logging_git(dir: &Path, version_line: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("calls.log");
+    let exe = dir.join("logging-git");
+    let real = Git::locate();
+    let real = real.exe_for_test();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a in \"$@\"; do if [ \"$a\" = version ]; then printf '%s\\n' '{version_line}'; exit 0; fi; done\nexec '{}' \"$@\"\n",
+        log.display(),
+        real.display()
+    );
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (exe, log)
+}
+
+#[test]
+fn the_lazy_fetch_guard_runs_before_any_revision_is_resolved() {
+    // A partial clone, an old git (raised minimum) and a range naming an object that is not
+    // there: the refusal comes first, and the first and only git calls are the guard's.
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    r.commit(&[], "base");
+    r.git(&[], &["config", "extensions.partialclone", "origin"]);
+    let tools = tempfile::tempdir().unwrap();
+    let (exe, log) = logging_git(tools.path(), "git version 2.43.0");
+    let git = Git::with_exe(&exe, r.path());
+    let missing = "1".repeat(40);
+    for args in [
+        ScanArgs {
+            range: Some(format!("{missing}..HEAD")),
+            ..ScanArgs::default()
+        },
+        ScanArgs {
+            staged: true,
+            ..ScanArgs::default()
+        },
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let got = source_with_min(&args, &git, (2, 44));
+        let Err(CliError::Refused(text)) = got else {
+            panic!("not refused");
+        };
+        assert!(text.contains("2.44"), "{text}");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        for c in calls.lines() {
+            assert!(
+                !c.contains("rev-parse") && !c.contains("cat-file") && !c.contains("rev-list"),
+                "an object-reading call ran before the refusal: {c}"
+            );
+        }
+        assert!(calls.lines().next().unwrap().contains("version"), "{calls}");
+    }
+    // Control: a new enough minimum goes on to resolve the revision (and fails on the
+    // missing object), so the log shows it is the guard that stopped the scan above.
+    let _ = std::fs::remove_file(&log);
+    let args = ScanArgs {
+        range: Some(format!("{missing}..HEAD")),
+        ..ScanArgs::default()
+    };
+    assert!(source_with_min(&args, &git, (2, 0)).is_err());
+    assert!(std::fs::read_to_string(&log).unwrap().contains("rev-parse"));
+    // Path scans use no git at all.
+    let _ = std::fs::remove_file(&log);
+    let paths = ScanArgs::default();
+    assert!(matches!(source_with_min(&paths, &git, (99, 0)), Ok(None)));
+    assert!(!log.exists());
 }
 
 #[test]
