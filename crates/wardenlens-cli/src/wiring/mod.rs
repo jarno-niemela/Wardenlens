@@ -31,6 +31,7 @@
 //! moves, a recorder stuck in `fsync`). Abandoning a tier move or a `.part` file is crash-safe
 //! (ADR 0005 sections 7 and 9: the same state a power cut leaves, repaired at the next start).
 
+mod backoff_log;
 mod http;
 mod index;
 mod limits;
@@ -584,13 +585,14 @@ impl Setup<'_> {
             return Err(());
         };
         let jitter_seed = self.seed ^ u64::try_from(wall_now().as_unix_millis()).unwrap_or(0);
-        let (frames, state, _dropped, supervisor) = Supervisor::spawn_joinable(
+        let (frames, state, _dropped, supervisor) = Supervisor::spawn_observed(
             source,
             InstantClock::new(),
             Backoff::DEFAULT,
             SplitMixJitter::new(jitter_seed),
             shared.supervisor,
             shared.cancel.clone(),
+            backoff_log::observer(id.clone(), shared.links.clone(), wall_now),
         );
         tokio::spawn(track_link(
             id.clone(),

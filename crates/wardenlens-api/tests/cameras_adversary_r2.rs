@@ -196,6 +196,8 @@ async fn every_failure_kind_is_served_as_its_code() {
             LinkStatus {
                 state: LinkState::Degraded(kind),
                 since: Timestamp::from_unix_millis(5),
+                last_failure: None,
+                attempts: 0,
             },
         )]));
         let (app, auth) = app(Dir(vec![cam("cam-a", RtspPath::new("/m").unwrap())]), st);
