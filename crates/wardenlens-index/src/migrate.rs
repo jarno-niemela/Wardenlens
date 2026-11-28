@@ -30,6 +30,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: include_str!("../migrations/003_api_tokens.sql"),
     },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/004_camera_basic_auth.sql"),
+    },
 ];
 
 /// The newest version `migrations` reaches.

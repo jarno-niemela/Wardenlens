@@ -42,6 +42,7 @@ pub struct CameraRecord {
     model: ModelRef,
     port: NonZeroU16,
     streams: StreamSet,
+    allow_basic_auth: bool,
 }
 
 impl CameraRecord {
@@ -53,7 +54,15 @@ impl CameraRecord {
             model,
             port,
             streams,
+            allow_basic_auth: false,
         }
+    }
+
+    /// Sets the per-camera opt-in to Basic authentication (ADR 0002 item 15). Off by default.
+    #[must_use]
+    pub fn with_allow_basic_auth(mut self, allow: bool) -> Self {
+        self.allow_basic_auth = allow;
+        self
     }
 
     /// The registry's share of `camera`; its host and display name are not read.
@@ -65,6 +74,7 @@ impl CameraRecord {
             camera.port(),
             camera.streams().clone(),
         )
+        .with_allow_basic_auth(camera.allow_basic_auth())
     }
 
     /// The camera id.
@@ -89,6 +99,13 @@ impl CameraRecord {
     #[must_use]
     pub fn streams(&self) -> &StreamSet {
         &self.streams
+    }
+
+    /// Whether a Basic-only challenge may be answered with the password (off unless the operator
+    /// opted this camera in).
+    #[must_use]
+    pub fn allow_basic_auth(&self) -> bool {
+        self.allow_basic_auth
     }
 }
 
@@ -247,8 +264,14 @@ fn decode(
     };
     let created_at = time_col(row, 5, "created_at_ms")?;
     let updated_at = time_col(row, 6, "updated_at_ms")?;
+    let allow_basic_auth = match int_col(row, 7, "allow_basic_auth")? {
+        0 => false,
+        1 => true,
+        _ => return Err(corrupt("allow_basic_auth")),
+    };
     Ok(StoredCamera {
-        record: CameraRecord::new(id, model, port, StreamSet::new(main, sub)),
+        record: CameraRecord::new(id, model, port, StreamSet::new(main, sub))
+            .with_allow_basic_auth(allow_basic_auth),
         created_at,
         updated_at,
     })
@@ -346,7 +369,8 @@ impl Index {
                     record.port.get(),
                     main.as_str(),
                     sub.as_ref().map(RtspPath::as_str),
-                    now.as_i64()
+                    now.as_i64(),
+                    i64::from(record.allow_basic_auth)
                 ],
             )
             .map_err(|e| match e.sqlite_error_code() {
@@ -396,6 +420,30 @@ impl Index {
             Ok((n > 0).then_some(()))
         })?;
         Ok(removed.is_some())
+    }
+
+    /// Sets the Basic authentication opt-in of the registered camera `id` (and its `updated_at`),
+    /// nothing else; `true` when there was such a camera. One write transaction, so a camera
+    /// removed meanwhile is never re-created. A missing id writes nothing.
+    ///
+    /// # Errors
+    /// [`IndexError::Busy`], [`IndexError::Sqlite`].
+    pub fn set_camera_basic_auth(
+        &mut self,
+        id: &CameraId,
+        allow: bool,
+        now: UnixMs,
+    ) -> Result<bool, IndexError> {
+        let changed = sql::write_tx_opt(&mut self.conn, "set camera basic auth", |w| {
+            let n = w
+                .write(
+                    sql::SET_CAMERA_BASIC_AUTH,
+                    params![id.as_str(), i64::from(allow), now.as_i64()],
+                )
+                .map_err(IndexError::sqlite("set camera basic auth"))?;
+            Ok((n > 0).then_some(()))
+        })?;
+        Ok(changed.is_some())
     }
 
     /// The camera ids that have segments and no registry row (at most 1,024, in id order): what

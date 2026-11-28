@@ -73,6 +73,7 @@ struct Raw {
     sub: &'static str,
     created: &'static str,
     updated: &'static str,
+    basic: &'static str,
 }
 
 fn base() -> Raw {
@@ -84,6 +85,7 @@ fn base() -> Raw {
         sub: "NULL",
         created: "1700000000000",
         updated: "1700000000000",
+        basic: "0",
     }
 }
 
@@ -91,9 +93,9 @@ fn insert_raw(c: &Connection, r: &Raw) {
     c.execute_batch(&format!(
         "PRAGMA ignore_check_constraints = ON; \
          INSERT INTO cameras (id, model, rtsp_port, main_path, sub_path, created_at_ms, \
-         updated_at_ms) VALUES ({}, {}, {}, {}, {}, {}, {}); \
+         updated_at_ms, allow_basic_auth) VALUES ({}, {}, {}, {}, {}, {}, {}, {}); \
          PRAGMA ignore_check_constraints = OFF;",
-        r.id, r.model, r.port, r.main, r.sub, r.created, r.updated
+        r.id, r.model, r.port, r.main, r.sub, r.created, r.updated, r.basic
     ))
     .unwrap();
 }
@@ -221,7 +223,7 @@ fn the_registry_is_bounded() {
         c.execute_batch("BEGIN").unwrap();
         for n in 0..MAX_CAMERAS {
             c.execute(
-                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/m', NULL, ?2, ?2)",
+                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/m', NULL, ?2, ?2, 0)",
                 rusqlite::params![format!("c{n:04}"), T0],
             )
             .unwrap();
@@ -283,7 +285,7 @@ fn insert_camera_respects_the_bound() {
         c.execute_batch("BEGIN").unwrap();
         for n in 0..MAX_CAMERAS {
             c.execute(
-                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/m', NULL, ?2, ?2)",
+                "INSERT INTO cameras VALUES (?1, 'acme/c1', 554, '/m', NULL, ?2, ?2, 0)",
                 rusqlite::params![format!("c{n:04}"), T0],
             )
             .unwrap();
@@ -507,7 +509,7 @@ fn a_stored_row_is_vetted_again_on_read_for_every_refused_path() {
                 (sql_text(path), "NULL".to_owned())
             };
             c.execute_batch(&format!(
-                "INSERT INTO cameras VALUES ('c{n:04}', 'acme/c1', 554, {main}, {sub}, {T0}, {T0});"
+                "INSERT INTO cameras VALUES ('c{n:04}', 'acme/c1', 554, {main}, {sub}, {T0}, {T0}, 0);"
             ))
             .unwrap();
         }
@@ -843,9 +845,17 @@ fn every_column_of_a_corrupt_row_is_a_typed_error_naming_the_column() {
             },
             "updated_at_ms",
         ),
+        (
+            "basic 2",
+            Raw {
+                basic: "2",
+                ..base()
+            },
+            "allow_basic_auth",
+        ),
     ];
     let columns: std::collections::BTreeSet<_> = cases.iter().map(|c| c.2).collect();
-    assert_eq!(columns.len(), 7, "a case for every column");
+    assert_eq!(columns.len(), 8, "a case for every column");
     for (label, row, field) in cases {
         let c = raw(&f.path);
         c.execute_batch("DELETE FROM cameras").unwrap();
@@ -878,8 +888,8 @@ fn the_schema_checks_refuse_what_the_reader_would() {
     let long = |n: usize| sql_text(&format!("/{}", "a".repeat(n - 1)));
     let row = |r: &Raw| {
         c.execute_batch(&format!(
-            "INSERT INTO cameras VALUES ({}, {}, {}, {}, {}, {}, {})",
-            r.id, r.model, r.port, r.main, r.sub, r.created, r.updated
+            "INSERT INTO cameras VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+            r.id, r.model, r.port, r.main, r.sub, r.created, r.updated, r.basic
         ))
     };
     let m513 = long(513);
@@ -1025,6 +1035,33 @@ fn the_schema_checks_refuse_what_the_reader_would() {
                 ..base()
             },
             true,
+        ),
+        (
+            "basic 1",
+            Raw {
+                id: "'n'",
+                basic: "1",
+                ..base()
+            },
+            true,
+        ),
+        (
+            "basic 2",
+            Raw {
+                id: "'o'",
+                basic: "2",
+                ..base()
+            },
+            false,
+        ),
+        (
+            "basic null",
+            Raw {
+                id: "'p'",
+                basic: "NULL",
+                ..base()
+            },
+            false,
         ),
     ] {
         assert_eq!(row(&r).is_ok(), ok, "{label}");
@@ -1217,6 +1254,7 @@ fn the_cameras_table_is_exactly_the_adr_columns_and_has_no_foreign_key() {
         ("sub_path", "TEXT", false, false),
         ("created_at_ms", "INTEGER", true, false),
         ("updated_at_ms", "INTEGER", true, false),
+        ("allow_basic_auth", "INTEGER", true, false),
     ];
     let want: Vec<_> = want
         .iter()
@@ -1245,7 +1283,7 @@ fn the_cameras_table_is_exactly_the_adr_columns_and_has_no_foreign_key() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 fn code_of(file: &str) -> String {
@@ -1317,4 +1355,126 @@ fn camera_paths_are_vetted_at_one_choke_point() {
         4,
         "definition, upsert main, upsert sub, path_col"
     );
+}
+
+// ---- the Basic authentication opt-in (ticket #225) --------------------------------------
+
+#[test]
+fn the_basic_opt_in_is_off_by_default_and_round_trips_through_insert_and_upsert() {
+    let (_f, mut idx) = open_new();
+    let cat = catalogue();
+    // Default: a record built with `new` stores 0.
+    idx.insert_camera(&simple("cam1"), &cat, at(T0)).unwrap();
+    assert!(
+        !idx.get_camera(&cam("cam1"), &cat)
+            .unwrap()
+            .unwrap()
+            .record()
+            .allow_basic_auth()
+    );
+    // On: insert stores 1, list and get read it back.
+    idx.insert_camera(&simple("cam2").with_allow_basic_auth(true), &cat, at(T0))
+        .unwrap();
+    let all = idx.list_cameras(&cat).unwrap();
+    let flags: Vec<_> = all.iter().map(|s| s.record().allow_basic_auth()).collect();
+    assert_eq!(flags, [false, true]);
+    assert!(
+        idx.get_camera(&cam("cam2"), &cat)
+            .unwrap()
+            .unwrap()
+            .record()
+            .allow_basic_auth()
+    );
+    // An upsert replaces the whole row, flag included, in both directions.
+    idx.upsert_camera(
+        &simple("cam1").with_allow_basic_auth(true),
+        &cat,
+        at(T0 + 1),
+    )
+    .unwrap();
+    idx.upsert_camera(&simple("cam2"), &cat, at(T0 + 1))
+        .unwrap();
+    let flags: Vec<_> = idx
+        .list_cameras(&cat)
+        .unwrap()
+        .iter()
+        .map(|s| s.record().allow_basic_auth())
+        .collect();
+    assert_eq!(flags, [true, false]);
+}
+
+/// The index of the previous release (version 3, no `allow_basic_auth` column) with a row opens,
+/// migrates to 4 and every existing camera has the opt-in off.
+#[test]
+fn a_version_3_index_migrates_to_4_with_every_camera_off() {
+    use crate::migrate::MIGRATIONS;
+    let f = fixture();
+    drop(Index::open_with(&f.path, &MIGRATIONS[..3], || {}).unwrap());
+    {
+        let c = raw(&f.path);
+        let cols: i64 = c
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('cameras') WHERE name = 'allow_basic_auth'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 0, "the fixture is the old schema");
+        c.execute_batch(
+            "INSERT INTO cameras VALUES ('old1', 'acme/c1', 554, '/main', '/sub', 1700000000000, 1700000000000), \
+             ('old2', 'acme/c1', 554, '/main', NULL, 1700000000000, 1700000000000);",
+        )
+        .unwrap();
+    }
+    // The read-only open reports the old schema without touching it.
+    assert!(matches!(
+        Index::open_read_only(&f.path).unwrap_err(),
+        IndexError::NeedsMigration
+    ));
+    let idx = Index::open(&f.path).unwrap();
+    let cat = catalogue();
+    let rows = idx.list_cameras(&cat).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|s| !s.record().allow_basic_auth()));
+    drop(idx);
+    Index::open_read_only(&f.path).unwrap();
+}
+
+#[test]
+fn set_camera_basic_auth_changes_the_flag_and_updated_at_only() {
+    let (_f, mut idx) = open_new();
+    let cat = catalogue();
+    idx.insert_camera(&simple("cam1"), &cat, at(T0)).unwrap();
+    let before = idx.get_camera(&cam("cam1"), &cat).unwrap().unwrap();
+    let g = generation(&idx);
+    assert!(
+        idx.set_camera_basic_auth(&cam("cam1"), true, at(T0 + 5))
+            .unwrap()
+    );
+    let after = idx.get_camera(&cam("cam1"), &cat).unwrap().unwrap();
+    assert!(after.record().allow_basic_auth());
+    assert_eq!(after.record().streams(), before.record().streams());
+    assert_eq!(after.record().port(), before.record().port());
+    assert_eq!(after.created_at(), before.created_at());
+    assert_eq!(after.updated_at(), at(T0 + 5));
+    assert!(generation(&idx) > g, "a write bumps the generation");
+    assert!(
+        idx.set_camera_basic_auth(&cam("cam1"), false, at(T0 + 6))
+            .unwrap()
+    );
+    assert!(
+        !idx.get_camera(&cam("cam1"), &cat)
+            .unwrap()
+            .unwrap()
+            .record()
+            .allow_basic_auth()
+    );
+    // An unknown id creates nothing and writes nothing.
+    let g = generation(&idx);
+    assert!(
+        !idx.set_camera_basic_auth(&cam("nope"), true, at(T0 + 7))
+            .unwrap()
+    );
+    assert_eq!(generation(&idx), g);
+    assert_eq!(idx.list_cameras(&cat).unwrap().len(), 1);
 }

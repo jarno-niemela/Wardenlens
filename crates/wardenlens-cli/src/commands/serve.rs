@@ -34,7 +34,7 @@ use wardenlens_core::config::Config;
 use wardenlens_core::entry::EntryKind;
 use wardenlens_fsutil::{FileLock, FsError, PrivateFile, check_parent, open_private_file};
 use wardenlens_index::{Index, IndexError};
-use wardenlens_ingest::RetinaSource;
+use wardenlens_ingest::{OpenOptions, RetinaSource};
 use wardenlens_secrets::{KeyFile, SecretsError};
 use wardenlens_storage::StatvfsUsage;
 use wardenlens_vault::{Value, Vault, VaultError};
@@ -235,7 +235,11 @@ pub(super) fn camera_inputs(
                     secrets.host.clone(),
                     record.port(),
                     record.streams().clone(),
-                );
+                )
+                .with_allow_basic_auth(record.allow_basic_auth());
+                if record.allow_basic_auth() {
+                    tracing::warn!(camera = %record.id(), "Basic authentication is allowed for this camera: its password may cross the network in base64 cleartext");
+                }
                 let source = RetinaSource::new(
                     secrets.host,
                     record.port(),
@@ -243,6 +247,9 @@ pub(super) fn camera_inputs(
                     secrets.credential,
                     StreamRole::Main,
                     SystemClock,
+                )
+                .with_open_options(
+                    OpenOptions::default().allow_basic_auth(record.allow_basic_auth()),
                 );
                 inputs.push(CameraInput { camera, source });
             }

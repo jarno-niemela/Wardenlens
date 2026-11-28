@@ -47,7 +47,7 @@ fn tok(i: &str, b: u8) -> NewToken {
     }
 }
 
-/// A version-2 index (as released before #65) migrates to version 3 on open, keeping its rows.
+/// A version-2 index (as released before #65) migrates to the latest version on open, keeping its rows.
 #[test]
 fn a_version_2_index_migrates_to_3_and_keeps_its_rows() {
     let f = fixture();
@@ -55,7 +55,8 @@ fn a_version_2_index_migrates_to_3_and_keeps_its_rows() {
     {
         let c = Connection::open(&f.path).unwrap();
         c.execute_batch(
-            "DROP TABLE api_tokens; PRAGMA user_version = 2; \
+            "DROP TABLE api_tokens; ALTER TABLE cameras DROP COLUMN allow_basic_auth; \
+             PRAGMA user_version = 2; \
              INSERT INTO cameras VALUES ('cam1', 'm', 554, '/a', NULL, 1, 1);",
         )
         .unwrap();
@@ -72,7 +73,7 @@ fn a_version_2_index_migrates_to_3_and_keeps_its_rows() {
     let v: i64 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 3);
+    assert_eq!(v, 4);
     let cams: i64 = c
         .query_row("SELECT count(*) FROM cameras", [], |r| r.get(0))
         .unwrap();

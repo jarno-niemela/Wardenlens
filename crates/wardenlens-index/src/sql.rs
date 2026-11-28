@@ -78,30 +78,36 @@ pub(crate) const LATEST_START: ReadSql =
 // The camera registry (ticket #50). The column list is repeated in `GET_CAMERA` and `LIST_CAMERAS`
 // on purpose, in the order `cameras::decode` reads it.
 
-/// ?1 id, ?2 model, ?3 port, ?4 main path, ?5 sub path or NULL, ?6 now. A new row gets `?6` as
+/// ?1 id, ?2 model, ?3 port, ?4 main path, ?5 sub path or NULL, ?6 now, ?7 Basic opt-in (0 or 1). A new row gets `?6` as
 /// both timestamps; an existing row keeps `created_at_ms`.
 pub(crate) const UPSERT_CAMERA: &str = "INSERT INTO cameras \
-    (id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms) \
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+    (id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms, allow_basic_auth) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7) \
     ON CONFLICT (id) DO UPDATE SET model = excluded.model, rtsp_port = excluded.rtsp_port, \
     main_path = excluded.main_path, sub_path = excluded.sub_path, \
-    updated_at_ms = excluded.updated_at_ms";
+    updated_at_ms = excluded.updated_at_ms, allow_basic_auth = excluded.allow_basic_auth";
 
 /// Insert only: a row with the id makes this a constraint error (the caller checks first).
 pub(crate) const INSERT_CAMERA: &str = "INSERT INTO cameras \
-    (id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms) \
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)";
+    (id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms, allow_basic_auth) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)";
 
 pub(crate) const GET_CAMERA: ReadSql = ReadSql(
-    "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms \
+    "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms, \
+    allow_basic_auth \
     FROM cameras WHERE id = ?1",
 );
 
 /// ?1 the row count to fetch.
 pub(crate) const LIST_CAMERAS: ReadSql = ReadSql(
-    "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms \
+    "SELECT id, model, rtsp_port, main_path, sub_path, created_at_ms, updated_at_ms, \
+    allow_basic_auth \
     FROM cameras ORDER BY id LIMIT ?1",
 );
+
+/// ?1 id, ?2 Basic opt-in (0 or 1), ?3 now. Only the flag and `updated_at_ms` change.
+pub(crate) const SET_CAMERA_BASIC_AUTH: &str =
+    "UPDATE cameras SET allow_basic_auth = ?2, updated_at_ms = ?3 WHERE id = ?1";
 
 pub(crate) const CAMERA_EXISTS: ReadSql = ReadSql("SELECT count(*) FROM cameras WHERE id = ?1");
 
