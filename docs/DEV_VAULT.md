@@ -3,7 +3,7 @@
 The owner's camera hosts, MAC addresses, serials, names and credentials live in the encrypted vault
 ([ADR 0006](adr/0006-sensitive-data-store.md)), never in loose files, the repo, prompts or notes. The spikes, the
 tooling and the agents read them through `wardenlens vault get` and filter their output with `wardenlens vault redact`.
-Entry ids are plain references such as `cam:reolink-1:host` and `cam:reolink-1:credential`; the values are never on
+Entry ids are plain references such as `cam:cam-1:host` and `cam:cam-1:credential`; the values are never on
 argv (`vault set` reads a prompt or stdin; `vault get` writes the value to a pipe or terminal only).
 
 ## One-time setup (owner)
@@ -58,7 +58,7 @@ service key (`/etc/wardenlens/vault.key`) is covered by the deployment docs. Che
 ## Using the vault from scripts
 
 - `wardenlens vault get cam:<id>:host`: the value on stdout, no trailing newline. Capture it with
-  `host="$(wardenlens vault get cam:xr:host)"`, never put the result on a command line you print.
+  `host="$(wardenlens vault get cam:<id>:host)"`, never put the result on a command line you print.
 - `wardenlens vault get cam:<id>:credential --field username|password`.
 - `command | wardenlens vault redact`: copies stdin to stdout and replaces every vault value (hosts, MACs, serials, names,
   passwords, the `user:password@` URL prefix) with `[REDACTED]`. It is an exact match against the vault, not a guess at

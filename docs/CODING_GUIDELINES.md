@@ -29,6 +29,21 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
 - **ARCH-6 No cyclic module dependencies** within a crate. If two modules need
   each other, extract the shared concept.
 
+- **ARCH-7 No site-specific camera facts in code or defaults.** Nothing derived
+  from one installation's cameras is hardcoded: camera count, which models are
+  present, per-camera stream or channel choices, hosts, paths, or behaviour
+  tuned to one site's mix. Site facts come at runtime from the registry, the
+  config or the vault. Vendor- and model-level facts (stream paths, ports,
+  events, quirks, vendor aliases such as a model's nickname) live in
+  `cameras/*.toml`, and code may name vendor protocols (enum variants such as
+  `Baichuan`). Test: would a user with a totally different set of cameras get
+  correct behaviour unchanged?
+  Good: the recorder opens the streams the registry lists, choosing the stream
+  the catalogue marks as main for that camera's model.
+  Bad: `if id == "reolink-1" { use_sub_stream() }`, a default of four cameras,
+  or a sample config that carries a real LAN address (use RFC 5737 addresses
+  such as `192.0.2.10`).
+
 ## 2. Types & API design (`TYPE`)
 
 - **TYPE-1 Make illegal states unrepresentable.** Use enums over boolean flags
@@ -189,7 +204,7 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
 2. Does `scripts/gate` pass?
 3. Any panic path, unchecked arithmetic, unbounded allocation or `as` cast on untrusted data?
 4. Are trust boundaries explicit, and is input parsed into validated types there?
-5. Is the module/crate boundary right (ARCH-1..6)? Is anything public that need not be?
+5. Is the module/crate boundary right (ARCH-1..7)? Is anything public that need not be?
 6. Are error types precise and contextual, with no secret leakage?
 7. Are tests deterministic, behaviour-named, and covering edges?
 8. Any new dependency — justified and `cargo deny` clean?
