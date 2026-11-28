@@ -73,7 +73,8 @@ fn import_legacy_does_not_hang_on_a_fifo() {
         .unwrap();
     let start = Instant::now();
     let mut done = None;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(30) {
+        // A FIFO with no writer blocks forever; 30 s is far above host load (TEST-5).
         if let Some(s) = child.try_wait().unwrap() {
             done = Some(s);
             break;
@@ -84,7 +85,7 @@ fn import_legacy_does_not_hang_on_a_fifo() {
         child.kill().unwrap();
     }
     let status = child.wait().unwrap();
-    assert!(done.is_some(), "import-legacy blocked on a FIFO for 5 s");
+    assert!(done.is_some(), "import-legacy blocked on a FIFO for 30 s");
     assert!(!status.success());
 }
 

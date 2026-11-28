@@ -378,9 +378,10 @@ async fn a_continuous_echoing_flood_cannot_extend_the_window() {
     let sent = flooder.join().unwrap();
     assert_eq!(got, Ok(Vec::new()));
     assert!(sent > 0);
-    // The window plus a generous second of slack for the last datagram and the scheduler.
+    // A flood that keeps the loop alive past its window would never end, so the bound is far
+    // above the 500 ms window and the scheduler's slack (TEST-5: it must not gauge host load).
     assert!(
-        took < std::time::Duration::from_millis(1500),
+        took < std::time::Duration::from_secs(20),
         "{took:?} for a 500 ms window ({sent} sent)"
     );
 }

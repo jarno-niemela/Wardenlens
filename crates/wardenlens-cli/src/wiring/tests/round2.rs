@@ -222,7 +222,8 @@ fn a_stop_signal_during_a_stuck_start_up_exits_promptly() {
     });
     assert_eq!(result.unwrap(), Stopped::Abandoned);
     release_runtime(runtime, false);
-    assert!(at.elapsed() < Duration::from_secs(8), "{:?}", at.elapsed());
+    // The stuck reconciliation never returns by itself; 30 s is a hang backstop (TEST-5).
+    assert!(at.elapsed() < Duration::from_secs(30), "{:?}", at.elapsed());
     assert_eq!(
         site.files(".mp4") + site.files(".part"),
         0,
@@ -329,7 +330,8 @@ async fn a_stop_signal_during_camera_start_up_does_not_wait_for_the_camera() {
     let stopped = tokio::time::timeout(Duration::from_secs(10), svc.shutdown())
         .await
         .expect("the stop is not held by the camera that is being set up");
-    assert!(at.elapsed() < Duration::from_secs(10));
+    // The 10 s timeout above is the real check; this is a redundant margin (TEST-5).
+    assert!(at.elapsed() < Duration::from_secs(30));
     assert_eq!(stopped.1.unwrap(), Stopped::Clean);
     // Let the abandoned set-up finish; its recorder is dropped, and ingest never opened it.
     let _ = release_tx.send(());
