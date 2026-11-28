@@ -41,9 +41,10 @@ fn equal_work_attribute_flood_ratio_is_linear() {
         }));
         best_large = best_large.min(timed(|| assert!(parse(large.as_bytes()).is_ok())));
     }
-    // Linear: about 1x. Quadratic: about 4x. 2.5x splits them with margin on both sides.
+    // Linear: about 1x. Quadratic: about 4x. 3x splits them; 2.5x was exceeded
+    // in about 0.2-0.5 % of runs under 8-way CPU contention (worst 3.42).
     assert!(
-        best_large * 2 < best_small.max(Duration::from_millis(1)) * 5,
+        best_large < best_small.max(Duration::from_millis(1)) * 3,
         "4 x {N} attributes took {best_small:?}, 1 x {} took {best_large:?}",
         4 * N
     );
