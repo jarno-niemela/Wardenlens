@@ -301,7 +301,9 @@ fn git_error(e: GitError) -> CliError {
         GitError::Missing => "an object listed by git is missing; fetch it and retry",
         GitError::TooMany => "too many objects for one scan; scan a smaller range",
         GitError::PathTooLong => "a path in the pushed trees is longer than the scan limit",
-        GitError::PathBytes => "the paths of the pushed trees are larger than the scan limit",
+        GitError::PathBytes => {
+            "too many paths in the pushed trees for one scan (their bytes pass the scan limit)"
+        }
         GitError::PartialClone => {
             "this is a partial clone and git is older than 2.44, which cannot stop lazy fetching; upgrade git"
         }
