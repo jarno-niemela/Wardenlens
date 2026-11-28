@@ -6,6 +6,7 @@ use std::fmt;
 use aho_corasick::{AhoCorasick, MatchKind};
 use secrecy::ExposeSecret;
 use wardenlens_core::entry::{EntryId, EntryKind};
+use zeroize::Zeroizing;
 
 use super::needles::{Boundary, Expansion, Literal, Net, expand, view};
 use super::net::Owners;
@@ -32,21 +33,34 @@ pub(super) struct Automaton {
     pub(super) patterns: Vec<Pattern>,
 }
 
+/// The bytes of a needle as a map key, wiped when dropped (`Zeroizing` itself is not `Hash`).
+#[derive(PartialEq, Eq)]
+struct NeedleKey(Zeroizing<Vec<u8>>);
+
+impl std::hash::Hash for NeedleKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_slice().hash(state);
+    }
+}
+
 #[derive(Default)]
 struct PatternSet {
-    index: HashMap<(Vec<u8>, Boundary), usize>,
-    texts: Vec<Vec<u8>>,
+    index: HashMap<(NeedleKey, Boundary), usize>,
+    texts: Vec<Zeroizing<Vec<u8>>>,
     patterns: Vec<Pattern>,
 }
 
 impl PatternSet {
-    fn add(&mut self, literal: Literal, entry: u32) {
-        let key = (literal.text.into_bytes(), literal.boundary);
+    fn add(&mut self, literal: &Literal, entry: u32) {
+        let key = (
+            NeedleKey(Zeroizing::new(literal.text.as_bytes().to_vec())),
+            literal.boundary,
+        );
         let id = if let Some(&id) = self.index.get(&key) {
             id
         } else {
             let id = self.patterns.len();
-            self.texts.push(key.0.clone());
+            self.texts.push(Zeroizing::new(key.0.0.to_vec()));
             self.patterns.push(Pattern {
                 boundary: key.1,
                 owners: Vec::new(),
@@ -158,9 +172,9 @@ impl Matcher {
                 }
                 if l.folded {
                     needs_joined |= l.views & view::JOINED != 0 && l.text.contains(' ');
-                    folded.add(l, index);
+                    folded.add(&l, index);
                 } else {
-                    exact.add(l, index);
+                    exact.add(&l, index);
                 }
             }
         }

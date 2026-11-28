@@ -11,7 +11,7 @@
 //!   it is in;
 //! - the ref names the push publishes.
 //!
-//! Nothing is printed except through [`render`], so a location never holds a value.
+//! Nothing is printed except through `render_in`, so a location never holds a value.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -22,7 +22,9 @@ use wardenlens_vault::{Content, Matcher, classify, scan};
 use self::walk::{Entries, tree_entries};
 use super::Unread;
 use super::git::{Body, Git, GitError, Kind, MAX_OBJECT_LEN, ObjectReader, RawEntry, Sha};
-use super::redact::{Loc, Part, render, render_in};
+#[cfg(test)]
+use super::redact::render;
+use super::redact::{Loc, Part, render_in};
 use crate::args::ScanArgs;
 use crate::error::CliError;
 use crate::terminal::Terminal;
@@ -309,7 +311,10 @@ fn print<T: Terminal>(
     term: &mut T,
 ) -> Result<GitTally, CliError> {
     for f in &found.findings {
-        let at = render(matcher, &loc(&f.at, &found.paths));
+        // The kind is part of the checked text: a value cannot be spelled across it and the
+        // location.
+        let kind = format!("{} ", f.kind);
+        let at = render_in(matcher, &loc(&f.at, &found.paths), (&kind, ""));
         say(term, &format!("{} {} {at}", f.id, f.kind))?;
     }
     for (at, why) in &found.problems {

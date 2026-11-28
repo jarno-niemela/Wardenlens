@@ -10,19 +10,19 @@
 //! blobs, every path, commit and tag objects, ref names, every tree name) by reading
 //! git objects (ADR 0006 section 9); the code for those sources is in `git_scan`.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
 use wardenlens_vault::{BINARY_PROBE_LEN, Content, MAX_FILE_LEN, Matcher, classify, scan};
 
 mod git;
 mod git_scan;
 mod redact;
+mod walk;
 
 use self::redact::Safe;
+use self::walk::{Input, Unread, walk};
 use super::session::open_read;
 use super::{say, warn};
 use crate::args::ScanArgs;
@@ -30,140 +30,10 @@ use crate::env::Paths;
 use crate::error::CliError;
 use crate::terminal::Terminal;
 
-/// Deepest directory nesting that is walked.
-const MAX_DEPTH: usize = 64;
 /// Most files and directories one scan walks.
 const MAX_INPUTS: usize = 100_000;
 /// Binary-file notices printed individually; the rest are counted.
 const MAX_BINARY_NOTICES: usize = 20;
-
-/// Why an input could not be scanned. The text never holds a path or a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum Unread {
-    #[error("cannot be read ({0})")]
-    Io(std::io::ErrorKind),
-    #[error("is not a regular file or directory")]
-    NotRegular,
-    #[error("is larger than the 8 MiB scan limit")]
-    TooLarge,
-    #[error("is nested deeper than the walk limit")]
-    TooDeep,
-    #[error("is not a well formed git object")]
-    Malformed,
-}
-
-/// Something found while walking: a file to scan or one that could not be read.
-struct Input {
-    path: PathBuf,
-    /// A path given on the command line is followed if it is a symlink; one found while walking
-    /// is skipped.
-    explicit: bool,
-    problem: Option<Unread>,
-}
-
-struct Walk {
-    inputs: Vec<Input>,
-    symlinks: usize,
-    special: usize,
-    seen: usize,
-    /// Most inputs this walk accepts.
-    limit: usize,
-}
-
-impl Walk {
-    fn new(limit: usize) -> Self {
-        Self {
-            inputs: Vec::new(),
-            symlinks: 0,
-            special: 0,
-            seen: 0,
-            limit,
-        }
-    }
-
-    fn push(
-        &mut self,
-        path: PathBuf,
-        explicit: bool,
-        problem: Option<Unread>,
-    ) -> Result<(), CliError> {
-        self.seen = self.seen.saturating_add(1);
-        if self.seen > self.limit {
-            return Err(CliError::Refused(
-                "too many files to scan in one command; scan a smaller directory",
-            ));
-        }
-        self.inputs.push(Input {
-            path,
-            explicit,
-            problem,
-        });
-        Ok(())
-    }
-
-    fn dir(&mut self, dir: &Path, depth: usize) -> Result<(), CliError> {
-        if depth > MAX_DEPTH {
-            return self.push(dir.to_owned(), false, Some(Unread::TooDeep));
-        }
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) => return self.push(dir.to_owned(), false, Some(Unread::Io(e.kind()))),
-        };
-        let mut paths = Vec::new();
-        for entry in entries {
-            match entry {
-                Ok(e) => paths.push(e.path()),
-                Err(e) => self.push(dir.to_owned(), false, Some(Unread::Io(e.kind())))?,
-            }
-            if paths.len().saturating_add(self.seen) > self.limit {
-                return Err(CliError::Refused(
-                    "too many files to scan in one command; scan a smaller directory",
-                ));
-            }
-        }
-        paths.sort();
-        for path in paths {
-            match fs::symlink_metadata(&path) {
-                Ok(m) if m.is_symlink() => self.symlinks = self.symlinks.saturating_add(1),
-                Ok(m) if m.is_dir() => self.dir(&path, depth.saturating_add(1))?,
-                Ok(m) if m.is_file() => self.push(path, false, None)?,
-                Ok(_) => self.special = self.special.saturating_add(1),
-                Err(e) => self.push(path, false, Some(Unread::Io(e.kind())))?,
-            }
-        }
-        Ok(())
-    }
-}
-
-fn walk(paths: &[PathBuf], limit: usize) -> Result<Walk, CliError> {
-    let mut w = Walk::new(limit);
-    for p in paths {
-        match fs::metadata(p) {
-            Ok(m) if m.is_dir() => w.dir(p, 0)?,
-            Ok(m) if m.is_file() => w.push(p.clone(), true, None)?,
-            Ok(_) => w.push(p.clone(), true, Some(Unread::NotRegular))?,
-            Err(e) => w.push(p.clone(), true, Some(Unread::Io(e.kind())))?,
-        }
-    }
-    Ok(w)
-}
-
-/// Opens a regular file without ever blocking on it (a FIFO would hang a plain open). A path
-/// found while walking is never followed if it is a symlink.
-fn open_regular(path: &Path, explicit: bool) -> Result<File, Unread> {
-    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY;
-    if !explicit {
-        flags |= OFlags::NOFOLLOW;
-    }
-    let fd = rustix::fs::open(path, flags, Mode::empty())
-        .map_err(|e| Unread::Io(std::io::Error::from(e).kind()))?;
-    let file = File::from(fd);
-    let meta = file.metadata().map_err(|e| Unread::Io(e.kind()))?;
-    if !meta.is_file() {
-        return Err(Unread::NotRegular);
-    }
-    Ok(file)
-}
 
 /// What a file turned out to be.
 enum Loaded {
@@ -228,7 +98,7 @@ fn scan_input<T: Terminal>(
     let binary_notice = || at(None, "notice: skipped binary file ", "");
     let outcome = match input.problem {
         Some(p) => Err(p),
-        None => open_regular(&input.path, input.explicit).and_then(load),
+        None => input.open().and_then(load),
     };
     let bytes = match outcome {
         Ok(Loaded::Bytes(b)) => b,
@@ -261,9 +131,11 @@ fn scan_input<T: Terminal>(
     }
     for h in &report.hits {
         tally.hits = tally.hits.saturating_add(1);
-        // The id and kind are printed as they are (not secret, ADR 0006 section 8); only the
-        // location is checked.
-        let loc = Safe::path(matcher, &input.path, ordinal, Some(h.line), ("", ""));
+        // The id and kind are printed as they are (not secret, ADR 0006 section 8). The kind is
+        // part of the text the location is checked with, so a value cannot be spelled across
+        // the kind and the path.
+        let kind = format!("{} ", h.kind);
+        let loc = Safe::path(matcher, &input.path, ordinal, Some(h.line), (&kind, ""));
         say(term, &format!("{} {} {loc}", h.id, h.kind))?;
     }
     Ok(())
@@ -393,46 +265,6 @@ fn verdict(unread: usize, hits: usize) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tree(files: usize) -> tempfile::TempDir {
-        let d = tempfile::tempdir().unwrap();
-        for i in 0..files {
-            std::fs::write(d.path().join(format!("f{i}")), "x").unwrap();
-        }
-        d
-    }
-
-    #[test]
-    fn the_input_limit_is_exact_and_one_more_is_refused() {
-        for (files, limit, ok) in [(4, 5, true), (5, 5, true), (6, 5, false)] {
-            let d = tree(files);
-            let r = walk(&[d.path().to_owned()], limit);
-            assert_eq!(r.is_ok(), ok, "{files} files, limit {limit}");
-            if let Ok(w) = r {
-                assert_eq!(w.inputs.len(), files);
-            }
-        }
-    }
-
-    #[test]
-    fn nesting_beyond_the_depth_limit_is_reported_not_walked() {
-        let d = tempfile::tempdir().unwrap();
-        let mut deep = d.path().to_owned();
-        for _ in 0..=MAX_DEPTH.saturating_add(1) {
-            deep.push("d");
-        }
-        std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(deep.join("leaf.txt"), "x").unwrap();
-        let w = walk(&[d.path().to_owned()], MAX_INPUTS).unwrap();
-        assert_eq!(
-            w.inputs
-                .iter()
-                .filter(|i| i.problem == Some(Unread::TooDeep))
-                .count(),
-            1
-        );
-        assert!(w.inputs.iter().all(|i| !i.path.ends_with("leaf.txt")));
-    }
 
     #[test]
     fn exit_codes_and_messages_of_the_scan_errors() {

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use percent_encoding::percent_encode;
 use wardenlens_core::entry::EntryKind;
+use zeroize::Zeroizing;
 
 use super::needles::{Expansion, Net, UNRESERVED, expand};
 use super::net::{self, Owners};
@@ -60,11 +61,11 @@ pub(crate) fn literals(
     kind: EntryKind,
     value: &str,
     addresses: &mut Addresses,
-) -> Option<Vec<String>> {
+) -> Option<Vec<Zeroizing<String>>> {
     let Expansion::Scannable { literals, net } = expand(kind, value) else {
         return None;
     };
-    let mut out: Vec<String> = literals.into_iter().map(|l| l.text).collect();
+    let mut out: Vec<Zeroizing<String>> = literals.into_iter().map(|l| l.text).collect();
     let is_address = !net.is_empty();
     for n in &net {
         addresses.add(n);
@@ -73,7 +74,7 @@ pub(crate) fn literals(
     // is matched as a token only: as a substring `192.0.2.7` would also eat part of `1192.0.2.7`.
     let raw = value.trim();
     if !is_address && !raw.is_empty() && raw.len() >= crate::MIN_SCANNABLE_LEN {
-        out.push(raw.to_owned());
+        out.push(Zeroizing::new(raw.to_owned()));
     }
     Some(out)
 }

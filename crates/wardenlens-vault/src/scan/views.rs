@@ -286,14 +286,14 @@ mod tests {
             let text = format!("a{c}b");
             let joined = joined_folded(&text);
             let by_view = joined.bytes.as_ref() == b"a b";
-            let by_needle = collapse(&text) == "a b";
+            let by_needle = collapse(&text).as_str() == "a b";
             assert_eq!(by_view, by_needle, "U+{n:04X}");
             assert_eq!(by_view, is_collapsible(c), "U+{n:04X}");
             if c != '\n' {
                 assert_eq!(joined.line_at(usize::MAX), 1, "U+{n:04X} adds a line break");
             }
         }
-        assert_eq!(collapse("  a \u{2028}\u{202F}b\n c  "), "a b c");
+        assert_eq!(collapse("  a \u{2028}\u{202F}b\n c  ").as_str(), "a b c");
     }
 
     #[test]

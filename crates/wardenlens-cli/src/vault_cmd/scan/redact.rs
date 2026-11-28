@@ -13,7 +13,7 @@ use std::path::Path;
 
 use wardenlens_vault::{Matcher, is_invisible, scan};
 
-/// Text that has passed the matcher and may be printed. Built only by [`render`] and
+/// Text that has passed the matcher and may be printed. Built only by [`render_in`] and
 /// [`Safe::path`].
 pub(super) struct Safe(String);
 
@@ -94,11 +94,12 @@ fn with_line(text: String, line: Option<usize>) -> String {
 
 /// Renders `loc`. The candidates run from the most to the least specific; the first whose text
 /// (and, for a path, whose raw bytes) holds no vault value is returned.
+#[cfg(test)]
 pub(super) fn render(matcher: &Matcher, loc: &Loc<'_>) -> Safe {
     render_in(matcher, loc, ("", ""))
 }
 
-/// Like [`render`], for a location printed as `{pre}{location}{post}`: the fixed text around it
+/// Like `render`, for a location printed as `{pre}{location}{post}`: the fixed text around it
 /// is part of what must hold no vault value, as for [`Safe::path`].
 pub(super) fn render_in(matcher: &Matcher, loc: &Loc<'_>, (pre, post): (&str, &str)) -> Safe {
     let mut candidates: Vec<String> = Vec::new();
@@ -173,11 +174,30 @@ impl Safe {
     }
 }
 
-/// True for a character that may be printed as it is: a graphic, visible one. This is an
-/// allowlist: everything else (controls, `Cf` format characters, separators, invisible
-/// fillers, white space other than the plain space) is escaped.
+/// Code points that render as nothing or as an unpredictable glyph although no category list
+/// of the standard library names them: the default-ignorable code points that are not yet
+/// assigned (U+FFF0..U+FFF8 and U+E0000..U+E0FFF, `DerivedCoreProperties.txt`, property
+/// `Default_Ignorable_Code_Point`), private use (`Co`) and the noncharacters. A future Unicode
+/// version can assign one of them; it is then escaped until this list is revisited (fail
+/// closed).
+fn is_reserved(c: char) -> bool {
+    let n = u32::from(c);
+    matches!(
+        n,
+        0xFFF0..=0xFFF8 | 0xE0000..=0xE0FFF | 0xE000..=0xF8FF | 0xF0000..=0x0010_FFFF | 0xFDD0..=0xFDEF
+    ) || n & 0xFFFE == 0xFFFE
+}
+
+/// True for a character that may be printed as it is: a graphic, visible one. This is a
+/// denylist by category, and the category list is [`is_invisible`] of the core crate (every
+/// `Cf` code point of Unicode 16, from `DerivedGeneralCategory.txt`, and the other invisible
+/// fillers; a test pins it), plus `Cc` (`char::is_control`: C0, DEL, C1), white space (so U+2028,
+/// U+2029, U+0085 and U+00A0 included; only the plain space is kept) and [`is_reserved`].
+/// Unassigned code points (`Cn`) outside [`is_reserved`] are not escaped: the standard library
+/// has no table for them, and they render as at most a replacement glyph, never as a line break
+/// or an escape sequence.
 fn is_printable(c: char) -> bool {
-    c == ' ' || !(c.is_control() || c.is_whitespace() || is_invisible(c))
+    c == ' ' || !(c.is_control() || c.is_whitespace() || is_invisible(c) || is_reserved(c))
 }
 
 /// A path as it may be printed: characters that are not printable are written as `\u{..}`
@@ -198,9 +218,9 @@ fn escaped(path: &Path) -> String {
 /// `post` are the fixed message text around it (never the entry id or kind, which are printed
 /// by the caller and are not secret). Redaction (ADR 0006 section 8) considers exactly this
 /// text and the raw path bytes. When either holds a vault value the name becomes
-/// `<redacted-path:N>` (`N` is the position of the file in this scan); if that text still
-/// spells a value (a number equal to the line or the position) the line is dropped, then the
-/// position. A text that cannot be scanned counts as holding a value (fail closed).
+/// `<redacted-path:N>` (`N` is the position of the file in this scan). A clean path whose
+/// `:line` spells a value (a number equal to the line) is printed without the line. If the
+/// numbered marker still spells a value the line is dropped, then the position. A text that cannot be scanned counts as holding a value (fail closed).
 fn location(
     matcher: &Matcher,
     path: &Path,
@@ -221,11 +241,19 @@ fn location(
         return plain;
     }
     let numbered = format!("<redacted-path:{ordinal}>");
-    for candidate in [
-        show(&numbered, line),
-        show(&numbered, None),
-        show("<redacted-path>", None),
-    ] {
+    // The most specific form that is clean wins: the name without the line (the line number
+    // can itself spell a value), then the position, then nothing. A candidate equal to the one
+    // before it (no line to drop) is not tried twice.
+    let mut candidates = Vec::new();
+    if raw_clean && line.is_some() {
+        candidates.push(show(&escaped(path), None));
+    }
+    candidates.push(show(&numbered, line));
+    if line.is_some() {
+        candidates.push(show(&numbered, None));
+    }
+    candidates.push(show("<redacted-path>", None));
+    for candidate in candidates {
         if clean(&candidate) {
             return candidate;
         }
@@ -273,6 +301,107 @@ mod tests {
             location(&m, Path::new("/w/a.txt"), 0, Some(4), ("", "")),
             "/w/a.txt:4"
         );
+    }
+
+    #[test]
+    fn fallback_table() {
+        use wardenlens_core::entry::EntryKind::Other;
+        // (value, path, ordinal, line, pre, post, want)
+        type Row = (
+            &'static str,
+            &'static str,
+            usize,
+            Option<usize>,
+            &'static str,
+            &'static str,
+            &'static str,
+        );
+        let rows: &[Row] = &[
+            // The line spells the value: a clean path keeps its name, loses the line.
+            (
+                "1234567",
+                "/w/a.txt",
+                3,
+                Some(1_234_567),
+                "",
+                "",
+                "/w/a.txt",
+            ),
+            // The path holds the value and the line equals the value too.
+            (
+                "1234567",
+                "/w/a-1234567.txt",
+                3,
+                Some(1_234_567),
+                "",
+                "",
+                "<redacted-path:3>",
+            ),
+            // No line: nothing to drop, the plain form is clean.
+            ("1234567", "/w/a.txt", 3, None, "", "", "/w/a.txt"),
+            // The position spells the value as well as the line.
+            (
+                "1234567",
+                "/w/a-1234567.txt",
+                1_234_567,
+                Some(1_234_567),
+                "",
+                "",
+                "<redacted-path>",
+            ),
+            // No line, position spells the value, path holds it too.
+            (
+                "1234567",
+                "/w/a-1234567.txt",
+                1_234_567,
+                None,
+                "",
+                "",
+                "<redacted-path>",
+            ),
+            // The fixed text before the path completes a value (the kind token).
+            (
+                "other-abcdefg",
+                "abcdefg",
+                0,
+                Some(1),
+                "other-",
+                "",
+                "<redacted-path:0>:1",
+            ),
+        ];
+        for &(value, path, ordinal, line, pre, post, want) in rows {
+            let m = matcher_of(Other, value);
+            assert_eq!(
+                location(&m, Path::new(path), ordinal, line, (pre, post)),
+                want,
+                "{value} {path} {ordinal} {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_code_points_are_escaped() {
+        let mut all: Vec<u32> = (0xFFF0..=0xFFF8).chain(0xE0000..=0xE0FFF).collect();
+        all.extend([0xE000, 0xF8FF, 0xF0000, 0xFFFFD, 0x10_0000, 0x10_FFFD]);
+        all.extend(0xFDD0..=0xFDEF);
+        for plane in 0..=0x10_u32 {
+            all.push(plane << 16 | 0xFFFE);
+            all.push(plane << 16 | 0xFFFF);
+        }
+        for n in all {
+            let Some(c) = char::from_u32(n) else { continue };
+            assert!(!is_printable(c), "U+{n:04X}");
+            assert!(!escaped(Path::new(&format!("a{c}b"))).contains(c));
+        }
+        // The neighbours stay printable.
+        for n in [
+            0xFFEF, 0xFFFC, 0xE1000, 0xDFFF_u32, 0xFB00, 0x1_0000, 0xFDCF, 0xFDF0,
+        ] {
+            if let Some(c) = char::from_u32(n) {
+                assert!(is_printable(c), "U+{n:04X}");
+            }
+        }
     }
 
     #[test]

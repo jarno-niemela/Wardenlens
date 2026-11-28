@@ -13,6 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use wardenlens_core::entry::EntryKind;
+use zeroize::Zeroizing;
 
 use super::squeeze::{fold, is_collapsible, squeeze};
 use crate::validate::MIN_SCANNABLE_LEN;
@@ -48,7 +49,7 @@ pub(super) enum Boundary {
 
 /// One literal needle and where it applies.
 pub(super) struct Literal {
-    pub(super) text: String,
+    pub(super) text: Zeroizing<String>,
     pub(super) boundary: Boundary,
     /// Matched in the lowercased views.
     pub(super) folded: bool,
@@ -82,8 +83,8 @@ struct Spec {
 
 /// The needle collapse: every run of [`is_collapsible`] characters becomes one space, and the
 /// ends are trimmed. The joined view uses the same definition.
-pub(super) fn collapse(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+pub(super) fn collapse(text: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
     let mut pending = false;
     for c in text.chars() {
         if is_collapsible(c) {
@@ -99,22 +100,22 @@ pub(super) fn collapse(text: &str) -> String {
     out
 }
 
-fn literals(bases: Vec<String>, spec: &Spec) -> Expansion {
+fn literals(bases: Vec<Zeroizing<String>>, spec: &Spec) -> Expansion {
     let mut out = Vec::new();
     for base in bases {
-        let mut sq = squeeze(&base);
+        let mut sq = Zeroizing::new(squeeze(&base));
         if spec.collapse {
             sq = collapse(&sq);
         }
         let (unsq, sq) = if spec.fold {
-            (fold(&base), fold(&sq))
+            (Zeroizing::new(fold(&base)), Zeroizing::new(fold(&sq)))
         } else {
             (base, sq)
         };
         if unsq.len() < spec.min_len || sq.len() < spec.min_len {
             return Expansion::Unscannable;
         }
-        let mut push = |text: String, views: u8| {
+        let mut push = |text: Zeroizing<String>, views: u8| {
             out.push(Literal {
                 text,
                 boundary: spec.boundary,
@@ -148,8 +149,8 @@ fn with_verbatim(expansion: Expansion, value: &str) -> Expansion {
     let Expansion::Scannable { mut literals, net } = expansion else {
         return expansion;
     };
-    let raw = fold(value);
-    let squeezed = fold(&squeeze(value));
+    let raw = Zeroizing::new(fold(value));
+    let squeezed = Zeroizing::new(fold(&Zeroizing::new(squeeze(value))));
     for (text, views) in [(raw, view::UNSQUEEZED), (squeezed, view::SQUEEZED_PLAIN)] {
         literals.push(Literal {
             text,
@@ -182,7 +183,7 @@ pub(super) fn expand(kind: EntryKind, value: &str) -> Expansion {
         EntryKind::Mac => mac(value),
         EntryKind::Serial => {
             let trimmed = value.trim();
-            let compact = trimmed
+            let compact: String = trimmed
                 .chars()
                 .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
                 .collect();
@@ -190,14 +191,14 @@ pub(super) fn expand(kind: EntryKind, value: &str) -> Expansion {
                 collapse: false,
                 ..text
             };
-            literals(vec![trimmed.to_owned(), compact], &spec)
+            literals(vec![z(trimmed.to_owned()), z(compact)], &spec)
         }
         EntryKind::DisplayName => {
             let base = collapse(value);
             let bases = vec![
-                base.replace(' ', "-"),
-                base.replace(' ', "_"),
-                base.replace(' ', ""),
+                z(base.replace(' ', "-")),
+                z(base.replace(' ', "_")),
+                z(base.replace(' ', "")),
                 base,
             ];
             with_verbatim(literals(bases, &text), value)
@@ -217,8 +218,13 @@ pub(super) fn expand(kind: EntryKind, value: &str) -> Expansion {
     }
 }
 
+/// Wraps an intermediate of a needle so it is wiped when dropped.
+fn z(text: String) -> Zeroizing<String> {
+    Zeroizing::new(text)
+}
+
 fn host(value: &str) -> Expansion {
-    let name = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    let name = Zeroizing::new(value.trim().trim_end_matches('.').to_ascii_lowercase());
     if let Ok(a) = name.parse::<Ipv4Addr>() {
         return only_net(Net::V4(u32::from(a)));
     }
@@ -265,8 +271,8 @@ pub(super) const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-fn percent_lower(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
+fn percent_lower(value: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(value.len()));
     for chunk in percent_encode(value.as_bytes(), UNRESERVED) {
         // A chunk is either a run of unreserved bytes or one `%XX`.
         if chunk.starts_with('%') {
@@ -278,8 +284,8 @@ fn percent_lower(value: &str) -> String {
     out
 }
 
-fn every_byte(value: &str, upper: bool) -> String {
-    let mut out = String::with_capacity(value.len().saturating_mul(3));
+fn every_byte(value: &str, upper: bool) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(value.len().saturating_mul(3)));
     for b in value.bytes() {
         // Writing to a String cannot fail.
         let _ = if upper {
@@ -294,53 +300,59 @@ fn every_byte(value: &str, upper: bool) -> String {
 /// Base64 without padding at the three alignments: with `k` filler bytes in front, only the
 /// characters fully determined by the value are kept (character `ceil(8k / 6)` up to, not
 /// including, `floor(8(k + n) / 6)`). With a 7-byte minimum the shortest needle is 8 characters.
-fn base64_needles(value: &[u8]) -> Vec<String> {
+fn base64_needles(value: &[u8]) -> Vec<Zeroizing<String>> {
     let mut out = Vec::new();
     for k in 0..3usize {
-        let mut buf = vec![0u8; k];
+        let mut buf = Zeroizing::new(vec![0u8; k]);
         buf.extend_from_slice(value);
         let from = k.saturating_mul(8).div_ceil(6);
         let to = k.saturating_add(value.len()).saturating_mul(8) / 6;
-        for enc in [STANDARD_NO_PAD.encode(&buf), URL_SAFE_NO_PAD.encode(&buf)] {
-            out.push(enc.get(from..to).unwrap_or_default().to_owned());
+        for enc in [STANDARD_NO_PAD.encode(&*buf), URL_SAFE_NO_PAD.encode(&*buf)] {
+            let enc = Zeroizing::new(enc);
+            out.push(z(enc.get(from..to).unwrap_or_default().to_owned()));
         }
     }
     out
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn xml_escape(value: &str) -> Zeroizing<String> {
+    // Each step's result is wiped when the next one replaces it.
+    let mut out = z(value.replace('&', "&amp;"));
+    for (from, to) in [
+        ('<', "&lt;"),
+        ('>', "&gt;"),
+        ('"', "&quot;"),
+        ('\'', "&apos;"),
+    ] {
+        out = z(out.replace(from, to));
+    }
+    out
 }
 
 /// The raw value, percent forms (upper, lower, every-byte, form-encoded), base64 (both
 /// alphabets, three alignments), hex (both cases) and the XML escape.
-fn secret_bases(value: &str) -> Vec<String> {
-    let upper = percent_encode(value.as_bytes(), UNRESERVED).to_string();
+fn secret_bases(value: &str) -> Vec<Zeroizing<String>> {
+    let upper = z(percent_encode(value.as_bytes(), UNRESERVED).to_string());
     let lower = percent_lower(value);
     let mut out = vec![
-        value.to_owned(),
-        upper.replace("%20", "+"),
-        lower.replace("%20", "+"),
+        z(value.to_owned()),
+        z(upper.replace("%20", "+")),
+        z(lower.replace("%20", "+")),
         upper,
         lower,
         every_byte(value, true),
         every_byte(value, false),
     ];
     out.extend(base64_needles(value.as_bytes()));
-    let hex: String = value.bytes().fold(String::new(), |mut s, b| {
+    let hex = z(value.bytes().fold(String::new(), |mut s, b| {
         // Writing to a String cannot fail.
         let _ = write!(s, "{b:02x}");
         s
-    });
-    out.push(hex.to_ascii_uppercase());
+    }));
+    out.push(z(hex.to_ascii_uppercase()));
     out.push(hex);
     let xml = xml_escape(value);
-    if xml != value {
+    if xml.as_str() != value {
         out.push(xml);
     }
     out
@@ -352,7 +364,10 @@ mod tests {
 
     fn texts(e: Expansion) -> Vec<String> {
         match e {
-            Expansion::Scannable { literals, .. } => literals.into_iter().map(|l| l.text).collect(),
+            Expansion::Scannable { literals, .. } => literals
+                .into_iter()
+                .map(|l| l.text.as_str().to_owned())
+                .collect(),
             Expansion::Unscannable => Vec::new(),
         }
     }
@@ -361,15 +376,15 @@ mod tests {
     fn base64_alignments_match_the_adr_worked_example() {
         let n = base64_needles(b"correct-horse-9");
         // (standard, url-safe) for k = 0, 1, 2
-        assert_eq!(n.first().map(String::as_str), Some("Y29ycmVjdC1ob3JzZS05"));
-        assert_eq!(n.get(2).map(String::as_str), Some("NvcnJlY3QtaG9yc2UtO"));
-        assert_eq!(n.get(4).map(String::as_str), Some("jb3JyZWN0LWhvcnNlLT"));
+        assert_eq!(n.first().map(|t| t.as_str()), Some("Y29ycmVjdC1ob3JzZS05"));
+        assert_eq!(n.get(2).map(|t| t.as_str()), Some("NvcnJlY3QtaG9yc2UtO"));
+        assert_eq!(n.get(4).map(|t| t.as_str()), Some("jb3JyZWN0LWhvcnNlLT"));
     }
 
     #[test]
     fn seven_byte_secret_keeps_every_alignment_with_at_least_eight_characters() {
         for n in base64_needles(b"abcdefg") {
-            assert!(n.len() >= 8, "{n}");
+            assert!(n.len() >= 8, "{}", n.as_str());
         }
     }
 
