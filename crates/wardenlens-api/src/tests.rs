@@ -638,9 +638,8 @@ async fn request_queued_for_a_slot_past_the_timeout_still_succeeds() {
 
 #[tokio::test(start_paused = true)]
 async fn waiting_inside_the_handler_does_consume_the_request_deadline() {
-    // Counterpart of the test above: waiting that starts after `call` (here, on a lock the
-    // handler takes) is charged to the 5 s deadline. Without this, the test above could
-    // not fail for any reason about when the timer starts.
+    // Counterpart: waiting after `call` is charged to the deadline; only waiting before
+    // `call` (in `poll_ready`) is free.
     async fn gated(State(gate): State<Arc<Semaphore>>) -> &'static str {
         let _permit = gate.acquire().await;
         tokio::time::sleep(Duration::from_secs(8)).await;
@@ -710,6 +709,7 @@ async fn undocumented_path_is_never_served() {
 }
 
 mod adversary;
+mod adversary_118;
 mod adversary_r2;
 mod cameras;
 mod recordings;
