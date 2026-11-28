@@ -9,6 +9,7 @@
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -206,11 +207,24 @@ impl Git {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Config injected through the environment would reach every git call (and could hide a
+        // partial clone from the guard's `git config`): none of it is trusted. The default
+        // global and system files ARE still read (user settings such as `safe.directory`
+        // keep working); a repository's own config is what marks a partial clone, and a
+        // redirected global file cannot undo that for the calls that read objects.
+        for (name, _) in std::env::vars_os() {
+            let n = name.to_string_lossy();
+            if n.starts_with("GIT_CONFIG_KEY_") || n.starts_with("GIT_CONFIG_VALUE_") {
+                c.env_remove(&name);
+            }
+        }
+        c.env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS");
         #[cfg(test)]
         c.env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1");
         c
@@ -219,6 +233,19 @@ impl Git {
     /// Runs git and returns its standard output, at most `limit` bytes; `stdin` is fed from a
     /// second thread so a large input cannot deadlock against the output.
     fn capture(&self, args: &[&OsStr], stdin: &[u8], limit: usize) -> Result<Vec<u8>, GitError> {
+        self.capture_codes(args, stdin, limit, &[0])
+            .map(|(out, _)| out)
+    }
+
+    /// [`Git::capture`] where every exit code in `ok` is a success; also returns the code. Any
+    /// other exit (or death by a signal) is `Failed`.
+    fn capture_codes(
+        &self,
+        args: &[&OsStr],
+        stdin: &[u8],
+        limit: usize,
+        ok: &[i32],
+    ) -> Result<(Vec<u8>, i32), GitError> {
         let mut child = Self::spawn(&mut self.command(args))?;
         let (Some(mut input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             kill(&mut child);
@@ -241,12 +268,13 @@ impl Git {
             return Err(GitError::TooLarge);
         }
         read.0.map_err(|_| GitError::Io)?;
-        if !status.success() {
-            return Err(GitError::Failed);
-        }
+        let code = status
+            .code()
+            .filter(|c| ok.contains(c))
+            .ok_or(GitError::Failed)?;
         // A write error with a successful, complete run cannot be told from a lost input.
         read.1?.map_err(|_| GitError::Io)?;
-        Ok(out)
+        Ok((out, code))
     }
 
     /// Refuses to go on when git is older than 2.44 (or its version is not understood) and the
@@ -262,20 +290,55 @@ impl Git {
         if parse_version(&out).is_some_and(|v| v >= min) {
             return Ok(());
         }
-        let partial = [
-            &["config", "--get", "extensions.partialclone"][..],
-            &["config", "--get-regexp", r"^remote\..*\.promisor$"][..],
+        // Keys that mark a partial clone (git's promisor-remote.c): the extension, a promisor
+        // remote, and the filter a partial clone records for its remote. They are read from the
+        // repository's own config files with `config --file` (includes followed), not with a
+        // plain `git config`: that honours `GIT_CONFIG`, which would point it at another file
+        // while the calls that read objects still see the repository's.
+        let keys = [
+            &["--get", "extensions.partialclone"][..],
+            &[
+                "--get-regexp",
+                r"^remote\..*\.(promisor|partialclonefilter)$",
+            ][..],
         ];
-        for a in partial {
-            match self.capture(&args(a), b"", 1024) {
-                // The key is set.
-                Ok(_) => return Err(GitError::PartialClone),
-                // `config` exits 1 when no key matches.
-                Err(GitError::Failed) => {}
-                Err(e) => return Err(e),
+        for file in self.config_files()? {
+            for key in keys {
+                let mut a = vec![OsStr::new("config"), OsStr::new("--file"), file.as_os_str()];
+                a.push(OsStr::new("--includes"));
+                a.extend(key.iter().map(OsStr::new));
+                // `config` exits 0 when a key matches and 1 when none does; any other exit (a
+                // config file it cannot read, say) is an error, not "not a partial clone".
+                let (_, code) = self.capture_codes(&a, b"", 1024, &[0, 1])?;
+                if code == 0 {
+                    return Err(GitError::PartialClone);
+                }
             }
         }
         Ok(())
+    }
+
+    /// The repository's own config files that exist: the shared `config` and the worktree's
+    /// `config.worktree`. (`rev-parse --git-dir` reads no object; a relative answer is relative to
+    /// the directory git runs in.)
+    fn config_files(&self) -> Result<Vec<PathBuf>, GitError> {
+        let dir_of = |flag: &str| -> Result<PathBuf, GitError> {
+            let out = self.capture(&args(&["rev-parse", flag]), b"", 4096)?;
+            let line = out.strip_suffix(b"\n").ok_or(GitError::Malformed)?;
+            if line.is_empty() {
+                return Err(GitError::Malformed);
+            }
+            let path = PathBuf::from(OsStr::from_bytes(line));
+            Ok(match &self.dir {
+                Some(d) => d.join(path),
+                None => path,
+            })
+        };
+        let files = [
+            dir_of("--git-common-dir")?.join("config"),
+            dir_of("--git-dir")?.join("config.worktree"),
+        ];
+        Ok(files.into_iter().filter(|f| f.is_file()).collect())
     }
 
     /// `git rev-parse --verify` of a revision to an object id.
@@ -679,6 +742,60 @@ mod tests {
     }
 
     #[test]
+    fn a_config_file_git_cannot_read_is_an_error_not_a_pass() {
+        // `config.worktree` is not read by the other git calls here, but the guard asks about it:
+        // an exit other than 0 and 1 must not read as "not a partial clone".
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let git = Git::at(dir.path());
+        assert_eq!(git.guard_lazy_fetch_from((99, 0)), Ok(()));
+        let gd = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .unwrap()
+            .stdout;
+        let gd = PathBuf::from(OsStr::from_bytes(gd.strip_suffix(b"\n").unwrap()));
+        std::fs::write(gd.join("config.worktree"), "[broken\n").unwrap();
+        assert_eq!(git.guard_lazy_fetch_from((99, 0)), Err(GitError::Failed));
+        // Not needed for a git that stops lazy fetching: no config is read at all.
+        assert_eq!(git.guard_lazy_fetch_from((0, 0)), Ok(()));
+    }
+
+    #[test]
+    fn a_partial_clone_filter_marks_a_promisor_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        for a in [
+            &["init", "-q"][..],
+            &["config", "remote.origin.partialclonefilter", "blob:none"][..],
+        ] {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(a)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        assert_eq!(
+            Git::at(dir.path()).guard_lazy_fetch_from((99, 0)),
+            Err(GitError::PartialClone)
+        );
+    }
+
+    #[test]
     fn raw_entries_are_paired_by_position_and_paths_keep_every_byte() {
         let mut out = raw("100644", Z, A, "A", b"a\nb :100644 x\xff");
         out.extend(raw("100644", A, A, "M", b":looks like metadata"));
@@ -941,5 +1058,65 @@ mod adversary_128 {
                 assert_eq!(v >= LAZY_FETCH_MIN, v.0 > 2 || (v.0 == 2 && v.1 >= 44));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adversary_128_r2 {
+    //! Adversarial tests (#128 round 2) of the old-git guard: the environment the scanner
+    //! inherits must not hide a partial clone from the guard while the object-reading calls
+    //! still see it (`GIT_CONFIG` redirects `git config` only).
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    /// A fake git 2.43 that exports `extra_env` and then runs the real git.
+    fn fake(extra_env: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("old-git");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = version ]; then echo 'git version 2.43.0'; exit 0; fi; done\n{extra_env}\nexec '{}' \"$@\"\n",
+            Git::locate().exe.display()
+        );
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for a in [
+            &["init", "-q"][..],
+            &["config", "extensions.partialclone", "origin"][..],
+        ] {
+            let ok = Command::new(Git::locate().exe)
+                .arg("-C")
+                .arg(&repo)
+                .args(a)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        (dir, exe, repo)
+    }
+
+    #[test]
+    fn control_an_old_git_refuses_the_partial_clone() {
+        let (_d, exe, repo) = fake("");
+        assert_eq!(
+            Git::with_exe(&exe, &repo).guard_lazy_fetch(),
+            Err(GitError::PartialClone)
+        );
+    }
+
+    #[test]
+    fn an_inherited_git_config_variable_does_not_hide_a_partial_clone_from_an_old_git() {
+        let (_d, exe, repo) = fake("GIT_CONFIG=/dev/null; export GIT_CONFIG");
+        // `GIT_CONFIG` redirects only the `git config` command: rev-list and cat-file still read
+        // the repository config, see the partial clone, and (on git before 2.44) lazy-fetch.
+        assert_eq!(
+            Git::with_exe(&exe, &repo).guard_lazy_fetch(),
+            Err(GitError::PartialClone)
+        );
     }
 }

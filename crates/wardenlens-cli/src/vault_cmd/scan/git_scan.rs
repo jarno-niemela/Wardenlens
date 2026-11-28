@@ -245,7 +245,7 @@ fn source_with_min(
 ///
 /// # Errors
 /// A malformed range, remote or ref list, or a revision git cannot resolve.
-pub(super) fn source_of(args: &ScanArgs, git: &Git) -> Result<Option<Source>, CliError> {
+fn source_of(args: &ScanArgs, git: &Git) -> Result<Option<Source>, CliError> {
     if args.staged {
         return Ok(Some(Source::Staged));
     }

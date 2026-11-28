@@ -173,7 +173,7 @@ struct Stored {
 }
 
 impl Stored {
-    /// Charges `n` bytes: `TooMany` once the budget is passed.
+    /// Charges `n` bytes: `PathBytes` once the budget is passed.
     fn add(&mut self, n: usize) -> Result<(), GitError> {
         self.bytes = self.bytes.saturating_add(n);
         if self.bytes > self.budget {

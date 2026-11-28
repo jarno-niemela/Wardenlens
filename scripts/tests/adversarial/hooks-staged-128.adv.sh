@@ -12,32 +12,11 @@ ok()  { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
 expect() { local name=$1; shift; if "$@"; then ok "$name"; else bad "$name"; fi; }
 
-# The check of scripts/tests/hooks-staged.test.sh is now the strict pairing (see strict_removed below); the round-1
-# relaxation this file was written against (`grep -vc 'refuse "'`) is gone.
-shipped_removed() { strict_removed "$1"; }
-
-# A strict form: every removed line must equal an added line once the refusal's detail argument is ignored.
-key() { sed -E 's/^(.*refuse "[^"]*").*$/\1/'; }
-suffix() { sed -E 's/^.*"//'; }
-has_key() {  # has_key KEY LINES: whether one of LINES has KEY
-  local a
-  while IFS= read -r a; do
-    if [[ "$(key <<<"$a")|$(suffix <<<"$a")" == "$1" ]]; then return 0; fi
-  done <<<"$2"
-  return 1
-}
-strict_removed() {
-  local d removed added n=0 line k
-  d=$(diff -u "$installed" "$1")
-  removed=$(grep '^-' <<<"$d" | grep -v '^---' | cut -c2-)
-  added=$(grep '^+' <<<"$d" | grep -v '^+++' | cut -c2-)
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    k="$(key <<<"$line")|$(suffix <<<"$line")"
-    if ! has_key "$k" "$added"; then n=$((n + 1)); fi
-  done <<<"$removed"
-  echo "$n"
-}
+# The shipped check, from the shared helper (no private copy): 0 means "accepted".
+# shellcheck disable=SC1091 # sourced helper
+source "$root/scripts/tests/lib/hook-pairing.sh"
+shipped_removed() { hook_pairing_gap "$installed" "$1"; }
+strict_removed() { hook_pairing_gap "$installed" "$1"; }
 
 mutant() {  # mutant NAME SED_EXPR -> path of the mutated copy
   local m=$tmp/$1
@@ -65,13 +44,8 @@ for m in "$m1" "$m2" "$m3"; do
   expect "the shipped check rejects mutant $n" test "$(shipped_removed "$m")" -gt 0
 done
 
-# The shipped "no refusal prints a ref name" check, applied to a mutant that prints the name with braces.
-# shellcheck disable=SC2016 # the patterns are literal shell text
-shipped_names_ok() {
-  ! grep 'refuse "' "$1" | grep -E 'refuse "[^"]*" "[^"]*[$](rref|lref|wf|[{](rref|lref|wf))'
-}
-expect "control: the shipped name check accepts the staged hook" shipped_names_ok "$staged"
+# A refusal printing the name with braces is rejected too (allow-list, not a denylist of names).
 # shellcheck disable=SC2016 # the sed expressions are literal shell text
 m4=$(mutant braced-name 's/refuse "non-fast-forward \/ force push" "ref:\$idx"/refuse "non-fast-forward \/ force push" "${rref}"/')
-if shipped_names_ok "$m4" >/dev/null; then bad "the shipped name check rejects a refusal printing \${rref}"; else ok "the shipped name check rejects a refusal printing \${rref}"; fi
+expect "the shipped check rejects a refusal printing \${rref}" test "$(shipped_removed "$m4")" -gt 0
 exit $fail

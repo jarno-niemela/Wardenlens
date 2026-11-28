@@ -1526,8 +1526,9 @@ fn the_lazy_fetch_guard_runs_before_any_revision_is_resolved() {
         assert!(text.contains("2.44"), "{text}");
         let calls = std::fs::read_to_string(&log).unwrap();
         for c in calls.lines() {
+            // (`rev-parse --git-dir` and `config` read no object; resolving a revision does.)
             assert!(
-                !c.contains("rev-parse") && !c.contains("cat-file") && !c.contains("rev-list"),
+                !c.contains("--verify") && !c.contains("cat-file") && !c.contains("rev-list"),
                 "an object-reading call ran before the refusal: {c}"
             );
         }
@@ -1541,7 +1542,7 @@ fn the_lazy_fetch_guard_runs_before_any_revision_is_resolved() {
         ..ScanArgs::default()
     };
     assert!(source_with_min(&args, &git, (2, 0)).is_err());
-    assert!(std::fs::read_to_string(&log).unwrap().contains("rev-parse"));
+    assert!(std::fs::read_to_string(&log).unwrap().contains("--verify"));
     // Path scans use no git at all.
     let _ = std::fs::remove_file(&log);
     let paths = ScanArgs::default();
