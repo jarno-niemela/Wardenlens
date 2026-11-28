@@ -1,4 +1,4 @@
-//! `wardenlens import agentdvr <objects.xml> [--dry-run] [--model M] [--camera-model ID=M]` (#66,
+//! `wardenlens import agentdvr [<objects.json|objects.xml>] [--format F] [--dry-run] [--model M] [--camera-model ID=M]` (#66,
 //! #163).
 //!
 //! Wires the parser ([`wardenlens_agentdvr`]), the key file ([`wardenlens_secrets`]), the vault and
@@ -14,6 +14,12 @@
 //! ADR 0006 section 4 (`/var/lib/wardenlens/vault.db`, a separate file next to the recording index).
 //!
 //! # Behaviour
+//! * **Formats (#226).** `objects.json` (current `AgentDVR`) and `objects.xml` are both read; the
+//!   format is detected from the content (first byte `{` is JSON) or forced with `--format`. The
+//!   JSON is parsed by the same crate into the same drafts, so the screen, the model match, the
+//!   vault writes and every refusal below are shared. With no file, the first of
+//!   `DEFAULT_INPUTS` that exists is read (never a `.bak`). The JSON layout is an assumption (see
+//!   the parser crate's `json` module).
 //! * The input is opened with `O_NOFOLLOW` as a regular file, refused when its size (`fstat`) is
 //!   over 8 MiB, and read through `take(limit + 1)` so a file that grows is bounded too (two
 //!   guards, each tested alone). Exit codes follow `ConfigFileError`: a document refused for its
@@ -99,7 +105,7 @@ use wardenlens_vault::{Scan, Value, Vault, VaultError};
 use zeroize::Zeroizing;
 
 use super::{Context, report_error};
-use crate::args::ImportCommand;
+use crate::args::{FormatArg, ImportCommand};
 use crate::config_file::{ConfigFileError, load, resolve_path};
 
 /// The vault file next to the index.
@@ -137,6 +143,12 @@ pub(crate) enum ImportError {
     /// The input path is not a regular file.
     #[error("input path {path:?} is not a regular file")]
     NotRegular { path: PathBuf },
+    /// No file was given and none of the usual install paths exists.
+    #[error(
+        "no input file given and none of the usual paths exists \
+         (/opt/AgentDVR/Media/XML/objects.json, .../objects.xml); give the file"
+    )]
+    NoDefaultInput,
     /// The input could not be opened.
     #[error("input file {path:?} cannot be opened")]
     Open {
@@ -325,10 +337,18 @@ pub(crate) fn execute(cmd: &ImportCommand, ctx: &Context<'_>) -> ExitCode {
     let result = match cmd {
         ImportCommand::Agentdvr {
             file,
+            format,
             model,
             camera_model,
             dry_run,
-        } => agentdvr(ctx, file, model.as_deref(), camera_model, *dry_run),
+        } => agentdvr(
+            ctx,
+            file.as_deref(),
+            *format,
+            model.as_deref(),
+            camera_model,
+            *dry_run,
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -393,7 +413,8 @@ impl Choice {
 
 fn agentdvr(
     ctx: &Context<'_>,
-    file: &Path,
+    file: Option<&Path>,
+    format: FormatArg,
     model: Option<&str>,
     camera_model: &[String],
     dry_run: bool,
@@ -404,8 +425,10 @@ fn agentdvr(
     }
     let catalogue = super::camera::catalogue().map_err(ImportError::Catalogue)?;
     let choice = Choice::parse(model, camera_model, &catalogue)?;
-    let bytes = read_input(file)?;
-    let parsed = wardenlens_agentdvr::parse(&bytes).map_err(ImportError::Parse)?;
+    let file = input_path(file, DEFAULT_INPUTS)?;
+    let bytes = read_input(&file)?;
+    let parsed = wardenlens_agentdvr::parse_as(format_of(format, &bytes), &bytes)
+        .map_err(ImportError::Parse)?;
     drop(bytes);
     if choice
         .each
@@ -437,6 +460,39 @@ fn agentdvr(
         rows.extend(written);
     }
     print_table(&rows, &mut io::stdout().lock()).map_err(ImportError::Output)
+}
+
+/// Where an install keeps its configuration, in the order tried when no file is given: the
+/// current `objects.json`, then the older `objects.xml`. The numbered `.bak` copies are never read.
+const DEFAULT_INPUTS: &[&str] = &[
+    "/opt/AgentDVR/Media/XML/objects.json",
+    "/opt/AgentDVR/Media/XML/objects.xml",
+];
+
+/// The file to read: the given one, else the first of `defaults` that is not missing. A candidate
+/// is skipped only when `lstat` says `NotFound`; any other error (permission denied, a file in the
+/// way) returns that path, so opening it reports the real cause instead of "no file". A symbolic
+/// link counts as present (opening it later refuses it). Nothing is opened or read to choose.
+fn input_path(given: Option<&Path>, defaults: &[&str]) -> Result<PathBuf, ImportError> {
+    if let Some(p) = given {
+        return Ok(p.to_path_buf());
+    }
+    for candidate in defaults.iter().map(Path::new) {
+        match std::fs::symlink_metadata(candidate) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => return Ok(candidate.to_path_buf()),
+        }
+    }
+    Err(ImportError::NoDefaultInput)
+}
+
+/// The format to parse as: the forced one, else the one the content shows.
+fn format_of(arg: FormatArg, bytes: &[u8]) -> wardenlens_agentdvr::Format {
+    match arg {
+        FormatArg::Xml => wardenlens_agentdvr::Format::Xml,
+        FormatArg::Json => wardenlens_agentdvr::Format::Json,
+        FormatArg::Auto => wardenlens_agentdvr::detect(bytes),
+    }
 }
 
 /// What the dry run knows of the registry (see [`open_for_dry_run`]).
@@ -956,6 +1012,90 @@ fn print_table(rows: &[Row], out: &mut impl Write) -> io::Result<()> {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret as _;
+
+    #[test]
+    fn the_default_input_is_the_first_existing_candidate_and_a_given_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("objects.json");
+        let xml = dir.path().join("objects.xml");
+        let (j, x) = (json.to_str().unwrap(), xml.to_str().unwrap());
+        let defaults = [j, x];
+        // None exists.
+        assert!(matches!(
+            input_path(None, &defaults),
+            Err(ImportError::NoDefaultInput)
+        ));
+        // Only the later one exists.
+        std::fs::write(&xml, "<objects/>").unwrap();
+        assert_eq!(input_path(None, &defaults).unwrap(), xml);
+        // Both exist: the first wins.
+        std::fs::write(&json, "{}").unwrap();
+        assert_eq!(input_path(None, &defaults).unwrap(), json);
+        // A given file is used as it is, existing or not (opening it reports the error).
+        let given = dir.path().join("elsewhere");
+        assert_eq!(input_path(Some(&given), &defaults).unwrap(), given);
+        // A dangling link counts as present, so opening it refuses it by name.
+        std::fs::remove_file(&json).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &json).unwrap();
+        assert_eq!(input_path(None, &defaults).unwrap(), json);
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_examined_is_returned_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let hidden = locked.join("objects.json");
+        let next = dir.path().join("objects.xml");
+        std::fs::write(&next, "<objects/>").unwrap();
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let defaults = [hidden.to_str().unwrap(), next.to_str().unwrap()];
+        let probe = std::fs::symlink_metadata(&hidden);
+        let got = input_path(None, &defaults);
+        let opened = read_input(&hidden);
+        // Restore first, so the directory is removable whatever the assertions say.
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        // As root the directory stays readable: the candidate is simply missing, nothing to test.
+        if !matches!(probe, Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied) {
+            return;
+        }
+        assert_eq!(got.unwrap(), hidden);
+        assert!(matches!(opened, Err(ImportError::Open { .. })));
+    }
+
+    #[test]
+    fn no_default_input_exits_2() {
+        assert_eq!(ImportError::NoDefaultInput.exit_code(), 2);
+    }
+
+    #[test]
+    fn the_built_in_defaults_name_the_json_first_and_never_a_backup() {
+        assert_eq!(
+            DEFAULT_INPUTS,
+            [
+                "/opt/AgentDVR/Media/XML/objects.json",
+                "/opt/AgentDVR/Media/XML/objects.xml"
+            ]
+        );
+    }
+
+    #[test]
+    fn format_of_forces_or_detects() {
+        use wardenlens_agentdvr::Format;
+        let rows: [(FormatArg, &[u8], Format); 6] = [
+            (FormatArg::Auto, b"{}", Format::Json),
+            (FormatArg::Auto, b"<objects/>", Format::Xml),
+            (FormatArg::Xml, b"{}", Format::Xml),
+            (FormatArg::Json, b"<objects/>", Format::Json),
+            (FormatArg::Json, b"", Format::Json),
+            (FormatArg::Auto, b"", Format::Xml),
+        ];
+        for (arg, bytes, want) in rows {
+            assert_eq!(format_of(arg, bytes), want);
+        }
+    }
 
     #[test]
     fn table_lists_columns_and_never_more() {

@@ -128,6 +128,18 @@ fn every_import_error_variant_is_produced_and_clean() {
         seen.insert(std::mem::discriminant(e));
         assert_clean(&render(&r), label);
     }
+    // The two JSON-only variants (the JSON reader's own leak rows are in `json.rs`).
+    for text in [
+        format!("{{\"cameras\":[{{\"settings\":{{\"login\":[\"{PW}\"]}}}}]}}"),
+        format!("{{\"cameras\":[{{\"name\":\"{PW}\"}}] x"),
+        format!("{{\"cameras\":[{{\"settings\":\"{PW}\"}}]}}"),
+        format!("{{\"cameras\":[{{\"settings\":{{\"login\":\"{PW}\",\"login\":\"{PW}\"}}}}]}}"),
+    ] {
+        let r = crate::parse_json(text.as_bytes());
+        let e = r.as_ref().expect_err("json refused");
+        seen.insert(std::mem::discriminant(e));
+        assert_clean(&render(&r), "json");
+    }
     // Every variant were reached (the match forces a new variant to be listed).
     let variants = [
         ImportError::TooLarge,
@@ -143,6 +155,10 @@ fn every_import_error_variant_is_produced_and_clean() {
             first: 0,
             second: 1,
         },
+        ImportError::MalformedJson { line: 1, column: 1 },
+        ImportError::FieldNotText,
+        ImportError::RepeatedMember,
+        ImportError::WrongShape,
     ];
     for v in variants {
         match v {
@@ -155,6 +171,10 @@ fn every_import_error_variant_is_produced_and_clean() {
             | ImportError::TooManyCameras
             | ImportError::TooManyLogins
             | ImportError::NotObjects
+            | ImportError::MalformedJson { .. }
+            | ImportError::FieldNotText
+            | ImportError::RepeatedMember
+            | ImportError::WrongShape
             | ImportError::DuplicateName { .. } => {}
         }
         assert!(

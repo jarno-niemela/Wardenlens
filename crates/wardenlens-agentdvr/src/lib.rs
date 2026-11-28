@@ -1,4 +1,4 @@
-//! Parses an `AgentDVR` `objects.xml` into camera drafts. Pure: bytes in, drafts out; no network,
+//! Parses an `AgentDVR` `objects.xml` (or `objects.json`, #226) into camera drafts. Pure: bytes in, drafts out; no network,
 //! no storage, no clock (ADR 0004 crate table; ARCH-1). Writing the drafts to the registry and
 //! the vault is the CLI import task (#66).
 //!
@@ -39,6 +39,10 @@
 //!    is skipped, see below).
 //! 4. That a source of kind "local device" or "ONVIF only" has no `rtsp://` URL in
 //!    `videosourcestring` (such entries are skipped, see [`SkipReason`]).
+//!
+//! `objects.json` (#226) maps the same fields from a JSON layout that mirrors this one (see the
+//! `json` module: cameras array, nested `settings`; the layout is an assumption, not read from a
+//! real file) and shares everything after the read: the camera rules, ids, limits and logins.
 //!
 //! # What an import gives
 //!
@@ -104,6 +108,7 @@ mod credential;
 mod document;
 mod error;
 mod identity;
+mod json;
 mod logins;
 mod source;
 
@@ -184,6 +189,66 @@ pub fn parse(input: &[u8]) -> Result<Import, ImportError> {
     }
     let text = std::str::from_utf8(input).map_err(|_| ImportError::NotUtf8)?;
     let (raws, logins) = document::read(text)?;
+    assemble(raws, logins)
+}
+
+/// The two document formats of an `AgentDVR` install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Format {
+    /// `objects.xml`.
+    Xml,
+    /// `objects.json`.
+    Json,
+}
+
+/// The format of `input` by content: JSON when its first byte after an optional UTF-8 BOM and
+/// white space is `{`, XML otherwise (so a document of neither kind gets the XML error).
+#[must_use]
+pub fn detect(input: &[u8]) -> Format {
+    let body = input.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(input);
+    let first = body
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    if first == Some(b'{') {
+        Format::Json
+    } else {
+        Format::Xml
+    }
+}
+
+/// Parses an `AgentDVR` `objects.json`; see the `json` module for the layout. The same limits,
+/// the same camera rules and the same login collection as [`parse`].
+///
+/// # Errors
+/// An [`ImportError`] when the document is over a limit, is not UTF-8, is not well-formed JSON,
+/// is not an objects file, holds a non-string source or login member, or has two cameras with
+/// the same normalised name. The error never contains input text.
+pub fn parse_json(input: &[u8]) -> Result<Import, ImportError> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(ImportError::TooLarge);
+    }
+    let text = std::str::from_utf8(input).map_err(|_| ImportError::NotUtf8)?;
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let (raws, logins) = json::read(text)?;
+    assemble(raws, logins)
+}
+
+/// Parses `input` as `format`.
+///
+/// # Errors
+/// As [`parse`] or [`parse_json`].
+pub fn parse_as(format: Format, input: &[u8]) -> Result<Import, ImportError> {
+    match format {
+        Format::Xml => parse(input),
+        Format::Json => parse_json(input),
+    }
+}
+
+/// The camera rules over the raw entries of either format: one place, so XML and JSON cannot
+/// differ in what they accept.
+fn assemble(raws: Vec<document::RawCamera>, logins: Logins) -> Result<Import, ImportError> {
     let mut import = Import {
         logins,
         ..Import::default()

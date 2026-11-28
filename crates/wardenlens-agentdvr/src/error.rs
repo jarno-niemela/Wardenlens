@@ -26,6 +26,21 @@ pub enum ImportError {
         /// Byte offset in the input where the parser gave up.
         position: u64,
     },
+    /// The JSON is not well formed: a syntax error, a truncated document, text after the value,
+    /// an invalid escape or a control character in a string. The line and column are positions
+    /// only; the parser's own message (which can echo input) is never forwarded.
+    #[error("the document is not well-formed JSON (line {line}, column {column})")]
+    MalformedJson {
+        /// One-based line of the failure.
+        line: usize,
+        /// One-based column of the failure.
+        column: usize,
+    },
+    /// A `videosourcestring`, `login` or `password` member of a JSON camera is a number, a
+    /// boolean, an array or an object. Refused whole: a value that is not collected as a login
+    /// could leak into a path.
+    #[error("a source or login member is not a string")]
+    FieldNotText,
     /// Elements are nested deeper than [`crate::MAX_DEPTH`].
     #[error("elements are nested deeper than the limit")]
     TooDeep,
@@ -39,9 +54,19 @@ pub enum ImportError {
     /// is not collected could leak into a path.
     #[error("the document holds more login values, or costs more login work, than the limit")]
     TooManyLogins,
-    /// The document is well formed but its root element is not `objects`, or it has none.
+    /// The document is not an objects file: an XML root element that is not `objects` (or none),
+    /// or a JSON document whose first value is not an object, or that has no `cameras` member
+    /// (or one that is `null`).
     #[error("the document is not an AgentDVR objects file")]
     NotObjects,
+    /// A JSON member is repeated in one object (two `login`, two `settings`, ...): the text has
+    /// two meanings, so the whole document is refused.
+    #[error("a JSON member is repeated in one object")]
+    RepeatedMember,
+    /// A JSON member has the wrong type where a structure is needed (a `settings` or a camera
+    /// that is not an object, `cameras` that is not an array).
+    #[error("a JSON member has the wrong type")]
+    WrongShape,
     /// Two imported cameras have the same name once normalised. Never merged and never resolved
     /// by first-wins: a credential must not land on the wrong camera (ADR 0006, #43). The
     /// positions are those of the two `camera` elements (the name itself is not reported).
