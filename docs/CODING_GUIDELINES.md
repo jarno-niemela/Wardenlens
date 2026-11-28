@@ -40,7 +40,7 @@ Goals, in priority order: **correct → secure → clear → maintainable → fa
   correct behaviour unchanged?
   Good: the recorder opens the streams the registry lists, choosing the stream
   the catalogue marks as main for that camera's model.
-  Bad: `if id == "reolink-1" { use_sub_stream() }`, a default of four cameras,
+  Bad: `if id == "front-door" { use_sub_stream() }`, a default of four cameras,
   or a sample config that carries a real LAN address (use RFC 5737 addresses
   such as `192.0.2.10`).
 

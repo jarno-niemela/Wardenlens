@@ -196,7 +196,7 @@ No major recurred in #75, #117, #32, #43, so this is compact. P3 minors did recu
 8. **P7:** is each assertion independent of the code under test? Do the generators reach the interesting branches? Are boundaries covered at -1, exact and +1?
 9. **P10:** for each policy, is it enforced at one choke point, by a pass-list or an exact match, and tested over every entry point? Do two components that must agree share one predicate?
 10. **P11:** for an invariant over an open input space, is the enumeration written and table-tested, and is every skip-optimisation proven in both directions?
-11. **ARCH-7:** does the diff hardcode anything about one site's cameras (a count, a model mix, an id such as `reolink-1` used as an identifier, a per-camera stream choice, a host or LAN address, a path)? Site facts come from the registry, config or vault; vendor and model facts live in `cameras/*.toml`; only vendor protocols may be named in code.
+11. **ARCH-7:** does the diff hardcode anything about one site's cameras (a count, a model mix, an id such as `front-door` used as an identifier, a per-camera stream choice, a host or LAN address, a path)? Site facts come from the registry, config or vault; vendor and model facts live in `cameras/*.toml`; only vendor protocols may be named in code.
 12. Are deviations, assumptions and anything left undone listed in NOTES FOR VERIFIERS?
 
 Last retro: 2026-11-25, PRs #71 (rework), #122, #125, #127 (retro #130). Earlier: 2026-11-24, PRs #93-#119. P10 recurred in all four and is now SEC-10; P11 is new (TEST-9).

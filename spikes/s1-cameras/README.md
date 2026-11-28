@@ -6,7 +6,7 @@ camera owner's explicit approval each time (`https-off` disables it). The defaul
 
 Inputs: hosts and credentials come from the Wardenlens vault (`wardenlens vault get cam:<id>:host`,
 `cam:<id>:credential`; see `docs/DEV_VAULT.md`), so `wardenlens` must be on `PATH` (or set `WARDENLENS_BIN`) and
-the vault initialised and imported. A camera is named by its inventory id (`reolink-1`, `xr`, ...).
+the vault initialised and imported. A camera is named by its inventory id (`cam-1`, `front-door`, ...).
 The legacy files (`agentdvr-cameras.secret.json`, `cameras.local.toml`) and `WARDENLENS_SECRET_FILE` /
 `WARDENLENS_CAMERAS` are read only by `wardenlens vault import-legacy`; delete the legacy files yourself after a verified
 import and a key export. The ONVIF port is `ONVIF_PORT` or the optional vault entry `cam:<id>:onvif_port`.
@@ -19,7 +19,7 @@ import and a key export. The ONVIF port is `ONVIF_PORT` or the optional vault en
 | `gop_sample.sh [secs]` | fps, bitrate and GOP per stream |
 | `onvif.sh` | minimal ONVIF SOAP client (WS-Security digest) |
 | `onvif_pull.sh` | ONVIF PullPoint event watcher (Tapo); `ONVIF_PULL_RAW_DIR` saves redacted raw notifications |
-| `onvif_flaky.sh` | ONVIF reliability measurement (hdipc) |
+| `onvif_flaky.sh` | ONVIF reliability measurement (a generic ONVIF camera) |
 | `dahua.sh` | Dahua CGI GET and `eventManager` attach long-poll |
 | `run_baichuan.sh` + `baichuan-probe/` | Reolink Baichuan login, service-port read, motion event push; optional action `abilities` (read) or `https-on`/`https-off` (WRITE, owner approval) |
 
