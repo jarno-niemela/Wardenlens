@@ -1,6 +1,6 @@
 [package]
 name = "wardenlens-agentdvr"
-description = "Parses an AgentDVR objects.xml into camera drafts. No network, no storage."
+description = "Parses an AgentDVR objects.xml or objects.json into camera drafts. No network, no storage."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 quick-xml = { version = "0.42", default-features = false }
 secrecy.workspace = true
+serde.workspace = true
+serde_json = "1"
 thiserror = { workspace = true }
 wardenlens-core.workspace = true
 

@@ -26,6 +26,21 @@ pub enum ImportError {
         /// Byte offset in the input where the parser gave up.
         position: u64,
     },
+    /// The JSON is not well formed: a syntax error, a truncated document, text after the value,
+    /// an invalid escape or a control character in a string. The line and column are positions
+    /// only; the parser's own message (which can echo input) is never forwarded.
+    #[error("the document is not well-formed JSON (line {line}, column {column})")]
+    MalformedJson {
+        /// One-based line of the failure.
+        line: usize,
+        /// One-based column of the failure.
+        column: usize,
+    },
+    /// A `videosourcestring`, `login` or `password` member of a JSON camera is a number, a
+    /// boolean, an array or an object. Refused whole: a value that is not collected as a login
+    /// could leak into a path.
+    #[error("a source or login member is not a string")]
+    FieldNotText,
     /// Elements are nested deeper than [`crate::MAX_DEPTH`].
     #[error("elements are nested deeper than the limit")]
     TooDeep,

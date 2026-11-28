@@ -9,6 +9,7 @@ mod document;
 mod fields;
 mod fixtures;
 mod identity;
+mod json;
 mod leaks;
 mod logins;
 mod props;
