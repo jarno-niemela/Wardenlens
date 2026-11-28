@@ -243,7 +243,8 @@ fn split(v: &str) -> (&str, &str) {
 // decides what a tree entry is by the file-type bits of its octal mode (`S_ISDIR`), not by the
 // exact text `40000`: an entry with mode `40755` is a directory to git (`ls-tree -r`, checkout,
 // `rev-list --objects` and the remote all descend into it), and fsck only warns
-// (`badFilemode`). The walk treats every mode it does not spell as a file and never descends.
+// (`badFilemode`). The walk classifies a mode as git does (octal, file-type bits), so such an
+// entry is descended into like `40000`; these tests pin that.
 // ---------------------------------------------------------------------------------------------
 
 /// A base commit with `holder/{inner}/f.txt` (published), then a commit whose root holds the

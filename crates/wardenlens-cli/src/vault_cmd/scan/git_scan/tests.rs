@@ -940,6 +940,40 @@ fn an_empty_directory_named_with_a_value_is_found_and_reported_without_the_name(
 }
 
 #[test]
+fn a_directory_holding_only_an_empty_tree_is_scanned_by_name() {
+    // `d-<value>/inner/` where `inner` is an empty tree: no file anywhere below, and the new
+    // root tree is the only new tree whose names say anything.
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    let base = r.commit(&[], "base");
+    let empty = r.git_in(&["mktree"], b"");
+    let holder = r.git_in(
+        &["mktree"],
+        format!("040000 tree {empty}\tinner\n").as_bytes(),
+    );
+    let entries = format!(
+        "{}\n040000 tree {holder}\td-{V_PATH}\n",
+        r.git(&[], &["ls-tree", "HEAD"])
+    );
+    let tree = r.git_in(&["mktree"], entries.as_bytes());
+    let c = r.git(
+        &[],
+        &["commit-tree", &tree, "-p", &base, "-m", "nested empty"],
+    );
+    let m = matcher(&[("e:path", V_PATH)]);
+    let found = r.range(Some(&base), &c, Sources::ALL, &m);
+    expect(&ids(&found), &["e:path"]);
+    // Reported at the empty directory (nothing below it reports the value): the full path
+    // `d-<value>/inner`, redacted.
+    let shown = render(&m, &loc(&found.findings[0].at, &found.paths)).to_string();
+    assert!(shown.starts_with("<redacted-path> tree "), "{shown}");
+    expect(
+        &ids(&r.range(Some(&base), &c, Sources::ALL.without(Sources::PATHS), &m)),
+        &[],
+    );
+}
+
+#[test]
 fn a_directory_name_found_through_a_file_path_is_reported_once() {
     // The root tree names the directory and the path of the file below it holds the same name.
     let r = Repo::new();
@@ -1275,8 +1309,9 @@ fn an_unchanged_subtree_is_read_once_and_skipped_at_the_same_path() {
 }
 
 #[test]
-fn old_trees_count_toward_the_tree_byte_bound() {
-    // A loader that reports more bytes than allowed fails the walk closed.
+fn a_loader_error_fails_the_walk_closed() {
+    // Only the propagation: whatever the loader reports, the walk stops with that error. The
+    // byte budget itself is tested against real git below.
     let m = matcher(&[("e:path", V_PATH)]);
     let old = fake_sha(3);
     let mut cache: HashMap<Sha, walk::Entries> =
@@ -1292,6 +1327,236 @@ fn old_trees_count_toward_the_tree_byte_bound() {
         true,
     );
     assert_eq!(r, Err(GitError::TooLarge));
+}
+
+fn size_of(r: &Repo, rev: &str) -> usize {
+    r.git(&[], &["cat-file", "-s", rev]).parse().unwrap()
+}
+
+#[test]
+fn an_old_subtree_counts_toward_a_small_tree_budget_in_real_git() {
+    // `git mv` keeps the subtree id: the new root tree is the only new tree, `e` leads to the
+    // old tree of `d`, which is read on demand and must be charged.
+    let r = Repo::new();
+    std::fs::create_dir(r.path().join("d")).unwrap();
+    for n in ["one", "two", "three"] {
+        r.write(&format!("d/{n}"), n.as_bytes());
+    }
+    let base = r.commit(&[], "base");
+    r.git(&[], &["mv", "d", "e"]);
+    let c = r.commit(&[], "moved");
+    let (new_root, old) = (
+        size_of(&r, "HEAD^{tree}"),
+        size_of(&r, &format!("{base}:d")),
+    );
+    let m = matcher(&[("e:path", V_PATH)]);
+    let run = |tree_bytes: usize| {
+        let limits = Limits {
+            tree_bytes,
+            ..Limits::DEFAULT
+        };
+        collect_range_in(
+            &m,
+            &Git::at(r.path()),
+            (Some(&r.sha(&base)), &r.sha(&c), None),
+            &[],
+            Sources::ALL,
+            Collected::with_limits(limits),
+        )
+    };
+    // Exactly the new root plus the old subtree fits; one byte less does not, and the new root
+    // alone would have fitted, so it is the old subtree that is refused.
+    assert!(run(new_root.saturating_add(old)).is_ok());
+    assert_eq!(
+        run(new_root.saturating_add(old).saturating_sub(1)).err(),
+        Some(GitError::TooLarge)
+    );
+    // The new root alone as the budget is refused: the old subtree is what passes it.
+    assert!(run(new_root).is_err());
+    assert!(old > 1);
+    // Control: the default budget is the documented 32 MiB.
+    assert_eq!(walk::MAX_TREE_BYTES, 32 * 1024 * 1024);
+    assert_eq!(Limits::DEFAULT.tree_bytes, walk::MAX_TREE_BYTES);
+}
+
+fn file_entry(name: &str, id: &Sha) -> TreeEntry {
+    TreeEntry {
+        name: name.as_bytes().to_vec(),
+        mode: walk::EntryMode::Blob,
+        id: id.clone(),
+    }
+}
+
+#[test]
+fn the_stored_paths_have_an_exact_byte_budget() {
+    // f1 (2 bytes: the visited set and the blob paths), d (1: visited), d/e (3 + 3).
+    let m = matcher(&[("e:path", V_PATH)]);
+    let blob = fake_sha(9);
+    let trees = HashMap::from([
+        (
+            fake_sha(1),
+            vec![file_entry("f1", &blob), dir_entry("d", &fake_sha(2))],
+        ),
+        (fake_sha(2), vec![file_entry("e", &blob)]),
+    ]);
+    let root = fake_sha(1);
+    let run = |path_bytes: usize| {
+        let mut found = Collected::with_limits(Limits {
+            path_bytes,
+            ..Limits::DEFAULT
+        });
+        walk::walk(&m, &mut found, &trees, [&root])
+    };
+    assert_eq!(run(11), Ok(()));
+    assert_eq!(run(10), Err(GitError::PathBytes));
+    assert_eq!(run(0), Err(GitError::PathBytes));
+    assert_eq!(walk::MAX_PATH_BYTES, 64 * 1024 * 1024);
+    assert_eq!(Limits::DEFAULT.path_bytes, walk::MAX_PATH_BYTES);
+}
+
+#[test]
+fn a_repeating_tree_of_long_paths_hits_the_byte_budget_before_the_place_bound() {
+    // 30 levels, two entries per level with 100-byte names: 2^k paths of up to 3000 bytes. A
+    // small byte budget stops it long before MAX_PLACES, with its own fail-closed error.
+    let m = matcher(&[("e:path", V_PATH)]);
+    let a = "a".repeat(100);
+    let b = "b".repeat(100);
+    let mut trees = HashMap::new();
+    for i in 1..=30u8 {
+        let next = fake_sha(i + 1);
+        trees.insert(
+            fake_sha(i),
+            vec![dir_entry(&a, &next), dir_entry(&b, &next)],
+        );
+    }
+    let root = fake_sha(1);
+    let mut small = Collected::with_limits(Limits {
+        path_bytes: 4096,
+        ..Limits::DEFAULT
+    });
+    assert_eq!(
+        walk::walk(&m, &mut small, &trees, [&root]),
+        Err(GitError::PathBytes)
+    );
+    assert!(small.findings.is_empty());
+}
+
+#[test]
+fn the_same_name_in_two_trees_is_reported_in_each() {
+    // Two roots hold a directory of the same name with different content. The visited set is
+    // keyed by (full path, entry id), so the second is not dropped as a repeat of the first.
+    let m = matcher(&[("e:path", V_PATH)]);
+    let name = format!("d-{V_PATH}");
+    let trees = HashMap::from([
+        (fake_sha(1), vec![dir_entry(&name, &fake_sha(3))]),
+        (fake_sha(2), vec![dir_entry(&name, &fake_sha(4))]),
+        (fake_sha(3), Vec::new()),
+        (fake_sha(4), vec![file_entry("f", &fake_sha(9))]),
+    ]);
+    let (r1, r2) = (fake_sha(1), fake_sha(2));
+    let mut found = Collected::default();
+    walk::walk(&m, &mut found, &trees, [&r1, &r2]).unwrap();
+    // The empty directory is a place of its own (tree 1); the other is published by its file.
+    assert_eq!(found.findings.len(), 2);
+    let sha_of = |f: &Finding| match &f.at {
+        Where::TreePath { sha, .. } | Where::BlobPath { sha, .. } => sha.clone(),
+        other => panic!("{other:?}"),
+    };
+    let places: BTreeSet<Sha> = found.findings.iter().map(sha_of).collect();
+    assert_eq!(places.len(), 2, "two different places: {places:?}");
+}
+
+#[test]
+fn the_path_byte_bound_has_its_own_refusal_text() {
+    let CliError::Refused(text) = git_error(GitError::PathBytes) else {
+        panic!("not a refusal");
+    };
+    assert!(text.contains("paths"), "{text}");
+    assert_ne!(
+        git_error(GitError::PathBytes).to_string(),
+        git_error(GitError::TooMany).to_string()
+    );
+}
+
+/// A git wrapper that logs every call's arguments, answers `version` as `version_line` and
+/// otherwise runs the real git. Returns the wrapper and the log's path.
+fn logging_git(dir: &Path, version_line: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("calls.log");
+    let exe = dir.join("logging-git");
+    let real = Git::locate();
+    let real = real.exe_for_test();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a in \"$@\"; do if [ \"$a\" = version ]; then printf '%s\\n' '{version_line}'; exit 0; fi; done\nexec '{}' \"$@\"\n",
+        log.display(),
+        real.display()
+    );
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (exe, log)
+}
+
+#[test]
+fn the_lazy_fetch_guard_runs_before_any_revision_is_resolved() {
+    // A partial clone, an old git (raised minimum) and a range naming an object that is not
+    // there: the refusal comes first, and the first and only git calls are the guard's.
+    let r = Repo::new();
+    r.write("a.txt", b"a\n");
+    r.commit(&[], "base");
+    r.git(&[], &["config", "extensions.partialclone", "origin"]);
+    let tools = tempfile::tempdir().unwrap();
+    let (exe, log) = logging_git(tools.path(), "git version 2.43.0");
+    let git = Git::with_exe(&exe, r.path());
+    let missing = "1".repeat(40);
+    for args in [
+        ScanArgs {
+            range: Some(format!("{missing}..HEAD")),
+            ..ScanArgs::default()
+        },
+        ScanArgs {
+            staged: true,
+            ..ScanArgs::default()
+        },
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let got = source_with_min(&args, &git, (2, 44));
+        let Err(CliError::Refused(text)) = got else {
+            panic!("not refused");
+        };
+        assert!(text.contains("2.44"), "{text}");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        for c in calls.lines() {
+            // (`rev-parse --git-dir` and `config` read no object; resolving a revision does.)
+            assert!(
+                !c.contains("--verify") && !c.contains("cat-file") && !c.contains("rev-list"),
+                "an object-reading call ran before the refusal: {c}"
+            );
+        }
+        assert!(calls.lines().next().unwrap().contains("version"), "{calls}");
+    }
+    // Control: a new enough minimum goes on to resolve the revision (and fails on the
+    // missing object), so the log shows it is the guard that stopped the scan above.
+    let _ = std::fs::remove_file(&log);
+    let args = ScanArgs {
+        range: Some(format!("{missing}..HEAD")),
+        ..ScanArgs::default()
+    };
+    assert!(source_with_min(&args, &git, (2, 0)).is_err());
+    assert!(std::fs::read_to_string(&log).unwrap().contains("--verify"));
+    // Path scans use no git at all.
+    let _ = std::fs::remove_file(&log);
+    let paths = ScanArgs::default();
+    assert!(matches!(source_with_min(&paths, &git, (99, 0)), Ok(None)));
+    assert!(!log.exists());
+}
+
+#[test]
+fn a_partial_clone_with_an_old_git_is_a_refusal_with_its_own_text() {
+    let CliError::Refused(text) = git_error(GitError::PartialClone) else {
+        panic!("not a refusal");
+    };
+    assert!(text.contains("2.44"), "{text}");
+    assert!(!text.contains("too large"), "{text}");
 }
 
 #[test]

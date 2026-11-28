@@ -111,28 +111,28 @@ for line in ${input[@]+"${input[@]}"}; do
   idx=$((idx + 1))
   read -r lref lsha rref rsha <<<"$line"
   case "$rref" in
-    refs/heads/main|refs/heads/master) refuse "never push to main; open a PR" "$lref -> $rref" ;;
+    refs/heads/main|refs/heads/master) refuse "never push to main; open a PR" "ref:$idx" ;;
   esac
   case "$rref" in
-    refs/tags/*) if ! is_zero "$rsha"; then refuse "existing tags are immutable (no update or deletion, forward or rewrite)" "$rref"; fi ;;
+    refs/tags/*) if ! is_zero "$rsha"; then refuse "existing tags are immutable (no update or deletion, forward or rewrite)" "ref:$idx"; fi ;;
   esac
-  if is_zero "$lsha"; then refuse "deleting remote branches requires the user" "$rref"; fi
+  if is_zero "$lsha"; then refuse "deleting remote branches requires the user" "ref:$idx"; fi
   if ! is_zero "$rsha"; then
-    git cat-file -e "$rsha^{commit}" 2>/dev/null || refuse "unknown remote state; fetch first" "$rref at $rsha"
+    git cat-file -e "$rsha^{commit}" 2>/dev/null || refuse "unknown remote state; fetch first" "ref:$idx at $rsha"
     if ! git merge-base --is-ancestor "$rsha" "$lsha" 2>/dev/null; then
       if [[ "${WARDENLENS_ALLOW_REWRITE:-}" == 1 && "$rref" == refs/heads/* ]]; then
         echo "pre-push: WARNING: rewriting $rref (WARDENLENS_ALLOW_REWRITE=1)" >&2
       else
-        refuse "non-fast-forward / force push" "$rref"
+        refuse "non-fast-forward / force push" "ref:$idx"
       fi
     fi
   fi
-  wf=$(workflow_files "$lsha" "$rsha" 2>/dev/null) || refuse "cannot inspect the pushed commits for workflow changes" "$rref"
+  wf=$(workflow_files "$lsha" "$rsha" 2>/dev/null) || refuse "cannot inspect the pushed commits for workflow changes" "ref:$idx"
   if [[ -n "$wf" ]]; then
     if [[ "${WARDENLENS_ALLOW_WORKFLOWS:-}" == 1 ]]; then
       echo "pre-push: WARNING: pushing changes to .github/workflows/ (WARDENLENS_ALLOW_WORKFLOWS=1)" >&2
     else
-      refuse "changes to .github/workflows/ need the user (WARDENLENS_ALLOW_WORKFLOWS=1, human only)" "$rref: $(head -n1 <<<"$wf")"
+      refuse "changes to .github/workflows/ need the user (WARDENLENS_ALLOW_WORKFLOWS=1, human only)" "ref:$idx"
     fi
   fi
 done

@@ -12,8 +12,9 @@
 //! full paths scanned, so it is skipped; the same subtree at a different path is walked again.
 //!
 //! It is an explicit stack over one shared path buffer (no recursion, so no overflow), and it is
-//! bounded: a path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places and more than
-//! [`MAX_TREE_BYTES`] of raw trees (old ones included) fail the scan closed.
+//! bounded: a path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places, more than
+//! [`MAX_PATH_BYTES`] of stored paths and more than [`MAX_TREE_BYTES`] of raw trees (old ones
+//! included) fail the scan closed. The bounds are read from `Collected::limits`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -30,6 +31,10 @@ pub(super) const MAX_PATH_LEN: usize = 4096;
 pub(super) const MAX_PLACES: usize = 500_000;
 /// Most bytes of raw tree objects held for one scan.
 pub(super) const MAX_TREE_BYTES: usize = 32 * 1024 * 1024;
+/// Most bytes of paths the walk stores for one scan (the visited set and the paths of blobs):
+/// a crafted repeating tree has up to [`MAX_PLACES`] places of [`MAX_PATH_LEN`] bytes, which
+/// would be gigabytes before the places bound stops it.
+pub(super) const MAX_PATH_BYTES: usize = 64 * 1024 * 1024;
 
 /// What a tree entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +55,10 @@ pub(super) struct TreeEntry {
 }
 
 /// Longest mode text accepted (git writes at most six octal digits; this leaves room for a
-/// leading zero and no more).
+/// leading zero and no more). DELIBERATE: git itself accepts longer octal text (`00040000` is
+/// a directory to `ls-tree` and checkout), but no tool writes it, and a mode the scan cannot
+/// be sure it reads as git does is `Malformed` (exit 2), never a guess. Fail closed beats
+/// matching git's leniency.
 const MAX_MODE_LEN: usize = 7;
 
 /// Classifies a tree entry's mode text the way git does: an octal number whose file-type bits
@@ -128,6 +136,22 @@ struct Frame {
     covered: Vec<EntryId>,
 }
 
+impl Frame {
+    /// The walk of a root tree: no path yet, nothing reported at it.
+    fn root(tree: &Sha, entries: Entries) -> Self {
+        Self {
+            tree: tree.clone(),
+            entries,
+            next: 0,
+            dir_len: 0,
+            slash: false,
+            at: None,
+            hits: Vec::new(),
+            covered: Vec::new(),
+        }
+    }
+}
+
 /// Closes a directory: its own hits that nothing below reported are reported at it, and what it
 /// held is reported at or below it for the directory above.
 fn finish(found: &mut Collected, frame: Frame, parent: Option<&mut Frame>) {
@@ -139,6 +163,23 @@ fn finish(found: &mut Collected, frame: Frame, parent: Option<&mut Frame>) {
     if let Some(p) = parent {
         p.covered.extend(frame.hits.into_iter().map(|(id, _)| id));
         p.covered.extend(frame.covered);
+    }
+}
+
+/// Bytes of paths stored so far, against the budget.
+struct Stored {
+    bytes: usize,
+    budget: usize,
+}
+
+impl Stored {
+    /// Charges `n` bytes: `PathBytes` once the budget is passed.
+    fn add(&mut self, n: usize) -> Result<(), GitError> {
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > self.budget {
+            return Err(GitError::PathBytes);
+        }
+        Ok(())
     }
 }
 
@@ -172,7 +213,8 @@ pub(super) fn walk<'a>(
 /// `skip_seen` false the visited-set skip is off (a test of the skip: same hits, more work).
 ///
 /// # Errors
-/// A path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places, or a loader error.
+/// A path longer than [`MAX_PATH_LEN`], more than [`MAX_PLACES`] places, more than
+/// [`MAX_PATH_BYTES`] of stored paths (`PathBytes`), or a loader error.
 pub(super) fn walk_with<'a>(
     matcher: &Matcher,
     found: &mut Collected,
@@ -184,22 +226,17 @@ pub(super) fn walk_with<'a>(
     let mut seen: HashSet<(Vec<u8>, Sha)> = HashSet::new();
     let mut failed: HashSet<Sha> = HashSet::new();
     let mut places: usize = 0;
+    let mut stored = Stored {
+        bytes: 0,
+        budget: found.limits.path_bytes,
+    };
     let mut path: Vec<u8> = Vec::new();
     let mut blob_paths: BTreeMap<Sha, Vec<Vec<u8>>> = BTreeMap::new();
     for root in roots {
         let Some(entries) = cache.get(root).cloned() else {
             continue;
         };
-        let mut stack = vec![Frame {
-            tree: root.clone(),
-            entries,
-            next: 0,
-            dir_len: 0,
-            slash: false,
-            at: None,
-            hits: Vec::new(),
-            covered: Vec::new(),
-        }];
+        let mut stack = vec![Frame::root(root, entries)];
         while let Some(top) = stack.last_mut() {
             let entries = Rc::clone(&top.entries);
             let Some(entry) = entries.get(top.next) else {
@@ -217,7 +254,9 @@ pub(super) fn walk_with<'a>(
             if path.len() > MAX_PATH_LEN {
                 return Err(GitError::PathTooLong);
             }
-            if !seen.insert((path.clone(), entry.id.clone())) && skip_seen {
+            if seen.insert((path.clone(), entry.id.clone())) {
+                stored.add(path.len())?;
+            } else if skip_seen {
                 continue;
             }
             places = places.saturating_add(1);
@@ -226,6 +265,7 @@ pub(super) fn walk_with<'a>(
             }
             let at = place(entry, &path, &top.tree);
             if entry.mode == EntryMode::Blob {
+                stored.add(path.len())?;
                 blob_paths
                     .entry(entry.id.clone())
                     .or_default()

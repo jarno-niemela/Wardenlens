@@ -25,8 +25,32 @@ check "the staged pre-push passes every pre-push test" env HOOKS="$staged" "$roo
 for adv in "$root"/scripts/tests/adversarial/pre-push-*.adv.sh; do
   check "the staged pre-push passes $(basename "$adv")" env HOOKS="$staged" "$adv"
 done
-removed=$(diff -u "$root/.githooks/pre-push" "$staged/pre-push" | grep '^-' | grep -vc '^---' || true)
-check "the staged pre-push only adds lines to the installed one" test "$removed" -eq 0
+# Nothing is removed from the installed pre-push except the DETAIL argument of a refusal (#128): a POSITIONAL, ALLOW-LIST
+# check in a helper shared with the adversarial tests (see scripts/tests/lib/hook-pairing.sh).
+# shellcheck disable=SC1091 # sourced helper
+source "$root/scripts/tests/lib/hook-pairing.sh"
+check "the staged pre-push only adds lines to the installed one, or changes a refusal's detail alone" test "$(hook_pairing_gap "$root/.githooks/pre-push" "$staged/pre-push")" -eq 0
+# Self-test: every mutant of a security-relevant line is rejected by the same check (mutants live in $tmp only).
+# shellcheck disable=SC2329 # called through `check`
+mut() { sed -E "$1" "$staged/pre-push" >"$tmp/mutant"; ! cmp -s "$tmp/mutant" "$staged/pre-push" || return 1; test "$(hook_pairing_gap "$root/.githooks/pre-push" "$tmp/mutant")" -gt 0; }
+# shellcheck disable=SC2016 # the sed expressions are literal shell text
+{
+check "the pairing check rejects a disabled main condition" mut 's/refs\/heads\/main\|refs\/heads\/master\) refuse/refs\/heads\/main) refuse/'
+check "the pairing check rejects a disabled tag condition" mut 's/then refuse "existing tags/then true "existing tags/'
+check "the pairing check rejects true || refuse" mut 's/git cat-file -e "\$rsha\^\{commit\}" 2>\/dev\/null \|\| refuse/true || refuse/'
+check "the pairing check rejects a workflow-inspection failure that no longer refuses" mut 's/2>\/dev\/null\) \|\| refuse "cannot inspect/2>\/dev\/null) || true refuse "cannot inspect/'
+check "the pairing check rejects a dropped refusal" mut 's/^( +)refuse "non-fast-forward \/ force push" "ref:\$idx"/\1true "non-fast-forward \/ force push"/'
+check "the pairing check rejects a refusal moved into a dead function" mut 's/^( +)(git cat-file -e .*)$/\1_dead() { \2; }/'
+check "the pairing check rejects code after the detail: & #" mut 's/(refuse "unknown remote state; fetch first" "ref:\$idx at \$rsha")$/\1 \& #"/'
+check "the pairing check rejects code after the detail: a piped refusal (main)" mut 's/(refuse "never push to main; open a PR" "ref:\$idx") ;;/\1 | true "" ;;/'
+check "the pairing check rejects code after the detail: a piped refusal (unknown remote)" mut 's/(refuse "unknown remote state; fetch first" "ref:\$idx at \$rsha")$/\1 | true ""/'
+check "the pairing check rejects code after the detail: a piped refusal (workflow inspection)" mut 's/(refuse "cannot inspect the pushed commits for workflow changes" "ref:\$idx")$/\1 | true ""/'
+check "the pairing check rejects code after the detail: exit 0" mut 's/(refuse "unknown remote state; fetch first" "ref:\$idx at \$rsha")$/\1; exit 0; : ""/'
+check "the pairing check rejects a redefinition of refuse" mut 's/(refuse "unknown remote state; fetch first" "ref:\$idx at \$rsha")$/\1; refuse() { :; }; : ""/'
+check "the pairing check rejects a detail that prints the update line" mut 's/(refuse "existing tags are immutable[^"]*") "ref:\$idx"/\1 "$line"/'
+check "the pairing check rejects a detail that prints the local ref" mut 's/(refuse "deleting remote branches requires the user") "ref:\$idx"/\1 "${line%% *}"/'
+check "the pairing check rejects a detail that prints the remote ref" mut 's/(refuse "non-fast-forward \/ force push") "ref:\$idx"/\1 "${rref}"/'
+}
 removed=$(diff -u "$root/.githooks/pre-commit" "$staged/pre-commit" | grep '^-' | grep -vc '^---' || true)
 check "the staged pre-commit only adds lines to the installed one" test "$removed" -eq 0
 check "no WARDENLENS_BIN override in either hook" bash -c "! grep -q 'WARDENLENS_BIN' '$staged/pre-push' '$staged/pre-commit' || ! grep -v '^#' '$staged/pre-push' '$staged/pre-commit' | grep -q 'WARDENLENS_BIN'"
@@ -162,5 +186,27 @@ rsha=$(git -C "$tmp/remote.git" rev-parse refs/heads/feat/two)
 del=":refs/heads/feat/two"
 checkf "a deletion with a clean scan: still refused by the policy" git -C "$w" push -q origin "$del"
 check "a deletion is scanned over --range=<rsha>..<rsha>" grep -q -- "^ARGS vault scan --default-paths --range=$rsha\.\.$rsha " "$tmp/calls"
+
+# every policy refusal names the update by index, never by ref name (#128), whatever the refusal is.
+fake 0
+name="zq-ref-name-mark"
+git -C "$w" checkout -q -b "feat/$name"; more
+git -C "$w" push -q origin "feat/$name" 2>/dev/null   # the remote now has the branch
+git -C "$w" reset -q --hard HEAD~1; more   # the local branch no longer descends from the remote one
+checkf "a force push is refused" git -C "$w" push -q --force origin "feat/$name"
+check "a force push refusal says ref:0 and never the name" bash -c "! git -C '$w' push -q --force origin 'feat/$name' 2>&1 | grep -q '$name'"
+check "a force push refusal names the update by index" bash -c "git -C '$w' push -q --force origin 'feat/$name' 2>&1 | grep -q 'ref:0'"
+check "a push to main is refused by index, not by name of the local ref" bash -c "out=\$(git -C '$w' push -q origin 'feat/$name:refs/heads/main' 2>&1); grep -q 'ref:0' <<<\"\$out\" && ! grep -q '$name' <<<\"\$out\""
+check "a deletion is refused by index, not by name" bash -c "out=\$(git -C '$w' push -q origin ':refs/heads/feat/$name' 2>&1); grep -q 'ref:0' <<<\"\$out\" && ! grep -q '$name' <<<\"\$out\""
+
+# a workflow-change refusal on a value-like branch name names the update by index and never prints the name or the path.
+fake 0
+wfname="zq-wf-branch-mark"
+git -C "$w" checkout -q -b "feat/$wfname"
+mkdir -p "$w/.github/workflows"; echo "name: zq-wf-file-mark" >"$w/.github/workflows/zq-wf-file-mark.yml"
+git -C "$w" add .github; tree=$(git -C "$w" write-tree); c=$(git -C "$w" commit-tree "$tree" -p HEAD -m wf); git -C "$w" update-ref HEAD "$c"
+checkf "a workflow change is refused" git -C "$w" push -q origin "feat/$wfname"
+check "the workflow refusal is the workflow one and says ref:0" bash -c "git -C '$w' push -q origin 'feat/$wfname' 2>&1 | grep -q 'workflows.*ref:0'"
+check "the workflow refusal prints neither the branch name nor the file name" bash -c "! git -C '$w' push -q origin 'feat/$wfname' 2>&1 | grep -q 'zq-wf-'"
 
 exit $fail
