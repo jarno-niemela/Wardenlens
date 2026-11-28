@@ -425,9 +425,13 @@ identity and every sidecar are proven by means no sidecar can influence**:
   `.prepare_with_flags` or `.transaction` on it; the only ways to run SQL are the functions of `sql.rs`, which take a
   `&'static str` or a `ReadSql`; (2) **the compiler**: the data writes (`WriteTx::write`, `WriteTx::write_batch`) need a
   `&WriteTx`, which only `write_tx` makes, and `write_tx` runs the bump before `COMMIT`; at run time they also refuse every
-  statement `sqlite3_stmt_readonly` calls read-only (`BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ATTACH`,
-  getter pragmas), each statement of a `write_batch` script before it runs (`IndexError::NotReadOnly`, #149), because
-  transaction control would end the transaction before the bump; the pragma getters a `ReadSql` may be are an allow-list
+  statement `sqlite3_stmt_readonly` calls read-only, which **includes** `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`,
+  `RELEASE`, `ATTACH`, `DETACH`, `REINDEX`, getter pragmas and pragmas like `foreign_keys = ON`, `locking_mode` and `optimize`
+  (a migration script may not use any of them), each statement of a `write_batch` script before it runs
+  (`IndexError::NotADataWrite`, #149), because transaction control would end the transaction before the bump. A statement
+  that ends the transaction without being read-only (`INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)`) is caught by an
+  `is_autocommit()` check before and after every write statement and before the bump: nothing further runs, nothing is bumped
+  or reported as success (`IndexError::TransactionEnded`); the pragma getters a `ReadSql` may be are an allow-list
   in the tests (#149); (3) **the compiler**: the read
   wrappers `sql::prepare` and `sql::query_row` take a `ReadSql` token, a newtype whose constructor is private to `sql.rs`
   and which exists only for the reviewed `SELECT`s and getter pragmas (a pass-list, not a shape check: `sqlite3_stmt_readonly`

@@ -260,7 +260,18 @@ fn the_unversioned_pragma_wrapper_still_sets_the_write_pragmas() {
 /// back), and an ordinary multi-statement script still runs.
 #[test]
 fn the_write_wrappers_refuse_with_the_typed_error_and_check_every_statement_of_a_script() {
+    use wardenlens_core::storage::SegmentIndex as _;
     let (_f, mut idx) = open_new();
+    idx.insert(
+        &crate::tests::rec("c", crate::tests::BASE, 1000, 10, 1),
+        wardenlens_core::storage::Tier::Hot,
+    )
+    .unwrap();
+    let count = |c: &Connection| -> i64 {
+        c.query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count(&idx.conn), 1);
     let before: i64 = idx
         .conn
         .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
@@ -270,15 +281,18 @@ fn the_write_wrappers_refuse_with_the_typed_error_and_check_every_statement_of_a
             .map_err(IndexError::sqlite("probe"))
     });
     assert!(
-        matches!(r, Err(IndexError::NotReadOnly { op: "probe" })),
+        matches!(r, Err(IndexError::NotADataWrite { op: "probe" })),
         "{r:?}"
     );
+    assert_eq!(count(&idx.conn), 1, "the DELETE before the COMMIT was kept");
     let r = sql::write_tx(&mut idx.conn, "probe", |w| {
         w.write("SELECT 1", [])
             .map(|_| ())
             .map_err(IndexError::sqlite("probe"))
     });
-    assert!(matches!(r, Err(IndexError::NotReadOnly { .. })), "{r:?}");
+    assert!(matches!(r, Err(IndexError::NotADataWrite { .. })), "{r:?}");
+    let msg = r.unwrap_err().to_string();
+    assert!(!msg.contains("not read-only"), "{msg}");
     let after: i64 = idx
         .conn
         .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
@@ -289,4 +303,66 @@ fn the_write_wrappers_refuse_with_the_typed_error_and_check_every_statement_of_a
             .map_err(IndexError::sqlite("probe"))
     })
     .unwrap();
+}
+
+/// One test per new error variant: the message names the refusal and nothing else, and the
+/// variants are distinct from the read-side `NotReadOnly`.
+#[test]
+fn the_write_side_error_variants_have_their_own_messages() {
+    let a = IndexError::NotADataWrite { op: "t" };
+    let b = IndexError::TransactionEnded { op: "t" };
+    assert_eq!(
+        a.to_string(),
+        "t: refused a statement that does not change data"
+    );
+    assert_eq!(b.to_string(), "t: the write transaction was ended early");
+    assert!(!a.is_transient() && !b.is_transient());
+}
+
+/// A closure that ignores the error of a transaction-ending statement and goes on: nothing it
+/// writes afterwards runs outside a transaction (the next write is refused with the typed
+/// error), and `write_tx` never reports success.
+#[test]
+fn a_statement_that_ends_the_transaction_makes_every_later_write_fail() {
+    let (_f, mut idx) = open_new();
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        let ins = |w: &sql::WriteTx<'_>| {
+            w.write(
+                sql::INSERT,
+                rusqlite::params![
+                    "c",
+                    1_700_000_000_000i64,
+                    1000i64,
+                    1_700_000_001_000i64,
+                    1i64,
+                    1i64,
+                    0i64
+                ],
+            )
+            .map(|_| ())
+            .map_err(IndexError::sqlite("probe"))
+        };
+        ins(w)?;
+        // A conflict: `OR ROLLBACK` ends the transaction.
+        let _ = w.write(
+            "INSERT OR ROLLBACK INTO segments (camera_id, started_at_ms, duration_ms, ended_at_ms, \
+             bytes, frame_count, tier) VALUES ('c', 1700000000000, 1000, 1700000001000, 1, 1, 0)",
+            [],
+        );
+        let later = ins(w);
+        assert!(
+            matches!(later, Err(IndexError::TransactionEnded { op: "probe" })),
+            "{later:?}"
+        );
+        Ok(())
+    });
+    assert!(
+        matches!(r, Err(IndexError::TransactionEnded { .. })),
+        "{r:?}"
+    );
+    let n: i64 = idx
+        .conn
+        .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
 }

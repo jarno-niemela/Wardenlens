@@ -302,3 +302,40 @@ fn a_failure_after_any_statement_rolls_back_to_the_exact_old_schema() {
         }
     }
 }
+
+/// A migration script that ends its own transaction is refused with that cause, not a bare
+/// `Migration { code: None }`.
+#[test]
+fn a_migration_that_ends_its_transaction_keeps_the_cause() {
+    let f = fixture();
+    drop(Index::open(&f.path).unwrap());
+    for (sql, rollback) in [
+        (
+            "CREATE TABLE half (x); COMMIT; PRAGMA user_version = 5;",
+            false,
+        ),
+        (
+            "CREATE TABLE half (x); ROLLBACK; PRAGMA user_version = 5;",
+            false,
+        ),
+    ] {
+        let _ = rollback;
+        let bad = Migration { version: 5, sql };
+        let err = Index::open_with(
+            &f.path,
+            &[
+                MIGRATIONS[0],
+                MIGRATIONS[1],
+                MIGRATIONS[2],
+                MIGRATIONS[3],
+                bad,
+            ],
+            || {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, IndexError::NotADataWrite { op: "migrate" }),
+            "{sql}: {err:?}"
+        );
+    }
+}
