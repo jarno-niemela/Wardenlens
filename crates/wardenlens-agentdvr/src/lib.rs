@@ -194,6 +194,7 @@ pub fn parse(input: &[u8]) -> Result<Import, ImportError> {
 
 /// The two document formats of an `AgentDVR` install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     /// `objects.xml`.
     Xml,

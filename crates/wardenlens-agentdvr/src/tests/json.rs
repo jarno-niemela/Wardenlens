@@ -274,7 +274,7 @@ fn a_member_that_is_not_text_refuses_the_whole_document() {
 #[test]
 fn settings_that_is_not_an_object_is_refused_and_null_is_absent() {
     for s in ["1", r#""x""#, "[]", "true"] {
-        assert_eq!(err(&with_settings(s)), E::NotObjects, "{s}");
+        assert_eq!(err(&with_settings(s)), E::WrongShape, "{s}");
     }
     let i = parse_json(with_settings("null").as_bytes()).unwrap();
     assert_eq!(i.skipped[0].reason, SkipReason::NoSource);
@@ -289,7 +289,7 @@ fn camera_entries_that_are_not_objects_are_refused() {
         // `null` is a camera with nothing in it: skipped like any entry with no name.
         match parse_json(text.as_bytes()) {
             Ok(i) => assert_eq!((entry, i.skipped.len()), ("null", 1)),
-            Err(e) => assert_eq!(e, E::NotObjects, "{entry}"),
+            Err(e) => assert_eq!(e, E::WrongShape, "{entry}"),
         }
     }
 }
@@ -305,12 +305,12 @@ fn structure_rows() {
         ("null", E::NotObjects),
         ("{}", E::NotObjects),
         (r#"{"cameras":null}"#, E::NotObjects),
-        (r#"{"cameras":{}}"#, E::NotObjects),
+        (r#"{"cameras":{}}"#, E::WrongShape),
         (
             r#"{"cameras":"wardenlens:too-many-cameras"}"#,
-            E::NotObjects,
+            E::WrongShape,
         ),
-        (r#"{"cameras":[],"cameras":[]}"#, E::NotObjects),
+        (r#"{"cameras":[],"cameras":[]}"#, E::RepeatedMember),
         (r#"{"Cameras":[]}"#, E::NotObjects),
     ];
     for (text, want) in rows {
@@ -373,7 +373,7 @@ fn repeated_members_refuse_the_whole_document() {
         r#"{"cameras":[{"name":"A","settings":{"password":"a","password":"b"}}]}"#,
     ];
     for text in rows {
-        assert_eq!(err(text), E::NotObjects, "{text}");
+        assert_eq!(err(text), E::RepeatedMember, "{text}");
     }
 }
 
@@ -589,7 +589,7 @@ fn no_error_carries_input_text() {
     // A payload that spells a sentinel of this module cannot forge its error.
     assert_eq!(
         err(r#"{"cameras":"wardenlens:too-many-cameras"}"#),
-        E::NotObjects
+        E::WrongShape
     );
 }
 

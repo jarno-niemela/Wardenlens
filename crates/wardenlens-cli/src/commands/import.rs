@@ -469,19 +469,21 @@ const DEFAULT_INPUTS: &[&str] = &[
     "/opt/AgentDVR/Media/XML/objects.xml",
 ];
 
-/// The file to read: the given one, else the first of `defaults` that exists (a symbolic link
-/// counts as existing here; opening it later refuses it). Existence is checked with `lstat`, so
-/// nothing is opened or read to choose.
+/// The file to read: the given one, else the first of `defaults` that is not missing. A candidate
+/// is skipped only when `lstat` says `NotFound`; any other error (permission denied, a file in the
+/// way) returns that path, so opening it reports the real cause instead of "no file". A symbolic
+/// link counts as present (opening it later refuses it). Nothing is opened or read to choose.
 fn input_path(given: Option<&Path>, defaults: &[&str]) -> Result<PathBuf, ImportError> {
     if let Some(p) = given {
         return Ok(p.to_path_buf());
     }
-    defaults
-        .iter()
-        .map(Path::new)
-        .find(|p| std::fs::symlink_metadata(p).is_ok())
-        .map(Path::to_path_buf)
-        .ok_or(ImportError::NoDefaultInput)
+    for candidate in defaults.iter().map(Path::new) {
+        match std::fs::symlink_metadata(candidate) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => return Ok(candidate.to_path_buf()),
+        }
+    }
+    Err(ImportError::NoDefaultInput)
 }
 
 /// The format to parse as: the forced one, else the one the content shows.
@@ -1036,6 +1038,34 @@ mod tests {
         std::fs::remove_file(&json).unwrap();
         std::os::unix::fs::symlink(dir.path().join("nowhere"), &json).unwrap();
         assert_eq!(input_path(None, &defaults).unwrap(), json);
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_examined_is_returned_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let hidden = locked.join("objects.json");
+        let next = dir.path().join("objects.xml");
+        std::fs::write(&next, "<objects/>").unwrap();
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let defaults = [hidden.to_str().unwrap(), next.to_str().unwrap()];
+        let got = input_path(None, &defaults);
+        let opened = read_input(&hidden);
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        // As root the directory stays readable and the candidate is simply missing.
+        if std::fs::symlink_metadata(&hidden).is_ok() || got.as_ref().is_ok_and(|p| *p == next) {
+            return;
+        }
+        assert_eq!(got.unwrap(), hidden);
+        assert!(matches!(opened, Err(ImportError::Open { .. })));
+    }
+
+    #[test]
+    fn no_default_input_exits_2() {
+        assert_eq!(ImportError::NoDefaultInput.exit_code(), 2);
     }
 
     #[test]

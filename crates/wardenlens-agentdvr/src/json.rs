@@ -26,8 +26,10 @@
 //!   an array or an object there refuses the whole document ([`ImportError::FieldNotText`]):
 //!   a value that is not collected as a login could leak into a path.
 //! * A repeated member of the same object (two `settings`, two `login`) refuses the whole
-//!   document: the JSON text has two meanings and which one a reader keeps differs. (XML skips the
-//!   one camera; the stricter refusal is fail-closed.)
+//!   document ([`ImportError::RepeatedMember`]): the JSON text has two meanings and which one a
+//!   reader keeps differs. (XML skips the one camera; the stricter refusal is fail-closed.)
+//! * A member of the wrong type where a structure is needed (`settings` or a camera that is not an
+//!   object, `cameras` that is not an array) is [`ImportError::WrongShape`].
 //!
 //! # Limits
 //!
@@ -36,10 +38,18 @@
 //! parser runs, so the parser never recurses past it; cameras are counted as the array is read
 //! ([`crate::MAX_CAMERAS`]). No error carries input text: a parser message is never forwarded.
 //!
+//! **Errors.** A repeated member, a camera count over the limit and a member of the wrong type are
+//! three distinct errors; the first two are signalled through a typed cell, never by matching a
+//! message.
+//!
 //! **Memory.** Field texts are copied into `Zeroizing` buffers at once. The JSON parser itself may
 //! hold an unescaped copy of a string that contains an escape (`é`) in a scratch buffer that is
-//! freed, not wiped; a string without an escape is read in place from the (zeroised) input.
+//! freed, not wiped; a string without an escape is read in place from the (zeroised) input. A serde
+//! "invalid type" error for a string value in a slot that wants another type (for example a string
+//! where an object belongs) copies that input string, unwiped, into the error before it is dropped
+//! unread; the error is never printed or forwarded.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt;
 
@@ -51,9 +61,24 @@ use crate::document::{Field, RawCamera, Slot, collect_field};
 use crate::logins::Secret;
 use crate::{ImportError, Logins, MAX_CAMERAS, MAX_DEPTH, MAX_FIELD_BYTES};
 
-/// Custom serde error texts that this module turns back into typed errors. A serde message that
-/// echoes input starts with something else (`invalid type: ...`), so no input can forge these.
-const TOO_MANY_CAMERAS: &str = "wardenlens:too-many-cameras";
+/// Why a visitor stopped the parse, passed out of serde (whose error type cannot carry it) in a
+/// typed cell, so no error text is ever matched.
+#[derive(Clone, Copy)]
+enum Stop {
+    TooManyCameras,
+    RepeatedMember,
+}
+
+thread_local! {
+    /// Set by a visitor just before it returns an error; taken by [`read`] after the parse.
+    static STOP: Cell<Option<Stop>> = const { Cell::new(None) };
+}
+
+/// Records `why` and returns a serde error with a fixed, input-free message.
+fn stop<E: de::Error>(why: Stop) -> E {
+    STOP.with(|c| c.set(Some(why)));
+    E::custom("stopped")
+}
 
 /// One text member: absent (missing or `null`), a string, or a value that is not text.
 #[derive(Default)]
@@ -196,9 +221,9 @@ enum Key {
 }
 
 /// Stores `value` in `slot`; a second value for the same key is an error (see the module docs).
-fn put<T, E: de::Error>(slot: &mut Option<T>, value: T, key: &'static str) -> Result<(), E> {
+fn put<T, E: de::Error>(slot: &mut Option<T>, value: T) -> Result<(), E> {
     if slot.replace(value).is_some() {
-        return Err(E::duplicate_field(key));
+        return Err(stop(Stop::RepeatedMember));
     }
     Ok(())
 }
@@ -227,9 +252,9 @@ impl<'de> Visitor<'de> for SettingsVisitor {
         let (mut source, mut login, mut password) = (None, None, None);
         while let Some(key) = map.next_key::<Key>()? {
             match key {
-                Key::Source => put(&mut source, map.next_value()?, "videosourcestring")?,
-                Key::Login => put(&mut login, map.next_value()?, "login")?,
-                Key::Password => put(&mut password, map.next_value()?, "password")?,
+                Key::Source => put(&mut source, map.next_value()?)?,
+                Key::Login => put(&mut login, map.next_value()?)?,
+                Key::Password => put(&mut password, map.next_value()?)?,
                 _ => skip(&mut map)?,
             }
         }
@@ -272,10 +297,10 @@ impl<'de> Visitor<'de> for CameraVisitor {
         let mut settings: Option<Option<SettingsJson>> = None;
         while let Some(key) = map.next_key::<Key>()? {
             match key {
-                Key::Id => put(&mut id, map.next_value()?, "id")?,
-                Key::Name => put(&mut name, map.next_value()?, "name")?,
-                Key::Deleted => put(&mut deleted, map.next_value()?, "deleted")?,
-                Key::Settings => put(&mut settings, map.next_value()?, "settings")?,
+                Key::Id => put(&mut id, map.next_value()?)?,
+                Key::Name => put(&mut name, map.next_value()?)?,
+                Key::Deleted => put(&mut deleted, map.next_value()?)?,
+                Key::Settings => put(&mut settings, map.next_value()?)?,
                 _ => skip(&mut map)?,
             }
         }
@@ -309,7 +334,7 @@ impl<'de> Visitor<'de> for CamerasVisitor {
         let mut all = Vec::new();
         while let Some(c) = seq.next_element::<CameraJson>()? {
             if all.len() >= MAX_CAMERAS {
-                return Err(de::Error::custom(TOO_MANY_CAMERAS));
+                return Err(stop(Stop::TooManyCameras));
             }
             all.push(c);
         }
@@ -340,7 +365,7 @@ impl<'de> Visitor<'de> for RootVisitor {
         let mut cameras: Option<Option<Cameras>> = None;
         while let Some(key) = map.next_key::<Key>()? {
             match key {
-                Key::Cameras => put(&mut cameras, map.next_value()?, "cameras")?,
+                Key::Cameras => put(&mut cameras, map.next_value()?)?,
                 _ => skip(&mut map)?,
             }
         }
@@ -397,15 +422,14 @@ fn check_depth(text: &str) -> Result<(), ImportError> {
 /// Reads the cameras of `text` (UTF-8, BOM already removed).
 pub(crate) fn read(text: &str) -> Result<(Vec<RawCamera>, Logins), ImportError> {
     check_depth(text)?;
-    let root: Root = serde_json::from_str(text).map_err(|e| match e.classify() {
-        serde_json::error::Category::Data => {
-            if e.to_string().starts_with(TOO_MANY_CAMERAS) {
-                ImportError::TooManyCameras
-            } else {
-                ImportError::NotObjects
-            }
-        }
-        _ => ImportError::MalformedJson {
+    STOP.with(|c| c.set(None));
+    let parsed = serde_json::from_str::<Root>(text);
+    let stopped = STOP.with(Cell::take);
+    let root = parsed.map_err(|e| match (stopped, e.classify()) {
+        (Some(Stop::TooManyCameras), _) => ImportError::TooManyCameras,
+        (Some(Stop::RepeatedMember), _) => ImportError::RepeatedMember,
+        (None, serde_json::error::Category::Data) => ImportError::WrongShape,
+        (None, _) => ImportError::MalformedJson {
             line: e.line(),
             column: e.column(),
         },

@@ -132,6 +132,8 @@ fn every_import_error_variant_is_produced_and_clean() {
     for text in [
         format!("{{\"cameras\":[{{\"settings\":{{\"login\":[\"{PW}\"]}}}}]}}"),
         format!("{{\"cameras\":[{{\"name\":\"{PW}\"}}] x"),
+        format!("{{\"cameras\":[{{\"settings\":\"{PW}\"}}]}}"),
+        format!("{{\"cameras\":[{{\"settings\":{{\"login\":\"{PW}\",\"login\":\"{PW}\"}}}}]}}"),
     ] {
         let r = crate::parse_json(text.as_bytes());
         let e = r.as_ref().expect_err("json refused");
@@ -155,6 +157,8 @@ fn every_import_error_variant_is_produced_and_clean() {
         },
         ImportError::MalformedJson { line: 1, column: 1 },
         ImportError::FieldNotText,
+        ImportError::RepeatedMember,
+        ImportError::WrongShape,
     ];
     for v in variants {
         match v {
@@ -169,6 +173,8 @@ fn every_import_error_variant_is_produced_and_clean() {
             | ImportError::NotObjects
             | ImportError::MalformedJson { .. }
             | ImportError::FieldNotText
+            | ImportError::RepeatedMember
+            | ImportError::WrongShape
             | ImportError::DuplicateName { .. } => {}
         }
         assert!(
