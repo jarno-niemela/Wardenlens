@@ -461,18 +461,45 @@ mod tests {
         assert_eq!(index.list_tokens().unwrap(), vec![]);
     }
 
-    #[test]
-    fn create_prints_only_the_token_on_stdout_and_never_the_secret_on_stderr() {
+    /// Runs `create` with `generate` and checks stdout carries exactly the token and stderr never
+    /// carries the whole 43-character secret. The secret is matched whole: base64url secrets can
+    /// contain `_`, so splitting on the last `_` (the old check) yields a short or empty piece
+    /// that substring-matches fixed hint text (#249).
+    fn check_create(generate: impl FnMut() -> Result<Token, RandomUnavailable>) {
         let (_d, mut index) = open();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        create(&mut index, &name("ci"), Token::generate, &mut out, &mut err).unwrap();
+        create(&mut index, &name("ci"), generate, &mut out, &mut err).unwrap();
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.ends_with('\n') && printed.matches('\n').count() == 1);
-        let parsed = Token::parse(printed.trim_end()).unwrap();
+        let shown = printed.trim_end();
+        let parsed = Token::parse(shown).unwrap();
+        let secret = shown.splitn(3, '_').nth(2).unwrap();
+        assert_eq!(secret.len(), 43, "the whole secret is checked");
         let hint = String::from_utf8(err).unwrap();
         assert!(hint.contains(parsed.id().as_str()));
-        assert!(!hint.contains(printed.trim_end().rsplit('_').next().unwrap()));
+        assert!(!hint.contains(secret));
+        assert!(!hint.contains(shown));
         assert!(parsed.verify(index.find_token(parsed.id()).unwrap().as_ref()));
+    }
+
+    #[test]
+    fn create_prints_only_the_token_on_stdout_and_never_the_secret_on_stderr() {
+        check_create(Token::generate);
+    }
+
+    #[test]
+    fn create_check_is_collision_free_for_secrets_with_underscores() {
+        // Each piece after the last `_` is one or two letters (the final character must be
+        // canonical base64url, so a secret cannot end in `_`); the old check matched them
+        // against the fixed hint text.
+        for secret in [
+            format!("A{}_g", "B".repeat(40)),
+            format!("A{}_w", "B".repeat(40)),
+            format!("A{}_Qw", "B".repeat(39)),
+            format!("A_{}_{}w", "B".repeat(20), "n".repeat(19)),
+        ] {
+            check_create(|| Ok(Token::parse(&format!("wl_abcdefgh_{secret}")).unwrap()));
+        }
     }
 
     /// A writer that always fails.
