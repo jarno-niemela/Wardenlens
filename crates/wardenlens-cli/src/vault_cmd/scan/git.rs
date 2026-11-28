@@ -111,7 +111,7 @@ impl RawEntry {
 
 /// The first git that honours `GIT_NO_LAZY_FETCH` (2.44). An older git ignores the variable, so
 /// in a partial clone it could fetch a missing object over the network and write packs during a
-/// scan; the scan refuses that combination instead ([`Git::guard_lazy_fetch`]).
+/// scan; the scan refuses that combination instead ([`Git::guard_lazy_fetch_from`]).
 pub(super) const LAZY_FETCH_MIN: (u32, u32) = (2, 44);
 
 /// `(major, minor)` from the output of `git version` (`git version 2.53.0`, or with a vendor
