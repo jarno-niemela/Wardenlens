@@ -6,7 +6,9 @@ camera owner's explicit approval each time (`https-off` disables it). The defaul
 
 Inputs: hosts and credentials come from the Wardenlens vault (`wardenlens vault get cam:<id>:host`,
 `cam:<id>:credential`; see `docs/DEV_VAULT.md`), so `wardenlens` must be on `PATH` (or set `WARDENLENS_BIN`) and
-the vault initialised and imported. A camera is named by its inventory id (`cam-1`, `front-door`, ...).
+the vault initialised and imported. A camera is named by its inventory id (`cam-1`, `front-door`, ...). The RTSP scripts also need the optional vault entry
+`cam:<id>:model` (`vault set --kind other`), the catalogue slug `<vendor>/<model>` such as `reolink/rlc-520a`: the stream
+paths are chosen by model, never by id.
 The legacy files (`agentdvr-cameras.secret.json`, `cameras.local.toml`) and `WARDENLENS_SECRET_FILE` /
 `WARDENLENS_CAMERAS` are read only by `wardenlens vault import-legacy`; delete the legacy files yourself after a verified
 import and a key export. The ONVIF port is `ONVIF_PORT` or the optional vault entry `cam:<id>:onvif_port`.
@@ -27,7 +29,7 @@ import and a key export. The ONVIF port is `ONVIF_PORT` or the optional vault en
 commit `6e05e78`, apply `baichuan-probe/neolink-debug.patch`, link or copy it as `baichuan-probe/neolink`, and
 `cargo build --release`. Spike only; never link it into Wardenlens.
 
-`results/` holds the measured outputs quoted in the ADR (camera ids only); `results/events/` has the redacted live
+`results/` holds the measured outputs quoted in the ADR (generic camera ids only: `cam-1` RTT-8700, `cam-2` and `cam-3` Reolink RLC-520A, `cam-5` Tapo C110, `cam-6` Dahua IPC-HFW4431R-Z; `rtt-8700-onvif.tsv` is the RTT-8700 ONVIF reliability run); `results/events/` has the redacted live
 event captures from #27.
 Never print `rtsp_url` output; pipe tool output through `redact`.
 

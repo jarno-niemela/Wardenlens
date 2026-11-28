@@ -1028,7 +1028,7 @@ const JSON: &str = r#"[{"name":"Front Gate","login":"svc-reader","password":"pw-
  {"name":"Unlisted Cam","login":"admin","password":"pw-synthetic-8"}]"#;
 const TOML: &str = r#"
 site_note = "zq-top-level-synthetic"
-[cameras.reolink-1]
+[cameras.cam-2]
 name = "Front Gate"
 host = "192.0.2.10"
 mac = "02:00:00:00:00:01"
@@ -1078,23 +1078,23 @@ fn import_legacy_imports_mapped_fields_and_lists_unknown_keys_by_name() {
     }
     let list = ok(&h, &["list"], Fake::pipe());
     for id in [
-        "cam:reolink-1:credential",
-        "cam:reolink-1:host",
-        "cam:reolink-1:mac",
-        "cam:reolink-1:name",
+        "cam:cam-2:credential",
+        "cam:cam-2:host",
+        "cam:cam-2:mac",
+        "cam:cam-2:name",
         "cam:cam-two:credential",
         "cam:cam-two:name",
     ] {
         assert!(list.contains(id), "{id}: {list}");
     }
     assert_eq!(
-        ok(&h, &["get", "cam:reolink-1:host"], Fake::pipe()),
+        ok(&h, &["get", "cam:cam-2:host"], Fake::pipe()),
         "192.0.2.10"
     );
     assert_eq!(
         ok(
             &h,
-            &["get", "cam:reolink-1:credential", "--field", "password"],
+            &["get", "cam:cam-2:credential", "--field", "password"],
             Fake::pipe()
         ),
         "pw-synthetic-9"
@@ -1133,7 +1133,7 @@ fn import_legacy_uses_default_files_and_skips_a_missing_default() {
     let cfg = h.dir.path().join(".config/wardenlens");
     std::fs::write(cfg.join("cameras.local.toml"), TOML).unwrap();
     let out = ok(&h, &["import-legacy"], Fake::pipe());
-    assert!(out.contains("cam:reolink-1:host"), "{out}");
+    assert!(out.contains("cam:cam-2:host"), "{out}");
 }
 
 #[test]
@@ -1845,24 +1845,24 @@ fn vault_mv_renames_every_entry_and_prints_ids_only() {
     let h = Home::new();
     h.init();
     seed_ordinal(&h);
-    let t = ok(&h, &["mv", "import-json-1", "reolink-1"], Fake::pipe());
-    assert!(t.contains("moved to cam:reolink-1:host"), "{t}");
+    let t = ok(&h, &["mv", "import-json-1", "cam-2"], Fake::pipe());
+    assert!(t.contains("moved to cam:cam-2:host"), "{t}");
     assert!(
-        t.contains("moved 3 entries from import-json-1 to reolink-1"),
+        t.contains("moved 3 entries from import-json-1 to cam-2"),
         "{t}"
     );
     assert!(!t.contains("192.0.2") && !t.contains("Front Gate"), "{t}");
     let list = ok(&h, &["list"], Fake::pipe());
     assert!(!list.contains("import-json"), "{list}");
     assert_eq!(
-        ok(&h, &["get", "cam:reolink-1:host"], Fake::pipe()),
+        ok(&h, &["get", "cam:cam-2:host"], Fake::pipe()),
         "192.0.2.41"
     );
     assert_eq!(
-        ok(&h, &["get", "cam:reolink-1:name"], Fake::pipe()),
+        ok(&h, &["get", "cam:cam-2:name"], Fake::pipe()),
         "Front Gate"
     );
-    assert_eq!(password(&h, "reolink-1"), "pw-synthetic-41");
+    assert_eq!(password(&h, "cam-2"), "pw-synthetic-41");
 }
 
 #[test]
@@ -1887,17 +1887,16 @@ fn vault_mv_refuses_a_taken_target_a_missing_source_and_bad_ids() {
     let h = Home::new();
     h.init();
     seed_ordinal(&h);
-    set_text(&h, "cam:reolink-1:name", "display-name", "Other Name");
+    set_text(&h, "cam:cam-2:name", "display-name", "Other Name");
     let before = ok(&h, &["list"], Fake::pipe());
     let err = cmd(
         &h.env(),
-        &["mv", "import-json-1", "reolink-1"],
+        &["mv", "import-json-1", "cam-2"],
         &mut Fake::pipe(),
     )
     .unwrap_err();
     assert!(
-        err.to_string()
-            .contains("cam:reolink-1:name already exists"),
+        err.to_string().contains("cam:cam-2:name already exists"),
         "{err}"
     );
     assert_eq!(err.exit_code(), 1);

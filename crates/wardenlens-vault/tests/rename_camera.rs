@@ -88,27 +88,22 @@ fn moves_every_entry_with_its_value_and_kind() {
     seed(&mut v, "import-json-1");
     put(&mut v, "cam:other:host", EntryKind::Host, "192.0.2.77");
     let moved = v
-        .rename_camera(&cam("import-json-1"), &cam("reolink-1"))
+        .rename_camera(&cam("import-json-1"), &cam("cam-2"))
         .unwrap();
     assert_eq!(moved.len(), 4);
     assert_eq!(
         ids(&v),
         [
             "cam:other:host",
-            "cam:reolink-1:credential",
-            "cam:reolink-1:host",
-            "cam:reolink-1:mac",
-            "cam:reolink-1:name"
+            "cam:cam-2:credential",
+            "cam:cam-2:host",
+            "cam:cam-2:mac",
+            "cam:cam-2:name"
         ]
     );
-    assert_eq!(text(&v, "cam:reolink-1:host"), "192.0.2.10");
-    assert_eq!(text(&v, "cam:reolink-1:mac"), "02:00:00:00:00:01");
-    let Value::Credential(c) = v
-        .get(&id("cam:reolink-1:credential"))
-        .unwrap()
-        .unwrap()
-        .value
-    else {
+    assert_eq!(text(&v, "cam:cam-2:host"), "192.0.2.10");
+    assert_eq!(text(&v, "cam:cam-2:mac"), "02:00:00:00:00:01");
+    let Value::Credential(c) = v.get(&id("cam:cam-2:credential")).unwrap().unwrap().value else {
         panic!("shape")
     };
     assert_eq!(c.password.expose_secret(), "pw-synthetic-9");

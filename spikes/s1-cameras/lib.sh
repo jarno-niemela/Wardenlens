@@ -146,15 +146,30 @@ redact() {
   ) || { echo "redact: filter unavailable; output suppressed" >&2; return 1; }
 }
 
-# Vendor RTSP paths (main|sub) by camera; takes an inventory id. An id with no known vendor path is an error.
-rtsp_path() { # <id> <main|sub>
-  local id
+# cam_model <id> -> the camera's catalogue slug "<vendor>/<model>" (cameras/<vendor>/<model>.toml), from the optional
+# vault entry cam:<id>:model (`vault set --kind other`). Which camera is which model is a site fact and stays in the
+# vault (ARCH-7); this file knows only model-level facts.
+cam_model() {
+  local id m
   id="$(cam_id "$1")" || return 1
-  case "$id" in
-    reolink-*) [[ $2 == main ]] && echo /h264Preview_01_main || echo /h264Preview_01_sub ;;
-    xr) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
-    tapo) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
-    hdipc) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
-    *) echo "no vendor RTSP path for camera: $id" >&2; return 1 ;;
+  m="$(vault_value "cam:$id:model" 2>/dev/null)" && [[ $m =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$ ]] || {
+    echo "no usable model for camera: $id (set the vault entry cam:$id:model to <vendor>/<model>, e.g. reolink/rlc-520a)" >&2
+    return 1
+  }
+  echo "$m"
+}
+
+# Model RTSP paths (main|sub) by catalogue model; takes an inventory id and looks its model up (cam_model). A model
+# with no known path is an error. Paths are the cameras/*.toml ones.
+rtsp_path() { # <id> <main|sub>
+  local id model
+  id="$(cam_id "$1")" || return 1
+  model="$(cam_model "$id")" || return 1
+  case "$model" in
+    reolink/rlc-520a) [[ $2 == main ]] && echo /h264Preview_01_main || echo /h264Preview_01_sub ;;
+    dahua/ipc-hfw4431r-z) [[ $2 == main ]] && echo '/cam/realmonitor?channel=1&subtype=0' || echo '/cam/realmonitor?channel=1&subtype=1' ;;
+    tp-link/tapo-c110) [[ $2 == main ]] && echo /stream1 || echo /stream2 ;;
+    rtt/rtt-8700) [[ $2 == main ]] && echo /11 || echo /12 ;; # from ONVIF GetStreamUri
+    *) echo "no RTSP path for model: $model (camera $id)" >&2; return 1 ;;
   esac
 }

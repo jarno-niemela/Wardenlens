@@ -1,4 +1,4 @@
-//! Synthetic data only: user / correct-horse, ids of the form `cam:reolink-1:credential`.
+//! Synthetic data only: user / correct-horse, ids of the form `cam:cam-2:credential`.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use super::*;
 
 const PASSWORD: &str = "correct-horse";
-const ID: &str = "cam:reolink-1:credential";
+const ID: &str = "cam:cam-2:credential";
 
 /// A temp dir that is not inside a git work tree (the system temp dir).
 fn dir() -> TempDir {
@@ -107,13 +107,7 @@ fn malformed_credential_plaintext_is_typed_error() {
 
 #[test]
 fn record_layout_is_version_nonce_ciphertext_tag() {
-    let rec = seal(
-        &key(),
-        RecordKind::Host,
-        "cam:reolink-1:host",
-        b"192.0.2.10",
-    )
-    .unwrap();
+    let rec = seal(&key(), RecordKind::Host, "cam:cam-2:host", b"192.0.2.10").unwrap();
     assert_eq!(rec.first(), Some(&0x01));
     assert_eq!(rec.len(), 1 + 24 + b"192.0.2.10".len() + 16);
     assert_eq!(MIN_RECORD_LEN, 41);
@@ -141,11 +135,11 @@ fn empty_plaintext_round_trips() {
 #[test]
 fn tampering_any_byte_fails_without_panic() {
     let k = key();
-    let rec = seal(&k, RecordKind::Host, "cam:reolink-1:host", b"192.0.2.10").unwrap();
+    let rec = seal(&k, RecordKind::Host, "cam:cam-2:host", b"192.0.2.10").unwrap();
     for i in 0..rec.len() {
         let mut bad = rec.clone();
         bad[i] ^= 0x01;
-        let err = open(&k, RecordKind::Host, "cam:reolink-1:host", &bad).unwrap_err();
+        let err = open(&k, RecordKind::Host, "cam:cam-2:host", &bad).unwrap_err();
         if i == 0 {
             assert!(matches!(err, SecretsError::UnsupportedVersion(0))); // 0x01 ^ 0x01
         } else {
@@ -157,17 +151,17 @@ fn tampering_any_byte_fails_without_panic() {
 #[test]
 fn wrong_key_kind_or_id_fails() {
     let k = key();
-    let rec = seal(&k, RecordKind::Host, "cam:reolink-1:host", b"192.0.2.10").unwrap();
+    let rec = seal(&k, RecordKind::Host, "cam:cam-2:host", b"192.0.2.10").unwrap();
     assert!(matches!(
-        open(&other_key(), RecordKind::Host, "cam:reolink-1:host", &rec),
+        open(&other_key(), RecordKind::Host, "cam:cam-2:host", &rec),
         Err(SecretsError::Authentication)
     ));
     assert!(matches!(
-        open(&k, RecordKind::Credential, "cam:reolink-1:host", &rec),
+        open(&k, RecordKind::Credential, "cam:cam-2:host", &rec),
         Err(SecretsError::Authentication)
     ));
     assert!(matches!(
-        open(&k, RecordKind::Host, "cam:reolink-2:host", &rec),
+        open(&k, RecordKind::Host, "cam:cam-3:host", &rec),
         Err(SecretsError::Authentication)
     ));
 }
@@ -184,20 +178,20 @@ fn keycheck_kind_is_not_interchangeable_with_entry_kinds() {
 #[test]
 fn truncation_is_typed_error() {
     let k = key();
-    let rec = seal(&k, RecordKind::Host, "cam:reolink-1:host", b"192.0.2.10").unwrap();
+    let rec = seal(&k, RecordKind::Host, "cam:cam-2:host", b"192.0.2.10").unwrap();
     assert!(matches!(
-        open(&k, RecordKind::Host, "cam:reolink-1:host", &[]),
+        open(&k, RecordKind::Host, "cam:cam-2:host", &[]),
         Err(SecretsError::Truncated)
     ));
     for n in 0..MIN_RECORD_LEN {
         assert!(matches!(
-            open(&k, RecordKind::Host, "cam:reolink-1:host", &rec[..n]),
+            open(&k, RecordKind::Host, "cam:cam-2:host", &rec[..n]),
             Err(SecretsError::Truncated)
         ));
     }
     for n in MIN_RECORD_LEN..rec.len() {
         assert!(matches!(
-            open(&k, RecordKind::Host, "cam:reolink-1:host", &rec[..n]),
+            open(&k, RecordKind::Host, "cam:cam-2:host", &rec[..n]),
             Err(SecretsError::Authentication)
         ));
     }

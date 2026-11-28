@@ -110,7 +110,7 @@ fn camera_id_exact_boundaries() {
 
 #[test]
 fn multibyte_char_in_every_position_never_panics_and_is_refused() {
-    let base = "reolink-1.example.invalid";
+    let base = "cam-2.example.invalid";
     for i in 0..=base.len() {
         let (a, b) = base.split_at(i);
         for c in ['\u{e9}', '\u{ff0e}', '\u{1f600}', '\u{301}'] {

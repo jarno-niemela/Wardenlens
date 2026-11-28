@@ -176,7 +176,7 @@ mod tests {
 
     fn cam(host: &str, port: u16, main: &str, sub: Option<&str>) -> Camera {
         Camera::new(
-            CameraId::new("reolink-1").unwrap(),
+            CameraId::new("cam-2").unwrap(),
             DisplayName::new("Back Door North").unwrap(),
             ModelRef::new("reolink", "rlc-520a").unwrap(),
             Host::new(host).unwrap(),
@@ -294,7 +294,7 @@ mod tests {
                 "{s}"
             );
         }
-        assert!(format!("{c:?}").contains("reolink-1"));
+        assert!(format!("{c:?}").contains("cam-2"));
     }
 
     fn parse_back(url: &str) -> (Host, u16, String) {

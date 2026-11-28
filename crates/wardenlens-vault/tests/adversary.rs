@@ -99,7 +99,7 @@ fn ordinal_ids_from_the_two_legacy_files_do_not_merge_different_cameras() {
 #[test]
 fn toml_name_and_display_name_together_do_not_yield_duplicate_ids() {
     let t: toml::Table = toml::from_str(
-        "[cameras.reolink-1]\nname = \"Back Door North\"\ndisplay_name = \"Back Door South\"\n",
+        "[cameras.cam-2]\nname = \"Back Door North\"\ndisplay_name = \"Back Door South\"\n",
     )
     .unwrap();
     let i = map_inventory_toml(&t).unwrap();
@@ -116,7 +116,7 @@ fn toml_name_and_display_name_together_do_not_yield_duplicate_ids() {
 fn json_password_without_login_is_reported_not_silently_dropped() {
     let v: serde_json::Value =
         serde_json::from_str(r#"[{"name":"Garage","password":"orphan-pw-1"}]"#).unwrap();
-    let m = BTreeMap::from([("Garage".to_owned(), "tapo".to_owned())]);
+    let m = BTreeMap::from([("Garage".to_owned(), "cam-5".to_owned())]);
     let i = map_secret_json(&v, &m).unwrap();
     let imported_cred = i.entries.iter().any(|e| e.kind == EntryKind::Credential);
     let reported = i.unknown_keys.iter().any(|k| k.ends_with(".password"));
@@ -134,7 +134,7 @@ fn json_username_shadowed_by_login_is_reported() {
         r#"[{"name":"Garage","login":"svc-reader","username":"svc-admin","password":"pw-x-1234"}]"#,
     )
     .unwrap();
-    let m = BTreeMap::from([("Garage".to_owned(), "tapo".to_owned())]);
+    let m = BTreeMap::from([("Garage".to_owned(), "cam-5".to_owned())]);
     let i = map_secret_json(&v, &m).unwrap();
     assert!(
         i.unknown_keys.iter().any(|k| k.ends_with(".username")),
@@ -148,7 +148,7 @@ fn json_username_shadowed_by_login_is_reported() {
 #[test]
 fn toml_top_level_unknown_keys_are_listed() {
     let t: toml::Table = toml::from_str(
-        "[site]\naddress = \"12 Example Lane\"\n\n[cameras.reolink-1]\nhost = \"192.0.2.10\"\n",
+        "[site]\naddress = \"12 Example Lane\"\n\n[cameras.cam-2]\nhost = \"192.0.2.10\"\n",
     )
     .unwrap();
     let i = map_inventory_toml(&t).unwrap();
@@ -195,7 +195,7 @@ fn toml_long_section_id_does_not_silently_drop_the_serial() {
 fn unknown_key_names_carry_no_control_characters() {
     let v: serde_json::Value =
         serde_json::from_str("[{\"name\":\"Garage\",\"x\\u001b[2J\\ny\":1}]").unwrap();
-    let m = BTreeMap::from([("Garage".to_owned(), "tapo".to_owned())]);
+    let m = BTreeMap::from([("Garage".to_owned(), "cam-5".to_owned())]);
     let i = map_secret_json(&v, &m).unwrap();
     for k in &i.unknown_keys {
         assert!(!k.chars().any(char::is_control), "{k:?}");
