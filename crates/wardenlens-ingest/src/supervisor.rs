@@ -286,6 +286,33 @@ pub fn failure_kind(e: &IngestError) -> FailureKind {
     }
 }
 
+/// Why and when a connection went into `Backoff` or `Degraded`: only values the state machine
+/// owns (a kind, counts and times), never an error text, host, URL or credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FailureNote {
+    /// What failed.
+    pub kind: FailureKind,
+    /// Failures since the connection was last stable (1 for the first).
+    pub attempt: u32,
+    /// How long until the next attempt (the backoff delay, or the background retry delay).
+    pub retry_in: DurationMs,
+    /// When the failure was handled, on the supervisor's monotonic clock.
+    pub at: MonoMs,
+    /// The retry budget is spent: the state is `Degraded`, not `Backoff`.
+    pub degraded: bool,
+}
+
+/// What the supervisor tells an observer, see [`Supervisor::spawn_observed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionNotice {
+    /// The connection entered `Backoff` (or `Degraded`) after a failure.
+    Failed(FailureNote),
+    /// The stream has stayed up long enough to end the outage: the attempt count starts over.
+    Recovered,
+}
+
 /// Entry point; see the module docs.
 #[derive(Debug, Clone, Copy)]
 pub struct Supervisor;
@@ -325,6 +352,36 @@ impl Supervisor {
         (frames, state, dropped)
     }
 
+    /// Like [`Supervisor::spawn_joinable`], and calls `observer` from the supervisor task for
+    /// every [`ConnectionNotice`]. The observer must not block; it sees no host, URL or
+    /// credential, only the notice.
+    ///
+    /// # Panics
+    /// Panics if called outside a tokio runtime (it uses `tokio::spawn`).
+    #[must_use]
+    pub fn spawn_observed<S, M, J, O>(
+        source: S,
+        clock: M,
+        backoff: Backoff,
+        jitter: J,
+        config: SupervisorConfig,
+        cancel: CancelToken,
+        observer: O,
+    ) -> (
+        mpsc::Receiver<Frame>,
+        watch::Receiver<ConnectionState>,
+        DroppedFrames,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        S: StreamSource,
+        M: MonotonicClock + Send + 'static,
+        J: JitterSource + Send + 'static,
+        O: FnMut(ConnectionNotice) + Send + 'static,
+    {
+        Self::start(source, clock, backoff, jitter, config, cancel, observer)
+    }
+
     /// Like [`Supervisor::spawn`], and also returns the task's handle: after cancelling, awaiting
     /// it returns once the stream is dropped and the task has ended.
     ///
@@ -349,6 +406,29 @@ impl Supervisor {
         M: MonotonicClock + Send + 'static,
         J: JitterSource + Send + 'static,
     {
+        Self::start(source, clock, backoff, jitter, config, cancel, |_| {})
+    }
+
+    fn start<S, M, J, O>(
+        source: S,
+        clock: M,
+        backoff: Backoff,
+        jitter: J,
+        config: SupervisorConfig,
+        cancel: CancelToken,
+        observer: O,
+    ) -> (
+        mpsc::Receiver<Frame>,
+        watch::Receiver<ConnectionState>,
+        DroppedFrames,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        S: StreamSource,
+        M: MonotonicClock + Send + 'static,
+        J: JitterSource + Send + 'static,
+        O: FnMut(ConnectionNotice) + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel(config.channel_capacity.clamp(1, MAX_CHANNEL_CAPACITY));
         let (state_tx, state_rx) = watch::channel(ConnectionState::INITIAL);
         let dropped = DroppedFrames::default();
@@ -372,6 +452,8 @@ impl Supervisor {
             dropped: dropped.clone(),
             pacer: Pacer::default(),
             last_frame: None,
+            observer,
+            failures: 0,
         };
         let handle = tokio::spawn(task.run());
         (rx, state_rx, dropped, handle)
@@ -398,7 +480,7 @@ struct Pacer {
     owed_params: Option<H264Params>,
 }
 
-struct Task<S, M, J> {
+struct Task<S, M, J, O> {
     source: S,
     clock: M,
     jitter: J,
@@ -412,9 +494,18 @@ struct Task<S, M, J> {
     pacer: Pacer,
     /// When the last frame of the current session arrived.
     last_frame: Option<MonoMs>,
+    observer: O,
+    /// Failures since the connection was last stable; the `attempt` of a [`FailureNote`].
+    failures: u32,
 }
 
-impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
+impl<S, M, J, O> Task<S, M, J, O>
+where
+    S: StreamSource,
+    M: MonotonicClock,
+    J: JitterSource,
+    O: FnMut(ConnectionNotice),
+{
     async fn run(mut self) {
         let mut last_attempt: Option<Instant> = None;
         loop {
@@ -462,14 +553,11 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
     }
 
     fn apply(&mut self, event: Event) {
-        let next = transition(
-            self.state,
-            event,
-            self.clock.now(),
-            &self.policy,
-            &mut self.jitter,
-        );
+        let now = self.clock.now();
+        let prev = self.state;
+        let next = transition(prev, event, now, &self.policy, &mut self.jitter);
         self.state = next;
+        self.notify(prev, event, next, now);
         self.state_tx.send_if_modified(|s| {
             if *s == next {
                 false
@@ -478,6 +566,46 @@ impl<S: StreamSource, M: MonotonicClock, J: JitterSource> Task<S, M, J> {
                 true
             }
         });
+    }
+
+    /// Tells the observer about a failure that moved the state into `Backoff` or `Degraded`, and
+    /// about the end of an outage. A failure in `Backoff` is stale and changes nothing; a tick
+    /// that fails an attempt is a timeout.
+    fn notify(&mut self, prev: ConnectionState, event: Event, next: ConnectionState, now: MonoMs) {
+        let entered = match (prev, next) {
+            (ConnectionState::Backoff { .. } | ConnectionState::Degraded { .. }, _) => None,
+            (_, ConnectionState::Backoff { until, .. }) => {
+                let kind = match event {
+                    Event::Failed(kind) => kind,
+                    _ => FailureKind::Timeout,
+                };
+                Some((kind, until, false))
+            }
+            (
+                _,
+                ConnectionState::Degraded {
+                    last_error_kind,
+                    next_retry,
+                    ..
+                },
+            ) => Some((last_error_kind, next_retry, true)),
+            _ => None,
+        };
+        if let Some((kind, due, degraded)) = entered {
+            self.failures = self.failures.saturating_add(1);
+            (self.observer)(ConnectionNotice::Failed(FailureNote {
+                kind,
+                attempt: self.failures,
+                retry_in: due.saturating_duration_since(now),
+                at: now,
+                degraded,
+            }));
+        } else if matches!(next, ConnectionState::Streaming { prior: None, .. })
+            && self.failures > 0
+        {
+            self.failures = 0;
+            (self.observer)(ConnectionNotice::Recovered);
+        }
     }
 
     /// Sleeps through `Backoff` and `Degraded` until the state machine says to connect again.
@@ -1479,6 +1607,133 @@ mod tests {
         };
         assert_eq!(last_error_kind, FailureKind::Auth);
         assert!(r.t0.elapsed() >= Duration::from_secs(30));
+        r.cancel.cancel();
+    }
+
+    fn observed(
+        script: Vec<Attempt>,
+        config: SupervisorConfig,
+    ) -> (Rig, Arc<Mutex<Vec<ConnectionNotice>>>) {
+        let shared = Arc::new(Shared::default());
+        let cancel = CancelToken::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let t0 = Instant::now();
+        let (frames, state, dropped, _task) = Supervisor::spawn_observed(
+            Fake {
+                script: script.into(),
+                shared: Arc::clone(&shared),
+            },
+            InstantClock::new(),
+            Backoff::DEFAULT,
+            Fixed0,
+            config,
+            cancel.clone(),
+            move |n| sink.lock().unwrap().push(n),
+        );
+        let r = Rig {
+            frames,
+            state,
+            dropped,
+            cancel,
+            shared,
+            t0,
+        };
+        (r, seen)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_backoff_entry_is_reported_once_with_kind_attempt_and_delay() {
+        let (mut r, seen) = observed(
+            vec![
+                Attempt::OpenFails(IngestError::AuthRejected),
+                Attempt::OpenFails(IngestError::OpenFailed),
+                Attempt::OpenHangs,
+            ],
+            SupervisorConfig::default(),
+        );
+        r.wait_state(|s| backoff_attempt(s).is_some_and(|a| a >= 3))
+            .await;
+        let notes = seen.lock().unwrap().clone();
+        let [
+            ConnectionNotice::Failed(a),
+            ConnectionNotice::Failed(b),
+            ConnectionNotice::Failed(c),
+            ..,
+        ] = notes.as_slice()
+        else {
+            panic!("{notes:?}");
+        };
+        assert_eq!((a.kind, a.attempt), (FailureKind::Auth, 1));
+        assert_eq!((b.kind, b.attempt), (FailureKind::Refused, 2));
+        // An attempt that hangs is failed by the connect timeout.
+        assert_eq!((c.kind, c.attempt), (FailureKind::Timeout, 3));
+        assert_eq!(a.retry_in, DurationMs::from_millis(2000));
+        assert_eq!(b.retry_in, DurationMs::from_millis(3000));
+        assert!(a.at < b.at && b.at < c.at);
+        assert!(!a.degraded && !b.degraded && !c.degraded);
+        r.cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn degraded_is_reported_and_a_stable_stream_reports_recovery() {
+        let cfg = SupervisorConfig {
+            budget: DurationMs::from_secs(5),
+            min_stable: DurationMs::from_secs(5),
+            ..SupervisorConfig::default()
+        };
+        let mut script: Vec<Attempt> = (0..4)
+            .map(|_| Attempt::OpenFails(IngestError::AuthRejected))
+            .collect();
+        script.push(Attempt::Stream(vec![
+            Step::Frame(frame(true)),
+            Step::Sleep(Duration::from_secs(6)),
+            Step::Frame(frame(false)),
+            Step::Silent,
+        ]));
+        let (mut r, seen) = observed(script, cfg);
+        r.wait_state(|s| matches!(s, ConnectionState::Degraded { .. }))
+            .await;
+        r.wait_state(|s| matches!(s, ConnectionState::Streaming { prior: None, .. }))
+            .await;
+        let notes = seen.lock().unwrap().clone();
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, ConnectionNotice::Failed(f) if f.degraded && f.kind == FailureKind::Auth)),
+            "{notes:?}"
+        );
+        assert_eq!(notes.last(), Some(&ConnectionNotice::Recovered));
+        r.cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_attempt_count_matches_the_core_outage_and_a_flap_keeps_it() {
+        let cfg = SupervisorConfig {
+            min_stable: DurationMs::from_secs(5),
+            ..SupervisorConfig::default()
+        };
+        let (mut r, seen) = observed(
+            vec![
+                Attempt::OpenFails(IngestError::OpenFailed),
+                // Up for 0 s, then dropped: the same outage continues.
+                Attempt::Stream(vec![Step::Frame(frame(true)), Step::Eof]),
+            ],
+            cfg,
+        );
+        r.wait_state(|s| backoff_attempt(s).is_some_and(|a| a >= 3))
+            .await;
+        let attempts: Vec<u32> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|n| match n {
+                ConnectionNotice::Failed(f) => Some(f.attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(&attempts[..3], &[1, 2, 3]);
+        assert!(!seen.lock().unwrap().contains(&ConnectionNotice::Recovered));
         r.cancel.cancel();
     }
 

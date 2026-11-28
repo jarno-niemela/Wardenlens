@@ -49,6 +49,20 @@ pub(crate) struct ConnectionDto {
     /// remote error text.
     #[serde(skip_serializing_if = "Option::is_none")]
     error_kind: Option<FailureKindDto>,
+    /// The most recent failed connection attempt, kept after the camera recovers; absent until
+    /// one fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failure: Option<LastFailureDto>,
+    /// Failures since the connection was last stable; zero while it streams stably.
+    attempts: u32,
+}
+
+/// Kind and time of a failed connection attempt. Never remote error text.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct LastFailureDto {
+    kind: FailureKindDto,
+    /// When the failure was handled, in UTC Unix milliseconds.
+    at: i64,
 }
 
 /// Why the last connection attempt failed.
@@ -141,6 +155,11 @@ fn connection_dto(status: LinkStatus) -> ConnectionDto {
         state,
         since: status.since.as_unix_millis(),
         error_kind,
+        last_failure: status.last_failure.map(|f| LastFailureDto {
+            kind: failure_kind_dto(f.kind),
+            at: f.at.as_unix_millis(),
+        }),
+        attempts: status.attempts,
     }
 }
 

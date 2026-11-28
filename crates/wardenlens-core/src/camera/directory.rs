@@ -88,6 +88,20 @@ pub struct LinkStatus {
     pub state: LinkState,
     /// When it entered `state`, in wall-clock time.
     pub since: Timestamp,
+    /// The most recent failed attempt, kept after the connection recovers; `None` until one
+    /// fails.
+    pub last_failure: Option<LastFailure>,
+    /// Failures since the connection was last stable (zero while it streams stably).
+    pub attempts: u32,
+}
+
+/// The kind and wall-clock time of a failed connection attempt. Never remote error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastFailure {
+    /// What failed.
+    pub kind: FailureKind,
+    /// When it was handled.
+    pub at: Timestamp,
 }
 
 impl LinkStatus {
@@ -103,7 +117,12 @@ impl LinkStatus {
                 last_error_kind, ..
             } => LinkState::Degraded(*last_error_kind),
         };
-        Self { state, since }
+        Self {
+            state,
+            since,
+            last_failure: None,
+            attempts: 0,
+        }
     }
 }
 
