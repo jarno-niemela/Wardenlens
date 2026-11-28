@@ -48,9 +48,9 @@ check "rtsp_url: the host part is exactly the vault host (path cannot move the a
 
 # ============================== load_cams vendor-path check ==============================
 cred cam-x admin pw-synth-x; host cam-x 192.0.2.9
-check "load_cams: one id with no vendor path among valid ones is refused, CAMS empty" \
+check "load_cams: one id with no model entry among valid ones is refused, CAMS empty" \
   '{ ! CAMERAS="cam-6 cam-x cam-5" load_cams 2>/dev/null && (( ${#CAMS[@]} == 0 )); }'
-check "load_cams (default selection): a vault host id with no vendor path refuses the whole selection" \
+check "load_cams (default selection): a vault host id with no model entry refuses the whole selection" \
   '{ unset CAMERAS; ! load_cams 2>/dev/null && (( ${#CAMS[@]} == 0 )); }'
 for s in probe_streams.sh gop_sample.sh; do
   reset; CAMERAS="cam-6 cam-x" "$here/$s" 1 >/dev/null 2>&1; rc=$?

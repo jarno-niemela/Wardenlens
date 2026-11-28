@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
 # ARCH-7 check: fail if a camera id from a site list kept OUTSIDE the repo occurs in non-test code, scripts, spike
 # scripts, compose.yaml or docker/. The list is never committed and never read from a fixed location: point
-# WARDENLENS_SITE_IDS_FILE at it (one id per line; blank lines and # comments ignored). Unset: skipped with a notice.
+# WARDENLENS_SITE_IDS_FILE at it (one id per line; leading and trailing blanks, CRs, blank lines and # comments are
+# ignored; a last line without a newline counts). A relative path is resolved before the check changes directory.
 # Usage: scripts/site-id-check [root]   (root defaults to the repository top level)
-# An id matches only as a whole token (not inside a longer [A-Za-z0-9_-] run), so `tapo-c110` is not `tapo`.
-# Rust files named tests.rs / under tests/ directories are excluded; the check never prints the list.
+#
+# Exit status: 0 clean, or skipped with a notice (list unset, or the list holds no ids: nothing to check);
+#              1 an id was found; 2 a usage or tool error (unreadable list, grep failure such as an unreadable file
+#              or no -P). A grep error never counts as "clean".
+# Matching: each id is a literal (every non-alphanumeric byte is escaped, so `.` or `(` are not operators) and
+# matches only as a whole token: not inside a longer run of [A-Za-z0-9_-] (so `tapo-c110` is not `tapo`), but an id
+# right after a string escape such as `\n`, `\t`, `\r` or `\0` still matches. All files are scanned as text, so a
+# NUL byte does not hide an id.
+# Scanned: crates/*/src, scripts, spikes, compose.yaml, docker. Not scanned: tests.rs files and tests/ directories
+# (fixtures may use ids), target/ and results/ (measured data, generic ids by convention) and this script.
+# Output: the files that match, never the id: the id is redacted (as <id>) in a reported path.
 set -euo pipefail
+export LC_ALL=C
 root="${1:-$(git rev-parse --show-toplevel)}"
 list="${WARDENLENS_SITE_IDS_FILE:-}"
 if [[ -z $list ]]; then
@@ -13,22 +24,30 @@ if [[ -z $list ]]; then
   exit 0
 fi
 [[ -f $list && -r $list ]] || { echo "site-id-check: WARDENLENS_SITE_IDS_FILE is not a readable file" >&2; exit 2; }
+list="$(cd "$(dirname -- "$list")" && pwd)/$(basename -- "$list")"
 cd "$root"
 targets=()
 for p in crates/*/src scripts spikes compose.yaml docker; do [[ -e $p ]] && targets+=("$p"); done
-found=0
-while IFS= read -r id; do
+found=0 count=0
+while IFS= read -r id || [[ -n $id ]]; do
   id="${id%$'\r'}"
+  id="${id#"${id%%[![:space:]]*}"}"; id="${id%"${id##*[![:space:]]}"}"
   [[ -z $id || $id == \#* ]] && continue
-  # The id is quoted literally (\Q..\E); an id containing \E is refused rather than interpreted.
-  [[ $id == *'\E'* ]] && { echo "site-id-check: unusable id in the list" >&2; exit 2; }
-  if grep -rnIP --exclude=tests.rs --exclude-dir=tests --exclude-dir=target --exclude-dir=results --exclude=site-id-check \
-      -e "(?<![A-Za-z0-9_-])\\Q${id}\\E(?![A-Za-z0-9_-])" -- "${targets[@]}" >/dev/null; then
-    # Report where, not the id.
-    grep -rlIP --exclude=tests.rs --exclude-dir=tests --exclude-dir=target --exclude-dir=results --exclude=site-id-check \
-      -e "(?<![A-Za-z0-9_-])\\Q${id}\\E(?![A-Za-z0-9_-])" -- "${targets[@]}" | sed 's/^/site-id-check: a site camera id occurs in /' >&2
-    found=1
-  fi
+  count=$((count + 1))
+  esc="$(printf '%s' "$id" | sed 's/[^A-Za-z0-9]/\\&/g')"
+  re="(?:(?<![A-Za-z0-9_-])|(?<=\\\\[ntr0]))${esc}(?![A-Za-z0-9_-])"
+  rc=0
+  files="$(grep -rlaP --exclude=tests.rs --exclude-dir=tests --exclude-dir=target --exclude-dir=results \
+      --exclude=site-id-check -e "$re" -- "${targets[@]}")" || rc=$?
+  case $rc in
+    0) while IFS= read -r f; do
+         echo "site-id-check: a site camera id occurs in ${f//"$id"/<id>}" >&2
+       done <<<"$files"
+       found=1 ;;
+    1) ;;
+    *) echo "site-id-check: grep failed (rc $rc); the check cannot vouch for the tree" >&2; exit 2 ;;
+  esac
 done <"$list"
+if (( count == 0 )); then echo "site-id-check: no ids in the list; nothing to check"; exit 0; fi
 if (( found )); then echo "site-id-check: FAILED (ARCH-7: no site camera ids outside tests)" >&2; exit 1; fi
 echo "site-id-check: ok"

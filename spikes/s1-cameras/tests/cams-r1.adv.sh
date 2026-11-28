@@ -75,21 +75,22 @@ reset; CAMERAS="cam-6 cam-6" "$here/stream_soak.sh" "$fx/soak3" 1 >/dev/null 2>&
 check "stream_soak.sh: a duplicate id in CAMERAS is refused or de-duplicated (one summary row per stream)" \
   '[[ ! -e $fx/soak3/summary.tsv ]] || [[ $(grep -c "^cam-6_main" "$fx/soak3/summary.tsv") == 1 ]]'
 
-# An id that passes cam_id but has no vendor path must not be opened at the bare host (rtsp://...@host:554).
+# An id that passes cam_id but has no model entry must not be opened at the bare host (rtsp://...@host:554).
 cred cam-x admin pw-synth-x; host cam-x 192.0.2.9
-check "rtsp_path: an id with no known vendor path is an error, not an empty path" '! p=$(rtsp_path cam-x main 2>/dev/null) || [[ -n $p ]]'
+check "rtsp_path: an id with no model entry is an error, not an empty path" '! p=$(rtsp_path cam-x main 2>/dev/null) || [[ -n $p ]]'
 cred cam-y admin pw-synth-y; host cam-y 192.0.2.8; model cam-y acme/no-such-model
-check "rtsp_path: a model with no known path is an error" '! p=$(rtsp_path cam-y main 2>/dev/null) || [[ -n $p ]]'
+check "rtsp_path: a model with no known path is an error naming the model, printing no path" \
+  '{ p=$(rtsp_path cam-y main 2>"$fx/err"); rc=$?; (( rc != 0 )) && [[ -z $p ]] && grep -q "no RTSP path for model" "$fx/err"; }'
 check "rtsp_path: model-based paths (rtt/reolink/tp-link/dahua), same for any id" \
   '[[ $(rtsp_path cam-2 sub) == /h264Preview_01_sub && $(rtsp_path cam-5 main) == /stream1 && $(rtsp_path cam-6 sub) == *subtype=1 ]]'
 check "rtsp_path: the path follows the model, not the id (cam-2 re-modelled)" \
   '{ model cam-2 tp-link/tapo-c110; [[ $(rtsp_path cam-2 main) == /stream1 ]]; r=$?; model cam-2 reolink/rlc-520a; (( r == 0 )); }'
 check "rtsp_path: a malformed model entry is refused" '{ model cam-2 "../x"; ! rtsp_path cam-2 main 2>/dev/null; r=$?; model cam-2 reolink/rlc-520a; (( r == 0 )); }'
 reset; CAMERAS="cam-x" "$here/probe_streams.sh" >/dev/null 2>&1
-check "probe_streams.sh: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
+check "probe_streams.sh: an id with no model entry is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
 for s in gop_sample.sh stream_soak.sh; do
   reset; if [[ $s == stream_soak.sh ]]; then CAMERAS="cam-x" "$here/$s" "$fx/novp-$s" 1 >/dev/null 2>&1; else CAMERAS="cam-x" "$here/$s" 1 >/dev/null 2>&1; fi
-  check "$s: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
+  check "$s: an id with no model entry is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
 done
 
 # ============================== cam_ids against the real binary ==============================

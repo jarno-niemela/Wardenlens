@@ -46,7 +46,7 @@ selected_cams() {
 }
 
 # load_cams -> fills the global array CAMS with the selected inventory ids. The one choke point for the scripts that
-# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, an id with no vendor RTSP path, a vault failure or an empty selection.
+# enumerate cameras: non-zero (CAMS empty) on an invalid or duplicate id, an id with no model entry or no path for its model, a vault failure or an empty selection.
 load_cams() {
   local out id
   declare -A seen=()
@@ -152,8 +152,13 @@ redact() {
 cam_model() {
   local id m
   id="$(cam_id "$1")" || return 1
-  m="$(vault_value "cam:$id:model" 2>/dev/null)" && [[ $m =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$ ]] || {
-    echo "no usable model for camera: $id (set the vault entry cam:$id:model to <vendor>/<model>, e.g. reolink/rlc-520a)" >&2
+  # A vault failure (stderr shown, say so) is reported separately from a missing or malformed entry.
+  if ! m="$(vault_value "cam:$id:model")"; then
+    echo "no model entry for camera: $id (the vault lookup of cam:$id:model failed; set it to <vendor>/<model>, e.g. reolink/rlc-520a)" >&2
+    return 1
+  fi
+  [[ $m =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$ ]] || {
+    echo "malformed model entry for camera: $id (cam:$id:model must be <vendor>/<model>)" >&2
     return 1
   }
   echo "$m"
