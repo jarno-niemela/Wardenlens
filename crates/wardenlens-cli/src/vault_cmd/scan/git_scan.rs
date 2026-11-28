@@ -125,7 +125,7 @@ struct Finding {
 }
 
 /// The memory bounds of one scan. Production uses [`Limits::DEFAULT`] only; a test builds a
-/// smaller one with [`Collected::with_limits`], so there is no way (no variable, no flag) to
+/// smaller one (a test-only constructor), so there is no way (no variable, no flag) to
 /// loosen them for a real scan.
 #[derive(Debug, Clone, Copy)]
 struct Limits {
