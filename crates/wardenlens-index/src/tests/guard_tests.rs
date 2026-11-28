@@ -366,3 +366,44 @@ fn a_statement_that_ends_the_transaction_makes_every_later_write_fail() {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+/// A script whose statement ends the transaction with `OR ROLLBACK` reports the statement's own
+/// error (the conflict), and then every later write and the bump are refused: nothing commits.
+#[test]
+fn a_write_batch_that_ends_its_transaction_reports_the_conflict_then_refuses_more() {
+    use wardenlens_core::storage::SegmentIndex as _;
+    let (_f, mut idx) = open_new();
+    idx.insert(
+        &crate::tests::rec("c", crate::tests::BASE, 1000, 10, 1),
+        wardenlens_core::storage::Tier::Hot,
+    )
+    .unwrap();
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        let first = w.write_batch(
+            "INSERT OR ROLLBACK INTO segments (camera_id, started_at_ms, duration_ms, ended_at_ms, \
+             bytes, frame_count, tier) VALUES ('c', 1700000000000, 1000, 1700000001000, 1, 1, 0);",
+        );
+        assert!(
+            matches!(
+                first.as_ref().map_err(rusqlite::Error::sqlite_error_code),
+                Err(Some(rusqlite::ErrorCode::ConstraintViolation))
+            ),
+            "{first:?}"
+        );
+        let later = w.write_batch("DELETE FROM segments;");
+        assert!(
+            later.as_ref().is_err_and(sql::is_transaction_ended),
+            "{later:?}"
+        );
+        Ok(())
+    });
+    assert!(
+        matches!(r, Err(IndexError::TransactionEnded { .. })),
+        "{r:?}"
+    );
+    let n: i64 = idx
+        .conn
+        .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "the DELETE after the rollback ran");
+}

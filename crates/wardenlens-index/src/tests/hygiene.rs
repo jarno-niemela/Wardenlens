@@ -35,13 +35,32 @@ const SQL_CALLS: &[&str] = &[
     // The same methods called as associated functions, and the other entry points that run SQL.
     "Connection::prepare(",
     "Connection::prepare_cached(",
+    "Connection::prepare_with_flags(",
     "Connection::execute(",
     "Connection::execute_batch(",
     "Connection::query_row(",
+    "Connection::query_one(",
+    "Connection::query_row_and_then(",
+    "Connection::pragma(",
+    "Connection::pragma_query(",
+    "Connection::pragma_query_one(",
+    "Connection::pragma_query_value(",
     "Connection::pragma_update(",
+    "Connection::pragma_update_and_check(",
     "Connection::transaction(",
+    "Connection::transaction_with_behavior(",
+    "Connection::unchecked_transaction(",
+    "Connection::savepoint(",
+    "Connection::savepoint_with_name(",
+    "Connection::backup(",
+    "Connection::restore(",
+    "Connection::blob_open(",
     "Backup::new(",
     "Batch::new(",
+    "Transaction::new(",
+    "Transaction::new_unchecked(",
+    "Savepoint::new(",
+    "Savepoint::with_name(",
 ];
 
 fn production_sources() -> Vec<PathBuf> {
@@ -264,4 +283,17 @@ fn adv_149_the_scan_sees_turbofish_and_associated_function_calls() {
         let n: usize = SQL_CALLS.iter().map(|c| text.matches(c).count()).sum();
         assert!(n > 0, "the scan misses: {src}");
     }
+}
+
+/// Adversary (#149 round 2): every method in the dot-form list is also listed in its
+/// associated-function form (`Connection::query_one(&c, ..)` runs SQL just as `.query_one(` does).
+#[test]
+fn adv_149_r2_every_dot_form_has_its_associated_function_form() {
+    let missing: Vec<String> = SQL_CALLS
+        .iter()
+        .filter_map(|c| c.strip_prefix('.'))
+        .map(|m| format!("Connection::{m}"))
+        .filter(|a| !SQL_CALLS.contains(&a.as_str()))
+        .collect();
+    assert!(missing.is_empty(), "not scanned: {missing:?}");
 }

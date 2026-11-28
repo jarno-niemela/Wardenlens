@@ -339,3 +339,36 @@ fn a_migration_that_ends_its_transaction_keeps_the_cause() {
         );
     }
 }
+
+/// A migration whose trigger ends the transaction (`RAISE(ROLLBACK)`) is `TransactionEnded`, and
+/// the older version stays usable.
+#[test]
+fn a_migration_trigger_that_rolls_back_is_a_transaction_ended_error() {
+    let f = fixture();
+    drop(Index::open(&f.path).unwrap());
+    let bad = Migration {
+        version: 5,
+        sql: "CREATE TRIGGER adv_t BEFORE INSERT ON segments BEGIN SELECT RAISE(ROLLBACK, 'x'); END; \
+              INSERT INTO segments (camera_id, started_at_ms, duration_ms, ended_at_ms, bytes, \
+              frame_count, tier) VALUES ('c', 1700000000000, 1000, 1700000001000, 1, 1, 0); \
+              PRAGMA user_version = 5;",
+    };
+    let err = Index::open_with(
+        &f.path,
+        &[
+            MIGRATIONS[0],
+            MIGRATIONS[1],
+            MIGRATIONS[2],
+            MIGRATIONS[3],
+            bad,
+        ],
+        || {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, IndexError::TransactionEnded { op: "migrate" }),
+        "{err:?}"
+    );
+    let idx = Index::open(&f.path).unwrap();
+    assert_eq!(version(&idx.conn), 4);
+}

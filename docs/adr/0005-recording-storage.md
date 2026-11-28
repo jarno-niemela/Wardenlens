@@ -431,7 +431,9 @@ identity and every sidecar are proven by means no sidecar can influence**:
   (`IndexError::NotADataWrite`, #149), because transaction control would end the transaction before the bump. A statement
   that ends the transaction without being read-only (`INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)`) is caught by an
   `is_autocommit()` check before and after every write statement and before the bump: nothing further runs, nothing is bumped
-  or reported as success (`IndexError::TransactionEnded`); the pragma getters a `ReadSql` may be are an allow-list
+  or reported as success (`IndexError::TransactionEnded`). The statement's own error always wins over that check, except a
+  trigger's `RAISE(ROLLBACK)`: SQLite rolls back by itself on `SQLITE_FULL`/`IOERR`/`NOMEM`/`INTERRUPT` and those must stay
+  the transient (or typed) errors they are, never a permanent `TransactionEnded`; the pragma getters a `ReadSql` may be are an allow-list
   in the tests (#149); (3) **the compiler**: the read
   wrappers `sql::prepare` and `sql::query_row` take a `ReadSql` token, a newtype whose constructor is private to `sql.rs`
   and which exists only for the reviewed `SELECT`s and getter pragmas (a pass-list, not a shape check: `sqlite3_stmt_readonly`

@@ -330,8 +330,7 @@ impl WriteTx<'_> {
         }
         let r = stmt.execute(params);
         drop(stmt);
-        self.ensure_in_transaction()?;
-        r
+        self.after_statement(r)
     }
 
     /// Runs a script of statements one by one, each checked like [`write`](Self::write) **before**
@@ -351,10 +350,41 @@ impl WriteTx<'_> {
                 Ok(())
             })();
             drop(stmt);
-            self.ensure_in_transaction()?;
-            r?;
+            self.after_statement(r)?;
         }
         Ok(())
+    }
+
+    /// What a statement returned, after the transaction check. The statement's **own** error comes
+    /// first: SQLite itself rolls the transaction back on `SQLITE_FULL`, `SQLITE_IOERR`,
+    /// `SQLITE_NOMEM` and `SQLITE_INTERRUPT`, and that error (transient or not) is what the caller
+    /// must see, not a permanent `TransactionEnded` (the recorder would quarantine a good
+    /// segment). The one error that is a deliberate rollback is a trigger's `RAISE(ROLLBACK)`
+    /// (extended code `SQLITE_CONSTRAINT_TRIGGER`), which is `TransactionEnded`. A statement that
+    /// succeeded but left autocommit on (nothing else can) is `TransactionEnded`. Either way the
+    /// next statement is refused by the check before it and the bump by the check before it.
+    fn after_statement<T>(&self, r: Result<T>) -> Result<T> {
+        match r {
+            Err(e) => {
+                let trigger_rollback = self.db.0.is_autocommit()
+                    && matches!(
+                        &e,
+                        rusqlite::Error::SqliteFailure(f, _)
+                            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+                    );
+                if trigger_rollback {
+                    Err(rusqlite::Error::InvalidParameterName(
+                        TRANSACTION_ENDED.to_owned(),
+                    ))
+                } else {
+                    Err(e)
+                }
+            }
+            Ok(v) => {
+                self.ensure_in_transaction()?;
+                Ok(v)
+            }
+        }
     }
 
     /// The transaction `write_tx` opened must still be open: a statement that ended it

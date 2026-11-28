@@ -3,6 +3,7 @@
 mod adv_145_guard;
 mod adv_145_r2_write;
 mod adv_149;
+mod adv_149_r2;
 mod camera_tests;
 mod cursor_tests;
 mod guard_tests;
