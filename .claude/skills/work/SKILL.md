@@ -37,7 +37,9 @@ git worktree add .claude/worktrees/N -b <branch> origin/main
 ```
 
 ## 2. Implement (Sonnet)
-Dispatch the `implementer` subagent with: ticket number, full ticket body, worktree path, branch. For a high-risk ticket, name the `defect-patterns` entries that apply in the brief and the self-tests you expect for each. High risk means destructive actions, parsing untrusted bytes, touching files the program did not create, clocks or timeouts, or merging several inputs into one key space. Getting these into round 1 is the cheapest way to save rounds. Outcomes:
+Dispatch the `implementer` subagent with: ticket number, full ticket body, worktree path, branch. For a high-risk ticket, name the `defect-patterns` entries that apply in the brief and the self-tests you expect for each. High risk means destructive actions, parsing untrusted bytes, touching files the program did not create, clocks or timeouts, or merging several inputs into one key space. Getting these into round 1 is the cheapest way to save rounds.
+For an ingest, recorder or catalogue ticket, say in the brief: "ARCH-7: nothing derived from the owner's own cameras goes in code or defaults (counts, models present, per-camera stream or channel choices, hosts, paths). Site facts come from the registry, config or vault at runtime; vendor and model facts go in `cameras/*.toml`; code may name vendor protocols. Test with a camera set unlike the owner's."
+Outcomes:
 - `NEEDS_CLARIFICATION`: answer from the codebase/ticket if you can, else comment the questions on the issue, label it `agent:human`, return it to `status:backlog`, remove the worktree, and move on.
 - `BLOCKED`: comment the blocker on the issue. If another ticket blocks it, `scripts/ticket status N blocked` and add a `Blocked by: #M` line to its body; otherwise label it `agent:human` and set `status:backlog`. Remove the worktree and continue with the next ticket.
 - `DONE`: verify the claims yourself. **You** run `scripts/gate` in the worktree; do not trust the report alone.

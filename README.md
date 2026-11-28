@@ -24,8 +24,8 @@ pipeline for adding new hardware is planned (epics #33 and #34).
 This project started from a practical problem: **no available NVR handled the advanced features of more than one
 camera brand properly.**
 
-A typical home or small-site install mixes vendors, for example a couple of Reolinks, a Dahua OEM bullet camera,
-a TP-Link Tapo and a no-name ONVIF camera. Existing NVRs handle this mix in one of two ways:
+A typical home or small-site install mixes vendors, for example a few IP cameras from different vendors (ONVIF,
+Reolink, Dahua OEM, Tapo). Existing NVRs handle this mix in one of two ways:
 
 - **Generic ONVIF/RTSP only.** Every camera works, but on-camera AI events, vendor event channels, smart encoding
   and tuning are lost, and motion has to be re-detected on the server.
