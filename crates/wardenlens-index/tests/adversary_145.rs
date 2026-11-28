@@ -230,7 +230,8 @@ fn hard_link_child() {
     drop(ib); // last connection on this name: checkpoints into the shared main file
 }
 
-/// The main file is exempt from the link rule. Two names of one main file in two directories get
+/// The main file is subject to the link rule too (exactly one link, `HardLinkedIndex`; ADR 0005).
+/// Two names of one main file in two directories get
 /// two separate `-wal`/`-shm` pairs, so SQLite's WAL locks do not see each other (a documented way
 /// to corrupt a database), and `Index::open`'s `flock` is released after the open. Two processes
 /// using one name each must not corrupt the index: the open of a hard-linked main file should

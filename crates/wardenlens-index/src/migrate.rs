@@ -72,9 +72,16 @@ pub(crate) fn run(conn: &mut Db, migrations: &[Migration]) -> Result<(), IndexEr
             if stored >= m.version {
                 return Ok(None);
             }
-            w.write_batch(m.sql).map_err(|e| IndexError::Migration {
-                version: m.version,
-                code: e.sqlite_error_code(),
+            w.write_batch(m.sql).map_err(|e| {
+                // A refusal by the write wrapper keeps its own cause (not a SQLite code).
+                if sql::is_not_a_data_write(&e) || sql::is_transaction_ended(&e) {
+                    IndexError::sqlite("migrate")(e)
+                } else {
+                    IndexError::Migration {
+                        version: m.version,
+                        code: e.sqlite_error_code(),
+                    }
+                }
             })?;
             if user_version(w.read_conn())? != m.version {
                 return Err(IndexError::MigrationDidNotAdvance { version: m.version });

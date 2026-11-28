@@ -209,6 +209,23 @@ pub enum IndexError {
         /// What was being done.
         op: &'static str,
     },
+    /// A write path was given a statement that does not change data (transaction control such as
+    /// `COMMIT` or `ROLLBACK`, `ATTACH`, a getter pragma): a programming error, never caused by
+    /// data. The write wrappers refuse it because it could end the transaction before the
+    /// generation bump.
+    #[error("{op}: refused a statement that does not change data")]
+    NotADataWrite {
+        /// What was being done.
+        op: &'static str,
+    },
+    /// The write transaction was ended by a statement inside it (`INSERT OR ROLLBACK`, a trigger's
+    /// `RAISE(ROLLBACK)`): whatever it had written is rolled back, nothing further ran, and the
+    /// generation was not bumped.
+    #[error("{op}: the write transaction was ended early")]
+    TransactionEnded {
+        /// What was being done.
+        op: &'static str,
+    },
     /// A segment with the same camera and start time exists.
     #[error("a segment with this camera and start time already exists")]
     Duplicate,
@@ -303,6 +320,8 @@ impl IndexError {
     pub(crate) fn sqlite(op: &'static str) -> impl FnOnce(rusqlite::Error) -> Self {
         move |e| match e.sqlite_error_code() {
             _ if matches!(e, rusqlite::Error::InvalidQuery) => Self::NotReadOnly { op },
+            _ if crate::sql::is_not_a_data_write(&e) => Self::NotADataWrite { op },
+            _ if crate::sql::is_transaction_ended(&e) => Self::TransactionEnded { op },
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy { op },
             code => Self::Sqlite { op, code },
         }
