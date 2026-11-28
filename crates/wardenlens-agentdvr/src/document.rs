@@ -40,7 +40,7 @@ pub(crate) struct RawCamera {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Field {
+pub(crate) enum Field {
     Source,
     Login,
     Password,
@@ -211,20 +211,13 @@ impl Walker {
             // later, but its text must still be known. The whole text, not the truncated slot.
             let direct = std::mem::take(&mut self.direct);
             for t in [&collected, &direct] {
-                let seen = match f {
-                    Field::Source => &mut self.seen_sources,
-                    Field::Login | Field::Password => &mut self.seen_fields,
-                };
-                // Hashing the text is a pass over it, seen or not.
-                self.logins.charge(t.len())?;
-                if t.is_empty() || seen.contains(t.as_str()) {
-                    continue;
-                }
-                seen.insert(Secret::new(t));
-                match f {
-                    Field::Source => self.logins.add_source(t)?,
-                    Field::Login | Field::Password => self.logins.add_field(t)?,
-                }
+                collect_field(
+                    &mut self.logins,
+                    &mut self.seen_fields,
+                    &mut self.seen_sources,
+                    f,
+                    t,
+                )?;
             }
             if let Some(c) = self.current_camera() {
                 let slot = slot_of(c, f);
@@ -254,6 +247,32 @@ impl Walker {
                 self.text.push_str(piece);
             }
         }
+    }
+}
+
+/// Offers the whole text of one `login`, `password` or `videosourcestring` field to the logins,
+/// once per distinct text (a repeat costs one hash pass). Shared by the XML walk and the JSON
+/// reader, so both collect exactly the same candidates.
+pub(crate) fn collect_field(
+    logins: &mut Logins,
+    seen_fields: &mut HashSet<Secret>,
+    seen_sources: &mut HashSet<Secret>,
+    field: Field,
+    text: &str,
+) -> Result<(), ImportError> {
+    let seen = match field {
+        Field::Source => seen_sources,
+        Field::Login | Field::Password => seen_fields,
+    };
+    // Hashing the text is a pass over it, seen or not.
+    logins.charge(text.len())?;
+    if text.is_empty() || seen.contains(text) {
+        return Ok(());
+    }
+    seen.insert(Secret::new(text));
+    match field {
+        Field::Source => logins.add_source(text),
+        Field::Login | Field::Password => logins.add_field(text),
     }
 }
 

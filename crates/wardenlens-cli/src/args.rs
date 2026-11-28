@@ -94,7 +94,16 @@ pub(crate) enum TokenCommand {
 /// `wardenlens import ...`
 #[derive(Debug, Subcommand)]
 pub(crate) enum ImportCommand {
-    /// Import the cameras of an `AgentDVR` `objects.xml`.
+    /// Import the cameras of an `AgentDVR` `objects.json` or `objects.xml`.
+    ///
+    /// The format is detected from the content (a file that starts with `{` is JSON), or forced
+    /// with `--format`. Both formats map the same fields and share every rule. Without a file,
+    /// the first of `/opt/AgentDVR/Media/XML/objects.json` and `.../objects.xml` that exists is
+    /// read (the numbered `.bak` copies are never used).
+    ///
+    /// The JSON layout (a `cameras` array with nested `settings`, mirroring the XML) is an
+    /// assumption not checked against a real file: a camera that does not fit is skipped and
+    /// said so, never guessed.
     ///
     /// Each camera is registered in the index named by `database.path`; its host, display name
     /// and login are sealed into the vault next to it with the key file `secrets.key_file`. Prints
@@ -113,8 +122,12 @@ pub(crate) enum ImportCommand {
     /// importing: the registry cannot tell them from imported ones, and a re-import replaces their
     /// host, name, login and main path.
     Agentdvr {
-        /// The `objects.xml` to read.
-        file: PathBuf,
+        /// The `objects.json` or `objects.xml` to read (default: the first of the usual install
+        /// paths that exists).
+        file: Option<PathBuf>,
+        /// The file format; `auto` detects it from the content.
+        #[arg(long, value_enum, default_value_t = FormatArg::Auto)]
+        format: FormatArg,
         /// Register every camera of the file under this catalogue model (`<vendor>/<model>`, as in
         /// cameras/README.md). A camera named by `--camera-model` keeps its own model.
         #[arg(long, value_name = "VENDOR/MODEL")]
@@ -128,6 +141,17 @@ pub(crate) enum ImportCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// The `--format` choices of `import agentdvr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum FormatArg {
+    /// Detect from the content.
+    Auto,
+    /// `objects.xml`.
+    Xml,
+    /// `objects.json`.
+    Json,
 }
 
 /// `wardenlens secrets ...`

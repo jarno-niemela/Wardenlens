@@ -2111,6 +2111,8 @@ dependencies = [
  "proptest",
  "quick-xml",
  "secrecy",
+ "serde",
+ "serde_json",
  "thiserror",
  "wardenlens-core",
 ]
