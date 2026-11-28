@@ -382,14 +382,30 @@ async fn http_and_soap_outcomes() {
 }
 
 #[tokio::test]
-async fn requests_that_cannot_be_built_never_touch_the_network() {
-    let fake = spawn(0, ok(&good_device_info())).await;
+async fn requests_that_cannot_be_built_never_open_a_connection() {
+    // Deterministic: the kernel queues every completed connect, so after the call this test
+    // connects once itself and accepts. If the first accepted peer is not the test's own
+    // socket, the client connected for a request it could not build.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
     let bad_user = Credential::new("a\u{1}b", SecretString::from("pw"));
-    let r = client(&fake, Some(bad_user), fast())
-        .get_device_information()
-        .await;
+    let r = OnvifClient::new(
+        Host::new("127.0.0.1").expect("host"),
+        NonZeroU16::new(port).expect("port"),
+        Some(bad_user),
+    )
+    .with_config(fast())
+    .get_device_information()
+    .await;
     assert_eq!(r.err(), Some(OnvifError::UserNotXmlSafe));
-    assert_eq!(fake.accepted(), 0);
+    let probe = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("probe");
+    let mine = probe.local_addr().expect("probe addr");
+    let (_s, first_peer) = listener.accept().await.expect("accept");
+    assert_eq!(first_peer, mine, "the client connected");
 }
 
 #[test]

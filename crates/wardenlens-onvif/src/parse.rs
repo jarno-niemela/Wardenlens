@@ -13,18 +13,8 @@ use crate::soap::Doc;
 use crate::stream_uri::{StreamEndpoint, reduce_stream_uri};
 use crate::{MAX_PROFILES, OnvifError};
 
-/// Unicode format characters (general category Cf): invisible, yet able to reorder or hide text
-/// (bidi controls, zero-width characters, tags). The standard library has no test for them.
-fn is_format_char(c: char) -> bool {
-    matches!(u32::from(c),
-        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
-        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
-        | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
-        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
-}
-
-/// The trimmed text of `idx`, checked as a display field (bounded, no control or format
-/// characters).
+/// The trimmed text of `idx`, checked as a display field (bounded, no control character and no invisible one: core's
+/// `is_invisible`, which covers Unicode Cf and U+2028/U+2029).
 fn field(doc: &Doc, idx: usize, name: &'static str) -> Result<String, OnvifError> {
     let e = doc
         .elem(idx)
@@ -32,7 +22,9 @@ fn field(doc: &Doc, idx: usize, name: &'static str) -> Result<String, OnvifError
     let text = e.text.trim();
     if e.text_too_long
         || text.len() > MAX_FIELD_LEN
-        || text.chars().any(|c| c.is_control() || is_format_char(c))
+        || text
+            .chars()
+            .any(|c| c.is_control() || wardenlens_core::text::is_invisible(c))
     {
         return Err(OnvifError::InvalidField { field: name });
     }

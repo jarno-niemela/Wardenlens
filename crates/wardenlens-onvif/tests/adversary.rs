@@ -296,7 +296,7 @@ async fn non_http_garbage_is_a_typed_error() {
 #[tokio::test]
 async fn content_length_over_the_cap_is_refused_without_waiting_for_the_body() {
     // The camera announces 2 MiB and then stays silent. The cap must not wait for the timeout:
-    // with request_timeout at 30 s the test would take 30 s and report Timeout.
+    // with the body timeout at 30 s the test would take 30 s and report Timeout.
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
         2 * MAX_BODY_BYTES
@@ -305,6 +305,7 @@ async fn content_length_over_the_cap_is_refused_without_waiting_for_the_body() {
     let fake = spawn(Script::RawThenHold(head)).await;
     let mut c = cfg();
     c.request_timeout = Duration::from_secs(2);
+    c.body_timeout = Duration::from_secs(30);
     let r = OnvifClient::new(
         Host::new("127.0.0.1").expect("host"),
         NonZeroU16::new(fake.port).expect("port"),

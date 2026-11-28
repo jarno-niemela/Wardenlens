@@ -13,8 +13,9 @@
 //! head": it is retried like a silent camera and, after the last attempt, reported as
 //! [`OnvifError::Unreachable`] rather than as a transport error.
 //!
-//! Each attempt builds its own request body (see [`Request1::body`]), so a WS-Security nonce is
-//! never sent twice.
+//! Each attempt builds its own request body (see [`Request1::body`]) before it connects, so a
+//! WS-Security nonce is never sent twice, and a body that cannot be built ends the call as that
+//! error without any connection being opened.
 //!
 //! The retry is for read-only queries only; a request that changed state must not use it.
 
@@ -116,6 +117,12 @@ pub(crate) struct Request1<'a> {
 
 /// One attempt up to the response head. `None` is a retryable failure; `Some(Err(_))` is final.
 async fn attempt(req: &Request1<'_>, cfg: &ClientConfig) -> Option<Result<Live, OnvifError>> {
+    // Built before connecting: a request that cannot be built (a user name XML cannot carry, no
+    // clock, no randomness) is final and reported as itself, and never opens a connection.
+    let body = match (req.body)() {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
     let stream = timeout(
         cfg.connect_timeout,
         TcpStream::connect((req.host.expose(), req.port)),
@@ -133,10 +140,6 @@ async fn attempt(req: &Request1<'_>, cfg: &ClientConfig) -> Option<Result<Live, 
         // failure that matters, and a dropped `Driver` aborts this task anyway.
         let _ = conn.await;
     }));
-    let body = match (req.body)() {
-        Ok(b) => b,
-        Err(e) => return Some(Err(e)),
-    };
     let request = Request::builder()
         .method(Method::POST)
         .uri(req.path)

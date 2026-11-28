@@ -117,7 +117,7 @@ pub enum OnvifError {
     /// The connection failed after the response head arrived, while reading the body.
     #[error("the connection failed while reading the reply")]
     Transport,
-    /// The body did not arrive within the request timeout after the head did.
+    /// The body did not arrive within `ClientConfig::body_timeout` after the head did.
     #[error("the reply body did not arrive in time")]
     Timeout,
 }

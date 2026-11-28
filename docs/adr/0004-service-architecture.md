@@ -330,7 +330,7 @@ one allowed branch; `subtle` is `BSD-3-Clause`, `tokio`/`axum`/`quick-xml`/`hype
 | tokio | 1.54.1 | MIT | 2026-10-21 | carllerche, Darksonn, tokio-rs core team | yes (`rt-multi-thread`, `net`, `time`, `sync`, `signal`, `macros`; default is empty) | no |
 | axum | 0.8.9 | MIT | 2026-04-14 | carllerche, davidpdrsn, tokio-rs teams | yes (`http1`, `json`, `query`, `tokio`) | no |
 | hyper | 1.12.0 | MIT | 2026-10-06 | seanmonstar, hyperium core team | yes (`server`, `client`, `http1`; default is empty; `http2` arrives through hyper-util `server-auto`, unused at runtime) | no |
-| hyper-util | 0.1.21 | MIT | 2026-09-24 | seanmonstar | yes (`client-legacy`, `http1`, `tokio`, `server`, `server-auto`, `server-graceful`, `service`; default is empty) | no |
+| hyper-util | 0.1.21 | MIT | 2026-09-24 | seanmonstar | yes (`http1`, `tokio`, `server`, `server-auto`, `server-graceful`, `service`; default is empty) | no |
 | http-body-util | 0.1.5 | MIT | 2026-08-12 | seanmonstar | n/a (no features needed) | no |
 | utoipa | 6.0.0 | MIT OR Apache-2.0 | 2026-09-22 | juhaku | yes (`macros` only) | no |
 | utoipa-axum | 0.3.0 | MIT OR Apache-2.0 | 2026-09-22 | juhaku | n/a (only feature is `debug`) | no |
