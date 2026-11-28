@@ -27,13 +27,18 @@ owner copies them in.
 - No vault file: `vault scan: SKIPPED (no vault at <path>)` (once per push), and the commit or push goes on. With
   `WARDENLENS_REQUIRE_VAULT=1` in the environment it fails instead (put it in the shell profile of the development
   machine). A vault but no installed scanner, a hit (exit 1) or a scan that could not run (exit 2) always refuses.
+- Minimum git: **2.44** for a **partial clone**. The scanner sets `GIT_NO_LAZY_FETCH=1` on every git call so that a missing
+  object fails the scan instead of being fetched over the network (and written to disk); git before 2.44 ignores it. So the
+  scanner checks `git version` and, with an older git, **refuses a partial clone** (`extensions.partialclone` or a
+  `remote.*.promisor` setting) with exit 2 and an "upgrade git" message. A full repository is scanned with any git.
 - `GITHUB_ACTIONS` is never consulted: with a vault present a scan is never skipped.
 
 ## `pre-push`: the combined form
 
 `scripts/hooks-staged/pre-push` is the **complete** new hook: the existing `.githooks/pre-push` with lines added and none
-removed. Every existing refusal (main, tags, deletions, unknown remote state, force pushes, workflow changes) is
-untouched. The vault scan runs **first**, over every ref update, before the policy loop, so that no refusal can print a
+removed, except the detail of each refusal. Every existing refusal (main, tags, deletions, unknown remote state, force
+pushes, workflow changes) keeps its message and its condition, but it now ends with `ref:<index>` where it printed the ref
+name (or, for a workflow change, the first workflow path): a name can hold a value, and a refusal must never print one. The vault scan runs **first**, over every ref update, before the policy loop, so that no refusal can print a
 ref name or a workflow path that holds a value (the scan refuses as `ref:<index>`). The additions are:
 
 1. a comment block describing the scan (after the exceptions list);
@@ -42,7 +47,7 @@ ref name or a workflow path that holds a value (the scan refuses as `ref:<index>
 3. lines around the `while read` loop that collect the updates and ref names, then scan every update before the policy
    loop runs (the policy loop is the original loop body, unchanged).
 
-Show the difference with `diff -u .githooks/pre-push scripts/hooks-staged/pre-push` (it has no `-` lines); the tests
+Show the difference with `diff -u .githooks/pre-push scripts/hooks-staged/pre-push` (its only `-` lines are `refuse` calls whose detail changed); the tests
 check that (`scripts/tests/hooks-staged.test.sh`) and also run every existing `pre-push.test.sh` case against the staged
 file.
 

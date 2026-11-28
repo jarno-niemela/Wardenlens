@@ -706,10 +706,16 @@ scans issue and PR bodies before `gh` posts them, and a detective scan of `~/.cl
   in a directory's path is reported at the files and directories below it (where it is published); only when nothing below
   reports it is it reported at the directory itself (an empty one). The walk replaces `git diff-tree -r --name-only
   --root -m` (named in the #117 criterion) and covers a superset of it: every path `diff-tree` lists, plus empty
-  directories, trees only a tag or the range end leads to, and the directory paths themselves. The `diff-tree` path scan was removed: the walk covers
-  everything it did (renames and second paths of a blob are paths in a new tree; a merge's tree is a root) and what it
-  could not (empty directories, trees only a tag or the range end leads to), and keeping both would report each place
-  twice. A tree git cannot list makes `git rev-list --objects` fail, which stops the scan (exit 2). Entry modes are classified as git does (octal, file-type bits: `40755` is a directory, `100664` a file); an unknown or unparsable mode is malformed (exit 2), and `GIT_NO_LAZY_FETCH=1` makes a missing object in a partial clone fail the scan instead of fetching.
+  directories, trees only a tag or the range end leads to, and the directory paths themselves. The `diff-tree` scan was removed
+  because keeping both would report each place twice (renames and second paths of a blob are paths in a new tree, and a
+  merge's tree is a root). A tree git cannot list makes `git rev-list --objects` fail, which stops the scan (exit 2). Entry modes are classified as git does
+  (octal, file-type bits: `40755` is a directory, `100664` a file); an unknown or unparsable mode is malformed (exit 2).
+  Over-long mode text (such as `00040000`, which git itself accepts as a directory) is **deliberately** malformed too:
+  no tool writes it, and the scan fails closed rather than copy git's leniency. The walk also stores at most 64 MiB of
+  paths (its visited set and the paths of blobs), so a crafted repeating tree cannot allocate gigabytes before the place
+  bound stops it; more is a refusal (exit 2). Every git call sets `GIT_NO_LAZY_FETCH=1`, so a missing object in a
+  partial clone fails the scan instead of being fetched. That variable needs **git 2.44**; with an older git the scan
+  refuses a partial clone (exit 2) and scans a full repository as usual.
 
 ### 10. Access, in-memory handling and the CLI
 

@@ -124,14 +124,32 @@ struct Finding {
     at: Where,
 }
 
+/// The memory bounds of one scan. Production uses [`Limits::DEFAULT`] only; a test builds a
+/// smaller one with [`Collected::with_limits`], so there is no way (no variable, no flag) to
+/// loosen them for a real scan.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Most bytes of raw tree objects held (old ones included).
+    tree_bytes: usize,
+    /// Most bytes of paths the walk stores (its visited set and the paths of the blobs).
+    path_bytes: usize,
+}
+
+impl Limits {
+    const DEFAULT: Self = Self {
+        tree_bytes: walk::MAX_TREE_BYTES,
+        path_bytes: walk::MAX_PATH_BYTES,
+    };
+}
+
 /// Everything one source yielded, before anything is printed.
-#[derive(Default)]
 struct Collected {
+    limits: Limits,
     findings: Vec<Finding>,
     problems: Vec<(Where, Unread)>,
     objects: usize,
     truncated: bool,
-    /// Bytes of raw tree objects held so far (bounded by `walk::MAX_TREE_BYTES`).
+    /// Bytes of raw tree objects held so far (bounded by `limits.tree_bytes`).
     tree_bytes: usize,
     /// Paths by blob id (range scans), for naming a blob in a report.
     paths: BTreeMap<Sha, Vec<Vec<u8>>>,
@@ -145,7 +163,30 @@ pub(super) struct GitTally {
     pub(super) truncated: bool,
 }
 
+impl Default for Collected {
+    fn default() -> Self {
+        Self {
+            limits: Limits::DEFAULT,
+            findings: Vec::new(),
+            problems: Vec::new(),
+            objects: 0,
+            truncated: false,
+            tree_bytes: 0,
+            paths: BTreeMap::new(),
+        }
+    }
+}
+
 impl Collected {
+    /// An empty result with smaller bounds (tests of the bounds).
+    #[cfg(test)]
+    fn with_limits(limits: Limits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     fn add(&mut self, id: &EntryId, kind: EntryKind, at: Where) {
         if self.findings.len() >= MAX_FINDINGS {
             self.truncated = true;
@@ -239,6 +280,9 @@ fn git_error(e: GitError) -> CliError {
         GitError::Missing => "an object listed by git is missing; fetch it and retry",
         GitError::TooMany => "too many objects for one scan; scan a smaller range",
         GitError::PathTooLong => "a path in the pushed trees is longer than the scan limit",
+        GitError::PartialClone => {
+            "this is a partial clone and git is older than 2.44, which cannot stop lazy fetching; upgrade git"
+        }
     })
 }
 
@@ -253,6 +297,7 @@ pub(super) fn run<T: Terminal>(
     sources: Sources,
     term: &mut T,
 ) -> Result<GitTally, CliError> {
+    git.guard_lazy_fetch().map_err(git_error)?;
     let found = match source {
         Source::Staged => collect_staged(matcher, git, sources),
         Source::Range {
@@ -427,12 +472,23 @@ fn collect_staged(matcher: &Matcher, git: &Git, sources: Sources) -> Result<Coll
 fn collect_range(
     matcher: &Matcher,
     git: &Git,
-    (from, to, remote): (Option<&Sha>, &Sha, Option<&str>),
+    range: (Option<&Sha>, &Sha, Option<&str>),
     refs: &[String],
     sources: Sources,
 ) -> Result<Collected, GitError> {
+    collect_range_in(matcher, git, range, refs, sources, Collected::default())
+}
+
+/// [`collect_range`] into `found`, which carries the bounds (a test passes smaller ones).
+fn collect_range_in(
+    matcher: &Matcher,
+    git: &Git,
+    (from, to, remote): (Option<&Sha>, &Sha, Option<&str>),
+    refs: &[String],
+    sources: Sources,
+    mut found: Collected,
+) -> Result<Collected, GitError> {
     let objects = git.new_objects(from, to, remote)?;
-    let mut found = Collected::default();
     // The new trees (parsed), and where a walk of them starts: the root tree of every new
     // commit and every tree a tag or the end of the range points at directly.
     let mut trees: HashMap<Sha, Entries> = HashMap::new();
@@ -568,7 +624,7 @@ fn take_tree(
         Err(why) => found.problems.push((at, why)),
         Ok(raw) => {
             found.tree_bytes = found.tree_bytes.saturating_add(raw.len());
-            if found.tree_bytes > walk::MAX_TREE_BYTES {
+            if found.tree_bytes > found.limits.tree_bytes {
                 return Err(GitError::TooLarge);
             }
             match tree_entries(&raw, sha.as_str().len() / 2) {

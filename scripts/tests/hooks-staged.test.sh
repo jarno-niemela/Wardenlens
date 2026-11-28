@@ -25,8 +25,11 @@ check "the staged pre-push passes every pre-push test" env HOOKS="$staged" "$roo
 for adv in "$root"/scripts/tests/adversarial/pre-push-*.adv.sh; do
   check "the staged pre-push passes $(basename "$adv")" env HOOKS="$staged" "$adv"
 done
-removed=$(diff -u "$root/.githooks/pre-push" "$staged/pre-push" | grep '^-' | grep -vc '^---' || true)
-check "the staged pre-push only adds lines to the installed one" test "$removed" -eq 0
+# Nothing is removed except the detail argument of a refusal (#128: it is `ref:$idx`, never a ref name or a workflow path).
+removed=$(diff -u "$root/.githooks/pre-push" "$staged/pre-push" | grep '^-' | grep -v '^---' | grep -vc 'refuse "' || true)
+check "the staged pre-push only adds lines to the installed one (or re-words a refusal's detail)" test "$removed" -eq 0
+# shellcheck disable=SC2016 # the patterns are literal shell text
+check "no refusal of the staged pre-push prints a ref name, a ref pair or a path" bash -c "! grep 'refuse \"' '$staged/pre-push' | grep -E 'refuse \"[^\"]*\" \"[^\"]*(\\\$rref|\\\$lref|\\\$wf)'"
 removed=$(diff -u "$root/.githooks/pre-commit" "$staged/pre-commit" | grep '^-' | grep -vc '^---' || true)
 check "the staged pre-commit only adds lines to the installed one" test "$removed" -eq 0
 check "no WARDENLENS_BIN override in either hook" bash -c "! grep -q 'WARDENLENS_BIN' '$staged/pre-push' '$staged/pre-commit' || ! grep -v '^#' '$staged/pre-push' '$staged/pre-commit' | grep -q 'WARDENLENS_BIN'"
@@ -162,5 +165,17 @@ rsha=$(git -C "$tmp/remote.git" rev-parse refs/heads/feat/two)
 del=":refs/heads/feat/two"
 checkf "a deletion with a clean scan: still refused by the policy" git -C "$w" push -q origin "$del"
 check "a deletion is scanned over --range=<rsha>..<rsha>" grep -q -- "^ARGS vault scan --default-paths --range=$rsha\.\.$rsha " "$tmp/calls"
+
+# every policy refusal names the update by index, never by ref name (#128), whatever the refusal is.
+fake 0
+name="zq-ref-name-mark"
+git -C "$w" checkout -q -b "feat/$name"; more
+git -C "$w" push -q origin "feat/$name" 2>/dev/null   # the remote now has the branch
+git -C "$w" reset -q --hard HEAD~1; more   # the local branch no longer descends from the remote one
+checkf "a force push is refused" git -C "$w" push -q --force origin "feat/$name"
+check "a force push refusal says ref:0 and never the name" bash -c "! git -C '$w' push -q --force origin 'feat/$name' 2>&1 | grep -q '$name'"
+check "a force push refusal names the update by index" bash -c "git -C '$w' push -q --force origin 'feat/$name' 2>&1 | grep -q 'ref:0'"
+check "a push to main is refused by index, not by name of the local ref" bash -c "out=\$(git -C '$w' push -q origin 'feat/$name:refs/heads/main' 2>&1); grep -q 'ref:0' <<<\"\$out\" && ! grep -q '$name' <<<\"\$out\""
+check "a deletion is refused by index, not by name" bash -c "out=\$(git -C '$w' push -q origin ':refs/heads/feat/$name' 2>&1); grep -q 'ref:0' <<<\"\$out\" && ! grep -q '$name' <<<\"\$out\""
 
 exit $fail

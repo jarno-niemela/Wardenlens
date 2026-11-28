@@ -42,6 +42,8 @@ pub(super) enum GitError {
     TooMany,
     #[error("a path is longer than the scan limit")]
     PathTooLong,
+    #[error("a partial clone is scanned with a git that cannot stop lazy fetching")]
+    PartialClone,
 }
 
 /// An object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
@@ -103,6 +105,22 @@ impl RawEntry {
     pub(super) fn any_sha(&self) -> Option<&Sha> {
         [&self.new, &self.old].into_iter().find(|s| !s.is_zero())
     }
+}
+
+/// The first git that honours `GIT_NO_LAZY_FETCH` (2.44). An older git ignores the variable, so
+/// in a partial clone it could fetch a missing object over the network and write packs during a
+/// scan; the scan refuses that combination instead ([`Git::guard_lazy_fetch`]).
+pub(super) const LAZY_FETCH_MIN: (u32, u32) = (2, 44);
+
+/// `(major, minor)` from the output of `git version` (`git version 2.53.0`, or with a vendor
+/// suffix); `None` when it is not in that form.
+pub(super) fn parse_version(out: &[u8]) -> Option<(u32, u32)> {
+    let text = std::str::from_utf8(out).ok()?;
+    let rest = text.trim_end().strip_prefix("git version ")?;
+    let mut nums = rest.split(|c: char| !c.is_ascii_digit());
+    let major = nums.next()?.parse().ok()?;
+    let minor = nums.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// The git binary to run.
@@ -212,6 +230,34 @@ impl Git {
         // A write error with a successful, complete run cannot be told from a lost input.
         read.1?.map_err(|_| GitError::Io)?;
         Ok(out)
+    }
+
+    /// Refuses to go on when git is older than 2.44 (or its version is not understood) and the
+    /// repository is a partial clone: only a git that honours `GIT_NO_LAZY_FETCH` is trusted not
+    /// to fetch or write during a scan. A full repository is fine with any git.
+    pub(super) fn guard_lazy_fetch(&self) -> Result<(), GitError> {
+        self.guard_lazy_fetch_from(LAZY_FETCH_MIN)
+    }
+
+    fn guard_lazy_fetch_from(&self, min: (u32, u32)) -> Result<(), GitError> {
+        let out = self.capture(&args(&["version"]), b"", 1024)?;
+        if parse_version(&out).is_some_and(|v| v >= min) {
+            return Ok(());
+        }
+        let partial = [
+            &["config", "--get", "extensions.partialclone"][..],
+            &["config", "--get-regexp", r"^remote\..*\.promisor$"][..],
+        ];
+        for a in partial {
+            match self.capture(&args(a), b"", 1024) {
+                // The key is set.
+                Ok(_) => return Err(GitError::PartialClone),
+                // `config` exits 1 when no key matches.
+                Err(GitError::Failed) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// `git rev-parse --verify` of a revision to an object id.
@@ -529,6 +575,7 @@ pub(super) fn parse_raw(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const Z: &str = "0000000000000000000000000000000000000000";
@@ -552,6 +599,62 @@ mod tests {
         };
         assert_eq!(env("GIT_NO_LAZY_FETCH"), Some("1".into()));
         assert_eq!(env("GIT_NO_REPLACE_OBJECTS"), Some("1".into()));
+        // Grafts are ignored by `git push`, so the scan must not read them either (the
+        // end-to-end proof is `a_graft_does_not_hide_content_from_the_scan`).
+        assert_eq!(env("GIT_GRAFT_FILE"), Some("/dev/null".into()));
+    }
+
+    #[test]
+    fn git_versions_are_read_as_major_and_minor() {
+        for (text, want) in [
+            ("git version 2.53.0\n", Some((2, 53))),
+            ("git version 2.39.5 (Apple Git-154)\n", Some((2, 39))),
+            ("git version 2.44.0.windows.1", Some((2, 44))),
+            ("git version 10.0", Some((10, 0))),
+            ("git version 2", None),
+            ("git version x.y", None),
+            ("hg version 2.53.0", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_version(text.as_bytes()), want, "{text:?}");
+        }
+        assert!(parse_version(b"\xff\xfe").is_none());
+    }
+
+    #[test]
+    fn an_old_git_refuses_a_partial_clone_and_only_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        let git = Git::at(dir.path());
+        // A full repository is fine whatever the version, and so is a new enough git.
+        assert_eq!(git.guard_lazy_fetch_from((99, 0)), Ok(()));
+        run(&["config", "extensions.partialclone", "origin"]);
+        assert_eq!(git.guard_lazy_fetch_from((0, 0)), Ok(()));
+        assert_eq!(git.guard_lazy_fetch(), Ok(()), "this git is new enough");
+        // An old git in a partial clone (either marker) is refused.
+        assert_eq!(
+            git.guard_lazy_fetch_from((99, 0)),
+            Err(GitError::PartialClone)
+        );
+        run(&["config", "--unset", "extensions.partialclone"]);
+        assert_eq!(git.guard_lazy_fetch_from((99, 0)), Ok(()));
+        run(&["config", "remote.origin.promisor", "true"]);
+        assert_eq!(
+            git.guard_lazy_fetch_from((99, 0)),
+            Err(GitError::PartialClone)
+        );
     }
 
     #[test]
