@@ -326,7 +326,7 @@ Option 2.
     unmodified; the second is the patch, kept also as `third_party/retina-0.4.22.patch` (a `diff -ru` against the
     package, 6 files, about 180 added lines, no new dependency). The pristine copy leaves out the package's `Cargo.lock`. It adds:
     - `SessionOptions::max_buffered_bytes(n)`: the connection fails (`Error::is_buffer_limit`) once the read ring must
-      keep more than `n` bytes (from the oldest pinned packet to the end). `wardenlens-ingest` sets just under 16 MiB.
+      keep more than `n` bytes (from the oldest pinned packet to the end). `wardenlens-ingest` sets 16 MiB - 64 KiB.
     - `SetupOptions::max_nals_per_access_unit(n)`: an H.264 access unit with more than `n` NALs, or `16 * n` pieces,
       fails the session. `wardenlens-ingest` sets 4096 (`MAX_NALS_PER_ACCESS_UNIT`).
     - `SessionOptions::allow_basic_auth(bool)`, default false: a `WWW-Authenticate` list whose best scheme is Basic
@@ -334,7 +334,7 @@ Option 2.
       before any credentials are sent. At the first challenge this fails the session. A Basic re-challenge at a
       keepalive only logs a warning and keeps the Digest client already in use; it does not fail the session. `wardenlens-ingest`
       maps it to `IngestError::BasicAuthRefused` and exposes the per-camera opt-in as `OpenOptions::allow_basic_auth`
-      (`RetinaSource::with_open_options`). Wiring the opt-in to a camera setting is follow-up work.
+      (`RetinaSource::with_open_options`). Item 15 wires it to a per-camera setting.
 
     Limits of a path source: cargo-deny does not match RUSTSEC advisories against it, so retina advisories must be
     watched by hand; and the vendored crate's own tests cannot run (the published manifest has no `mylog`
@@ -350,3 +350,15 @@ Option 2.
     AND-ed with the `RUST_LOG` filter on the fmt layer (the user's string is not edited, so no directive spelling can
     loosen the cap). No `log` bridge is installed, so today nothing from
     retina is printed; the cap is what keeps that true when one is added.
+15. **Per-camera Basic authentication opt-in (#225).** The opt-in of item 13 lives in the camera registry, not in the
+    config: column `cameras.allow_basic_auth` (index migration 4, `INTEGER NOT NULL DEFAULT 0 CHECK (IN (0, 1))`, so every
+    existing camera stays off and a read-only open of an older index reports `NeedsMigration`). It is a flag, not a
+    secret or a site identifier, so it is not a vault entry, and `serve` needs no config change: it reads the flag with
+    the rest of the row and passes it to `RetinaSource::with_open_options` (and to the camera view the API serves as
+    `allow_basic_auth`, additive). It is set with `wardenlens camera add --allow-basic-auth` or later with
+    `wardenlens camera set <id> --allow-basic-auth true|false` (the registry row only; it takes effect when the service next
+    starts), shown by `camera list` (`BASIC`: allowed or refused) and by `GET /api/v1/cameras`. Setting it prints, and
+    `serve` logs for each such camera, a warning that the password then crosses the network in base64, which is
+    cleartext. `import agentdvr` never turns it on: it writes the row with the flag off, so re-importing a camera resets
+    an opt-in made with `camera set` (the safe direction; set it again afterwards). A challenge that also offers Digest is
+    answered with Digest whatever the flag says.

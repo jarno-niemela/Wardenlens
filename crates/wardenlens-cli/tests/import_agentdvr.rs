@@ -230,6 +230,28 @@ fn rerun_is_idempotent_and_updates_the_credential() {
     assert_eq!(site.vault().list().unwrap().len(), 3);
 }
 
+/// #225: an import never turns the Basic opt-in on, and a re-import writes the registry row
+/// again with it off (fail closed): the operator sets it afterwards with `camera set`.
+#[test]
+fn import_never_sets_the_basic_opt_in_and_a_reimport_turns_it_off() {
+    let site = Site::new();
+    site.init_key();
+    let file = one(&site);
+    assert!(site.import(&file, &[]).status.success());
+    let flag = || {
+        let index = wardenlens_index::Index::open(&site.p("state/index.db")).unwrap();
+        let rows = index.list_cameras(&[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows[0].record().allow_basic_auth()
+    };
+    assert!(!flag());
+    let set = site.run(&["camera", "set", "agentdvr-1", "--allow-basic-auth", "true"]);
+    assert!(set.status.success(), "{}", text(&set.stderr));
+    assert!(flag());
+    assert!(site.import(&file, &[]).status.success());
+    assert!(!flag());
+}
+
 #[test]
 fn a_login_removed_from_the_file_is_removed_from_the_vault() {
     let site = Site::new();

@@ -29,7 +29,7 @@ fn fresh_open_sets_and_verifies_every_pragma() {
     assert_eq!(pragma_i64(c, "synchronous"), 2);
     assert_eq!(pragma_i64(c, "foreign_keys"), 1);
     assert_eq!(pragma_i64(c, "application_id"), i64::from(APPLICATION_ID));
-    assert_eq!(pragma_i64(c, "user_version"), 3);
+    assert_eq!(pragma_i64(c, "user_version"), 4);
     assert_eq!(pragma_i64(c, "busy_timeout"), 5000);
     assert_eq!(pragma_i64(c, "journal_size_limit"), 67_108_864);
     // The pragma statements in sql.rs carry these literal values.

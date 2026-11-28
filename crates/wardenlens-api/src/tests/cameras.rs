@@ -382,3 +382,31 @@ async fn openapi_documents_both_routes_with_schemas() {
         }
     }
 }
+
+/// #225: the response says whether Basic authentication is allowed for a camera, and shows false
+/// unless the operator opted in.
+#[tokio::test]
+async fn allow_basic_auth_is_shown_per_camera_and_off_by_default() {
+    let dir = FakeDirectory {
+        cameras: vec![
+            camera("cam-a", "192.0.2.10", None),
+            camera("cam-b", "192.0.2.11", None).with_allow_basic_auth(true),
+        ],
+        ..FakeDirectory::default()
+    };
+    let (app, auth) = app_of(dir, FakeStatus::default());
+    let (_, body) = fetch(&app, "/api/v1/cameras", Some(&auth)).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let flags: Vec<_> = v["cameras"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["id"].as_str().unwrap(), c["allow_basic_auth"].as_bool()))
+        .collect();
+    assert_eq!(flags, [("cam-a", Some(false)), ("cam-b", Some(true))]);
+    for (id, want) in [("cam-a", false), ("cam-b", true)] {
+        let (_, body) = fetch(&app, &format!("/api/v1/cameras/{id}"), Some(&auth)).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["allow_basic_auth"], want, "{id}");
+    }
+}

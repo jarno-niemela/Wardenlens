@@ -166,9 +166,12 @@ mod tests {
             for quiet in ["r-warn", "r-info", "r-debug", "r-trace", "192.0.2.7"] {
                 assert!(!out.contains(quiet), "{rust_log:?}: {quiet} in {out}");
             }
-            // Errors still get through wherever the filter enables retina at error. A directive
-            // that names only other targets, or only spans (`retina::client=trace`, `[sp]=trace`),
-            // leaves the unnamed ones off, as for any target; the sub-target still prints its error.
+            // Errors still get through wherever the filter enables retina at error. Per row:
+            // `r-error` (target `retina`) is expected for every row except those in
+            // `SUB_TARGET_OR_SPAN_ONLY`, whose directives name only a sub-target or only spans and
+            // so leave the unnamed `retina` target off, as for any target; `rc-error` (target
+            // `retina::client`) is expected for every row except the three span-only ones, so
+            // `retina::client=trace` asserts `rc-error` only.
             if !SUB_TARGET_OR_SPAN_ONLY.contains(&rust_log) {
                 assert!(out.contains("r-error"), "{rust_log:?}: {out}");
             }

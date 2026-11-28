@@ -107,6 +107,9 @@ pub(crate) struct CameraDto {
     model: ModelDto,
     host: String,
     streams: StreamsDto,
+    /// Whether a Basic-only authentication challenge from the camera is answered (the login then
+    /// crosses the network in base64, which is cleartext). Off unless the operator opted in.
+    allow_basic_auth: bool,
     /// `null` when no connection is supervised for the camera yet.
     connection: Option<ConnectionDto>,
 }
@@ -180,6 +183,7 @@ pub(crate) fn camera_dto(camera: &Camera, status: Option<LinkStatus>) -> CameraD
                 .as_ref()
                 .map(RtspPath::redacted_for_display),
         },
+        allow_basic_auth: camera.allow_basic_auth(),
         connection: status.map(connection_dto),
     }
 }

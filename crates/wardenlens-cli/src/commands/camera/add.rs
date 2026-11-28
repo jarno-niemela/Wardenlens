@@ -254,14 +254,15 @@ pub(super) fn add(
         req.model.clone(),
         streams.port,
         StreamSet::new(streams.main.clone(), streams.sub.clone()),
-    );
+    )
+    .with_allow_basic_auth(args.allow_basic_auth);
     let mut vault = open_vault(&vault_path(config), key).map_err(CameraCmdError::Vault)?;
     let mut index = Index::open(config.database_path()).map_err(CameraCmdError::Index)?;
     commit(
         &mut index, &mut vault, &record, &entries, stamp, &req, password,
     )?;
     // The camera is stored: a failure to print must not turn into an error exit.
-    let _ = print(&req, &streams, term);
+    let _ = print(&req, &streams, args.allow_basic_auth, term);
     Ok(())
 }
 
@@ -345,7 +346,12 @@ fn rollback(vault: &mut impl VaultOps, id: &CameraId) {
     }
 }
 
-fn print(req: &Request, streams: &Streams, term: &mut impl Terminal) -> Result<(), CameraCmdError> {
+fn print(
+    req: &Request,
+    streams: &Streams,
+    allow_basic_auth: bool,
+    term: &mut impl Terminal,
+) -> Result<(), CameraCmdError> {
     let source = match streams.source {
         Source::Onvif => "ONVIF",
         Source::Catalogue => "catalogue",
@@ -359,6 +365,9 @@ fn print(req: &Request, streams: &Streams, term: &mut impl Terminal) -> Result<(
     }
     for note in &streams.notes {
         writeln!(term.err(), "note: {note}").map_err(CameraCmdError::Output)?;
+    }
+    if allow_basic_auth {
+        writeln!(term.err(), "{}", super::BASIC_AUTH_WARNING).map_err(CameraCmdError::Output)?;
     }
     let sub = streams
         .sub

@@ -4,7 +4,8 @@
 //! |---|---|
 //! | `discover` | one WS-Discovery probe; lists what answered, **suggestions only** ([`discover`]) |
 //! | `add` | probes a camera over ONVIF (catalogue paths if it is unreachable), stores it ([`add`]) |
-//! | `list` | id, model and host of every registered camera; never a login |
+//! | `list` | id, model, Basic authentication allowed or refused, and host of every registered camera; never a login |
+//! | `set` | `--allow-basic-auth true\|false`: the per-camera Basic opt-in, in the registry row (ADR 0002 item 15) |
 //! | `remove` | the registry row first, then the camera's vault entries; recordings are kept |
 //!
 //! A camera is stored exactly as `import agentdvr` stores one (ADR 0006): host, display name and
@@ -199,6 +200,7 @@ fn run(
             add::add(&config, args, term, &services)
         }
         CameraCommand::List => list(&config, term),
+        CameraCommand::Set(args) => set(&config, args, term),
         CameraCommand::Remove { id } => remove(&config, id, term),
     }
 }
@@ -277,14 +279,24 @@ fn list(config: &Config, term: &mut impl Terminal) -> Result<(), CameraCmdError>
         writeln!(term.err(), "note: hosts not shown: {}", error_chain(e))
             .map_err(CameraCmdError::Output)?;
     }
-    let rows: Vec<[String; 3]> = stored
+    let rows: Vec<[String; 4]> = stored
         .iter()
         .map(|s| {
             let id = s.record().id();
             let host = vault.as_ref().ok().map_or("-".to_owned(), |v| {
                 read_host(v, id).map_or("?".to_owned(), |h| h.expose())
             });
-            [id.to_string(), s.record().model().to_string(), host]
+            let basic = if s.record().allow_basic_auth() {
+                "allowed"
+            } else {
+                "refused"
+            };
+            [
+                id.to_string(),
+                s.record().model().to_string(),
+                basic.to_owned(),
+                host,
+            ]
         })
         .collect();
     let out = term.out();
@@ -296,15 +308,48 @@ fn list(config: &Config, term: &mut impl Terminal) -> Result<(), CameraCmdError>
             .max()
             .unwrap_or(0)
     };
-    let (w_id, w_model) = (width(0, "ID"), width(1, "MODEL"));
-    let line = |out: &mut dyn Write, a: &str, b: &str, c: &str| {
-        writeln!(out, "{a:<w_id$}  {b:<w_model$}  {c}")
+    let (w_id, w_model, w_basic) = (width(0, "ID"), width(1, "MODEL"), width(2, "BASIC"));
+    let line = |out: &mut dyn Write, a: &str, b: &str, c: &str, d: &str| {
+        writeln!(out, "{a:<w_id$}  {b:<w_model$}  {c:<w_basic$}  {d}")
     };
-    line(out, "ID", "MODEL", "HOST").map_err(CameraCmdError::Output)?;
-    for [id, model, host] in &rows {
-        line(out, id, model, host).map_err(CameraCmdError::Output)?;
+    line(out, "ID", "MODEL", "BASIC", "HOST").map_err(CameraCmdError::Output)?;
+    for [id, model, basic, host] in &rows {
+        line(out, id, model, basic, host).map_err(CameraCmdError::Output)?;
     }
     Ok(())
+}
+
+/// The notice printed whenever a camera is set to answer a Basic challenge.
+const BASIC_AUTH_WARNING: &str = "warning: Basic authentication is allowed for this camera: if it offers nothing better, its password crosses the network in base64, which is cleartext";
+
+/// `camera set`: changes the Basic opt-in of a registered camera (the registry row only).
+fn set(
+    config: &Config,
+    args: &crate::args::CameraSetArgs,
+    term: &mut impl Terminal,
+) -> Result<(), CameraCmdError> {
+    let id = CameraId::new(&args.id).map_err(CameraCmdError::Camera)?;
+    let stamp = now()?;
+    let mut index = open_existing_index(config)?.ok_or(CameraCmdError::NotFound)?;
+    if !index
+        .set_camera_basic_auth(&id, args.allow_basic_auth, stamp)
+        .map_err(CameraCmdError::Index)?
+    {
+        return Err(CameraCmdError::NotFound);
+    }
+    if args.allow_basic_auth {
+        writeln!(term.err(), "{BASIC_AUTH_WARNING}").map_err(CameraCmdError::Output)?;
+    }
+    writeln!(
+        term.out(),
+        "{id}: Basic authentication {} (takes effect when the service next starts)",
+        if args.allow_basic_auth {
+            "allowed"
+        } else {
+            "refused"
+        }
+    )
+    .map_err(CameraCmdError::Output)
 }
 
 fn remove(config: &Config, id: &str, term: &mut impl Terminal) -> Result<(), CameraCmdError> {

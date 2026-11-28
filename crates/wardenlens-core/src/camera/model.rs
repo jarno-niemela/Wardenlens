@@ -73,6 +73,7 @@ pub struct Camera {
     host: Host,
     port: NonZeroU16,
     streams: StreamSet,
+    allow_basic_auth: bool,
 }
 
 impl Camera {
@@ -93,7 +94,22 @@ impl Camera {
             host,
             port,
             streams,
+            allow_basic_auth: false,
         }
+    }
+
+    /// Sets the per-camera opt-in to Basic authentication (ADR 0002 item 15). Off by default.
+    #[must_use]
+    pub fn with_allow_basic_auth(mut self, allow: bool) -> Self {
+        self.allow_basic_auth = allow;
+        self
+    }
+
+    /// Whether a Basic-only authentication challenge may be answered with the password, which
+    /// then crosses the network in base64 cleartext. Off unless the operator opted this camera in.
+    #[must_use]
+    pub fn allow_basic_auth(&self) -> bool {
+        self.allow_basic_auth
     }
 
     /// The camera id.
@@ -170,6 +186,16 @@ mod tests {
                 sub.map(|s| RtspPath::new(s).unwrap()),
             ),
         )
+    }
+
+    #[test]
+    fn the_basic_opt_in_is_off_unless_set_and_does_not_change_equality_of_the_rest() {
+        let c = cam("192.0.2.1", 554, "/a", None);
+        assert!(!c.allow_basic_auth());
+        let on = c.clone().with_allow_basic_auth(true);
+        assert!(on.allow_basic_auth());
+        assert_ne!(c, on);
+        assert!(!on.with_allow_basic_auth(false).allow_basic_auth());
     }
 
     #[test]
