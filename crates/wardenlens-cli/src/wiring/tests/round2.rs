@@ -26,7 +26,8 @@ fn releasing_the_runtime_after_an_overrun_does_not_wait_for_blocking_tasks() {
     });
     let at = std::time::Instant::now();
     release_runtime(runtime, false);
-    assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
+    // The stuck task sleeps 30 s; waiting for it would exceed this (TEST-5: not a load gauge).
+    assert!(at.elapsed() < Duration::from_secs(20), "{:?}", at.elapsed());
 }
 
 /// A clean release of an idle runtime is quick.

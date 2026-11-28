@@ -340,24 +340,51 @@ fn accepted_constructs() {
     }
 }
 
+/// An `<objects>` element with `n` empty attributes.
+fn attribute_flood(n: u32) -> String {
+    let mut s = String::from("<objects");
+    for k in 0..n {
+        s.push_str(&format!(" a{k}=\"\""));
+    }
+    s.push_str("/>");
+    s
+}
+
+/// Best of `REPEATS` parse times: a load spike inflates one run, rarely all of them.
+fn best_parse_time(doc: &str) -> std::time::Duration {
+    const REPEATS: usize = 3;
+    (0..REPEATS)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            let r = parse(doc.as_bytes());
+            let took = start.elapsed();
+            assert!(r.is_ok());
+            took
+        })
+        .min()
+        .unwrap_or_default()
+}
+
 #[test]
 fn many_attributes_do_not_take_quadratic_time() {
     // quick-xml's duplicate-attribute check compares each key with the earlier ones; an element
     // with a million attributes must be refused or read fast, not tie a core up for hours.
-    let mut s = String::from("<objects");
-    for n in 0..700_000_u32 {
-        s.push_str(&format!(" a{n}=\"\""));
-    }
-    s.push_str("/>");
-    assert!(s.len() > 7_000_000 && s.len() <= MAX_INPUT_BYTES);
-    let start = std::time::Instant::now();
-    let r = parse(s.as_bytes());
+    //
+    // Load-independent (TEST-5): no absolute bound. Parse N and 4N attributes in the same test
+    // and compare. Linear work gives a ratio near 4, quadratic work near 16; the threshold sits
+    // between, and the best of several runs per size keeps a loaded host from tipping it.
+    const N: u32 = 175_000;
+    const MAX_RATIO: u32 = 10;
+    let small = attribute_flood(N);
+    let large = attribute_flood(4 * N);
+    assert!(large.len() > 7_000_000 && large.len() <= MAX_INPUT_BYTES);
+    let t_small = best_parse_time(&small);
+    let t_large = best_parse_time(&large);
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
-        "{:?}",
-        start.elapsed()
+        t_large < t_small.max(std::time::Duration::from_millis(1)) * MAX_RATIO,
+        "{N} attributes took {t_small:?}, {} took {t_large:?}",
+        4 * N
     );
-    assert!(r.is_ok());
 }
 
 #[test]

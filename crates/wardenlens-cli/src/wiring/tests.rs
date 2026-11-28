@@ -520,7 +520,8 @@ async fn stop_all_reports_a_part_that_overruns_the_deadline() {
     let at = std::time::Instant::now();
     let deadline = Instant::now() + Duration::from_millis(300);
     assert!(!stop_all(Vec::new(), storage(&site), stuck, deadline).await);
-    assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+    // `stuck` never ends; the 300 ms deadline must cut it off. A huge bound still catches a hang.
+    assert!(at.elapsed() < Duration::from_secs(30), "{:?}", at.elapsed());
 
     let done = tokio::spawn(async {});
     let deadline = Instant::now() + Duration::from_secs(10);

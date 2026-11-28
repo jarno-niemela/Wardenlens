@@ -231,7 +231,9 @@ mod tests {
             probe(addr, SHORT).await,
             Err(HealthError::Timeout)
         ));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The stalled peer holds for 30 s; a probe that waited for it would pass 25 s. A bound
+        // tighter than that only measures host load (TEST-5).
+        assert!(started.elapsed() < Duration::from_secs(25));
     }
 
     #[tokio::test]

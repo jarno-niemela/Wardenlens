@@ -381,7 +381,8 @@ fn one_mib_moof_of_empty_trafs_is_fast() {
     ]);
     let t = Instant::now();
     let r = run(&f);
-    assert!(t.elapsed() < Duration::from_secs(5));
+    // Runaway work takes minutes or more; the bound only has to beat that, not host load (TEST-5).
+    assert!(t.elapsed() < Duration::from_secs(60));
     assert_eq!(r.map(|s| s.frame_count), Ok(1));
 }
 
@@ -401,7 +402,8 @@ fn one_mib_traf_of_many_truns_is_fast_and_summed() {
     let f = cat(&[ftyp(), moov(1000), moof(&children), mdat()]);
     let t = Instant::now();
     let r = run(&f);
-    assert!(t.elapsed() < Duration::from_secs(5));
+    // Runaway work takes minutes or more; the bound only has to beat that, not host load (TEST-5).
+    assert!(t.elapsed() < Duration::from_secs(60));
     assert_eq!(
         r,
         Ok(Mp4Summary {

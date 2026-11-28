@@ -129,7 +129,8 @@ fn a_200_with_a_huge_content_length_and_no_body_is_healthy_at_once() {
     drop(hold_tx);
     assert!(out.status.success(), "{out:?}");
     assert!(
-        took < Duration::from_secs(2),
+        // A probe that waited for the 1 GiB body would never return; the bound is huge (TEST-5).
+        took < Duration::from_secs(60),
         "waited for the body: {took:?}"
     );
 }
