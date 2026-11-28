@@ -151,7 +151,7 @@ impl Redactor {
         let mut unredactable = Vec::new();
         for item in items {
             match redaction_literals(item.kind, &item.secret, &mut addresses) {
-                Some(l) => texts.extend(l.into_iter().map(Zeroizing::new)),
+                Some(l) => texts.extend(l),
                 None => unredactable.push(Unredactable {
                     id: item.id.clone(),
                     kind: item.kind,
@@ -161,9 +161,7 @@ impl Redactor {
                 // A short username (`admin`) is public text; only a long one is a needle.
                 texts.extend(
                     redaction_literals(EntryKind::Secret, user, &mut Addresses::default())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(Zeroizing::new),
+                        .unwrap_or_default(),
                 );
                 texts.extend(
                     userinfo_literals(user, &item.secret)

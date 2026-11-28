@@ -543,7 +543,10 @@ fn every_location_kind_is_redacted_when_its_text_holds_a_value() {
     for l in &locs {
         let shown = render(&m, l).to_string();
         assert!(!shown.contains(value), "{l:?} -> {shown}");
-        assert_ne!(shown, "");
+        // A location whose every form spells the value (the object id does) is dropped; it
+        // is never replaced by an unchecked marker.
+        let line = render(&m, l).print("e:hex secret ", "");
+        assert!(line.is_some_and(|x| !x.contains(value)), "{l:?}");
     }
 }
 
@@ -596,9 +599,12 @@ fn a_clean_location_is_printed_in_full_in_the_forms_of_the_adr() {
     );
     // Even the position of a ref can spell a value.
     let m = matcher(&[("e:num", "1234567")]);
+    // No form of it is clean: the location is dropped, never printed (ticket #124 r2).
+    let shown = render(&m, &Loc::Ref(1_234_567));
+    assert_eq!(shown.to_string(), "");
     assert_eq!(
-        render(&m, &Loc::Ref(1_234_567)).to_string(),
-        "<redacted-location>"
+        shown.print("e:num secret ", "").as_deref(),
+        Some("e:num secret")
     );
 }
 
@@ -870,9 +876,11 @@ fn a_problem_line_is_checked_with_the_text_around_the_location() {
     // The value spans the fixed text and the location: neither part alone holds it.
     let m = matcher(&[("e:span", "error: ref:3")]);
     assert_eq!(render(&m, &Loc::Ref(3)).to_string(), "ref:3");
+    let shown = render_in(&m, &Loc::Ref(3), ("error: ", " is too large"));
+    assert_eq!(shown.to_string(), "");
     assert_eq!(
-        render_in(&m, &Loc::Ref(3), ("error: ", " is too large")).to_string(),
-        "<redacted-location>"
+        shown.print("error: ", " is too large").as_deref(),
+        Some("error: is too large")
     );
 }
 
