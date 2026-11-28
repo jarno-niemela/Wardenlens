@@ -575,3 +575,94 @@ fn fault_text_never_reaches_the_error() {
         assert!(!format!("{e} {e:?}").contains("SENTINEL"));
     }
 }
+
+#[test]
+fn format_characters_are_refused_in_device_information() {
+    // Unicode Cf: the bidi controls, zero-width characters, the soft hyphen, the BOM, tags.
+    for bad in [
+        "\u{AD}",
+        "\u{61C}",
+        "\u{200B}",
+        "\u{200E}",
+        "\u{202A}",
+        "\u{202E}",
+        "\u{2060}",
+        "\u{2066}",
+        "\u{2069}",
+        "\u{FEFF}",
+        "\u{E0001}",
+        "\u{E0041}",
+    ] {
+        let text = format!("Acme{bad}");
+        assert_eq!(
+            parse_device_information(device_info(&text, "m", "m", "m", "m").as_bytes()),
+            Err(OnvifError::InvalidField {
+                field: "Manufacturer"
+            }),
+            "{bad:?}"
+        );
+    }
+    // Ordinary non-ASCII text stays valid.
+    assert!(
+        parse_device_information(
+            device_info("Caf\u{e9} \u{65E5}\u{672C}", "m", "m", "m", "m").as_bytes()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn off_list_video_profile_token_is_refused_not_skipped() {
+    // Decision: a video profile whose token cannot be sent back is a loud failure, not a
+    // silently missing stream.
+    let r = parse_profiles(profiles(&[profile("a b", "n", "10", "10", "H264")]).as_bytes());
+    assert_eq!(r.err(), Some(OnvifError::InvalidField { field: "token" }));
+}
+
+#[test]
+fn a_leading_space_token_is_refused_untrimmed() {
+    let r = parse_profiles(profiles(&[profile("&#32;main", "n", "10", "10", "H264")]).as_bytes());
+    assert_eq!(r.err(), Some(OnvifError::InvalidField { field: "token" }));
+}
+
+fn prof_enc(token: &str, w: u32, h: u32, enc: &str) -> Profile {
+    parse_profiles(profiles(&[profile(token, "n", &w.to_string(), &h.to_string(), enc)]).as_bytes())
+        .expect("profile")
+        .remove(0)
+}
+
+#[test]
+fn pick_streams_prefers_h264_and_h265_before_pixels() {
+    let pick = |ps: &[Profile]| {
+        let c = pick_streams(ps).expect("choice");
+        (
+            c.main.token.as_str().to_owned(),
+            c.sub.map(|p| p.token.as_str().to_owned()),
+        )
+    };
+    // A tiny MJPEG profile is not the sub stream.
+    let ps = [
+        prof_enc("main", 2560, 1440, "H264"),
+        prof_enc("sub", 640, 360, "H265"),
+        prof_enc("tiny", 160, 120, "JPEG"),
+    ];
+    assert_eq!(pick(&ps), ("main".to_owned(), Some("sub".to_owned())));
+    // A huge MJPEG profile is not the main stream either.
+    let ps = [
+        prof_enc("jpeg", 3840, 2160, "JPEG"),
+        prof_enc("main", 1920, 1080, "H264"),
+    ];
+    assert_eq!(pick(&ps), ("main".to_owned(), None));
+    // Without any H.264/H.265 profile the ranking falls back to all of them.
+    let ps = [
+        prof_enc("big", 1920, 1080, "JPEG"),
+        prof_enc("small", 320, 240, "MPEG4"),
+    ];
+    assert_eq!(pick(&ps), ("big".to_owned(), Some("small".to_owned())));
+    // Other and missing encodings rank below H.264.
+    let ps = [
+        prof_enc("odd", 3840, 2160, "VP9"),
+        prof_enc("main", 640, 480, "H265"),
+    ];
+    assert_eq!(pick(&ps), ("main".to_owned(), None));
+}

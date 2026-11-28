@@ -121,7 +121,6 @@ fn big_text_is_kept_bounded() {
 
 #[test]
 fn text_limit_boundary() {
-    let at = |n: usize| device_info(&"x".repeat(n), "m", "m", "m", "m");
     // 4096 bytes are kept; the 256-byte field rule then refuses it, so probe the keep limit
     // through the arena directly.
     let kept = |n: usize| {
@@ -132,5 +131,4 @@ fn text_limit_boundary() {
     assert_eq!(kept(4095), (4095, false));
     assert_eq!(kept(4096), (4096, false));
     assert_eq!(kept(4097), (0, true));
-    let _ = at;
 }

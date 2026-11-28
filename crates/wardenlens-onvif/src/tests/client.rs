@@ -23,6 +23,7 @@ pub(crate) fn fast() -> ClientConfig {
     ClientConfig {
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
+        body_timeout: Duration::from_secs(5),
         backoff: Backoff::new(DurationMs::from_millis(1), DurationMs::from_millis(1)),
     }
 }
@@ -291,9 +292,11 @@ async fn failures_after_the_head_are_final_not_retried() {
     assert_eq!(r.err(), Some(OnvifError::Transport));
     assert_eq!(fake.accepted(), 1);
 
+    // The head arrives at once and the body stalls: only the body timeout is short, so a slow
+    // CI machine cannot turn the head wait into a retry.
     let fake = spawn(0, Reply::StalledBody).await;
     let cfg = ClientConfig {
-        request_timeout: Duration::from_millis(40),
+        body_timeout: Duration::from_millis(40),
         ..fast()
     };
     let r = client(&fake, None, cfg).get_device_information().await;
@@ -379,14 +382,30 @@ async fn http_and_soap_outcomes() {
 }
 
 #[tokio::test]
-async fn requests_that_cannot_be_built_never_touch_the_network() {
-    let fake = spawn(0, ok(&good_device_info())).await;
+async fn requests_that_cannot_be_built_never_open_a_connection() {
+    // Deterministic: the kernel queues every completed connect, so after the call this test
+    // connects once itself and accepts. If the first accepted peer is not the test's own
+    // socket, the client connected for a request it could not build.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
     let bad_user = Credential::new("a\u{1}b", SecretString::from("pw"));
-    let r = client(&fake, Some(bad_user), fast())
-        .get_device_information()
-        .await;
+    let r = OnvifClient::new(
+        Host::new("127.0.0.1").expect("host"),
+        NonZeroU16::new(port).expect("port"),
+        Some(bad_user),
+    )
+    .with_config(fast())
+    .get_device_information()
+    .await;
     assert_eq!(r.err(), Some(OnvifError::UserNotXmlSafe));
-    assert_eq!(fake.accepted(), 0);
+    let probe = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("probe");
+    let mine = probe.local_addr().expect("probe addr");
+    let (_s, first_peer) = listener.accept().await.expect("accept");
+    assert_eq!(first_peer, mine, "the client connected");
 }
 
 #[test]
@@ -467,7 +486,7 @@ async fn the_transport_caps_the_read_itself() {
             port: fake.port(),
             path: "/x",
             action: "a",
-            body: bytes::Bytes::new(),
+            body: &|| Ok(bytes::Bytes::new()),
         };
         let r = post(&req, &fast()).await;
         if want_ok {
@@ -476,4 +495,38 @@ async fn the_transport_caps_the_read_itself() {
             assert_eq!(r.err(), Some(OnvifError::BodyTooLarge));
         }
     }
+}
+
+/// The `Nonce` and `Created` values of a recorded request.
+fn nonce_and_created(request: &str) -> (String, String) {
+    let between = |from: &str, to: &str| {
+        let start = request.find(from).map_or(0, |i| i + from.len());
+        request[start..]
+            .split(to)
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    (
+        between("#Base64Binary\">", "<"),
+        between("<wsu:Created>", "<"),
+    )
+}
+
+#[tokio::test]
+async fn every_attempt_carries_its_own_nonce() {
+    // A camera that caches nonces would refuse a retry that repeats one. The camera closes
+    // without answering, so all six attempts are made.
+    let fake = spawn(0, Reply::Close).await;
+    let r = client(&fake, Some(cred()), fast())
+        .get_device_information()
+        .await;
+    assert_eq!(r.err(), Some(OnvifError::Unreachable { attempts: 6 }));
+    let requests = fake.requests.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 6);
+    let mut nonces: Vec<String> = requests.iter().map(|r| nonce_and_created(r).0).collect();
+    assert!(nonces.iter().all(|n| !n.is_empty()));
+    nonces.sort();
+    nonces.dedup();
+    assert_eq!(nonces.len(), 6, "a nonce was reused across attempts");
 }

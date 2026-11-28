@@ -101,10 +101,13 @@ apply to `[dev-dependencies]`, which are unrestricted (test helpers never ship).
 ### 7. ONVIF approach (hand-rolled)
 
 1. **quick-xml + hyper-util client + sha1/base64** (chosen).
-   - Transport: `hyper-util` legacy client (`client-legacy`, `http1`, `tokio`) with `http-body-util`; plain HTTP
-     only. ADR 0002 measured ONVIF on plain HTTP ports (tapo 2020, hdipc 1018, reolink 8000). `hyper` and `hyper-util`
-     are already in the tree via axum, so this adds only `http-body-util` and the `client-legacy` feature (probe
-     below: 119 crates in the full set).
+   - Transport: `hyper::client::conn::http1` (the low-level connection API, one fresh connection per call, driven by a
+     spawned task that is aborted on drop) with `http-body-util`; not the `hyper-util` legacy client
+     (`client-legacy`), which pools connections and follows nothing we want. `hyper-util` is used only for
+     `TokioIo`. Plain HTTP only. ADR 0002 measured ONVIF on plain HTTP ports (tapo 2020, hdipc 1018, reolink 8000).
+     `hyper` and `hyper-util` are already in the tree via axum, so this adds only `http-body-util`.
+     A `Content-Length` above the 1 MiB cap is refused as soon as the head is read; the head and the body each have
+     their own timeout; every retry attempt builds its own request, so a WS-Security nonce is never repeated.
    - Parsing and writing: `quick-xml` 0.42 (no default features; `serialize` is not enabled, the SOAP bodies we need
      are a handful of fixed requests, `GetCapabilities`, `GetProfiles`, `GetStreamUri`, PullPoint, built from string
      templates with escaped values and read with the event reader). quick-xml does not expand custom entities, which
@@ -112,8 +115,8 @@ apply to `[dev-dependencies]`, which are unrestricted (test helpers never ship).
      (64) and each request with a timeout (SEC-2/3).
    - Authentication: WS-Security UsernameToken digest, `Base64(SHA1(nonce + created + password))`, with a 16-byte
      nonce from `getrandom`. SHA-1 is required by the WS-Security profile the cameras implement; it is used only to
-     answer that challenge, never for a local security decision (SEC-7: audited RustCrypto `sha1` and `base64`,
-     nothing hand-rolled). `base64` is used with `default-features = false, features = ["std"]` to drop the
+     answer that challenge, never for a local security decision (SEC-7: audited RustCrypto `sha1`, with its `zeroize` feature on so the hasher
+     state is wiped on drop, and `base64`; nothing hand-rolled). `base64` is used with `default-features = false, features = ["std"]` to drop the
      `simd-unsafe` default.
    - Discovery: WS-Discovery `Probe` multicast to `239.255.255.250:3702` using `tokio::net::UdpSocket`, opened with
      `socket2` to pick the outgoing interface with `IP_MULTICAST_IF` (no group is joined, because replies are unicast;
@@ -327,7 +330,7 @@ one allowed branch; `subtle` is `BSD-3-Clause`, `tokio`/`axum`/`quick-xml`/`hype
 | tokio | 1.54.1 | MIT | 2026-10-21 | carllerche, Darksonn, tokio-rs core team | yes (`rt-multi-thread`, `net`, `time`, `sync`, `signal`, `macros`; default is empty) | no |
 | axum | 0.8.9 | MIT | 2026-04-14 | carllerche, davidpdrsn, tokio-rs teams | yes (`http1`, `json`, `query`, `tokio`) | no |
 | hyper | 1.12.0 | MIT | 2026-10-06 | seanmonstar, hyperium core team | yes (`server`, `client`, `http1`; default is empty; `http2` arrives through hyper-util `server-auto`, unused at runtime) | no |
-| hyper-util | 0.1.21 | MIT | 2026-09-24 | seanmonstar | yes (`client-legacy`, `http1`, `tokio`, `server`, `server-auto`, `server-graceful`, `service`; default is empty) | no |
+| hyper-util | 0.1.21 | MIT | 2026-09-24 | seanmonstar | yes (`http1`, `tokio`, `server`, `server-auto`, `server-graceful`, `service`; default is empty) | no |
 | http-body-util | 0.1.5 | MIT | 2026-08-12 | seanmonstar | n/a (no features needed) | no |
 | utoipa | 6.0.0 | MIT OR Apache-2.0 | 2026-09-22 | juhaku | yes (`macros` only) | no |
 | utoipa-axum | 0.3.0 | MIT OR Apache-2.0 | 2026-09-22 | juhaku | n/a (only feature is `debug`) | no |

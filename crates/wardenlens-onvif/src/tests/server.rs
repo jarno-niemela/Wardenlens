@@ -15,6 +15,8 @@ pub(crate) enum Reply {
     Http { status: u16, body: Vec<u8> },
     /// Reads the request, then says nothing and holds the connection open.
     Silent,
+    /// Reads the request, then closes the connection without answering.
+    Close,
     /// A 200 head that promises `promised` bytes, sends `sent` of them, then closes.
     Truncated { promised: usize, sent: usize },
     /// A 200 head with no length, then body bytes until the client hangs up.
@@ -126,6 +128,7 @@ async fn serve(mut stream: TcpStream, reply: Reply, requests: Arc<Mutex<Vec<Stri
             let _ = stream.shutdown().await;
         }
         Reply::Silent => std::future::pending::<()>().await,
+        Reply::Close => drop(stream),
         Reply::Truncated { promised, sent } => {
             let head = format!(
                 "HTTP/1.1 200 X\r\nContent-Length: {promised}\r\nConnection: close\r\n\r\n"

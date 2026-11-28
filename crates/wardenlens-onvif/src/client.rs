@@ -129,13 +129,14 @@ impl OnvifClient {
         body: &str,
         parse: impl FnOnce(&[u8]) -> Result<T, OnvifError>,
     ) -> Result<T, OnvifError> {
-        let envelope = envelope(self.credential.as_ref(), body)?;
+        // Built per attempt: a fresh nonce and `Created` each time.
+        let build = || envelope(self.credential.as_ref(), body);
         let req = Request1 {
             host: &self.host,
             port: self.port.get(),
             path: &path.0,
             action,
-            body: envelope,
+            body: &build,
         };
         let (status, reply) = post(&req, &self.config).await?;
         match parse(&reply) {
