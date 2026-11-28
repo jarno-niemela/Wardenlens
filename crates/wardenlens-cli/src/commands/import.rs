@@ -1051,12 +1051,14 @@ mod tests {
         std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
         let defaults = [hidden.to_str().unwrap(), next.to_str().unwrap()];
+        let probe = std::fs::symlink_metadata(&hidden);
         let got = input_path(None, &defaults);
         let opened = read_input(&hidden);
+        // Restore first, so the directory is removable whatever the assertions say.
         std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        // As root the directory stays readable and the candidate is simply missing.
-        if std::fs::symlink_metadata(&hidden).is_ok() || got.as_ref().is_ok_and(|p| *p == next) {
+        // As root the directory stays readable: the candidate is simply missing, nothing to test.
+        if !matches!(probe, Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied) {
             return;
         }
         assert_eq!(got.unwrap(), hidden);
