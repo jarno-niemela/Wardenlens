@@ -474,7 +474,9 @@ pub(crate) fn wal_verdict(
         // `Damaged` stays here on purpose (#145 asked to map it to `Damaged`; two committed
         // tests pin `ForeignWal` for a replay that fails its integrity check: a foreign `-wal`
         // with stale frames replays into a corrupt database, and `DamagedBtree` in
-        // `schema_tests`; a decision for the controller). The `ForeignWal` message says so.
+        // `schema_tests`). The #145 ruling (PR #147) kept `ForeignWal` and ADR 0005 records it
+        // ("a `-wal` ... whose replay is not an index of ours (wrong `application_id`, schema or
+        // integrity), is `ForeignWal`"). The `ForeignWal` message says so.
         Err(
             IndexError::WrongApplicationId { .. }
             | IndexError::UnexpectedSchema

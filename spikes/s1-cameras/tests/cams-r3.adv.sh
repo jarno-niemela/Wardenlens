@@ -19,8 +19,9 @@ export HOME="$fx/home"; mkdir -p "$HOME"
 unset CAMERAS WARDENLENS_BIN
 # shellcheck source=vault_stub.sh
 source "$here/tests/vault_stub.sh"
-for c in reolink-1 xr tapo; do cred "$c" admin "pw-synth-$c"; done
-host reolink-1 192.0.2.1; host xr 192.0.2.2; host tapo 192.0.2.3
+for c in cam-2 cam-6 cam-5; do cred "$c" admin "pw-synth-$c"; done
+host cam-2 192.0.2.1; host cam-6 192.0.2.2; host cam-5 192.0.2.3
+model cam-2 reolink/rlc-520a; model cam-6 dahua/ipc-hfw4431r-z; model cam-5 tp-link/tapo-c110
 
 for t in ffprobe ffmpeg; do
   printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in rtsp://*) printf "%%s\\n" "$a" >>%q;; esac; done\nexit 1\n' \
@@ -37,34 +38,35 @@ source "$here/lib.sh"
 for p in '' 'h264Preview_01_main' ' /x' $'\n/x' '@evil/x' ':8554/x'; do
   reset
   check "rtsp_url: path $(printf %q "$p") is refused before any vault read" \
-    '! rtsp_url xr "$p" >/dev/null 2>&1 && [[ ! -s $VAULT_STUB/.argv ]]'
+    '! rtsp_url cam-6 "$p" >/dev/null 2>&1 && [[ ! -s $VAULT_STUB/.argv ]]'
 done
 reset
 check "rtsp_url: a missing path argument is refused (set -u safe)" \
-  '! ( set -u; rtsp_url xr >/dev/null 2>&1 ) && [[ ! -s $VAULT_STUB/.argv ]]'
+  '! ( set -u; rtsp_url cam-6 >/dev/null 2>&1 ) && [[ ! -s $VAULT_STUB/.argv ]]'
 check "rtsp_url: the host part is exactly the vault host (path cannot move the authority)" \
-  '[[ $(rtsp_url xr /x) == rtsp://*@192.0.2.2:554/x ]]'
+  '[[ $(rtsp_url cam-6 /x) == rtsp://*@192.0.2.2:554/x ]]'
 
 # ============================== load_cams vendor-path check ==============================
 cred cam-x admin pw-synth-x; host cam-x 192.0.2.9
-check "load_cams: one id with no vendor path among valid ones is refused, CAMS empty" \
-  '{ ! CAMERAS="xr cam-x tapo" load_cams 2>/dev/null && (( ${#CAMS[@]} == 0 )); }'
-check "load_cams (default selection): a vault host id with no vendor path refuses the whole selection" \
+check "load_cams: one id with no model entry among valid ones is refused, CAMS empty" \
+  '{ ! CAMERAS="cam-6 cam-x cam-5" load_cams 2>/dev/null && (( ${#CAMS[@]} == 0 )); }'
+check "load_cams (default selection): a vault host id with no model entry refuses the whole selection" \
   '{ unset CAMERAS; ! load_cams 2>/dev/null && (( ${#CAMS[@]} == 0 )); }'
 for s in probe_streams.sh gop_sample.sh; do
-  reset; CAMERAS="xr cam-x" "$here/$s" 1 >/dev/null 2>&1; rc=$?
+  reset; CAMERAS="cam-6 cam-x" "$here/$s" 1 >/dev/null 2>&1; rc=$?
   check "$s: a no-vendor-path id after a valid one -> non-zero, no camera contacted at all" '[[ $rc != 0 ]] && ! contacted'
 done
-reset; CAMERAS="xr cam-x" "$here/stream_soak.sh" "$fx/soak-mixed" 1 >/dev/null 2>&1; rc=$?
+reset; CAMERAS="cam-6 cam-x" "$here/stream_soak.sh" "$fx/soak-mixed" 1 >/dev/null 2>&1; rc=$?
 check "stream_soak.sh: a no-vendor-path id after a valid one -> non-zero, nothing contacted, no out dir" \
   '[[ $rc != 0 ]] && ! contacted && [[ ! -e $fx/soak-mixed ]]'
 no_entries
-for c in reolink-1 xr tapo; do cred "$c" admin "pw-synth-$c"; done
-host reolink-1 192.0.2.1; host xr 192.0.2.2; host tapo 192.0.2.3
+for c in cam-2 cam-6 cam-5; do cred "$c" admin "pw-synth-$c"; done
+host cam-2 192.0.2.1; host cam-6 192.0.2.2; host cam-5 192.0.2.3
+model cam-2 reolink/rlc-520a; model cam-6 dahua/ipc-hfw4431r-z; model cam-5 tp-link/tapo-c110
 
 # A vendor-path id whose host is missing: the pre-flight fails. It should not leave an out dir behind either.
-cred reolink-9 admin pw-synth-9
-reset; CAMERAS="reolink-9" "$here/stream_soak.sh" "$fx/soak-nohost" 1 >/dev/null 2>&1; rc=$?
+cred cam-4 admin pw-synth-9; model cam-4 reolink/rlc-520a
+reset; CAMERAS="cam-4" "$here/stream_soak.sh" "$fx/soak-nohost" 1 >/dev/null 2>&1; rc=$?
 check "stream_soak.sh: a missing host -> non-zero, nothing contacted" '[[ $rc != 0 ]] && ! contacted'
 check "stream_soak.sh: a failed pre-flight leaves no out dir behind" '[[ ! -e $fx/soak-nohost ]]'
 
@@ -73,7 +75,7 @@ mkdir -p "$fx/copy/baichuan-probe/target/release"
 cp "$here/lib.sh" "$here/run_baichuan.sh" "$fx/copy/"
 printf '#!/usr/bin/env bash\nprintf "[%%s]\\n" "$1" >>%q\n' "$fx/probe.called" >"$fx/copy/baichuan-probe/target/release/baichuan-probe"
 chmod +x "$fx/copy/baichuan-probe/target/release/baichuan-probe"
-"$fx/copy/run_baichuan.sh" reolink-9 1 >/dev/null 2>&1; rc=$?
+"$fx/copy/run_baichuan.sh" cam-4 1 >/dev/null 2>&1; rc=$?
 check "run_baichuan.sh: a camera with no vault host -> non-zero, the probe is never started" \
   '[[ $rc != 0 && ! -e $fx/probe.called ]]'
 
@@ -96,7 +98,7 @@ for t in lib.adv.sh lib-r2.adv.sh cams-r2.adv.sh; do
 done
 # CAMERAS / ONVIF_* exported by the developer must not change what the tests exercise.
 for t in lib.adv.sh lib-r2.adv.sh cams-r2.adv.sh; do
-  CAMERAS="tapo" ONVIF_PORT=8000 ONVIF_MEDIA_URL=http://192.0.2.200/m ONVIF_EVENTS_URL=http://192.0.2.200/e \
+  CAMERAS="cam-5" ONVIF_PORT=8000 ONVIF_MEDIA_URL=http://192.0.2.200/m ONVIF_EVENTS_URL=http://192.0.2.200/e \
     timeout 300 "$here/tests/$t" >"$fx/$t.env.out" 2>&1; rc=$?
   check "gate spike test $t: passes with CAMERAS/ONVIF_* set in the caller's environment" '[[ $rc == 0 ]]'
 done

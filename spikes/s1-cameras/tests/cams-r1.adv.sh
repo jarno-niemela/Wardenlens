@@ -22,8 +22,9 @@ export HOME="$fx/home"; mkdir -p "$HOME"
 unset CAMERAS
 # shellcheck source=vault_stub.sh
 source "$here/tests/vault_stub.sh"
-for c in reolink-1 xr tapo; do cred "$c" admin "pw-synth-$c"; done
-host reolink-1 192.0.2.1; host xr 192.0.2.2; host tapo 192.0.2.3
+for c in cam-2 cam-6 cam-5; do cred "$c" admin "pw-synth-$c"; done
+host cam-2 192.0.2.1; host cam-6 192.0.2.2; host cam-5 192.0.2.3
+model cam-2 reolink/rlc-520a; model cam-6 dahua/ipc-hfw4431r-z; model cam-5 tp-link/tapo-c110
 
 # Stub ffprobe/ffmpeg: record every URL they were handed (a camera contact), then fail fast.
 for t in ffprobe ffmpeg; do
@@ -38,15 +39,15 @@ reset() { rm -f "$fx/contacted"; : >"$VAULT_STUB/.argv"; }
 source "$here/lib.sh"
 
 # ============================== selected_cams ==============================
-check "selected_cams: default lists every vault host id" '[[ $(selected_cams | sort | tr "\n" " ") == "reolink-1 tapo xr " ]]'
-check "selected_cams: CAMERAS picks exactly those ids, in order" '[[ $(CAMERAS="xr tapo" selected_cams | tr "\n" " ") == "xr tapo " ]]'
+check "selected_cams: default lists every vault host id" '[[ $(selected_cams | sort | tr "\n" " ") == "cam-2 cam-5 cam-6 " ]]'
+check "selected_cams: CAMERAS picks exactly those ids, in order" '[[ $(CAMERAS="cam-6 cam-5" selected_cams | tr "\n" " ") == "cam-6 cam-5 " ]]'
 check "selected_cams: a display name in CAMERAS is refused" '! CAMERAS="Front Door Cam" selected_cams >/dev/null 2>&1'
-for v in 'xr;touch PWNED' '$(touch PWNED)' '`touch PWNED`' '../xr' 'CAM-X' 'Cam-Y1' 'xr:host' '-xr' 'xr_1' $'xr\x01'; do
+for v in 'cam-6;touch PWNED' '$(touch PWNED)' '`touch PWNED`' '../cam-6' 'CAM-X' 'Cam-Y1' 'cam-6:host' '-cam-6' 'cam-6_1' $'cam-6\x01'; do
   check "selected_cams: hostile CAMERAS entry refused, nothing run: $(printf %q "$v")" \
     '( cd "$fx" && ! CAMERAS="$v" selected_cams >/dev/null 2>&1 ) && [[ ! -e $fx/PWNED ]]'
 done
 # A glob character in CAMERAS must not be expanded against the current directory.
-mkdir -p "$fx/cwd"; touch "$fx/cwd/xr" "$fx/cwd/tapo"
+mkdir -p "$fx/cwd"; touch "$fx/cwd/cam-6" "$fx/cwd/cam-5"
 check "selected_cams: CAMERAS='*' is refused, not glob-expanded to file names in the cwd" \
   '( cd "$fx/cwd" && ! CAMERAS="*" selected_cams >/dev/null 2>&1 )'
 check "selected_cams: CAMERAS='?r' is refused, not glob-expanded" \
@@ -54,34 +55,45 @@ check "selected_cams: CAMERAS='?r' is refused, not glob-expanded" \
 
 # ============================== scripts fail closed ==============================
 for s in probe_streams.sh gop_sample.sh; do
-  reset; CAMERAS="xr Front" "$here/$s" 1 >/dev/null 2>&1; rc=$?
+  reset; CAMERAS="cam-6 Front" "$here/$s" 1 >/dev/null 2>&1; rc=$?
   check "$s: one invalid id in CAMERAS aborts before contacting any camera" '[[ $rc != 0 ]] && ! contacted'
   reset; CAMERAS="ghost" "$here/$s" 1 >/dev/null 2>&1; rc=$?
   check "$s: an id with no vault entries -> non-zero, no camera contacted" '[[ $rc != 0 ]] && ! contacted'
   reset; touch "$VAULT_STUB/.broken"; "$here/$s" 1 >/dev/null 2>&1; rc=$?; rm -f "$VAULT_STUB/.broken"
   check "$s: unusable vault -> non-zero, no camera contacted" '[[ $rc != 0 ]] && ! contacted'
-  reset; out=$(CAMERAS="xr" "$here/$s" 1 2>&1)
+  reset; out=$(CAMERAS="cam-6" "$here/$s" 1 2>&1)
   check "$s: output and stub argv carry no credential or host" \
     '[[ $out != *pw-synth* && $out != *192.0.2.2* ]] && ! grep -qF -e pw-synth -e 192.0.2 "$VAULT_STUB/.argv"'
 done
 mkdir -p "$fx/soak1"; reset
-CAMERAS="xr Front" "$here/stream_soak.sh" "$fx/soak1" 1 >/dev/null 2>&1; rc=$?
+CAMERAS="cam-6 Front" "$here/stream_soak.sh" "$fx/soak1" 1 >/dev/null 2>&1; rc=$?
 check "stream_soak.sh: one invalid id in CAMERAS aborts before contacting any camera" '[[ $rc != 0 ]] && ! contacted'
 reset; touch "$VAULT_STUB/.broken"; "$here/stream_soak.sh" "$fx/soak2" 1 >/dev/null 2>&1; rc=$?; rm -f "$VAULT_STUB/.broken"
 check "stream_soak.sh: unusable vault -> non-zero, no camera contacted" '[[ $rc != 0 ]] && ! contacted'
 # Duplicates: two parallel writers on the same <cam>_<kind>.log would interleave or truncate each other.
-reset; CAMERAS="xr xr" "$here/stream_soak.sh" "$fx/soak3" 1 >/dev/null 2>&1
+reset; CAMERAS="cam-6 cam-6" "$here/stream_soak.sh" "$fx/soak3" 1 >/dev/null 2>&1
 check "stream_soak.sh: a duplicate id in CAMERAS is refused or de-duplicated (one summary row per stream)" \
-  '[[ ! -e $fx/soak3/summary.tsv ]] || [[ $(grep -c "^xr_main" "$fx/soak3/summary.tsv") == 1 ]]'
+  '[[ ! -e $fx/soak3/summary.tsv ]] || [[ $(grep -c "^cam-6_main" "$fx/soak3/summary.tsv") == 1 ]]'
 
-# An id that passes cam_id but has no vendor path must not be opened at the bare host (rtsp://...@host:554).
+# An id that passes cam_id but has no model entry must not be opened at the bare host (rtsp://...@host:554).
 cred cam-x admin pw-synth-x; host cam-x 192.0.2.9
-check "rtsp_path: an id with no known vendor path is an error, not an empty path" '! p=$(rtsp_path cam-x main 2>/dev/null) || [[ -n $p ]]'
+check "rtsp_path: an id with no model entry is an error, not an empty path" \
+  '{ p=$(rtsp_path cam-x main 2>/dev/null); rc=$?; (( rc != 0 )) && [[ -z $p ]]; }'
+check "rtsp_path: a stream kind other than main or sub is refused, nothing printed" \
+  '{ p=$(rtsp_path cam-2 MAIN 2>/dev/null); rc=$?; (( rc != 0 )) && [[ -z $p ]] && ! rtsp_path cam-2 "" 2>/dev/null && ! rtsp_path cam-2 2>/dev/null; }'
+cred cam-y admin pw-synth-y; host cam-y 192.0.2.8; model cam-y acme/no-such-model
+check "rtsp_path: a model with no known path is an error naming the model, printing no path" \
+  '{ p=$(rtsp_path cam-y main 2>"$fx/err"); rc=$?; (( rc != 0 )) && [[ -z $p ]] && grep -q "no RTSP path for model" "$fx/err"; }'
+check "rtsp_path: model-based paths (rtt/reolink/tp-link/dahua), same for any id" \
+  '[[ $(rtsp_path cam-2 sub) == /h264Preview_01_sub && $(rtsp_path cam-5 main) == /stream1 && $(rtsp_path cam-6 sub) == *subtype=1 ]]'
+check "rtsp_path: the path follows the model, not the id (cam-2 re-modelled)" \
+  '{ model cam-2 tp-link/tapo-c110; [[ $(rtsp_path cam-2 main) == /stream1 ]]; r=$?; model cam-2 reolink/rlc-520a; (( r == 0 )); }'
+check "rtsp_path: a malformed model entry is refused" '{ model cam-2 "../x"; ! rtsp_path cam-2 main 2>/dev/null; r=$?; model cam-2 reolink/rlc-520a; (( r == 0 )); }'
 reset; CAMERAS="cam-x" "$here/probe_streams.sh" >/dev/null 2>&1
-check "probe_streams.sh: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
+check "probe_streams.sh: an id with no model entry is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
 for s in gop_sample.sh stream_soak.sh; do
   reset; if [[ $s == stream_soak.sh ]]; then CAMERAS="cam-x" "$here/$s" "$fx/novp-$s" 1 >/dev/null 2>&1; else CAMERAS="cam-x" "$here/$s" 1 >/dev/null 2>&1; fi
-  check "$s: an id with no vendor path is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
+  check "$s: an id with no model entry is not opened at the bare host" '! grep -q "@192.0.2.9:554$" "$fx/contacted" 2>/dev/null'
 done
 
 # ============================== cam_ids against the real binary ==============================
@@ -91,12 +103,12 @@ real="$tdir/debug/wardenlens"
 export HOME="$fx/realhome"; mkdir -p "$HOME"; chmod 700 "$HOME"
 unset WARDENLENS_VAULT WARDENLENS_VAULT_KEY_FILE WARDENLENS_VAULT_KEY
 "$real" vault init >/dev/null 2>&1 || { echo "FAIL vault init"; exit 1; }
-for id in cam:reolink-1:host cam:xr:host cam:front_door:host cam:side.yard:host; do
+for id in cam:cam-2:host cam:cam-6:host cam:front_door:host cam:side.yard:host; do
   printf '192.0.2.77\n' | "$real" vault set "$id" --kind host >/dev/null 2>&1 || { echo "FAIL set $id"; exit 1; }
 done
-printf 'Synthetic Porch\n' | "$real" vault set cam:xr:name --kind display-name >/dev/null 2>&1
+printf 'Synthetic Porch\n' | "$real" vault set cam:cam-6:name --kind display-name >/dev/null 2>&1
 got=$(WARDENLENS_BIN="$real" bash -c 'source "$1/lib.sh"; cam_ids' _ "$here" 2>"$fx/ids.err" | sort | tr '\n' ' ')
-check "cam_ids (real binary): lists the inventory host ids, ignores other kinds" '[[ $got == *"reolink-1 "* && $got == *"xr "* && $got != *name* ]]'
+check "cam_ids (real binary): lists the inventory host ids, ignores other kinds" '[[ $got == *"cam-2 "* && $got == *"cam-6 "* && $got != *name* ]]'
 check "cam_ids (real binary): a vault host id it cannot use (cam:front_door:host, cam:side.yard:host) is reported, not dropped silently" \
   '[[ $got == *front_door* || -s $fx/ids.err ]]'
 out=$(WARDENLENS_BIN="$real" bash -c 'source "$1/lib.sh"; cam_ids' _ "$here" 2>&1)

@@ -30,7 +30,7 @@ pub enum EntryError {
     UnknownKind,
 }
 
-/// An opaque, non-sensitive entry reference such as `cam:reolink-1:host`.
+/// An opaque, non-sensitive entry reference such as `cam:cam-1:host`.
 ///
 /// Matches `[a-z0-9][a-z0-9:_.-]{0,127}` and never starts with `meta:`. An id must never be
 /// derived from a value.
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn accepts_inventory_style_ids() {
         for id in [
-            "cam:reolink-1:host",
+            "cam:cam-2:host",
             "0",
             "a",
             "cam:import-3:credential",

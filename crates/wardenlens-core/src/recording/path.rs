@@ -205,8 +205,8 @@ mod tests {
     #[test]
     fn formats_the_documented_layout() {
         // 2024-02-29T13:45:07.042Z
-        let p = RelPath::new(&cam("hdipc"), UnixMs::new(1_709_214_307_042).unwrap());
-        assert_eq!(p.to_string(), "hdipc/2024-02-29/134507-042.mp4");
+        let p = RelPath::new(&cam("cam-1"), UnixMs::new(1_709_214_307_042).unwrap());
+        assert_eq!(p.to_string(), "cam-1/2024-02-29/134507-042.mp4");
     }
 
     #[test]
@@ -258,20 +258,20 @@ mod tests {
     fn rejects_noncanonical_paths() {
         for bad in [
             "",
-            "hdipc/2024-02-29/134507-042.mp4.part",
-            "hdipc/2024-02-29/996099-000.mp4",
-            "hdipc/2024-02-29/240000-000.mp4",
-            "hdipc/2024-02-30/000000-000.mp4",
-            "hdipc/2023-02-29/000000-000.mp4",
-            "hdipc/2024-2-29/134507-042.mp4",
-            "hdipc/2024-02-29/134507-42.mp4",
-            "hdipc/2024-02-29/+34507-042.mp4",
-            "hdipc/1999-12-31/235959-999.mp4",
-            "hdipc/2100-01-01/000000-000.mp4",
+            "cam-1/2024-02-29/134507-042.mp4.part",
+            "cam-1/2024-02-29/996099-000.mp4",
+            "cam-1/2024-02-29/240000-000.mp4",
+            "cam-1/2024-02-30/000000-000.mp4",
+            "cam-1/2023-02-29/000000-000.mp4",
+            "cam-1/2024-2-29/134507-042.mp4",
+            "cam-1/2024-02-29/134507-42.mp4",
+            "cam-1/2024-02-29/+34507-042.mp4",
+            "cam-1/1999-12-31/235959-999.mp4",
+            "cam-1/2100-01-01/000000-000.mp4",
             "../2024-02-29/134507-042.mp4",
-            "/hdipc/2024-02-29/134507-042.mp4",
-            "hdipc/2024-02-29/134507-042.mp4/",
-            "hdipc/x/2024-02-29/134507-042.mp4",
+            "/cam-1/2024-02-29/134507-042.mp4",
+            "cam-1/2024-02-29/134507-042.mp4/",
+            "cam-1/x/2024-02-29/134507-042.mp4",
             "_quarantine/2024-02-29/134507-042.mp4",
         ] {
             assert!(bad.parse::<RelPath>().is_err(), "{bad:?}");
@@ -280,9 +280,9 @@ mod tests {
 
     #[test]
     fn parses_a_canonical_path() {
-        let p: RelPath = "hdipc/2024-02-29/134507-042.mp4".parse().unwrap();
+        let p: RelPath = "cam-1/2024-02-29/134507-042.mp4".parse().unwrap();
         assert_eq!(p.started_at().as_i64(), 1_709_214_307_042);
-        assert_eq!(p.camera().as_str(), "hdipc");
+        assert_eq!(p.camera().as_str(), "cam-1");
     }
 
     proptest::proptest! {

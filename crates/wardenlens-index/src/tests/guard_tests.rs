@@ -156,9 +156,55 @@ fn every_read_token_prepares_and_runs_through_both_wrappers() {
     }
 }
 
+/// The only pragmas a `ReadSql` may be: a bare getter named here, or the one call form
+/// `integrity_check(1)`. An allow-list, so a pragma SQLite adds later (or one that acts when
+/// read, like `wal_checkpoint`, `incremental_vacuum`, `shrink_memory`, `optimize`) is refused
+/// until someone reviews it and names it here.
+const ALLOWED_PRAGMA_GETTERS: &[&str] = &[
+    "application_id",
+    "user_version",
+    "synchronous",
+    "foreign_keys",
+    "journal_size_limit",
+    "busy_timeout",
+    "integrity_check(1)",
+];
+
+fn pragma_is_an_allowed_getter(text: &str) -> bool {
+    let Some(rest) = text.trim().strip_prefix("PRAGMA ") else {
+        return false;
+    };
+    ALLOWED_PRAGMA_GETTERS.contains(&rest)
+}
+
+/// Self-test of the allow-list: pragmas that act on read, setters and spelling tricks are out.
+#[test]
+fn the_pragma_allow_list_refuses_acting_and_setter_pragmas() {
+    for bad in [
+        "PRAGMA wal_checkpoint",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "PRAGMA incremental_vacuum",
+        "PRAGMA shrink_memory",
+        "PRAGMA optimize",
+        "PRAGMA locking_mode",
+        "PRAGMA journal_mode",
+        "PRAGMA user_version = 1",
+        "PRAGMA main.user_version",
+        "PRAGMA integrity_check(100)",
+        "PRAGMA integrity_check",
+        "pragma user_version",
+        "SELECT 1",
+    ] {
+        assert!(!pragma_is_an_allowed_getter(bad), "{bad}");
+    }
+    for ok in ["PRAGMA application_id", "PRAGMA integrity_check(1)"] {
+        assert!(pragma_is_an_allowed_getter(ok), "{ok}");
+    }
+}
+
 /// The pass-list is reviewed text, not a shape check: none of its statements is transaction
 /// control, `ATTACH`/`DETACH`, a setter pragma (`=` or a call form) or anything but a `SELECT`
-/// or a getter pragma, and each is read-only and returns a column.
+/// or a getter pragma named in `ALLOWED_PRAGMA_GETTERS`, and each is read-only and returns a column.
 #[test]
 fn the_token_list_has_no_setter_transaction_or_attach_statement() {
     let (_f, idx) = open_new();
@@ -167,10 +213,8 @@ fn the_token_list_has_no_setter_transaction_or_attach_statement() {
         let upper = text.trim_start().to_ascii_uppercase();
         let ok_start = upper.starts_with("SELECT ")
             || upper.starts_with("WITH ")
-            || (upper.starts_with("PRAGMA ") && !upper.contains('=') && !upper.contains('('));
-        // `PRAGMA integrity_check(1)` is the one call form: a check, not a setter.
-        let integrity = text == sql::INTEGRITY_CHECK.text();
-        assert!(ok_start || integrity, "{text}");
+            || (upper.starts_with("PRAGMA ") && pragma_is_an_allowed_getter(text));
+        assert!(ok_start, "{text}");
         assert!(!TOKEN_ONLY.contains(&text), "{text}");
         let words: Vec<&str> = upper
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -209,4 +253,157 @@ fn the_unversioned_pragma_wrapper_still_sets_the_write_pragmas() {
     let conn = sql::Db::new(Connection::open_in_memory().unwrap());
     let mode: String = sql::query_row_unversioned(&conn, sql::SET_WAL, |r| r.get(0)).unwrap();
     assert_eq!(mode, "memory"); // an in-memory database cannot use WAL; the statement ran
+}
+
+/// The write wrappers refuse a read-only statement with the typed error, a script is checked
+/// statement by statement (a `COMMIT` after a write is refused before it runs and the write rolls
+/// back), and an ordinary multi-statement script still runs.
+#[test]
+fn the_write_wrappers_refuse_with_the_typed_error_and_check_every_statement_of_a_script() {
+    use wardenlens_core::storage::SegmentIndex as _;
+    let (_f, mut idx) = open_new();
+    idx.insert(
+        &crate::tests::rec("c", crate::tests::BASE, 1000, 10, 1),
+        wardenlens_core::storage::Tier::Hot,
+    )
+    .unwrap();
+    let count = |c: &Connection| -> i64 {
+        c.query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count(&idx.conn), 1);
+    let before: i64 = idx
+        .conn
+        .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
+        .unwrap();
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        w.write_batch("DELETE FROM segments; COMMIT;")
+            .map_err(IndexError::sqlite("probe"))
+    });
+    assert!(
+        matches!(r, Err(IndexError::NotADataWrite { op: "probe" })),
+        "{r:?}"
+    );
+    assert_eq!(count(&idx.conn), 1, "the DELETE before the COMMIT was kept");
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        w.write("SELECT 1", [])
+            .map(|_| ())
+            .map_err(IndexError::sqlite("probe"))
+    });
+    assert!(matches!(r, Err(IndexError::NotADataWrite { .. })), "{r:?}");
+    let msg = r.unwrap_err().to_string();
+    assert!(!msg.contains("not read-only"), "{msg}");
+    let after: i64 = idx
+        .conn
+        .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "a refused write_tx bumped the generation");
+    sql::write_tx(&mut idx.conn, "probe", |w| {
+        w.write_batch("DELETE FROM segments; DELETE FROM segments;")
+            .map_err(IndexError::sqlite("probe"))
+    })
+    .unwrap();
+}
+
+/// One test per new error variant: the message names the refusal and nothing else, and the
+/// variants are distinct from the read-side `NotReadOnly`.
+#[test]
+fn the_write_side_error_variants_have_their_own_messages() {
+    let a = IndexError::NotADataWrite { op: "t" };
+    let b = IndexError::TransactionEnded { op: "t" };
+    assert_eq!(
+        a.to_string(),
+        "t: refused a statement that does not change data"
+    );
+    assert_eq!(b.to_string(), "t: the write transaction was ended early");
+    assert!(!a.is_transient() && !b.is_transient());
+}
+
+/// A closure that ignores the error of a transaction-ending statement and goes on: nothing it
+/// writes afterwards runs outside a transaction (the next write is refused with the typed
+/// error), and `write_tx` never reports success.
+#[test]
+fn a_statement_that_ends_the_transaction_makes_every_later_write_fail() {
+    let (_f, mut idx) = open_new();
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        let ins = |w: &sql::WriteTx<'_>| {
+            w.write(
+                sql::INSERT,
+                rusqlite::params![
+                    "c",
+                    1_700_000_000_000i64,
+                    1000i64,
+                    1_700_000_001_000i64,
+                    1i64,
+                    1i64,
+                    0i64
+                ],
+            )
+            .map(|_| ())
+            .map_err(IndexError::sqlite("probe"))
+        };
+        ins(w)?;
+        // A conflict: `OR ROLLBACK` ends the transaction.
+        let _ = w.write(
+            "INSERT OR ROLLBACK INTO segments (camera_id, started_at_ms, duration_ms, ended_at_ms, \
+             bytes, frame_count, tier) VALUES ('c', 1700000000000, 1000, 1700000001000, 1, 1, 0)",
+            [],
+        );
+        let later = ins(w);
+        assert!(
+            matches!(later, Err(IndexError::TransactionEnded { op: "probe" })),
+            "{later:?}"
+        );
+        Ok(())
+    });
+    assert!(
+        matches!(r, Err(IndexError::TransactionEnded { .. })),
+        "{r:?}"
+    );
+    let n: i64 = idx
+        .conn
+        .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// A script whose statement ends the transaction with `OR ROLLBACK` reports the statement's own
+/// error (the conflict), and then every later write and the bump are refused: nothing commits.
+#[test]
+fn a_write_batch_that_ends_its_transaction_reports_the_conflict_then_refuses_more() {
+    use wardenlens_core::storage::SegmentIndex as _;
+    let (_f, mut idx) = open_new();
+    idx.insert(
+        &crate::tests::rec("c", crate::tests::BASE, 1000, 10, 1),
+        wardenlens_core::storage::Tier::Hot,
+    )
+    .unwrap();
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        let first = w.write_batch(
+            "INSERT OR ROLLBACK INTO segments (camera_id, started_at_ms, duration_ms, ended_at_ms, \
+             bytes, frame_count, tier) VALUES ('c', 1700000000000, 1000, 1700000001000, 1, 1, 0);",
+        );
+        assert!(
+            matches!(
+                first.as_ref().map_err(rusqlite::Error::sqlite_error_code),
+                Err(Some(rusqlite::ErrorCode::ConstraintViolation))
+            ),
+            "{first:?}"
+        );
+        let later = w.write_batch("DELETE FROM segments;");
+        assert!(
+            later.as_ref().is_err_and(sql::is_transaction_ended),
+            "{later:?}"
+        );
+        Ok(())
+    });
+    assert!(
+        matches!(r, Err(IndexError::TransactionEnded { .. })),
+        "{r:?}"
+    );
+    let n: i64 = idx
+        .conn
+        .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "the DELETE after the rollback ran");
 }

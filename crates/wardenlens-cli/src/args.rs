@@ -283,7 +283,7 @@ pub(crate) enum KeyCommand {
 /// Arguments of `set`.
 #[derive(Debug, Args)]
 pub(crate) struct SetArgs {
-    /// The entry id, for example `cam:reolink-1:host`.
+    /// The entry id, for example `cam:cam-1:host`.
     pub(crate) id: String,
     /// What the value is.
     #[arg(long, value_enum)]

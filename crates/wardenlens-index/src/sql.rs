@@ -18,7 +18,14 @@
 //!    [`WriteTx::write_batch`] need a `&WriteTx`, which only [`write_tx`] makes, and it runs
 //!    [`BUMP_GENERATION`] before `COMMIT`. They keep `&'static str` rather than a token because a
 //!    `WriteTx` is already the proof that the bump will follow, and the migration scripts are
-//!    whole files.
+//!    whole files. At run time they refuse every statement that `sqlite3_stmt_readonly` calls
+//!    read-only, which **includes** transaction control (`COMMIT`, `ROLLBACK`, `SAVEPOINT`, ...),
+//!    `ATTACH`, `DETACH`, `REINDEX`, getter pragmas and pragmas like `foreign_keys = ON`,
+//!    `locking_mode` and `optimize` (a migration may not use them): none is a data write, and
+//!    transaction control would end the transaction before the bump
+//!    (`IndexError::NotADataWrite`). They also check `is_autocommit()` before and after every
+//!    statement, because `INSERT OR ROLLBACK` ends the transaction without being read-only
+//!    (`IndexError::TransactionEnded`).
 //! 5. **By convention, checked by test:** [`execute_unversioned`], [`query_row_unversioned`] and
 //!    [`unversioned_tx`] do not bump. They are the setup wrappers (the creation bootstrap,
 //!    connection pragmas, the reference schema) and the `hygiene` test limits them to `open.rs`
@@ -306,13 +313,108 @@ impl WriteTx<'_> {
         self.db
     }
 
+    /// Runs one data-changing statement. A statement SQLite calls read-only is refused with the
+    /// [`IndexError::NotADataWrite`] sentinel. That **includes** transaction control (`COMMIT`,
+    /// `END`, `ROLLBACK`, `BEGIN`, `SAVEPOINT`, `RELEASE`), which would end the transaction early
+    /// (a write landing with no generation bump, and a closure error no longer rolling it back),
+    /// and also `ATTACH`, `DETACH`, `REINDEX`, getter pragmas and pragmas such as
+    /// `foreign_keys = ON`, `locking_mode` and `optimize`; a migration script may not use those.
+    /// A statement that ends the transaction without being read-only (`INSERT OR ROLLBACK`, a
+    /// trigger's `RAISE(ROLLBACK)`) is caught by the autocommit check: once the transaction is
+    /// gone nothing further runs ([`IndexError::TransactionEnded`]).
     pub(crate) fn write<P: Params>(&self, sql: &'static str, params: P) -> Result<usize> {
-        self.db.0.execute(sql, params)
+        self.ensure_in_transaction()?;
+        let mut stmt = self.db.0.prepare(sql)?;
+        if stmt.readonly() {
+            return Err(not_a_data_write());
+        }
+        let r = stmt.execute(params);
+        drop(stmt);
+        self.after_statement(r)
     }
 
+    /// Runs a script of statements one by one, each checked like [`write`](Self::write) **before**
+    /// it runs (a `COMMIT` in the middle of a script is refused, and the statements before it are
+    /// rolled back with the transaction).
     pub(crate) fn write_batch(&self, sql: &'static str) -> Result<()> {
-        self.db.0.execute_batch(sql)
+        use rusqlite::fallible_iterator::FallibleIterator as _;
+        self.ensure_in_transaction()?;
+        let mut batch = rusqlite::Batch::new(&self.db.0, sql);
+        while let Some(mut stmt) = batch.next()? {
+            if stmt.readonly() {
+                return Err(not_a_data_write());
+            }
+            let r: Result<()> = (|| {
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })();
+            drop(stmt);
+            self.after_statement(r)?;
+        }
+        Ok(())
     }
+
+    /// What a statement returned, after the transaction check. The statement's **own** error comes
+    /// first: SQLite itself rolls the transaction back on `SQLITE_FULL`, `SQLITE_IOERR`,
+    /// `SQLITE_NOMEM` and `SQLITE_INTERRUPT`, and that error (transient or not) is what the caller
+    /// must see, not a permanent `TransactionEnded` (the recorder would quarantine a good
+    /// segment). The one error that is a deliberate rollback is a trigger's `RAISE(ROLLBACK)`
+    /// (extended code `SQLITE_CONSTRAINT_TRIGGER`), which is `TransactionEnded`. A statement that
+    /// succeeded but left autocommit on (nothing else can) is `TransactionEnded`. Either way the
+    /// next statement is refused by the check before it and the bump by the check before it.
+    fn after_statement<T>(&self, r: Result<T>) -> Result<T> {
+        match r {
+            Err(e) => {
+                let trigger_rollback = self.db.0.is_autocommit()
+                    && matches!(
+                        &e,
+                        rusqlite::Error::SqliteFailure(f, _)
+                            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+                    );
+                if trigger_rollback {
+                    Err(rusqlite::Error::InvalidParameterName(
+                        TRANSACTION_ENDED.to_owned(),
+                    ))
+                } else {
+                    Err(e)
+                }
+            }
+            Ok(v) => {
+                self.ensure_in_transaction()?;
+                Ok(v)
+            }
+        }
+    }
+
+    /// The transaction `write_tx` opened must still be open: a statement that ended it
+    /// (`INSERT OR ROLLBACK`) must not be followed by a write that would autocommit unbumped.
+    fn ensure_in_transaction(&self) -> Result<()> {
+        if self.db.0.is_autocommit() {
+            Err(rusqlite::Error::InvalidParameterName(
+                TRANSACTION_ENDED.to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+const NOT_A_DATA_WRITE: &str = "wardenlens: not a data write";
+const TRANSACTION_ENDED: &str = "wardenlens: transaction ended";
+
+fn not_a_data_write() -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(NOT_A_DATA_WRITE.to_owned())
+}
+
+/// The write-side refusal of a read-only statement (the sentinel `write` and `write_batch` raise).
+pub(crate) fn is_not_a_data_write(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::InvalidParameterName(m) if m == NOT_A_DATA_WRITE)
+}
+
+/// The sentinel raised when the write transaction was ended by a statement inside it.
+pub(crate) fn is_transaction_ended(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::InvalidParameterName(m) if m == TRANSACTION_ENDED)
 }
 
 /// The one way to change the database after creation: `BEGIN IMMEDIATE`, `f`, the generation
@@ -329,6 +431,9 @@ pub(crate) fn write_tx_opt<T>(
         let Some(out) = f(&w)? else {
             return Ok(None);
         };
+        // The closure may have ignored an error that ended the transaction: never bump or report
+        // success for a transaction that is gone (`write` checks it too).
+        w.ensure_in_transaction().map_err(IndexError::sqlite(op))?;
         w.write(BUMP_GENERATION, [])
             .map_err(IndexError::sqlite(op))?;
         out

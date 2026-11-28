@@ -199,7 +199,7 @@ Criterion "what the local API needs documented": **MET** (partly from public kno
 Criterion "ONVIF retry/timeout behaviour characterised": **MET**.
 
 Method: `onvif_flaky.sh`, 60 rounds, 5 s apart, one unauthenticated `GetSystemDateAndTime` and one authenticated
-`GetDeviceInformation` per round, fresh TCP connection each, 10 s client timeout (`results/hdipc-onvif.tsv`).
+`GetDeviceInformation` per round, fresh TCP connection each, 10 s client timeout (`results/rtt-8700-onvif.tsv`).
 
 | request | attempts | failed (10 s timeout) | successful latency |
 |---|---|---|---|

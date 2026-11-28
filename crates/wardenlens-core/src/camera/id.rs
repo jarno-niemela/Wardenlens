@@ -4,7 +4,7 @@
 //!
 //! | input | result |
 //! |---|---|
-//! | `a`, `cam1`, `reolink-1`, 32 chars | accepted |
+//! | `a`, `cam1`, `cam-1`, 32 chars | accepted |
 //! | `a-`, `a--b`, `a-1-` | accepted (the ADR charset allows `-` anywhere after the first char) |
 //! | empty | `IdEmpty` |
 //! | 33 or more bytes | `IdTooLong` |
@@ -95,15 +95,7 @@ mod tests {
 
     #[test]
     fn accepts_slugs() {
-        for id in [
-            "a",
-            "cam1",
-            "reolink-1",
-            "a-",
-            "a--b",
-            "a-1-",
-            &"a".repeat(32),
-        ] {
+        for id in ["a", "cam1", "cam-2", "a-", "a--b", "a-1-", &"a".repeat(32)] {
             assert_eq!(CameraId::new(id).unwrap().as_str(), id);
         }
     }
@@ -172,16 +164,16 @@ mod tests {
 
     #[test]
     fn entry_ids_follow_the_adr_naming() {
-        let id = CameraId::new("reolink-1").unwrap();
+        let id = CameraId::new("cam-2").unwrap();
         let name = |k| id.entry_id(k).map(|e| e.as_str().to_owned()).ok();
-        assert_eq!(name(EntryKind::Host).as_deref(), Some("cam:reolink-1:host"));
+        assert_eq!(name(EntryKind::Host).as_deref(), Some("cam:cam-2:host"));
         assert_eq!(
             name(EntryKind::Credential).as_deref(),
-            Some("cam:reolink-1:credential")
+            Some("cam:cam-2:credential")
         );
         assert_eq!(
             name(EntryKind::DisplayName).as_deref(),
-            Some("cam:reolink-1:name")
+            Some("cam:cam-2:name")
         );
         assert_eq!(name(EntryKind::Mac), None);
         assert_eq!(

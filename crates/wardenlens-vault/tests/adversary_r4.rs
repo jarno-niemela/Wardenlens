@@ -260,7 +260,7 @@ fn bad_username_and_password_report_both_under_their_keys() {
 fn reports_never_contain_values() {
     let v =
         json(r#"[{"name":"Secret Cam 9","login":"zz\u0000top","password":"Hunter2-synthetic"}]"#);
-    let m = BTreeMap::from([("Secret Cam 9".to_owned(), "tapo".to_owned())]);
+    let m = BTreeMap::from([("Secret Cam 9".to_owned(), "cam-5".to_owned())]);
     let i = map_secret_json(&v, &m).unwrap();
     let all = format!("{:?}", i.unknown_keys);
     assert!(!all.contains("Secret Cam") && !all.contains("Hunter2") && !all.contains("zz"));

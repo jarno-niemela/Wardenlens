@@ -95,7 +95,7 @@ fn json_every_non_null_key_is_imported_or_reported() {
         r#"{"login":"","username":"","password":"p"}"#,
         r#"{"name":"Front Gate","x":1}"#,
     ];
-    let m = BTreeMap::from([("Garage".to_owned(), "tapo".to_owned())]);
+    let m = BTreeMap::from([("Garage".to_owned(), "cam-5".to_owned())]);
     for c in cases {
         let doc = json(&format!("[{c}]"));
         let obj = doc[0].as_object().unwrap().clone();
@@ -183,12 +183,12 @@ fn inventory_id_with_colons_cannot_alias_another_cameras_field() {
 /// `merge` refuses a duplicate in either direction and keeps nothing from a failed merge.
 #[test]
 fn merge_is_symmetric_on_duplicates() {
-    let first = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Garage\"\n")).unwrap();
-    let second = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Side\"\n")).unwrap();
-    let again = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Garage\"\n")).unwrap();
-    let dup = LegacyError::DuplicateId("cam:tapo:name".to_owned());
+    let first = map_inventory_toml(&toml_of("[cameras.cam-5]\nname = \"Garage\"\n")).unwrap();
+    let second = map_inventory_toml(&toml_of("[cameras.cam-5]\nname = \"Side\"\n")).unwrap();
+    let again = map_inventory_toml(&toml_of("[cameras.cam-5]\nname = \"Garage\"\n")).unwrap();
+    let dup = LegacyError::DuplicateId("cam:cam-5:name".to_owned());
     assert_eq!(first.merge(second).unwrap_err(), dup);
-    let other = map_inventory_toml(&toml_of("[cameras.tapo]\nname = \"Side\"\n")).unwrap();
+    let other = map_inventory_toml(&toml_of("[cameras.cam-5]\nname = \"Side\"\n")).unwrap();
     assert_eq!(other.merge(again).unwrap_err(), dup);
 }
 
@@ -198,8 +198,8 @@ fn merge_is_symmetric_on_duplicates() {
 fn map_legacy_output_imports_one_to_one() {
     let (_d, _p, mut vault) = fresh();
     let names = BTreeMap::from([
-        ("Front Gate".to_owned(), "reolink-1".to_owned()),
-        ("Garage".to_owned(), "tapo".to_owned()),
+        ("Front Gate".to_owned(), "cam-2".to_owned()),
+        ("Garage".to_owned(), "cam-5".to_owned()),
     ]);
     let agent = json(
         r#"[{"name":"Front Gate","login":"svc-reader","password":"Tr0ub4dor-x9"},
@@ -207,8 +207,8 @@ fn map_legacy_output_imports_one_to_one() {
             {"login":"anon","password":"pw-anon-12"}]"#,
     );
     let inv = toml_of(
-        "[cameras.reolink-1]\nhost = \"192.0.2.10\"\nmac = \"02:00:5e:00:53:af\"\n\
-         [cameras.tapo]\nserial = \"SN-0042-ZQ\"\n[cameras.\"Odd One\"]\nhost = \"nvr-1.example.invalid\"\n",
+        "[cameras.cam-2]\nhost = \"192.0.2.10\"\nmac = \"02:00:5e:00:53:af\"\n\
+         [cameras.cam-5]\nserial = \"SN-0042-ZQ\"\n[cameras.\"Odd One\"]\nhost = \"nvr-1.example.invalid\"\n",
     );
     let imp = map_legacy(Some(&agent), &names, Some(&inv)).unwrap();
     for e in &imp.entries {

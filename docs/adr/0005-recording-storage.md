@@ -424,7 +424,17 @@ identity and every sidecar are proven by means no sidecar can influence**:
   `rusqlite::Connection` is private to `sql.rs`, so no other file can call `.execute`, `.query_row`, `.pragma_update`,
   `.prepare_with_flags` or `.transaction` on it; the only ways to run SQL are the functions of `sql.rs`, which take a
   `&'static str` or a `ReadSql`; (2) **the compiler**: the data writes (`WriteTx::write`, `WriteTx::write_batch`) need a
-  `&WriteTx`, which only `write_tx` makes, and `write_tx` runs the bump before `COMMIT`; (3) **the compiler**: the read
+  `&WriteTx`, which only `write_tx` makes, and `write_tx` runs the bump before `COMMIT`; at run time they also refuse every
+  statement `sqlite3_stmt_readonly` calls read-only, which **includes** `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`,
+  `RELEASE`, `ATTACH`, `DETACH`, `REINDEX`, getter pragmas and pragmas like `foreign_keys = ON`, `locking_mode` and `optimize`
+  (a migration script may not use any of them), each statement of a `write_batch` script before it runs
+  (`IndexError::NotADataWrite`, #149), because transaction control would end the transaction before the bump. A statement
+  that ends the transaction without being read-only (`INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)`) is caught by an
+  `is_autocommit()` check before and after every write statement and before the bump: nothing further runs, nothing is bumped
+  or reported as success (`IndexError::TransactionEnded`). The statement's own error always wins over that check, except a
+  trigger's `RAISE(ROLLBACK)`: SQLite rolls back by itself on `SQLITE_FULL`/`IOERR`/`NOMEM`/`INTERRUPT` and those must stay
+  the transient (or typed) errors they are, never a permanent `TransactionEnded`; the pragma getters a `ReadSql` may be are an allow-list
+  in the tests (#149); (3) **the compiler**: the read
   wrappers `sql::prepare` and `sql::query_row` take a `ReadSql` token, a newtype whose constructor is private to `sql.rs`
   and which exists only for the reviewed `SELECT`s and getter pragmas (a pass-list, not a shape check: `sqlite3_stmt_readonly`
   is true for `COMMIT`, `ATTACH`, `PRAGMA locking_mode = ...` and others, so it cannot be the test). A test checks that every
@@ -454,6 +464,10 @@ identity and every sidecar are proven by means no sidecar can influence**:
   file out of the directory and keep it). A `-wal` copied from this very index (same instance id) by the same user is accepted when
   it replays consistently; a stale `-wal` of an older state of this same index is indistinguishable and needs the
   privileges to edit the index itself.
+  Decisions of #149 (the safer option, nothing changed): `fsutil::Scratch::sweep_stale` keeps its documented one-pid-namespace
+  assumption (no liveness marker or minimum age: the service runs one process per data directory, and a marker adds a
+  new file kind to the data directory); `main_unreadable` keeps `ErrorCode::Unknown` (SQLite's `SQLITE_ERROR`, which is what
+  a main file without `index_meta` reports; the error type keeps only the primary code, so it cannot be narrowed).
 
 **Migration scheme: `PRAGMA user_version`, migrations written in-house** as an ordered array of SQL scripts compiled in
 with `include_str!`. `Index::open` runs, under `BEGIN IMMEDIATE`, every script with a number above the stored
