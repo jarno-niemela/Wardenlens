@@ -18,7 +18,10 @@
 //!    [`WriteTx::write_batch`] need a `&WriteTx`, which only [`write_tx`] makes, and it runs
 //!    [`BUMP_GENERATION`] before `COMMIT`. They keep `&'static str` rather than a token because a
 //!    `WriteTx` is already the proof that the bump will follow, and the migration scripts are
-//!    whole files.
+//!    whole files. At run time they refuse every statement that `sqlite3_stmt_readonly` calls
+//!    read-only, which is exactly transaction control (`COMMIT`, `ROLLBACK`, `SAVEPOINT`, ...)
+//!    plus `ATTACH` and getter pragmas: none of those is a data write, and transaction control
+//!    would end the transaction before the bump (`IndexError::NotReadOnly`).
 //! 5. **By convention, checked by test:** [`execute_unversioned`], [`query_row_unversioned`] and
 //!    [`unversioned_tx`] do not bump. They are the setup wrappers (the creation bootstrap,
 //!    connection pragmas, the reference schema) and the `hygiene` test limits them to `open.rs`
@@ -306,12 +309,33 @@ impl WriteTx<'_> {
         self.db
     }
 
+    /// Runs one data-changing statement. A statement SQLite calls read-only is refused with
+    /// `rusqlite::Error::InvalidQuery` (mapped to [`IndexError::NotReadOnly`]): that includes
+    /// `COMMIT`, `END`, `ROLLBACK`, `BEGIN`, `SAVEPOINT` and `RELEASE`, which would end the
+    /// transaction early (a write landing with no generation bump, and a closure error no longer
+    /// rolling it back). A data write is never read-only, so nothing legitimate is lost.
     pub(crate) fn write<P: Params>(&self, sql: &'static str, params: P) -> Result<usize> {
-        self.db.0.execute(sql, params)
+        let mut stmt = self.db.0.prepare(sql)?;
+        if stmt.readonly() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        stmt.execute(params)
     }
 
+    /// Runs a script of statements one by one, each checked like [`write`](Self::write) **before**
+    /// it runs (a `COMMIT` in the middle of a script is refused, and the statements before it are
+    /// rolled back with the transaction).
     pub(crate) fn write_batch(&self, sql: &'static str) -> Result<()> {
-        self.db.0.execute_batch(sql)
+        use rusqlite::fallible_iterator::FallibleIterator as _;
+        let mut batch = rusqlite::Batch::new(&self.db.0, sql);
+        while let Some(mut stmt) = batch.next()? {
+            if stmt.readonly() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        Ok(())
     }
 }
 

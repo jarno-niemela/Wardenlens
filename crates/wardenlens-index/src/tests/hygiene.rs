@@ -7,16 +7,31 @@
 
 use std::path::{Path, PathBuf};
 
-/// `rusqlite` methods that take SQL text.
-const SQL_CALLS: [&str; 8] = [
+/// Every `rusqlite` 0.43 `Connection` method that runs SQL text, opens a transaction or copies a
+/// database in or out (the same list `tests/adversary_145_r2_hygiene.rs` scans for).
+const SQL_CALLS: [&str; 22] = [
     ".prepare(",
     ".prepare_cached(",
+    ".prepare_with_flags(",
     ".execute(",
     ".execute_batch(",
     ".query_row(",
     ".query_one(",
-    ".pragma_update(",
+    ".query_row_and_then(",
+    ".pragma(",
+    ".pragma_query(",
+    ".pragma_query_one(",
     ".pragma_query_value(",
+    ".pragma_update(",
+    ".pragma_update_and_check(",
+    ".transaction(",
+    ".transaction_with_behavior(",
+    ".unchecked_transaction(",
+    ".savepoint(",
+    ".savepoint_with_name(",
+    ".backup(",
+    ".restore(",
+    ".blob_open(",
 ];
 
 fn production_sources() -> Vec<PathBuf> {
@@ -143,16 +158,18 @@ fn the_wrappers_take_only_static_strings() {
     }
 }
 
-/// Statements that are not index data run through `sql::execute_unversioned` and
-/// `sql::query_row_unversioned`, which do not bump the generation: only the open sequence and the
+/// Statements that are not index data run through `sql::execute_unversioned`,
+/// `sql::query_row_unversioned` and `sql::unversioned_tx`, which do not bump the generation: only the open sequence and the
 /// reference schema may use them, never a segment operation (those need a `WriteTx`, enforced by
 /// the types).
 #[test]
 fn execute_unversioned_is_used_only_by_open_and_migrate() {
     let mut seen = 0;
     for p in production_sources() {
-        let n = code(&p).matches("execute_unversioned(").count()
-            + code(&p).matches("query_row_unversioned(").count();
+        let text = code(&p);
+        let n = text.matches("execute_unversioned(").count()
+            + text.matches("query_row_unversioned(").count()
+            + text.matches("unversioned_tx(").count();
         let name = file_name(&p);
         if name == "sql.rs" {
             continue;

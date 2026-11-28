@@ -156,9 +156,55 @@ fn every_read_token_prepares_and_runs_through_both_wrappers() {
     }
 }
 
+/// The only pragmas a `ReadSql` may be: a bare getter named here, or the one call form
+/// `integrity_check(1)`. An allow-list, so a pragma SQLite adds later (or one that acts when
+/// read, like `wal_checkpoint`, `incremental_vacuum`, `shrink_memory`, `optimize`) is refused
+/// until someone reviews it and names it here.
+const ALLOWED_PRAGMA_GETTERS: &[&str] = &[
+    "application_id",
+    "user_version",
+    "synchronous",
+    "foreign_keys",
+    "journal_size_limit",
+    "busy_timeout",
+    "integrity_check(1)",
+];
+
+fn pragma_is_an_allowed_getter(text: &str) -> bool {
+    let Some(rest) = text.trim().strip_prefix("PRAGMA ") else {
+        return false;
+    };
+    ALLOWED_PRAGMA_GETTERS.contains(&rest)
+}
+
+/// Self-test of the allow-list: pragmas that act on read, setters and spelling tricks are out.
+#[test]
+fn the_pragma_allow_list_refuses_acting_and_setter_pragmas() {
+    for bad in [
+        "PRAGMA wal_checkpoint",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "PRAGMA incremental_vacuum",
+        "PRAGMA shrink_memory",
+        "PRAGMA optimize",
+        "PRAGMA locking_mode",
+        "PRAGMA journal_mode",
+        "PRAGMA user_version = 1",
+        "PRAGMA main.user_version",
+        "PRAGMA integrity_check(100)",
+        "PRAGMA integrity_check",
+        "pragma user_version",
+        "SELECT 1",
+    ] {
+        assert!(!pragma_is_an_allowed_getter(bad), "{bad}");
+    }
+    for ok in ["PRAGMA application_id", "PRAGMA integrity_check(1)"] {
+        assert!(pragma_is_an_allowed_getter(ok), "{ok}");
+    }
+}
+
 /// The pass-list is reviewed text, not a shape check: none of its statements is transaction
 /// control, `ATTACH`/`DETACH`, a setter pragma (`=` or a call form) or anything but a `SELECT`
-/// or a getter pragma, and each is read-only and returns a column.
+/// or a getter pragma named in `ALLOWED_PRAGMA_GETTERS`, and each is read-only and returns a column.
 #[test]
 fn the_token_list_has_no_setter_transaction_or_attach_statement() {
     let (_f, idx) = open_new();
@@ -167,10 +213,8 @@ fn the_token_list_has_no_setter_transaction_or_attach_statement() {
         let upper = text.trim_start().to_ascii_uppercase();
         let ok_start = upper.starts_with("SELECT ")
             || upper.starts_with("WITH ")
-            || (upper.starts_with("PRAGMA ") && !upper.contains('=') && !upper.contains('('));
-        // `PRAGMA integrity_check(1)` is the one call form: a check, not a setter.
-        let integrity = text == sql::INTEGRITY_CHECK.text();
-        assert!(ok_start || integrity, "{text}");
+            || (upper.starts_with("PRAGMA ") && pragma_is_an_allowed_getter(text));
+        assert!(ok_start, "{text}");
         assert!(!TOKEN_ONLY.contains(&text), "{text}");
         let words: Vec<&str> = upper
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -209,4 +253,40 @@ fn the_unversioned_pragma_wrapper_still_sets_the_write_pragmas() {
     let conn = sql::Db::new(Connection::open_in_memory().unwrap());
     let mode: String = sql::query_row_unversioned(&conn, sql::SET_WAL, |r| r.get(0)).unwrap();
     assert_eq!(mode, "memory"); // an in-memory database cannot use WAL; the statement ran
+}
+
+/// The write wrappers refuse a read-only statement with the typed error, a script is checked
+/// statement by statement (a `COMMIT` after a write is refused before it runs and the write rolls
+/// back), and an ordinary multi-statement script still runs.
+#[test]
+fn the_write_wrappers_refuse_with_the_typed_error_and_check_every_statement_of_a_script() {
+    let (_f, mut idx) = open_new();
+    let before: i64 = idx
+        .conn
+        .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
+        .unwrap();
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        w.write_batch("DELETE FROM segments; COMMIT;")
+            .map_err(IndexError::sqlite("probe"))
+    });
+    assert!(
+        matches!(r, Err(IndexError::NotReadOnly { op: "probe" })),
+        "{r:?}"
+    );
+    let r = sql::write_tx(&mut idx.conn, "probe", |w| {
+        w.write("SELECT 1", [])
+            .map(|_| ())
+            .map_err(IndexError::sqlite("probe"))
+    });
+    assert!(matches!(r, Err(IndexError::NotReadOnly { .. })), "{r:?}");
+    let after: i64 = idx
+        .conn
+        .query_row("SELECT generation FROM index_meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "a refused write_tx bumped the generation");
+    sql::write_tx(&mut idx.conn, "probe", |w| {
+        w.write_batch("DELETE FROM segments; DELETE FROM segments;")
+            .map_err(IndexError::sqlite("probe"))
+    })
+    .unwrap();
 }
