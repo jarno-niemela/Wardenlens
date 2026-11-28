@@ -22,6 +22,10 @@ pub enum IngestError {
     /// The camera answered 401 or 403: wrong or missing credentials.
     #[error("the camera rejected the credentials")]
     AuthRejected,
+    /// The camera asked for Basic authentication, which sends the password in the clear, and
+    /// the camera is not configured to allow that. No credentials were sent.
+    #[error("the camera only offers Basic authentication, which is refused unless allowed")]
+    BasicAuthRefused,
     /// The camera answered with another RTSP error status (for example 404 for a wrong path).
     #[error("the camera refused the request with RTSP status {0}")]
     Rejected(u16),
@@ -54,6 +58,7 @@ mod tests {
             | IngestError::OpenFailed
             | IngestError::OpenTimeout
             | IngestError::AuthRejected
+            | IngestError::BasicAuthRefused
             | IngestError::Rejected(_)
             | IngestError::NoVideoStream
             | IngestError::UnsupportedCodec
@@ -66,6 +71,7 @@ mod tests {
             IngestError::OpenFailed,
             IngestError::OpenTimeout,
             IngestError::AuthRejected,
+            IngestError::BasicAuthRefused,
             IngestError::Rejected(404),
             IngestError::NoVideoStream,
             IngestError::UnsupportedCodec,
@@ -94,7 +100,7 @@ mod tests {
                 assert!(!both.contains(needle), "{needle} in {both}");
             }
         }
-        assert_eq!(seen.len(), 12);
+        assert_eq!(seen.len(), 13);
     }
 
     #[test]

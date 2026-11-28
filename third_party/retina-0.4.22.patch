@@ -1,0 +1,387 @@
+diff -ru a/src/buf.rs b/src/buf.rs
+--- a/src/buf.rs
++++ b/src/buf.rs
+@@ -414,6 +414,14 @@
+         self.ring.capacity()
+     }
+ 
++    /// Bytes the buffer must keep: from the oldest mark (or the unparsed
++    /// position) to the end. This is what a hostile peer grows by sending an
++    /// access unit that never ends; `spare_capacity` reclaims everything else.
++    pub fn buffered_len(&self) -> usize {
++        let floor = self.registry.earliest().unwrap_or(self.unparsed);
++        usize::try_from(self.ring.end().saturating_sub(floor)).unwrap_or(usize::MAX)
++    }
++
+     /// Returns data at `[pos, pos+len)` as a [`Split`].
+     ///
+     /// # Panics
+diff -ru a/src/client/mod.rs b/src/client/mod.rs
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -489,6 +489,8 @@
+     unassigned_channel_data: UnassignedChannelDataPolicy,
+     session_id: SessionIdPolicy,
+     max_message_size: Option<usize>,
++    max_buffered_bytes: Option<usize>,
++    allow_basic_auth: bool,
+     receiver_reports: ReceiverReportPolicy,
+     bind_addr: Option<std::net::IpAddr>,
+     backchannel: bool,
+@@ -762,6 +764,37 @@
+         self
+     }
+ 
++    /// Limits the bytes of unfinished data retina holds for the connection
++    /// (local patch, see ADR 0002).
++    ///
++    /// A peer that sends the packets of one access unit and never ends it makes
++    /// retina keep all of them, so memory grows with what the peer sends. Once
++    /// more than this many bytes (plus up to one read) are held, the session
++    /// fails; see `Error::is_buffer_limit`. Choose more than the largest
++    /// access unit you accept, as RTP headers count too. The limit is on the
++    /// data, not the ring: the ring grows to the next power of two of what it
++    /// holds (a limit just under a power of two keeps it from doubling), and a
++    /// frame handed to the caller is copied out of it.
++    ///
++    /// There's no limit by default.
++    pub fn max_buffered_bytes(mut self, max_buffered_bytes: usize) -> Self {
++        self.max_buffered_bytes = Some(max_buffered_bytes);
++        self
++    }
++
++    /// Allows answering a Basic-only challenge with the password in the clear
++    /// (local patch, see ADR 0002). Defaults to false.
++    ///
++    /// By default a challenge whose best scheme is Basic fails the session
++    /// before any credentials are sent; see `Error::is_basic_auth_refused`. A
++    /// challenge that also offers Digest is answered with Digest regardless.
++    /// A Basic re-challenge at a keepalive is only logged, and the existing
++    /// client is kept.
++    pub fn allow_basic_auth(mut self, allow: bool) -> Self {
++        self.allow_basic_auth = allow;
++        self
++    }
++
+     fn get_max_message_size(&self) -> usize {
+         self.max_message_size.unwrap_or(usize::MAX)
+     }
+@@ -801,9 +834,23 @@
+ pub struct SetupOptions {
+     transport: Transport,
+     frame_format: Option<crate::codec::FrameFormat>,
++    max_nals_per_access_unit: Option<usize>,
+ }
+ 
+ impl SetupOptions {
++    /// Limits the NALs in one H.264 access unit (local patch, see ADR 0002).
++    ///
++    /// Each NAL costs 12 bytes of depacketizer metadata and each piece 16,
++    /// however short, so a flood of tiny NALs costs several times its bytes
++    /// and `SessionOptions::max_buffered_bytes` does not see it. An access unit
++    /// with more than `n` NALs (or more than `16 * n` pieces, which a
++    /// fragmented NAL adds) fails the session. No limit by default.
++    #[inline]
++    pub fn max_nals_per_access_unit(mut self, n: usize) -> Self {
++        self.max_nals_per_access_unit = Some(n);
++        self
++    }
++
+     /// Sets the underlying transport to use.
+     #[inline]
+     pub fn transport(mut self, transport: Transport) -> Self {
+@@ -1405,6 +1452,26 @@
+         .expect("BACKCHANNEL_REQUIRE is checked to be a valid header value at compile time")
+ }
+ 
++/// Why a `WWW-Authenticate` header was not adopted.
++enum ChallengeError {
++    Unparseable(String),
++    /// The best scheme offered is Basic and `allow_basic_auth` is off.
++    BasicRefused,
++}
++
++/// Parses a `WWW-Authenticate` challenge list. `http-auth` prefers Digest when
++/// both are offered, so only a Basic-only list can come back as Basic.
++fn parse_challenge(
++    header: &str,
++    allow_basic: bool,
++) -> Result<http_auth::PasswordClient, ChallengeError> {
++    let c = http_auth::PasswordClient::try_from(header).map_err(ChallengeError::Unparseable)?;
++    if !allow_basic && matches!(c, http_auth::PasswordClient::Basic(_)) {
++        return Err(ChallengeError::BasicRefused);
++    }
++    Ok(c)
++}
++
+ impl RtspConnection {
+     async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
+         let host =
+@@ -1418,6 +1485,10 @@
+         )
+         .await
+         .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
++        let mut inner = inner;
++        if let Some(n) = options.max_buffered_bytes {
++            inner.set_max_buffered(n);
++        }
+         Ok(Self {
+             inner,
+             channels: ChannelMappings::default(),
+@@ -1549,9 +1620,17 @@
+                     })
+                 }
+                 let www_authenticate: &str = www_authenticate;
+-                *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
++                *requested_auth = match parse_challenge(www_authenticate, options.allow_basic_auth)
++                {
+                     Ok(c) => Some(c),
+-                    Err(e) => bail!(ErrorInt::RtspResponseError {
++                    Err(ChallengeError::BasicRefused) => bail!(ErrorInt::BasicAuthRefused {
++                        conn_ctx: *self.inner.ctx(),
++                        msg_ctx,
++                        method: req.method().clone(),
++                        cseq,
++                        status: resp.status_code,
++                    }),
++                    Err(ChallengeError::Unparseable(e)) => bail!(ErrorInt::RtspResponseError {
+                         conn_ctx: *self.inner.ctx(),
+                         msg_ctx,
+                         method: req.method().clone(),
+@@ -2046,6 +2125,11 @@
+         {
+             d.set_frame_format(format);
+         }
++        if let Some(n) = options.max_nals_per_access_unit
++            && let Ok(d) = &mut stream.depacketizer
++        {
++            d.set_max_nals(n);
++        }
+         if sending {
+             *inner.flags |= SessionFlag::Backchannel as u8;
+         }
+@@ -2680,7 +2764,7 @@
+                         && let Some(h) = response.headers.get("WWW-Authenticate")
+                     {
+                         let h: &str = h;
+-                        match http_auth::PasswordClient::try_from(h) {
++                        match parse_challenge(h, inner.options.allow_basic_auth) {
+                             Ok(c) => {
+                                 *inner.requested_auth = Some(c);
+                                 if !retried {
+@@ -2698,7 +2782,10 @@
+                                     retrying = true;
+                                 }
+                             }
+-                            Err(e) => {
++                            Err(ChallengeError::BasicRefused) => {
++                                warn!("keepalive: Basic authentication refused");
++                            }
++                            Err(ChallengeError::Unparseable(e)) => {
+                                 warn!("keepalive: can't understand WWW-Authenticate: {e}");
+                             }
+                         }
+diff -ru a/src/codec/h264.rs b/src/codec/h264.rs
+--- a/src/codec/h264.rs
++++ b/src/codec/h264.rs
+@@ -118,6 +118,11 @@
+ 
+     /// Output format controlling NAL framing and parameter set insertion.
+     frame_format: super::FrameFormat,
++
++    /// Most NALs one access unit may have; more is an error. Each NAL costs 12
++    /// bytes of `nals` and at least 16 of `pieces`, whatever its length.
++    /// (Local patch, see ADR 0002.)
++    max_nals: usize,
+ }
+ 
+ #[derive(Debug)]
+@@ -170,6 +175,7 @@
+     pieces: &'a mut Vec<BufRange>,
+     nals: &'a mut Vec<Nal>,
+     in_progress: &'a mut Option<InProgressNal>,
++    max_nals: usize,
+ }
+ 
+ impl super::h26x::NalHandler for H264NalHandler<'_> {
+@@ -192,6 +198,9 @@
+             .as_mut()
+             .ok_or_else(|| "piece without start".to_string())?;
+         ip.pieces_bytes += usize::from(piece.len);
++        if self.pieces.len() >= self.max_nals.saturating_mul(16) {
++            return Err("too many pieces in one access unit".to_string());
++        }
+         self.pieces.push(piece);
+         Ok(())
+     }
+@@ -201,6 +210,9 @@
+             .in_progress
+             .take()
+             .ok_or_else(|| "end without start".to_string())?;
++        if self.nals.len() >= self.max_nals {
++            return Err("too many NALs in one access unit".to_string());
++        }
+         self.nals.push(Nal {
+             hdr: ip.hdr,
+             next_piece_idx: u32::try_from(self.pieces.len())
+@@ -318,9 +330,15 @@
+             seen_inconsistent_fu_a_nal_hdr: false,
+             seen_single_fragment_fu_a: false,
+             frame_format: Default::default(),
++            max_nals: usize::MAX,
+         })
+     }
+ 
++    /// Limits the NALs (and, at 16 times that, the pieces) of one access unit.
++    pub(super) fn set_max_nals(&mut self, n: usize) {
++        self.max_nals = n;
++    }
++
+     /// Sets the frame format for output assembly.
+     ///
+     /// If existing parameters were parsed with a different framing, they are
+@@ -599,6 +617,7 @@
+                                 pieces: &mut self.pieces,
+                                 nals: &mut self.nals,
+                                 in_progress: &mut fu_a.in_progress,
++                                max_nals: self.max_nals,
+                             },
+                         )?;
+                         if !end {
+@@ -624,6 +643,7 @@
+                                 pieces: &mut self.pieces,
+                                 nals: &mut self.nals,
+                                 in_progress: &mut fu_a.in_progress,
++                                max_nals: self.max_nals,
+                             },
+                         )?;
+                         if !end {
+@@ -695,6 +715,7 @@
+                 pieces: &mut self.pieces,
+                 nals: &mut self.nals,
+                 in_progress: &mut in_progress,
++                max_nals: self.max_nals,
+             },
+         )
+     }
+diff -ru a/src/codec/mod.rs b/src/codec/mod.rs
+--- a/src/codec/mod.rs
++++ b/src/codec/mod.rs
+@@ -965,6 +965,14 @@
+         }
+     }
+ 
++    /// Limits the NALs per access unit (H.264 only; local patch, see ADR 0002).
++    #[doc(hidden)]
++    pub fn set_max_nals(&mut self, n: usize) {
++        if let DepacketizerInner::H264(d) = &mut self.0 {
++            d.set_max_nals(n);
++        }
++    }
++
+     /// Sets the frame format for output assembly.
+     ///
+     /// Controls H.26x NAL framing (length-prefixed vs Annex B) and parameter
+diff -ru a/src/error.rs b/src/error.rs
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -24,10 +24,24 @@
+     /// Returns the status code, if the error was generated from a response.
+     pub fn status_code(&self) -> Option<u16> {
+         match self.0.as_ref() {
+-            ErrorInt::RtspResponseError { status, .. } => Some((*status).into()),
++            ErrorInt::RtspResponseError { status, .. }
++            | ErrorInt::BasicAuthRefused { status, .. } => Some((*status).into()),
+             _ => None,
+         }
+     }
++
++    /// True if the session failed because the peer's only offered
++    /// authentication scheme was Basic and `SessionOptions::allow_basic_auth`
++    /// was not set. No credentials were sent. (Local patch, see ADR 0002.)
++    pub fn is_basic_auth_refused(&self) -> bool {
++        matches!(self.0.as_ref(), ErrorInt::BasicAuthRefused { .. })
++    }
++
++    /// True if the session failed because the peer sent more unfinished data
++    /// than `SessionOptions::max_buffered_bytes`. (Local patch, see ADR 0002.)
++    pub fn is_buffer_limit(&self) -> bool {
++        matches!(self.0.as_ref(), ErrorInt::BufferLimit { .. })
++    }
+ }
+ 
+ #[derive(Debug, derive_more::Display, derive_more::Error)]
+@@ -132,6 +146,25 @@
+     #[display("Timeout")]
+     Timeout,
+ 
++    /// The peer sent more than `SessionOptions::max_buffered_bytes` that retina must hold
++    /// (an access unit that does not end).
++    #[display("Buffered more than {limit} bytes of unfinished data\n\nconn: {conn_ctx}")]
++    BufferLimit {
++        conn_ctx: ConnectionContext,
++        limit: usize,
++    },
++
++    /// The peer asked for Basic authentication, which is refused unless
++    /// `SessionOptions::allow_basic_auth` is set. No credentials were sent.
++    #[display("Basic authentication refused\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
++    BasicAuthRefused {
++        conn_ctx: ConnectionContext,
++        msg_ctx: RtspMessageContext,
++        method: crate::rtsp::msg::Method,
++        cseq: u32,
++        status: crate::rtsp::msg::StatusCode,
++    },
++
+     #[display("Unsupported: {_0}")]
+     Unsupported(#[error(not(source))] String),
+ }
+diff -ru a/src/tokio.rs b/src/tokio.rs
+--- a/src/tokio.rs
++++ b/src/tokio.rs
+@@ -121,6 +121,9 @@
+     parser: crate::rtsp::parse::Parser,
+     read_buf: MarkBuf,
+ 
++    /// Most unfinished data `read_buf` may hold before the connection fails.
++    max_buffered: usize,
++
+     /// Write buffer for outgoing messages, appended to by `start_send` and
+     /// [`Connection::queue_data`] and drained by `poll_flush`.
+     ///
+@@ -252,6 +255,7 @@
+                 .max_message_size(max_message_size)
+                 .build(),
+             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
++            max_buffered: usize::MAX,
+             write_buf: BytesMut::new(),
+             written: 0,
+             write_failed: None,
+@@ -259,6 +263,11 @@
+         }
+     }
+ 
++    /// Fails the connection once more than `n` bytes of unfinished data are held.
++    pub(crate) fn set_max_buffered(&mut self, n: usize) {
++        self.max_buffered = n;
++    }
++
+     pub(crate) fn ctx(&self) -> &ConnectionContext {
+         &self.ctx
+     }
+@@ -509,6 +518,14 @@
+                 }
+             }
+ 
++            // A peer that never ends an access unit pins everything it sends.
++            if this.read_buf.buffered_len() > this.max_buffered {
++                return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::BufferLimit {
++                    conn_ctx: this.ctx,
++                    limit: this.max_buffered,
++                }))));
++            }
++
+             // Need more data. Read from the stream into the ring buffer
+             // using vectored I/O to fill both halves of the ring.
+             let (first, second) = this.read_buf.spare_capacity(4096);

@@ -146,10 +146,7 @@ pub(crate) struct SpsSpec {
 }
 
 pub(crate) fn has_chroma(profile: u8) -> bool {
-    matches!(
-        profile,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    )
+    wardenlens_core::video::HIGH_FAMILY_PROFILES.contains(&profile)
 }
 
 fn write_hrd(w: &mut BitWriter, h: &Hrd) {
@@ -496,15 +493,8 @@ pub(crate) fn sps_strategy() -> impl Strategy<Value = SpsSpec> {
         Just(66_u8),
         Just(77),
         Just(88),
-        Just(100),
-        Just(110),
-        Just(122),
-        Just(244),
-        Just(44),
-        Just(83),
-        Just(86),
-        Just(118),
-        Just(128),
+        // Every High family profile, from the same list the parser uses.
+        proptest::sample::select(wardenlens_core::video::HIGH_FAMILY_PROFILES.to_vec()),
     ];
     (
         (

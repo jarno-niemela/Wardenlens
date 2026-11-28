@@ -9,6 +9,8 @@ FROM rust:1.100.0-slim-bookworm@sha256:bb875b0f8ce726053e259034848c471840e96bfe5
 WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The vendored, patched retina of [patch.crates-io] (ADR 0002 section 13, #155); the build fails without it.
+COPY third_party ./third_party
 # The camera catalogue is embedded in the CLI with include_str! (#67).
 COPY cameras ./cameras
 RUN cargo build --release --locked -p wardenlens-cli

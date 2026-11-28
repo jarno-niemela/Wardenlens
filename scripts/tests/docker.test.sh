@@ -31,6 +31,9 @@ check_dockerignore() { # FILE -> prints one message per problem
   for e in 'cameras' 'cameras/' '/cameras' '/cameras/'; do
     has "$f" "$e" && echo "dockerignore excludes the camera catalogue ($e)"
   done
+  for e in 'third_party' 'third_party/' '/third_party' '/third_party/' '**/third_party' '*.patch' '**/*.patch' 'third_party/**'; do
+    has "$f" "$e" && echo "dockerignore excludes third_party/ (the patched retina) ($e)"
+  done
 }
 check_gitignore() {
   local f=$1 e
@@ -56,6 +59,7 @@ check_dockerfile() {
   contains "$f" '^ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility$' || echo "NVIDIA_DRIVER_CAPABILITIES missing"
   contains "$f" 'cargo build --release --locked -p wardenlens-cli' || echo "release locked build missing"
   contains "$f" '^COPY cameras( |/ )' || echo "the builder does not copy cameras/ (embedded catalogue)"
+  contains "$f" '^COPY third_party( |/ )' || echo "the builder does not copy third_party/ (the patched retina)"
   contains "$f" '^COPY rust-toolchain\.toml ' || echo "rust-toolchain.toml not copied into the builder"
   # The default (last) stage runs as a fixed numeric non-root user.
   local last_user
@@ -127,6 +131,12 @@ grep -v '^COPY cameras' "$df" >"$tmp/df"
 expect_flagged "a builder without cameras/ is flagged" "cameras" check_dockerfile "$tmp/df"
 { cat "$di"; echo 'cameras/'; } >"$tmp/di"
 expect_flagged "a dockerignore excluding cameras/ is flagged" "camera catalogue" check_dockerignore "$tmp/di"
+grep -v '^COPY third_party' "$df" >"$tmp/df"
+expect_flagged "a builder without third_party/ is flagged" "third_party" check_dockerfile "$tmp/df"
+{ cat "$di"; echo 'third_party/'; } >"$tmp/di"
+expect_flagged "a dockerignore excluding third_party/ is flagged" "patched retina" check_dockerignore "$tmp/di"
+{ cat "$di"; echo '*.patch'; } >"$tmp/di"
+expect_flagged "a dockerignore excluding *.patch is flagged" "patched retina" check_dockerignore "$tmp/di"
 sed -E 's/ --locked -p wardenlens-cli/ -p wardenlens-cli/' "$df" >"$tmp/df"
 expect_flagged "an unlocked build is flagged" "locked build" check_dockerfile "$tmp/df"
 { cat "$df"; echo 'RUN apt-get install -y curl'; } >"$tmp/df"

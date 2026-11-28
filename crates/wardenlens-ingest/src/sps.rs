@@ -145,10 +145,7 @@ pub fn sps_reordering(nal: &[u8]) -> Result<ReorderVerdict, SpsError> {
 
 /// High family profiles carry the chroma and scaling list syntax (spec 7.3.2.1.1).
 fn has_chroma_info(profile_idc: u8) -> bool {
-    matches!(
-        profile_idc,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    )
+    wardenlens_core::video::is_high_family(profile_idc)
 }
 
 fn read_sps(r: &mut Bits<'_>) -> Result<SpsSummary, SpsError> {

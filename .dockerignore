@@ -1,5 +1,5 @@
 # Backstop for the Docker build context (#69). The Dockerfile copies only Cargo.*, rust-toolchain.toml,
-# crates/ and cameras/, so everything else is excluded anyway; these entries keep a stray secret out of the context.
+# crates/, cameras/ and third_party/ (the patched retina), so everything else is excluded anyway; these entries keep a stray secret out of the context.
 target/
 **/target/
 spikes/

@@ -262,7 +262,6 @@ fn avcc_high_extension_carries_422_10bit_fields() {
 /// (ffmpeg and the JM decoder both read them). The writer emits the avcC High extension for 144,
 /// so the parser must read those fields too, or the dimensions and the extension are wrong.
 #[test]
-#[ignore = "follow-up #100"]
 fn profile_144_sps_reads_the_chroma_fields() {
     // profile 144, constraint 0, level 30, sps_id 0, chroma_format_idc 3, separate_planes 0,
     // bit depths 0/0, qpprime 0, no scaling, log2_max_frame_num 0, poc type 0, poc lsb 0,

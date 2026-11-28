@@ -48,7 +48,7 @@ use wardenlens_core::time::{Clock, DurationMs, MonoMs, MonotonicClock};
 
 use crate::error::IngestError;
 use crate::frame::{Frame, H264Params};
-use crate::session::{FRAME_TIMEOUT, FrameStream, open_stream};
+use crate::session::{FRAME_TIMEOUT, FrameStream, OpenOptions, open_stream_with};
 
 /// Shortest idle timeout and reconnect pause the supervisor accepts. A smaller configured value
 /// is raised to it, so a zero cannot turn the reconnect loop into a busy loop.
@@ -92,7 +92,7 @@ impl<C: Clock + Send + 'static> FrameSource for FrameStream<C> {
     }
 }
 
-/// The retina session of [`open_stream`] as a [`StreamSource`].
+/// The retina session of [`open_stream_with`] as a [`StreamSource`].
 pub struct RetinaSource<C> {
     host: Host,
     port: NonZeroU16,
@@ -100,6 +100,7 @@ pub struct RetinaSource<C> {
     credential: Option<Credential>,
     role: StreamRole,
     clock: C,
+    options: OpenOptions,
 }
 
 impl<C> RetinaSource<C> {
@@ -119,7 +120,16 @@ impl<C> RetinaSource<C> {
             credential,
             role,
             clock,
+            options: OpenOptions::default(),
         }
+    }
+
+    /// Sets the per-camera [`OpenOptions`] (for example the Basic authentication opt-in). The
+    /// default is the safe one.
+    #[must_use]
+    pub fn with_open_options(mut self, options: OpenOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
@@ -127,13 +137,14 @@ impl<C: Clock + Clone + Send + 'static> StreamSource for RetinaSource<C> {
     type Stream = FrameStream<C>;
 
     async fn open(&mut self, idle_timeout: Duration) -> Result<Self::Stream, IngestError> {
-        let stream = open_stream(
+        let stream = open_stream_with(
             &self.host,
             self.port,
             &self.path,
             self.credential.as_ref(),
             self.role,
             self.clock.clone(),
+            self.options,
         )
         .await?;
         Ok(stream.with_frame_timeout(idle_timeout))
@@ -277,7 +288,7 @@ pub fn failure_kind(e: &IngestError) -> FailureKind {
     match e {
         IngestError::OpenTimeout | IngestError::FrameTimeout => FailureKind::Timeout,
         IngestError::OpenFailed => FailureKind::Refused,
-        IngestError::AuthRejected => FailureKind::Auth,
+        IngestError::AuthRejected | IngestError::BasicAuthRefused => FailureKind::Auth,
         IngestError::Rejected(_)
         | IngestError::NoVideoStream
         | IngestError::UnsupportedCodec
@@ -1129,6 +1140,7 @@ mod tests {
             | IngestError::OpenFailed
             | IngestError::OpenTimeout
             | IngestError::AuthRejected
+            | IngestError::BasicAuthRefused
             | IngestError::Rejected(_)
             | IngestError::NoVideoStream
             | IngestError::UnsupportedCodec
@@ -1141,6 +1153,7 @@ mod tests {
             (IngestError::OpenFailed, FailureKind::Refused),
             (IngestError::OpenTimeout, FailureKind::Timeout),
             (IngestError::AuthRejected, FailureKind::Auth),
+            (IngestError::BasicAuthRefused, FailureKind::Auth),
             (IngestError::Rejected(404), FailureKind::Protocol),
             (IngestError::NoVideoStream, FailureKind::Protocol),
             (IngestError::UnsupportedCodec, FailureKind::Protocol),

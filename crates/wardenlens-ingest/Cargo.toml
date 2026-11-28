@@ -13,7 +13,9 @@ repository.workspace = true
 wardenlens-core.workspace = true
 thiserror.workspace = true
 secrecy.workspace = true
-retina = { version = "0.4.22", default-features = false }
+# `=`: the workspace [patch.crates-io] (ADR 0002 section 13) is for exactly this version; a bump must not
+# silently fall away from the patch.
+retina = { version = "=0.4.22", default-features = false }
 # retina's `describe` takes a `url::Url`; the same major version retina uses.
 url = { version = "2.5", default-features = false }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }

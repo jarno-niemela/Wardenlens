@@ -31,6 +31,20 @@ pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// not covered, retina limits each message to under 64 KiB itself.
 const MAX_RTSP_MESSAGE_BYTES: usize = 256 * 1024;
 
+/// Most unfinished data retina may hold for one session (its read ring, which pins every packet
+/// of the access unit being assembled). Just under 16 MiB, so the ring (a power of two) never
+/// grows past 16 MiB, and well over [`crate::MAX_FRAME_BYTES`] plus its RTP and interleaving
+/// headers: a frame at the cap still passes and an oversize one is still dropped and counted,
+/// while an access unit that never ends fails the session. Needs the patched retina of ADR 0002
+/// section 13.
+const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
+
+/// Most NALs in one access unit. Real cameras send a handful (slices, SEI, parameter sets). retina
+/// keeps 28 bytes of metadata per NAL however short it is, which `MAX_BUFFERED_BYTES` does not
+/// see (a 2-byte NAL costs 4 ring bytes), so this bounds that metadata to well under 1 MiB. More
+/// fails the session. Needs the patched retina of ADR 0002 section 13.
+pub const MAX_NALS_PER_ACCESS_UNIT: usize = 4096;
+
 /// What `select_video_stream` needs to know about one SDP media section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamInfo<'a> {
@@ -82,6 +96,9 @@ fn stream_url(host: &Host, port: NonZeroU16, path: &RtspPath) -> Result<Url, Ing
 
 /// Keeps only the kind of a retina error.
 fn classify(e: &retina::Error, otherwise: IngestError) -> IngestError {
+    if e.is_basic_auth_refused() {
+        return IngestError::BasicAuthRefused;
+    }
     match e.status_code() {
         Some(401 | 403) => IngestError::AuthRejected,
         Some(status) => IngestError::Rejected(status),
@@ -102,16 +119,38 @@ pub struct FrameStream<C> {
     finished: bool,
 }
 
+/// Per-camera choices for [`open_stream_with`]. The default is the safe one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpenOptions {
+    /// Answer a Basic-only challenge with the password, which then crosses the network in the
+    /// clear (base64 is not protection). Off by default: a Basic-only challenge fails with
+    /// [`IngestError::BasicAuthRefused`] and nothing is sent. A challenge that also offers Digest
+    /// is answered with Digest either way.
+    pub allow_basic_auth: bool,
+}
+
+impl OpenOptions {
+    /// Sets [`OpenOptions::allow_basic_auth`].
+    #[must_use]
+    pub fn allow_basic_auth(mut self, allow: bool) -> Self {
+        self.allow_basic_auth = allow;
+        self
+    }
+}
+
 /// Opens an RTSP session over TCP (interleaved) and starts playing the first H.264 video stream.
 ///
 /// The URL is built from `host`, `port` and `path` and has no user info. Credentials go only
-/// through retina's credential option, which uses them if the camera asks for digest or basic
-/// authentication. retina needs them as `String`s, so the password is copied out of its
+/// through retina's credential option, which uses them if the camera asks for digest
+/// authentication. A Basic-only challenge is refused (see [`OpenOptions::allow_basic_auth`] and
+/// [`open_stream_with`]). retina needs them as `String`s, so the password is copied out of its
 /// `SecretString` into one that retina owns for the life of the session and is not zeroed.
 ///
 /// # Errors
 /// [`IngestError`]: `InvalidUrl`, `OpenTimeout` after [`OPEN_TIMEOUT`], `AuthRejected` or
-/// `Rejected` for an RTSP error status, `NoVideoStream`, `UnsupportedCodec`, or `OpenFailed`.
+/// `Rejected` for an RTSP error status, `BasicAuthRefused`, `NoVideoStream`, `UnsupportedCodec`,
+/// or `OpenFailed`.
 pub async fn open_stream<C: Clock>(
     host: &Host,
     port: NonZeroU16,
@@ -120,12 +159,37 @@ pub async fn open_stream<C: Clock>(
     role: StreamRole,
     clock: C,
 ) -> Result<FrameStream<C>, IngestError> {
+    open_stream_with(
+        host,
+        port,
+        path,
+        credential,
+        role,
+        clock,
+        OpenOptions::default(),
+    )
+    .await
+}
+
+/// [`open_stream`] with per-camera [`OpenOptions`].
+///
+/// # Errors
+/// As [`open_stream`].
+pub async fn open_stream_with<C: Clock>(
+    host: &Host,
+    port: NonZeroU16,
+    path: &RtspPath,
+    credential: Option<&Credential>,
+    role: StreamRole,
+    clock: C,
+    options: OpenOptions,
+) -> Result<FrameStream<C>, IngestError> {
     let url = stream_url(host, port, path)?;
     let creds = credential.map(|c| Credentials {
         username: c.user.clone(),
         password: c.password.expose_secret().to_owned(),
     });
-    let demuxed_and_index = timeout(OPEN_TIMEOUT, open_session(url, creds))
+    let demuxed_and_index = timeout(OPEN_TIMEOUT, open_session(url, creds, options))
         .await
         .map_err(|_| IngestError::OpenTimeout)??;
     Ok(FrameStream {
@@ -142,10 +206,13 @@ pub async fn open_stream<C: Clock>(
 async fn open_session(
     url: Url,
     creds: Option<Credentials>,
+    open: OpenOptions,
 ) -> Result<(Demuxed, usize), IngestError> {
     let options = SessionOptions::default()
         .creds(creds)
-        .max_message_size(MAX_RTSP_MESSAGE_BYTES);
+        .max_message_size(MAX_RTSP_MESSAGE_BYTES)
+        .max_buffered_bytes(MAX_BUFFERED_BYTES)
+        .allow_basic_auth(open.allow_basic_auth);
     let mut session = Session::describe(url, options)
         .await
         .map_err(|e| classify(&e, IngestError::OpenFailed))?;
@@ -161,6 +228,7 @@ async fn open_session(
     let stream_i = select_video_stream(&infos)?;
     drop(infos);
     let setup = SetupOptions::default()
+        .max_nals_per_access_unit(MAX_NALS_PER_ACCESS_UNIT)
         .transport(Transport::Tcp(TcpTransportOptions::default()))
         .frame_format(FrameFormat::MP4);
     session
@@ -286,6 +354,15 @@ mod tests {
             encoding_name: enc,
             receiving,
         }
+    }
+
+    #[test]
+    fn the_buffer_bound_keeps_the_ring_at_16_mib_and_fits_a_frame_at_the_cap() {
+        const FRAME: usize = crate::frame::MAX_FRAME_BYTES;
+        const { assert!(MAX_BUFFERED_BYTES + 4096 <= 16 * 1024 * 1024) };
+        // 8 MiB of payload in 1400-byte packets with 16 bytes of RTP and interleave header each,
+        // plus a generous allowance for the unparsed tail.
+        const { assert!(MAX_BUFFERED_BYTES > FRAME + FRAME / 50 + 256 * 1024) };
     }
 
     #[test]
