@@ -27,7 +27,7 @@ for t in scripts/tests/*.test.sh scripts/tests/adversarial/*.sh; do "$t" >/dev/n
 # scrubbed environment and unsets the same variables itself. Gate-only until CI runs them (CI is locked; owner follow-up).
 spike_env=(env -u WARDENLENS_BIN -u WARDENLENS_VAULT -u WARDENLENS_VAULT_KEY_FILE -u WARDENLENS_VAULT_KEY -u CAMERAS -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u BASH_ENV -u ENV)
 while read -r v; do spike_env+=(-u "$v"); done < <(compgen -e | grep '^ONVIF_' || true)
-for t in lib.adv.sh lib-r2.adv.sh cams-r1.adv.sh cams-r2.adv.sh cams-r3.adv.sh cams-r4.adv.sh model-r1.adv.sh pullpoint.test.sh; do
+for t in lib.adv.sh lib-r2.adv.sh cams-r1.adv.sh cams-r2.adv.sh cams-r3.adv.sh cams-r4.adv.sh model-r1.adv.sh model-r2.adv.sh pullpoint.test.sh; do
   "${spike_env[@]}" "spikes/s1-cameras/tests/$t" >/dev/null || {
     echo "FAILED: spikes/s1-cameras/tests/$t" >&2; "${spike_env[@]}" "spikes/s1-cameras/tests/$t" | grep -v '^ok' >&2 || true; exit 1; }
 done

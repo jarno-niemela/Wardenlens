@@ -77,7 +77,10 @@ check "stream_soak.sh: a duplicate id in CAMERAS is refused or de-duplicated (on
 
 # An id that passes cam_id but has no model entry must not be opened at the bare host (rtsp://...@host:554).
 cred cam-x admin pw-synth-x; host cam-x 192.0.2.9
-check "rtsp_path: an id with no model entry is an error, not an empty path" '! p=$(rtsp_path cam-x main 2>/dev/null) || [[ -n $p ]]'
+check "rtsp_path: an id with no model entry is an error, not an empty path" \
+  '{ p=$(rtsp_path cam-x main 2>/dev/null); rc=$?; (( rc != 0 )) && [[ -z $p ]]; }'
+check "rtsp_path: a stream kind other than main or sub is refused, nothing printed" \
+  '{ p=$(rtsp_path cam-2 MAIN 2>/dev/null); rc=$?; (( rc != 0 )) && [[ -z $p ]] && ! rtsp_path cam-2 "" 2>/dev/null && ! rtsp_path cam-2 2>/dev/null; }'
 cred cam-y admin pw-synth-y; host cam-y 192.0.2.8; model cam-y acme/no-such-model
 check "rtsp_path: a model with no known path is an error naming the model, printing no path" \
   '{ p=$(rtsp_path cam-y main 2>"$fx/err"); rc=$?; (( rc != 0 )) && [[ -z $p ]] && grep -q "no RTSP path for model" "$fx/err"; }'

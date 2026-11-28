@@ -34,4 +34,18 @@ WARDENLENS_SITE_IDS_FILE=$tmp/bad "$tool" "$t" >/dev/null 2>&1; rc=$?; [[ $rc ==
 printf 'a\\Eb\n' >"$t/compose.yaml"
 WARDENLENS_SITE_IDS_FILE=$tmp/bad "$tool" "$t" >/dev/null 2>&1; rc=$?; [[ $rc == 1 ]] && ok "an id containing \\E matches itself literally" || bad "\\E id literal match"
 WARDENLENS_SITE_IDS_FILE=$tmp/none "$tool" "$t" >/dev/null 2>&1; [[ $? == 2 ]] && ok "a missing list file is an error" || bad "missing list"
+# <id>_main / <id>_sub (spike stream names) match; other snake_case forms are a documented limit (not caught).
+for ctx in zq-site-7_main zq-site-7_sub; do
+  printf 'x %s\n' "$ctx" >"$t/scripts/s.sh"; printf 'zq-site-7\n' >"$tmp/ids7"
+  WARDENLENS_SITE_IDS_FILE=$tmp/ids7 "$tool" "$t" >/dev/null 2>&1; rc=$?; [[ $rc == 1 ]] && ok "<$ctx> matches" || bad "<$ctx> ($rc)"
+done
+printf 'x zq-site-7_other\n' >"$t/scripts/s.sh"
+WARDENLENS_SITE_IDS_FILE=$tmp/ids7 "$tool" "$t" >/dev/null 2>&1; rc=$?; [[ $rc == 0 ]] && ok "documented limit: zq-site-7_other is not caught" || bad "limit row ($rc)"
+rm -f "$t/scripts/s.sh"
+# A git tree: only tracked files are candidates; a tracked path with an id is reported, redacted.
+g=$tmp/gt; mkdir -p "$g/scripts"; git -C "$g" init -q; printf 'clean\n' >"$g/scripts/a.sh"; printf 'echo zq-site-7\n' >"$g/scripts/untracked.sh"
+git -C "$g" add scripts/a.sh
+WARDENLENS_SITE_IDS_FILE=$tmp/ids7 "$tool" "$g" >/dev/null 2>&1; rc=$?; [[ $rc == 0 ]] && ok "git tree: an untracked file is not scanned" || bad "git untracked ($rc)"
+printf 'clean\n' >"$g/scripts/zq-site-7.sh"; git -C "$g" add scripts/zq-site-7.sh
+out=$(WARDENLENS_SITE_IDS_FILE=$tmp/ids7 "$tool" "$g" 2>&1); rc=$?; [[ $rc == 1 && $out != *zq-site-7* ]] && ok "git tree: a tracked path with an id is reported, redacted" || bad "git path ($rc: $out)"
 exit $fail

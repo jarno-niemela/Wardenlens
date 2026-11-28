@@ -168,6 +168,7 @@ cam_model() {
 # with no known path is an error. Paths are the cameras/*.toml ones.
 rtsp_path() { # <id> <main|sub>
   local id model
+  [[ ${2:-} == main || ${2:-} == sub ]] || { echo "rtsp_path: the stream kind must be main or sub" >&2; return 1; }
   id="$(cam_id "$1")" || return 1
   model="$(cam_model "$id")" || return 1
   case "$model" in

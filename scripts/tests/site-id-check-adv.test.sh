@@ -60,7 +60,7 @@ for ctx in 'printf "a\nzq-site-7\n"' "CAMERAS=\$'a\\tzq-site-7'" '"cam:zq-site-7
   run "$tmp/ids"
   [[ $rc == 1 ]] && ok "an id in context <$ctx> is found" || bad "id in context <$ctx> missed ($rc: $out)"
 done
-for ctx in 'zq-site-77' 'xzq-site-7' 'zq-site-7_main' 'zq-site-7-b'; do
+for ctx in 'zq-site-77' 'xzq-site-7' 'zq-site-7-b' 'zq-site-7_other'; do
   fresh; plant scripts/x.sh "$ctx"
   run "$tmp/ids"
   [[ $rc == 0 ]] && ok "a longer token <$ctx> is not a match" || bad "false positive on <$ctx> ($rc: $out)"
